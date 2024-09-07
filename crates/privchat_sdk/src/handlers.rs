@@ -1,4 +1,4 @@
-use super::message::{Message};
+use super::message::Message;
 use privchat_protocol::message::*;
 
 pub trait CloneBox {
