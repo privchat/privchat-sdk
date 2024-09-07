@@ -1,4 +1,4 @@
-use super::handlers::{MessageHandler, ConnectAckHandler, DisconnectHandler, RecvHandler, SendAckHandler};
+use super::handlers::MessageHandler;
 use super::message::Message;
 use privchat_protocol::Protocol;
 use privchat_protocol::message::*;
@@ -15,6 +15,7 @@ pub struct PrivchatSDK {
     client: MessageTransportClient<QuicClientChannel>,
     protocol: Protocol,
     handlers: MessageHandlerMap,
+    compression_type: CompressionMethod,
 }
 
 impl PrivchatSDK {
@@ -31,6 +32,7 @@ impl PrivchatSDK {
             client: client.clone(), 
             protocol,
             handlers,
+            compression_type: CompressionMethod::None
         };
 
         let sdk_clone = sdk.clone();
@@ -72,24 +74,21 @@ impl PrivchatSDK {
         self.handlers.insert(message_type, Box::new(handler));
     }
 
+    pub fn set_compression_type(&mut self, compression_type: CompressionMethod) {
+        self.compression_type = compression_type;
+    }
+
     pub async fn send_message(&self, message: SendMessage) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let encoded_send_message = self.protocol.encode::<SendMessage>(&message);
 
         let packet_header = PacketHeader {
-            message_id: 1, // 假设 SendMessage 的 ID 是 1
+            message_id: MessageType::Send.to_u32(),
             message_length: encoded_send_message.len() as u32,
-            compression_type: CompressionMethod::None,
+            compression_type: self.compression_type,
             extend_length: 0,
         };
 
         let packet = Packet::new(packet_header, Vec::new(), encoded_send_message);
         self.client.send(packet).await
     }
-}
-
-pub fn setup_handlers(sdk: &mut PrivchatSDK) {
-    sdk.register_message_handler(MessageType::ConnectAck, ConnectAckHandler);
-    sdk.register_message_handler(MessageType::Disconnect, DisconnectHandler);
-    sdk.register_message_handler(MessageType::Recv, RecvHandler);
-    sdk.register_message_handler(MessageType::SendAck, SendAckHandler);
 }
