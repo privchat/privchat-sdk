@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/privchat_sdk",
+    "crates/privchat_ffi"
+]
+

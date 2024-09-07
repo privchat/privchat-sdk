@@ -1,0 +1,11 @@
+[package]
+name = "privchat_ffi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = "1"
+privchat_sdk = { path = "../privchat_sdk" }
+
+[lib]
+crate-type = ["cdylib"]
