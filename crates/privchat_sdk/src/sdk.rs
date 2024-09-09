@@ -19,7 +19,7 @@ pub struct PrivchatSDK {
 }
 
 impl PrivchatSDK {
-    pub fn new(address: &str, port: u16, cert_path: String) -> Self {
+    pub fn new(address: &str, port: u16, cert_path: &str) -> Self {
         let mut client = MessageTransportClient::new();
         let protocol = Protocol::new();
 

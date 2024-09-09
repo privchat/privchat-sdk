@@ -23,12 +23,10 @@ pub extern "C" fn privchat_sdk_new(
 ) -> *mut PrivchatSDK {
     let address = unsafe { CStr::from_ptr(address) }
         .to_str()
-        .unwrap_or("127.0.0.1")
-        .to_string();
+        .unwrap_or("127.0.0.1");
     let cert_path = unsafe { CStr::from_ptr(cert_path) }
         .to_str()
-        .unwrap_or("/path/to/cert.pem")
-        .to_string();
+        .unwrap_or("/path/to/cert.pem");
     let mut sdk = PrivchatSDK::new(&address, port, cert_path);
 
     sdk.register_message_handler(MessageType::ConnectAck, ConnectAckHandler);
