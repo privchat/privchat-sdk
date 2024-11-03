@@ -7,7 +7,7 @@ use privchat_sdk::sdk::PrivchatSDK;
 #[tokio::main]
 async fn main() {
     // 创建 PrivchatSDK 实例
-    let mut sdk = PrivchatSDK::new("127.0.0.1", 8080, "/path/to/cert.pem".into());
+    let mut sdk = PrivchatSDK::new("127.0.0.1", 10001, "./certs/cert.pem".into());
 
     // 设置压缩类型
     sdk.set_compression_type(CompressionMethod::Zstd);
