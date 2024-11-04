@@ -1,0 +1,10 @@
+[package]
+name = "privchat_sdk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = "1"
+anyhow = "1"
+privchat_protocol = { path = "../../../privchat-protocol" }
+msgtrans = { path = "../../../msgtrans-rust" }
