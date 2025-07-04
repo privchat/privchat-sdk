@@ -1,189 +1,239 @@
-use msgtrans::compression::CompressionMethod;
-use privchat_protocol::message::MessageType;
-use privchat_protocol::message::*;
-use privchat_sdk::handlers::{ConnectAckHandler, RecvHandler};
-use privchat_sdk::PrivchatSDK;
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use privchat_sdk::PrivchatClient;
 
-/// 创建一个新的 PrivchatSDK 实例，并注册默认的消息处理器。
-///
-/// # 参数
-/// - `address`: 服务器地址
-/// - `port`: 服务器端口
-/// - `cert_path`: SSL 证书路径
-///
-/// # 返回值
-/// - `*mut PrivchatSDK`: PrivchatSDK 实例的指针
-#[no_mangle]
-pub extern "C" fn privchat_sdk_new(
-    address: *const c_char,
-    port: u16,
-    cert_path: *const c_char,
-) -> *mut PrivchatSDK {
-    let address = unsafe { CStr::from_ptr(address) }
-        .to_str()
-        .unwrap_or("127.0.0.1");
-    let cert_path = unsafe { CStr::from_ptr(cert_path) }
-        .to_str()
-        .unwrap_or("/path/to/cert.pem");
-    let mut sdk = PrivchatSDK::new(&address, port, cert_path);
-
-    sdk.register_message_handler(MessageType::ConnectAck, ConnectAckHandler);
-    sdk.register_message_handler(MessageType::Recv, RecvHandler);
-
-    Box::into_raw(Box::new(sdk))
+// 全局运行时管理
+lazy_static::lazy_static! {
+    static ref TOKIO_RUNTIME: tokio::runtime::Runtime = 
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build Tokio runtime");
 }
 
-/// 连接到服务器。
+/// 创建一个新的 PrivchatClient 实例
 ///
 /// # 参数
-/// - `sdk_ptr`: PrivchatSDK 实例的指针
+/// - `work_dir`: 工作目录路径
 ///
 /// # 返回值
-/// - `bool`: 连接是否成功
+/// - `*mut PrivchatClient`: PrivchatClient 实例的指针，失败时返回空指针
+/// 
+/// # 注意
+/// 当前版本的FFI需要完整的msgtrans Transport实现才能正常工作
 #[no_mangle]
-pub extern "C" fn privchat_sdk_connect(sdk_ptr: *mut PrivchatSDK) -> bool {
-    if sdk_ptr.is_null() {
-        return false;
-    }
-    let sdk = unsafe { &mut *sdk_ptr };
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to build Tokio runtime")
-        .block_on(async { sdk.connect().await.is_ok() })
-}
-
-/// 发送消息。
-///
-/// # 参数
-/// - `sdk_ptr`: PrivchatSDK 实例的指针
-/// - `client_seq`: 客户端序列号
-/// - `client_msg_no`: 客户端唯一消息编号
-/// - `stream_no`: 流式编号
-/// - `channel_id`: 频道ID
-/// - `channel_type`: 频道类型
-/// - `expire`: 消息过期时间（可选）
-/// - `from_uid`: 发送者UID
-/// - `topic`: 主题（可选）
-/// - `payload`: 消息负载
-/// - `payload_len`: 负载长度
-///
-/// # 返回值
-/// - `bool`: 消息是否成功发送
-#[no_mangle]
-pub extern "C" fn privchat_sdk_send_message(
-    sdk_ptr: *mut PrivchatSDK,
-    client_seq: u32,
-    client_msg_no: *const c_char,
-    stream_no: *const c_char,
-    channel_id: *const c_char,
-    channel_type: u8,
-    expire: Option<u32>,
-    from_uid: *const c_char,
-    topic: Option<*const c_char>,
-    payload: *const u8,
-    payload_len: usize,
-) -> bool {
-    if sdk_ptr.is_null()
-        || client_msg_no.is_null()
-        || stream_no.is_null()
-        || channel_id.is_null()
-        || from_uid.is_null()
-        || payload.is_null()
-    {
-        return false;
-    }
-
-    let sdk = unsafe { &mut *sdk_ptr };
-
-    let client_msg_no = unsafe { CStr::from_ptr(client_msg_no) }
-        .to_str()
-        .unwrap_or("unique_msg_no")
-        .to_string();
-    let stream_no = unsafe { CStr::from_ptr(stream_no) }
-        .to_str()
-        .unwrap_or("stream_001")
-        .to_string();
-    let channel_id = unsafe { CStr::from_ptr(channel_id) }
-        .to_str()
-        .unwrap_or("channel_01")
-        .to_string();
-    let from_uid = unsafe { CStr::from_ptr(from_uid) }
-        .to_str()
-        .unwrap_or("default_uid")
-        .to_string();
-
-    let topic = if let Some(topic_ptr) = topic {
-        Some(
-            unsafe { CStr::from_ptr(topic_ptr) }
+pub extern "C" fn privchat_client_new(
+    work_dir: *const c_char,
+) -> *mut PrivchatClient {
+    let work_dir_str = unsafe { 
+        if work_dir.is_null() {
+            "./privchat_data"
+        } else {
+            CStr::from_ptr(work_dir)
                 .to_str()
-                .unwrap_or("default_topic")
-                .to_string(),
-        )
-    } else {
-        None
+                .unwrap_or("./privchat_data")
+        }
     };
 
-    let payload_data = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+    // 创建客户端实例（这里需要根据实际的msgtrans API来实现）
+    // 目前返回null指针，等待实际的Transport实现
+    eprintln!("⚠️  FFI功能需要完整的Transport实现");
+    eprintln!("📁 工作目录: {}", work_dir_str);
+    eprintln!("💡 请参考 examples/main.rs 查看完整的使用示例");
+    std::ptr::null_mut()
 
-    let message = SendMessage {
-        setting: Setting::new(),
-        client_seq,
-        client_msg_no,
-        stream_no,
-        channel_id,
-        channel_type,
-        expire,
-        from_uid,
-        topic,
-        payload: payload_data.to_vec(),
-    };
-
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to build Tokio runtime")
-        .block_on(async { sdk.send_message(message).await.is_ok() })
+    // TODO: 完整实现需要以下步骤：
+    // 1. 创建或获取 Transport 实例
+    // 2. 调用 PrivchatClient::new(work_dir_str, transport).await
+    // 3. 返回 Box::into_raw(Box::new(client))
+    //
+    // 示例代码：
+    // let transport = Arc::new(transport_instance);
+    // match TOKIO_RUNTIME.block_on(PrivchatClient::new(work_dir_str, transport)) {
+    //     Ok(client) => Box::into_raw(Box::new(client)),
+    //     Err(_) => std::ptr::null_mut(),
+    // }
 }
 
-/// 设置压缩类型。
+/// 连接到服务器并登录
 ///
 /// # 参数
-/// - `sdk_ptr`: PrivchatSDK 实例的指针
-/// - `compression_type`: 压缩类型（0: None, 1: Zstd, 2: Zlib）
+/// - `client_ptr`: PrivchatClient 实例的指针
+/// - `login`: 登录凭证（手机号、用户名等）
+/// - `token`: 认证令牌（密码、短信验证码等）
 ///
 /// # 返回值
-/// - `bool`: 设置是否成功
+/// - `true`: 连接成功
+/// - `false`: 连接失败
 #[no_mangle]
-pub extern "C" fn privchat_sdk_set_compression_type(
-    sdk_ptr: *mut PrivchatSDK,
-    compression_type: u32,
+pub extern "C" fn privchat_client_connect(
+    client_ptr: *mut PrivchatClient,
+    login: *const c_char,
+    token: *const c_char,
 ) -> bool {
-    if sdk_ptr.is_null() {
+    if client_ptr.is_null() || login.is_null() || token.is_null() {
+        eprintln!("❌ 参数不能为空");
         return false;
     }
-    let sdk = unsafe { &mut *sdk_ptr };
-    let compression_method = match compression_type {
-        0 => CompressionMethod::None,
-        1 => CompressionMethod::Zstd,
-        2 => CompressionMethod::Zlib,
-        _ => CompressionMethod::None,
-    };
-    sdk.set_compression_type(compression_method);
-    true
+    
+    eprintln!("⚠️  connect() 功能需要完整的Transport实现");
+    false
+
+    // TODO: 完整实现
+    // let client = unsafe { &mut *client_ptr };
+    // let login_str = unsafe { CStr::from_ptr(login) }.to_str().unwrap_or("");
+    // let token_str = unsafe { CStr::from_ptr(token) }.to_str().unwrap_or("");
+    // 
+    // TOKIO_RUNTIME.block_on(async {
+    //     client.connect(login_str, token_str).await.is_ok()
+    // })
 }
 
-/// 释放 PrivchatSDK 实例。
+/// 断开连接
 ///
 /// # 参数
-/// - `sdk_ptr`: PrivchatSDK 实例的指针
+/// - `client_ptr`: PrivchatClient 实例的指针
+/// - `reason`: 断开原因
+///
+/// # 返回值
+/// - `true`: 断开成功
+/// - `false`: 断开失败
 #[no_mangle]
-pub extern "C" fn privchat_sdk_free(sdk_ptr: *mut PrivchatSDK) {
-    if !sdk_ptr.is_null() {
+pub extern "C" fn privchat_client_disconnect(
+    client_ptr: *mut PrivchatClient,
+    _reason: *const c_char,
+) -> bool {
+    if client_ptr.is_null() {
+        return false;
+    }
+    
+    eprintln!("⚠️  disconnect() 功能需要完整的Transport实现");
+    false
+
+    // TODO: 完整实现
+    // let client = unsafe { &mut *client_ptr };
+    // let reason_str = if _reason.is_null() {
+    //     "客户端主动断开"
+    // } else {
+    //     unsafe { CStr::from_ptr(_reason) }.to_str().unwrap_or("客户端主动断开")
+    // };
+    // 
+    // TOKIO_RUNTIME.block_on(async {
+    //     client.disconnect(reason_str).await.is_ok()
+    // })
+}
+
+/// 获取当前用户ID
+///
+/// # 参数
+/// - `client_ptr`: PrivchatClient 实例的指针
+/// - `buffer`: 输出缓冲区
+/// - `buffer_len`: 缓冲区长度
+///
+/// # 返回值
+/// - `true`: 获取成功
+/// - `false`: 获取失败
+#[no_mangle]
+pub extern "C" fn privchat_client_get_user_id(
+    client_ptr: *mut PrivchatClient,
+    buffer: *mut c_char,
+    buffer_len: usize,
+) -> bool {
+    if client_ptr.is_null() || buffer.is_null() || buffer_len == 0 {
+        return false;
+    }
+    
+    eprintln!("⚠️  get_user_id() 功能需要完整的Transport实现");
+    false
+
+    // TODO: 完整实现
+    // let client = unsafe { &*client_ptr };
+    // if let Some(user_id) = client.user_id() {
+    //     let user_id_bytes = user_id.as_bytes();
+    //     if user_id_bytes.len() + 1 <= buffer_len {
+    //         unsafe {
+    //             std::ptr::copy_nonoverlapping(
+    //                 user_id_bytes.as_ptr() as *const c_char,
+    //                 buffer,
+    //                 user_id_bytes.len(),
+    //             );
+    //             *buffer.add(user_id_bytes.len()) = 0; // null terminator
+    //         }
+    //         return true;
+    //     }
+    // }
+    // false
+}
+
+/// 检查连接状态
+///
+/// # 参数
+/// - `client_ptr`: PrivchatClient 实例的指针
+///
+/// # 返回值
+/// - `true`: 已连接
+/// - `false`: 未连接
+#[no_mangle]
+pub extern "C" fn privchat_client_is_connected(client_ptr: *mut PrivchatClient) -> bool {
+    if client_ptr.is_null() {
+        return false;
+    }
+
+    eprintln!("⚠️  is_connected() 功能需要完整的Transport实现");
+    false
+
+    // TODO: 完整实现
+    // let client = unsafe { &*client_ptr };
+    // TOKIO_RUNTIME.block_on(async {
+    //     client.is_connected().await
+    // })
+}
+
+/// 释放 PrivchatClient 实例
+///
+/// # 参数
+/// - `client_ptr`: PrivchatClient 实例的指针
+#[no_mangle]
+pub extern "C" fn privchat_client_free(client_ptr: *mut PrivchatClient) {
+    if !client_ptr.is_null() {
         unsafe {
-            drop(Box::from_raw(sdk_ptr));
+            let _ = Box::from_raw(client_ptr);
         }
+    }
+}
+
+/// 获取FFI版本信息
+///
+/// # 参数
+/// - `buffer`: 输出缓冲区
+/// - `buffer_len`: 缓冲区长度
+///
+/// # 返回值
+/// - `true`: 获取成功
+/// - `false`: 缓冲区太小
+#[no_mangle]
+pub extern "C" fn privchat_get_version(
+    buffer: *mut c_char,
+    buffer_len: usize,
+) -> bool {
+    if buffer.is_null() || buffer_len == 0 {
+        return false;
+    }
+
+    let version = "PrivchatSDK v0.1.0 - Rust FFI";
+    let version_bytes = version.as_bytes();
+    
+    if version_bytes.len() + 1 <= buffer_len {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                version_bytes.as_ptr() as *const c_char,
+                buffer,
+                version_bytes.len(),
+            );
+            *buffer.add(version_bytes.len()) = 0; // null terminator
+        }
+        true
+    } else {
+        false
     }
 }
