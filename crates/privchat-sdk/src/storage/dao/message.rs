@@ -275,7 +275,7 @@ impl<'a> MessageDao<'a> {
     /// 标记消息为已读
     pub fn mark_as_read(&self, message_id: &str) -> Result<()> {
         let sql = "UPDATE message SET viewed = 1, viewed_at = ?1, updated_at = ?2 WHERE message_id = ?3";
-        let now = Utc::now().timestamp() as i32;
+        let now = Utc::now().timestamp();  // Returns i64
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         
         self.conn.execute(sql, params![now, now_str, message_id])?;
@@ -286,7 +286,7 @@ impl<'a> MessageDao<'a> {
     pub fn delete_expired(&self) -> Result<u32> {
         let sql = "UPDATE message SET is_deleted = 1, updated_at = ?1 
                   WHERE expire_timestamp > 0 AND expire_timestamp < ?2 AND is_deleted = 0";
-        let now = Utc::now().timestamp();
+        let now = Utc::now().timestamp();  // Returns i64
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         
         let affected = self.conn.execute(sql, params![now_str, now])?;

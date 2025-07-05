@@ -8,6 +8,7 @@ use msgtrans::{Transport, transport::TransportOptions};
 use crate::error::{PrivchatSDKError, Result};
 use privchat_protocol::{MessageType, encode_message, decode_message};
 use privchat_protocol::{ConnectRequest, ConnectResponse, DisconnectRequest, SendRequest, SubscribeRequest, PingRequest};
+use crate::storage::dao;
 
 /// 用户会话信息
 #[derive(Debug, Clone)]
@@ -312,49 +313,9 @@ impl PrivchatClient {
 
     /// 创建数据库表
     pub fn create_database_tables(conn: &Connection) -> Result<()> {
-        // 创建消息表
-        conn.execute(
-            r#"
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id TEXT UNIQUE,
-                channel_id TEXT NOT NULL,
-                from_uid TEXT NOT NULL,
-                message_type INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-            [],
-        )?;
-
-        // 创建频道表
-        conn.execute(
-            r#"
-            CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT UNIQUE NOT NULL,
-                channel_name TEXT,
-                channel_type INTEGER NOT NULL,
-                subscribed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-            [],
-        )?;
-
-        // 创建设置表
-        conn.execute(
-            r#"
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-            [],
-        )?;
-
+        // 使用迁移管理器执行数据库初始化
+        let migration_dao = dao::MigrationDao::new(conn);
+        migration_dao.migrate()?;
         Ok(())
     }
 

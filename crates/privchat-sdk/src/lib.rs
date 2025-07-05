@@ -37,6 +37,7 @@
 pub mod error;
 pub mod client;
 pub mod storage;
+pub mod network;
 
 // 重新导出核心类型，方便使用
 pub use client::{PrivchatClient, UserSession};

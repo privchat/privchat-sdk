@@ -1,83 +1,74 @@
-use thiserror::Error;
+use std::fmt;
 use rusqlite;
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum PrivchatSDKError {
-    #[error("传输错误: {0}")]
-    Transport(String),
-    
-    #[error("序列化错误: {0}")]
-    Serialization(String),
-    
-    #[error("IO错误: {0}")]
-    IO(String),
-    
-    #[error("数据库错误: {0}")]
-    Database(String),
-    
-    #[error("SQLite错误: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-    
-    #[error("认证错误: {0}")]
-    Auth(String),
-    
-    #[error("未知消息类型: {0}")]
-    UnknownMessageType(u8),
-    
-    #[error("消息解码错误: {0}")]
-    MessageDecode(String),
-    
-    #[error("未连接到服务器")]
-    NotConnected,
-    
-    #[error("消息类型 {0:?} 没有找到处理器")]
-    HandlerNotFound(privchat_protocol::MessageType),
-    
-    // 存储模块错误类型
-    #[error("KV存储错误: {0}")]
+    SqliteError(rusqlite::Error),
+    JsonError(String),
+    InvalidArgument(String),
+    NotFound(String),
+    AlreadyExists(String),
+    Other(String),
+    // 添加缺失的错误变体
     KvStore(String),
-    
-    #[error("队列错误: {0}")]
-    Queue(String),
-    
-    #[error("媒体文件错误: {0}")]
-    Media(String),
-    
-    #[error("数据库升级错误: {0}")]
+    Serialization(String),
+    IO(String),
+    Database(String),
     Migration(String),
-    
-    #[error("存储配置错误: {0}")]
-    StorageConfig(String),
-    
-    #[error("文件系统错误: {0}")]
-    FileSystem(String),
-    
-    #[error("加密错误: {0}")]
-    Encryption(String),
-    
-    #[error("压缩错误: {0}")]
-    Compression(String),
-    
-    #[error("网络错误: {0}")]
-    Network(String),
-    
-    #[error("用户不存在: {0}")]
-    UserNotFound(String),
-    
-    #[error("权限错误: {0}")]
-    Permission(String),
-    
-    #[error("资源不足: {0}")]
-    ResourceExhausted(String),
-    
-    #[error("操作超时: {0}")]
-    Timeout(String),
-    
-    #[error("版本不兼容: {0}")]
-    VersionMismatch(String),
-    
-    #[error("数据损坏: {0}")]
-    DataCorruption(String),
+    NotConnected,
+    Transport(String),  // 添加传输层错误
+    Auth(String),       // 添加认证错误
 }
 
-pub type Result<T> = std::result::Result<T, PrivchatSDKError>; 
+impl fmt::Display for PrivchatSDKError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PrivchatSDKError::SqliteError(e) => write!(f, "SQLite error: {}", e),
+            PrivchatSDKError::JsonError(e) => write!(f, "JSON error: {}", e),
+            PrivchatSDKError::InvalidArgument(e) => write!(f, "Invalid argument: {}", e),
+            PrivchatSDKError::NotFound(e) => write!(f, "Not found: {}", e),
+            PrivchatSDKError::AlreadyExists(e) => write!(f, "Already exists: {}", e),
+            PrivchatSDKError::Other(e) => write!(f, "Other error: {}", e),
+            PrivchatSDKError::KvStore(e) => write!(f, "KV store error: {}", e),
+            PrivchatSDKError::Serialization(e) => write!(f, "Serialization error: {}", e),
+            PrivchatSDKError::IO(e) => write!(f, "IO error: {}", e),
+            PrivchatSDKError::Database(e) => write!(f, "Database error: {}", e),
+            PrivchatSDKError::Migration(e) => write!(f, "Migration error: {}", e),
+            PrivchatSDKError::NotConnected => write!(f, "Not connected"),
+            PrivchatSDKError::Transport(e) => write!(f, "Transport error: {}", e),
+            PrivchatSDKError::Auth(e) => write!(f, "Authentication error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for PrivchatSDKError {}
+
+impl From<rusqlite::Error> for PrivchatSDKError {
+    fn from(error: rusqlite::Error) -> Self {
+        PrivchatSDKError::SqliteError(error)
+    }
+}
+
+impl From<serde_json::Error> for PrivchatSDKError {
+    fn from(error: serde_json::Error) -> Self {
+        PrivchatSDKError::JsonError(error.to_string())
+    }
+}
+
+impl From<std::io::Error> for PrivchatSDKError {
+    fn from(error: std::io::Error) -> Self {
+        PrivchatSDKError::IO(error.to_string())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, PrivchatSDKError>;
+
+pub enum SendFailureReason {
+    NetworkTimeout,     // 网络超时 → 重试
+    NetworkUnavailable, // 无网络 → 等待恢复
+    ServerError,        // 服务端错误 → 根据错误码
+    AuthFailure,        // 认证失败 → 重新登录
+    RateLimited,        // 限流 → 延迟重试
+    MessageTooLarge,    // 消息过大 → 不重试
+    Forbidden,          // 权限不足 → 不重试
+} 

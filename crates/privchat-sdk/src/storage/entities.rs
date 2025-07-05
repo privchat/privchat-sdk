@@ -6,6 +6,7 @@
 //! - 序列化/反序列化支持
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// 消息实体 - 对应 message 表
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +34,7 @@ pub struct Message {
     pub flame: i16,
     pub flame_second: i32,
     pub viewed: i16,
-    pub viewed_at: i32,
+    pub viewed_at: i64,
     // 话题支持
     pub topic_id: String,
     // 消息过期时间
@@ -313,13 +314,191 @@ pub enum ChannelType {
 }
 
 /// 消息状态枚举
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 
+/// 状态流转图：
+/// Draft → Sending → Sent → Delivered → Read
+///           ↓        ↓
+///       Retrying → Failed
+///           ↓
+///       Expired
+/// 
+/// 特殊状态：
+/// - Revoked: 可以从 Sent/Delivered/Read 状态转换而来
+/// - Burned: 阅后即焚消息的最终状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(i32)]
 pub enum MessageStatus {
-    Sending = 0,     // 发送中
-    Sent = 1,        // 已发送
-    Failed = 2,      // 发送失败
-    Delivered = 3,   // 已送达
-    Read = 4,        // 已读
+    Draft = 0,         // 草稿
+    Sending = 1,       // 发送中
+    Sent = 2,          // 已发送
+    Delivered = 3,     // 已投递
+    Read = 4,          // 已读
+    Failed = 5,        // 发送失败
+    Revoked = 6,       // 已撤回
+    Burned = 7,        // 已焚烧
+    Retrying = 8,      // 重试中
+    Expired = 9,       // 过期
+}
+
+impl MessageStatus {
+    /// 检查状态是否为最终状态（不能再转换）
+    pub fn is_final_state(&self) -> bool {
+        matches!(self, 
+            MessageStatus::Read | 
+            MessageStatus::Revoked | 
+            MessageStatus::Burned
+        )
+    }
+    
+    /// 检查状态是否表示发送成功
+    pub fn is_sent_successfully(&self) -> bool {
+        matches!(self, 
+            MessageStatus::Sent | 
+            MessageStatus::Delivered | 
+            MessageStatus::Read
+        )
+    }
+    
+    /// 检查状态是否表示发送失败
+    pub fn is_send_failed(&self) -> bool {
+        matches!(self, 
+            MessageStatus::Failed | 
+            MessageStatus::Expired
+        )
+    }
+    
+    /// 检查状态是否需要网络处理
+    pub fn needs_network_processing(&self) -> bool {
+        matches!(self, 
+            MessageStatus::Sending | 
+            MessageStatus::Retrying
+        )
+    }
+    
+    /// 检查状态是否可以重试
+    pub fn can_retry(&self) -> bool {
+        matches!(self, 
+            MessageStatus::Failed | 
+            MessageStatus::Expired |
+            MessageStatus::Retrying
+        )
+    }
+    
+    /// 检查状态是否可以撤回
+    pub fn can_revoke(&self) -> bool {
+        matches!(self, 
+            MessageStatus::Sent | 
+            MessageStatus::Delivered | 
+            MessageStatus::Read
+        )
+    }
+    
+    /// 获取状态的显示名称
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            MessageStatus::Draft => "草稿",
+            MessageStatus::Sending => "发送中",
+            MessageStatus::Sent => "已发送",
+            MessageStatus::Delivered => "已投递",
+            MessageStatus::Read => "已读",
+            MessageStatus::Failed => "发送失败",
+            MessageStatus::Revoked => "已撤回",
+            MessageStatus::Burned => "已焚烧",
+            MessageStatus::Retrying => "重试中",
+            MessageStatus::Expired => "已过期",
+        }
+    }
+    
+    /// 从数据库整数值转换
+    pub fn from_i32(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(MessageStatus::Draft),
+            1 => Some(MessageStatus::Sending),
+            2 => Some(MessageStatus::Sent),
+            3 => Some(MessageStatus::Delivered),
+            4 => Some(MessageStatus::Read),
+            5 => Some(MessageStatus::Failed),
+            6 => Some(MessageStatus::Revoked),
+            7 => Some(MessageStatus::Burned),
+            8 => Some(MessageStatus::Retrying),
+            9 => Some(MessageStatus::Expired),
+            _ => None,
+        }
+    }
+    
+    /// 转换为数据库整数值
+    pub fn to_i32(&self) -> i32 {
+        *self as i32
+    }
+}
+
+impl fmt::Display for MessageStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+impl Default for MessageStatus {
+    fn default() -> Self {
+        MessageStatus::Draft
+    }
+}
+
+/// 状态转换错误
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusTransitionError {
+    pub from: MessageStatus,
+    pub to: MessageStatus,
+    pub reason: String,
+}
+
+impl fmt::Display for StatusTransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "不能从状态 '{}' 转换到 '{}': {}", self.from, self.to, self.reason)
+    }
+}
+
+impl std::error::Error for StatusTransitionError {}
+
+/// 状态转换验证器
+pub struct StatusTransition;
+
+impl StatusTransition {
+    /// 验证状态转换是否有效
+    pub fn validate(from: MessageStatus, to: MessageStatus) -> Result<(), StatusTransitionError> {
+        if from.can_transition_to(to) {
+            Ok(())
+        } else {
+            Err(StatusTransitionError {
+                from,
+                to,
+                reason: "无效的状态转换".to_string(),
+            })
+        }
+    }
+    
+    /// 验证状态转换并提供详细原因
+    pub fn validate_with_reason(
+        from: MessageStatus, 
+        to: MessageStatus,
+        context: Option<&str>
+    ) -> Result<(), StatusTransitionError> {
+        if from.can_transition_to(to) {
+            Ok(())
+        } else {
+            let reason = match (from, to) {
+                (MessageStatus::Read, MessageStatus::Sending) => 
+                    "已读消息不能重新发送".to_string(),
+                (MessageStatus::Revoked, _) => 
+                    "已撤回的消息不能改变状态".to_string(),
+                (MessageStatus::Burned, _) => 
+                    "已焚烧的消息不能改变状态".to_string(),
+                _ => context.map(|c| c.to_string()).unwrap_or_else(|| "无效的状态转换".to_string()),
+            };
+            
+            Err(StatusTransitionError { from, to, reason })
+        }
+    }
 }
 
 /// 成员角色枚举

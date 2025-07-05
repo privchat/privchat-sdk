@@ -6,21 +6,23 @@
 //! - Entities: 数据实体定义，类型安全的数据传输
 //! - 支持多用户、事务管理、数据迁移
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::collections::{HashMap, BTreeMap};
 use tokio::sync::{RwLock, Mutex};
 use rusqlite::Connection;
-use crate::error::{Result, PrivchatSDKError};
-use tracing;
 use serde::{Serialize, Deserialize};
+use tracing;
+
+use crate::error::{PrivchatSDKError, Result};
+use crate::storage::entities::{Message, Conversation, Channel, MessageExtra};
+use crate::storage::queue::{TaskQueue, TaskQueueTrait, SendTask, MessageData, QueuePriority, TaskStatus};
 
 pub mod dao;
 pub mod entities;
 pub mod sqlite;
 pub mod kv;
+pub mod message_state;
 pub mod queue;
 pub mod media;
 pub mod migration;
@@ -119,7 +121,7 @@ pub struct StorageManager {
     /// KV 存储
     kv_store: Option<Arc<crate::storage::kv::KvStore>>,
     /// 队列管理器
-    queue_manager: Option<Arc<crate::storage::queue::TaskQueue>>,
+    queue_manager: Option<Arc<dyn crate::storage::queue::TaskQueueTrait + Send + Sync>>,
     /// 媒体索引管理器
     media_manager: Option<Arc<crate::storage::media::MediaIndex>>,
 }
@@ -149,8 +151,10 @@ impl StorageManager {
             assets_path: assets_path.map(|p| p.to_path_buf()),
             user_connections: Arc::new(RwLock::new(HashMap::new())),
             current_user: Arc::new(RwLock::new(None)),
-            kv_store: Some(kv_store),
-            queue_manager: None,
+            kv_store: Some(kv_store.clone()),
+            queue_manager: Some(Arc::new(crate::storage::queue::TaskQueue::Persistent(
+                crate::storage::queue::PersistentTaskQueue::new(kv_store, String::new())
+            ))),
             media_manager: None,
         })
     }
@@ -668,6 +672,76 @@ impl StorageManager {
         
         let message_dao = dao::MessageDao::new(&*conn_guard);
         message_dao.delete_expired()
+    }
+
+    /// 恢复发送队列中的任务
+    pub async fn recover_send_queue(&self) -> Result<()> {
+        let conn = self.get_connection().await?;
+        let conn = conn.lock().await;
+        
+        let mut stmt = conn.prepare(
+            "SELECT m.*, me.* FROM messages m 
+             LEFT JOIN message_extra me ON m.message_id = me.message_id 
+             WHERE m.status IN (1, 8)"
+        )?;
+        
+        let mut rows = stmt.query([])?;
+        
+        while let Some(row) = rows.next()? {
+            let message = Message {
+                client_seq: row.get(0)?,
+                message_id: row.get(1)?,
+                message_seq: row.get(2)?,
+                channel_id: row.get(3)?,
+                channel_type: row.get(4)?,
+                timestamp: row.get(5)?,
+                from_uid: row.get(6)?,
+                message_type: row.get(7)?,
+                content: row.get(8)?,
+                status: row.get(9)?,
+                voice_status: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+                searchable_word: row.get(13)?,
+                client_msg_no: row.get(14)?,
+                is_deleted: row.get(15)?,
+                setting: row.get(16)?,
+                order_seq: row.get(17)?,
+                extra: row.get(18)?,
+                flame: row.get(19)?,
+                flame_second: row.get(20)?,
+                viewed: row.get(21)?,
+                viewed_at: row.get(22)?,
+                topic_id: row.get(23)?,
+                expire_time: row.get(24)?,
+                expire_timestamp: row.get(25)?,
+            };
+            
+            let message_data = MessageData {
+                client_msg_no: message.client_msg_no.clone(),
+                channel_id: message.channel_id.clone(),
+                channel_type: message.channel_type,
+                from_uid: message.from_uid.clone(),
+                content: message.content.clone(),
+                message_type: message.message_type,
+                extra: HashMap::new(),
+                created_at: message.timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp()) as u64,
+                expires_at: message.expire_timestamp.map(|t| t as u64),
+            };
+            
+            let task = SendTask::new(
+                message.client_msg_no.clone(),
+                message.channel_id.clone(),
+                message_data,
+                QueuePriority::Normal,
+            );
+            
+            if let Some(queue_manager) = &self.queue_manager {
+                queue_manager.push(task).await?;
+            }
+        }
+        
+        Ok(())
     }
 }
 
