@@ -1,94 +1,215 @@
-use privchat_sdk::{PrivchatClient, SendRequest};
-use std::sync::Arc;
+use privchat_sdk::storage::StorageManager;
+use std::path::PathBuf;
+use tokio;
+use tracing;
 
-/// PrivchatClient 使用示例
-/// 
-/// 演示新的架构设计：
-/// 1. PrivchatClient::new(work_dir, transport) - 传入工作目录
-/// 2. client.connect(login, token) - 连接后获取服务器返回的 UID
-/// 3. SDK 自动创建用户目录和数据库
-/// 4. 后续所有操作都基于用户目录
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 PrivchatClient 新架构示例");
+    // 初始化日志
+    tracing_subscriber::fmt::init();
     
-    // 展示正确的使用流程
-    println!("\n📋 正确的使用流程:");
-    println!("   1️⃣ 创建 PrivchatClient - 只传入工作根目录");
-    println!("   2️⃣ 调用 connect() - 服务器返回真实的 UID");
-    println!("   3️⃣ SDK 自动创建用户目录: ~/.privchat/u_<UID>/");
-    println!("   4️⃣ 初始化数据库和媒体目录");
-    println!("   5️⃣ 所有后续操作都基于用户目录");
+    println!("=== PrivChat SDK 存储管理器示例 ===\n");
     
-    // 目录结构说明
-    println!("\n📁 目录结构示例:");
-    println!("   ~/.privchat/");
-    println!("   ├── u_2489dks83/          # 服务器返回的用户 UID");
-    println!("   │   ├── messages.db       # 加密聊天记录数据库 (SQLCipher)");
-    println!("   │   ├── messages/         # 消息缓存");
-    println!("   │   ├── media/            # 媒体文件");
-    println!("   │   │   ├── images/       # 图片");
-    println!("   │   │   ├── videos/       # 视频");
-    println!("   │   │   └── audios/       # 音频");
-    println!("   │   ├── files/            # 附件文件");
-    println!("   │   └── cache/            # 临时缓存");
-    println!("   └── u_8392kd92/           # 另一个用户账号");
+    // 示例1：使用嵌入式 SQL 初始化数据库
+    println!("📁 示例1: 使用嵌入式 SQL 初始化数据库");
+    let user_data_dir = PathBuf::from("./test_data");
+    let storage_manager = StorageManager::new_simple(&user_data_dir).await?;
     
-    // 代码示例（注释形式，因为需要真实的Transport）
-    println!("\n💻 代码示例:");
-    println!(r#"
-    // 1. 创建客户端 - 只传入工作根目录，不需要知道用户ID
-    let mut client = PrivchatClient::new(
-        "/home/user/.privchat",
-        transport
-    ).await?;
+    // 初始化用户数据库（使用嵌入式 SQL）
+    let uid = "user123";
+    storage_manager.init_user(uid).await?;
+    storage_manager.switch_user(uid).await?;
     
-    // 2. 连接并登录 - 服务器返回真实的UID
-    client.connect("13800001111", "sms_token_abc").await?;
-    // 此时SDK已创建: ~/.privchat/u_123456/ 目录和数据库
+    println!("✅ 用户数据库初始化完成: {}", uid);
+    println!("📍 用户数据目录: {}", storage_manager.user_dir(uid).display());
+    println!("📍 基础数据目录: {}", storage_manager.base_path().display());
+    println!();
     
-    // 3. 获取用户信息
-    let user_id = client.user_id().unwrap();
-    let user_dir = client.user_dir().unwrap();
-         println!("用户ID: {{user_id}}");
-     println!("用户目录: {{user_dir}}");
+    // 示例2：使用预设的外部 assets 目录初始化数据库（智能缓存）
+    println!("📁 示例2: 使用预设的外部 assets 目录初始化数据库（智能缓存）");
+    let user_data_dir = PathBuf::from("./test_data2");
+    let assets_dir = PathBuf::from("./assets");
     
-    // 4. 发送消息 - 自动保存到数据库
-    let mut message = SendRequest::new();
-    message.from_uid = user_id.to_string();
-    message.channel_id = "channel_123".to_string();
-    message.payload = "Hello, World!".as_bytes().to_vec();
+    // 先创建示例迁移文件
+    create_sample_migration_files(&assets_dir).await?;
     
-    client.send_chat_message(&message).await?;
+    let storage_manager2 = StorageManager::new_with_assets(&user_data_dir, &assets_dir).await?;
     
-    // 5. 其他操作
-    client.subscribe_channel("news_channel").await?;
-    client.send_ping().await?;
+    // 初始化用户数据库（使用预设的外部 assets 目录）
+    let uid2 = "user456";
     
-    // 6. 断开连接 - 自动清理资源
-    client.disconnect("用户主动退出").await?;
-    "#);
+    // 第一次初始化 - 会扫描 assets 目录
+    println!("🔍 第一次初始化 - 扫描 assets 目录");
+    storage_manager2.init_user_with_assets(uid2).await?;
+    storage_manager2.switch_user(uid2).await?;
     
-    // 架构优势说明
-    println!("\n✅ 新架构的优势:");
-    println!("   🎯 时机正确: 在不知道UID时不创建用户目录");
-    println!("   🔐 安全性: UID来自服务器验证，不可伪造");
-    println!("   🔒 数据加密: 使用 SQLCipher 加密数据库，保护隐私");
-    println!("   📦 自动化: 目录、数据库、缓存自动管理");
-    println!("   🔄 状态管理: 连接状态与用户数据绑定");
-    println!("   👥 多用户: 支持同根目录下多用户账号");
-    println!("   💾 持久化: 聊天记录、设置、媒体文件持久存储");
+    // 查看缓存信息
+    if let Some(cache_info) = storage_manager2.get_assets_cache_info().await? {
+        println!("📋 缓存信息:");
+        println!("   SDK 版本: {}", cache_info.sdk_version);
+        println!("   Assets 路径: {}", cache_info.assets_path);
+        println!("   文件数量: {}", cache_info.file_timestamps.len());
+        for (filename, timestamp) in &cache_info.file_timestamps {
+            println!("   文件: {} (时间戳: {})", filename, timestamp);
+        }
+    }
     
-    // 注意事项
-    println!("\n⚠️  注意事项:");
-    println!("   • 需要真实的 msgtrans Transport 实例才能运行");
-    println!("   • connect() 方法会修改客户端状态（需要 &mut self）");
-    println!("   • 数据库连接会在 disconnect() 时自动关闭");
-    println!("   • 媒体文件需要应用层主动管理路径");
-    println!("   • 加密数据库使用用户ID派生密钥，确保安全性");
-    println!("   • 无法使用 sqlite3 CLI 直接查看加密数据库");
+    // 第二次初始化 - 应该使用缓存，跳过扫描
+    println!("\n🚀 第二次初始化 - 使用缓存，跳过扫描");
+    storage_manager2.init_user_with_assets(uid2).await?;
     
-    println!("\n🎉 PrivchatClient 新架构展示完成！");
+    println!("✅ 用户数据库初始化完成: {}", uid2);
+    println!("📍 用户数据目录: {}", storage_manager2.user_dir(uid2).display());
+    println!("📍 基础数据目录: {}", storage_manager2.base_path().display());
+    println!("📍 Assets 目录: {}", storage_manager2.assets_path().unwrap().display());
+    println!();
+    
+    // 示例3：演示缓存管理
+    println!("📁 示例3: 演示缓存管理");
+    
+    // 清理缓存
+    println!("🧹 清理 assets 缓存");
+    storage_manager2.clear_assets_cache().await?;
+    
+    // 再次初始化应该重新扫描
+    println!("🔍 清理缓存后再次初始化 - 重新扫描");
+    storage_manager2.init_user_with_assets(uid2).await?;
+    
+    // 手动刷新缓存
+    println!("🔄 手动刷新缓存");
+    storage_manager2.refresh_assets_cache(&assets_dir).await?;
+    
+    println!("✅ 缓存管理演示完成");
+    println!();
+    
+    // 示例4：使用自定义 assets 目录
+    println!("📁 示例4: 使用自定义 assets 目录");
+    let user_data_dir = PathBuf::from("./test_data3");
+    let storage_manager3 = StorageManager::new_simple(&user_data_dir).await?;
+    
+    // 初始化用户数据库（使用自定义 assets 目录）
+    let uid3 = "user789";
+    let custom_assets_dir = PathBuf::from("./custom_assets");
+    create_sample_migration_files(&custom_assets_dir).await?;
+    
+    storage_manager3.init_user_with_custom_assets(uid3, &custom_assets_dir).await?;
+    storage_manager3.switch_user(uid3).await?;
+    
+    println!("✅ 用户数据库初始化完成: {}", uid3);
+    println!("📍 用户数据目录: {}", storage_manager3.user_dir(uid3).display());
+    println!("📍 基础数据目录: {}", storage_manager3.base_path().display());
+    println!("📍 使用的 Assets 目录: {}", custom_assets_dir.display());
+    println!();
+    
+    // 示例5：演示文件变化检测
+    println!("📁 示例5: 演示文件变化检测");
+    
+    // 添加新的迁移文件
+    let new_migration = r#"
+-- 新增的迁移文件
+CREATE TABLE IF NOT EXISTS test_table (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+    
+    let new_file = assets_dir.join("20240401000001.sql");
+    tokio::fs::write(&new_file, new_migration).await?;
+    
+    println!("📝 添加新的迁移文件: {}", new_file.display());
+    
+    // 再次初始化应该检测到变化
+    println!("🔍 检测到文件变化，执行迁移");
+    storage_manager2.init_user_with_assets(uid2).await?;
+    
+    println!("✅ 文件变化检测演示完成");
+    println!();
+    
+    println!("🎉 所有示例执行完成！");
+    println!("\n💡 性能优化说明:");
+    println!("1. 首次运行时会扫描 assets 目录并缓存文件信息");
+    println!("2. 后续运行时只有在以下情况才会重新扫描:");
+    println!("   - SDK 版本变化");
+    println!("   - assets 目录路径变化");
+    println!("   - assets 目录中的文件发生变化");
+    println!("3. 缓存存储在每个用户的 KV 存储中，与用户数据隔离");
+    println!("4. 可以手动清理或刷新缓存");
+    
+    Ok(())
+}
+
+/// 创建示例 SQL 迁移文件
+async fn create_sample_migration_files(assets_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    // 确保 assets 目录存在
+    tokio::fs::create_dir_all(assets_dir).await?;
+    
+    // 创建基础表结构（较早的时间戳）
+    let init_sql = r#"
+-- 初始化基础表结构
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL UNIQUE,
+    channel_id TEXT NOT NULL,
+    from_uid TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL UNIQUE,
+    channel_type INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+    
+    let init_file = assets_dir.join("20240101000001.sql");
+    if !init_file.exists() {
+        tokio::fs::write(&init_file, init_sql).await?;
+    }
+    
+    // 创建扩展表结构（较晚的时间戳）
+    let extension_sql = r#"
+-- 添加消息扩展字段
+ALTER TABLE messages ADD COLUMN message_type INTEGER DEFAULT 0;
+ALTER TABLE messages ADD COLUMN status INTEGER DEFAULT 0;
+ALTER TABLE messages ADD COLUMN extra TEXT DEFAULT '{}';
+
+-- 添加用户表
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL UNIQUE,
+    username TEXT NOT NULL,
+    avatar TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+    
+    let extension_file = assets_dir.join("20240201000001.sql");
+    if !extension_file.exists() {
+        tokio::fs::write(&extension_file, extension_sql).await?;
+    }
+    
+    // 创建索引优化（更晚的时间戳）
+    let index_sql = r#"
+-- 创建性能优化索引
+CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel_id);
+CREATE INDEX IF NOT EXISTS idx_messages_from_uid ON messages(from_uid);
+CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_conversations_channel_id ON conversations(channel_id);
+"#;
+    
+    let index_file = assets_dir.join("20240301000001.sql");
+    if !index_file.exists() {
+        tokio::fs::write(&index_file, index_sql).await?;
+    }
+    
+    println!("📝 已创建示例迁移文件:");
+    println!("   - {}", init_file.display());
+    println!("   - {}", extension_file.display());
+    println!("   - {}", index_file.display());
     
     Ok(())
 }

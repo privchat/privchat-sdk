@@ -36,10 +36,12 @@
 // 导出核心模块
 pub mod error;
 pub mod client;
+pub mod storage;
 
 // 重新导出核心类型，方便使用
 pub use client::{PrivchatClient, UserSession};
 pub use error::{PrivchatSDKError, Result};
+pub use storage::{StorageManager, StorageStats};
 
 // 重新导出协议层的类型，避免用户需要单独导入 privchat-protocol
 pub use privchat_protocol::*;
