@@ -251,34 +251,41 @@ impl AdvancedFeaturesManager {
             .unwrap()
             .as_secs();
 
-        let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-
         let mut events = Vec::new();
         
-        for message_id in message_ids {
-            // 插入已读回执记录
-            tx.execute(
-                "INSERT OR REPLACE INTO read_receipts 
-                 (message_id, channel_id, channel_type, reader_uid, read_at) 
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![message_id, channel_id, channel_type, reader_uid, now],
-            )?;
+        // 首先在事务中插入已读回执记录
+        {
+            let conn = self.conn.lock().unwrap();
+            let tx = conn.unchecked_transaction()?;
 
+            for message_id in message_ids {
+                // 插入已读回执记录
+                tx.execute(
+                    "INSERT OR REPLACE INTO read_receipts 
+                     (message_id, channel_id, channel_type, reader_uid, read_at) 
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![message_id, channel_id, channel_type, reader_uid, now],
+                )?;
+
+                events.push(ReadReceiptEvent {
+                    message_id: message_id.clone(),
+                    channel_id: channel_id.to_string(),
+                    channel_type,
+                    reader_uid: reader_uid.to_string(),
+                    read_at: now,
+                    need_sync: true,
+                });
+            }
+
+            tx.commit()?;
+        } // 事务结束，释放连接锁
+
+        // 然后更新消息状态（在事务外部，避免死锁）
+        for message_id in message_ids {
             // 更新消息状态为已读
             self.state_manager.update_message_state(message_id, MessageStatus::Read as i32)?;
-
-            events.push(ReadReceiptEvent {
-                message_id: message_id.clone(),
-                channel_id: channel_id.to_string(),
-                channel_type,
-                reader_uid: reader_uid.to_string(),
-                read_at: now,
-                need_sync: true,
-            });
         }
 
-        tx.commit()?;
         info!("Batch marked {} messages as read by user {}", message_ids.len(), reader_uid);
 
         Ok(events)
@@ -775,6 +782,10 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let conn = Connection::open(&temp_file.path()).unwrap();
         
+        // 启用WAL模式以支持并发访问
+        let _ = conn.execute("PRAGMA journal_mode=WAL", []);
+        let _ = conn.execute("PRAGMA synchronous=NORMAL", []);
+        
         // 创建基础表
         conn.execute(
             "CREATE TABLE messages (
@@ -787,7 +798,10 @@ mod tests {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 message_seq INTEGER NOT NULL,
-                is_deleted INTEGER NOT NULL DEFAULT 0
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                client_msg_no TEXT,
+                extra TEXT,
+                events TEXT
             )",
             [],
         ).unwrap();
@@ -807,9 +821,13 @@ mod tests {
             [],
         ).unwrap();
 
-        let state_manager = Arc::new(MessageStateManager::new(
-            Connection::open_in_memory().unwrap()
-        ));
+        // 为MessageStateManager创建一个使用同一个数据库文件的连接
+        let state_manager_conn = Connection::open(&temp_file.path()).unwrap();
+        // 也为这个连接启用WAL模式
+        let _ = state_manager_conn.execute("PRAGMA journal_mode=WAL", []);
+        let _ = state_manager_conn.execute("PRAGMA synchronous=NORMAL", []);
+        
+        let state_manager = Arc::new(MessageStateManager::new(state_manager_conn));
         
         let manager = AdvancedFeaturesManager::new(
             conn,
@@ -834,7 +852,7 @@ mod tests {
                  VALUES ('msg1', 'channel1', 1, 'user1', 'Hello', 1)",
                 [],
             ).unwrap();
-        }
+        } // 这里连接的借用结束
 
         // 测试标记消息为已读
         let receipt = manager.mark_message_as_read(
@@ -857,13 +875,13 @@ mod tests {
         
         // 插入测试消息
         {
-            let conn = manager.conn.lock().unwrap();
+            let conn = manager.get_connection();
             conn.execute(
                 "INSERT INTO messages (message_id, channel_id, channel_type, from_uid, content, status, message_seq) 
                  VALUES ('msg1', 'channel1', 1, 'user1', 'Hello', 2, 1)",
                 [],
             ).unwrap();
-        }
+        } // 这里连接的借用结束
 
         // 测试检查撤回权限
         let can_revoke = manager.can_revoke_message("msg1", "user1").unwrap();
@@ -885,13 +903,13 @@ mod tests {
         
         // 插入测试消息
         {
-            let conn = manager.conn.lock().unwrap();
+            let conn = manager.get_connection();
             conn.execute(
                 "INSERT INTO messages (message_id, channel_id, channel_type, from_uid, content, status, message_seq) 
                  VALUES ('msg1', 'channel1', 1, 'user1', 'Hello', 2, 1)",
                 [],
             ).unwrap();
-        }
+        } // 这里连接的借用结束
 
         // 测试检查编辑权限
         let can_edit = manager.can_edit_message("msg1", "user1").unwrap();
@@ -942,7 +960,7 @@ mod tests {
                     params![format!("msg{}", i), i],
                 ).unwrap();
             }
-        }
+        } // 这里连接的借用结束
 
         // 测试批量标记为已读
         let message_ids = vec!["msg1".to_string(), "msg2".to_string(), "msg3".to_string()];

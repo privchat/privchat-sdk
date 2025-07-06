@@ -378,8 +378,39 @@ mod tests {
     fn create_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         
-        // 创建表结构
-        conn.execute_batch(include_str!("../../../assets/20240101000001.sql")).unwrap();
+        // 创建消息表结构
+        conn.execute(
+            "CREATE TABLE message (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_seq INTEGER,
+                message_id TEXT UNIQUE,
+                message_seq INTEGER NOT NULL,
+                channel_id TEXT NOT NULL,
+                channel_type INTEGER NOT NULL,
+                timestamp INTEGER,
+                from_uid TEXT NOT NULL,
+                type INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                status INTEGER NOT NULL DEFAULT 0,
+                voice_status INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                searchable_word TEXT NOT NULL DEFAULT '',
+                client_msg_no TEXT NOT NULL DEFAULT '',
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                setting INTEGER NOT NULL DEFAULT 0,
+                order_seq INTEGER NOT NULL DEFAULT 0,
+                extra TEXT NOT NULL DEFAULT '{}',
+                flame INTEGER NOT NULL DEFAULT 0,
+                flame_second INTEGER NOT NULL DEFAULT 0,
+                viewed INTEGER NOT NULL DEFAULT 0,
+                viewed_at INTEGER NOT NULL DEFAULT 0,
+                topic_id TEXT NOT NULL DEFAULT '',
+                expire_time INTEGER,
+                expire_timestamp INTEGER
+            )",
+            [],
+        ).unwrap();
         
         conn
     }

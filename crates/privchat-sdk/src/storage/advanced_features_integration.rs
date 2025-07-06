@@ -57,6 +57,27 @@ impl AdvancedFeaturesIntegration {
         // 发布已读回执事件
         self.event_manager.emit(SDKEvent::ReadReceiptReceived(receipt_event)).await;
 
+        // 获取消息序列号，用于更新会话已读状态
+        let message_seq = {
+            let conn = self.features_manager.get_connection();
+            conn.query_row(
+                "SELECT message_seq FROM messages WHERE message_id = ?1",
+                rusqlite::params![message_id],
+                |row| row.get::<_, i64>(0)
+            ).unwrap_or(0)
+        };
+
+        // 更新会话已读状态
+        if message_seq > 0 {
+            self.features_manager.update_conversation_read_state(
+                channel_id, 
+                channel_type, 
+                reader_uid, 
+                Some(message_id), 
+                message_seq
+            )?;
+        }
+
         // 更新未读数并发布事件
         let unread_count = self.features_manager.get_unread_count(
             channel_id, channel_type, reader_uid
@@ -415,6 +436,10 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let conn = Connection::open(&temp_file.path()).unwrap();
         
+        // 启用WAL模式以支持并发访问
+        let _ = conn.execute("PRAGMA journal_mode=WAL", []);
+        let _ = conn.execute("PRAGMA synchronous=NORMAL", []);
+        
         // 创建基础表
         conn.execute(
             "CREATE TABLE messages (
@@ -427,7 +452,13 @@ mod tests {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 message_seq INTEGER NOT NULL,
-                is_deleted INTEGER NOT NULL DEFAULT 0
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                client_msg_no TEXT,
+                extra TEXT,
+                searchable_word TEXT,
+                content_edit TEXT,
+                edited_at INTEGER,
+                extra_version INTEGER
             )",
             [],
         ).unwrap();
@@ -447,9 +478,12 @@ mod tests {
             [],
         ).unwrap();
 
-        let state_manager = Arc::new(MessageStateManager::new(
-            Connection::open_in_memory().unwrap()
-        ));
+        // 为MessageStateManager创建同一个数据库的连接
+        let state_manager_conn = Connection::open(&temp_file.path()).unwrap();
+        let _ = state_manager_conn.execute("PRAGMA journal_mode=WAL", []);
+        let _ = state_manager_conn.execute("PRAGMA synchronous=NORMAL", []);
+        
+        let state_manager = Arc::new(MessageStateManager::new(state_manager_conn));
         
         let features_manager = Arc::new(AdvancedFeaturesManager::new(
             conn,
@@ -483,7 +517,7 @@ mod tests {
                  VALUES ('msg1', 'channel1', 1, 'user1', 'Hello', 1)",
                 [],
             ).unwrap();
-        }
+        } // 这里连接的借用结束
 
         // 订阅事件
         let mut receiver = integration.event_manager.subscribe().await;
@@ -525,7 +559,7 @@ mod tests {
                  VALUES ('msg1', 'channel1', 1, 'user1', 'Hello', 2, 1)",
                 [],
             ).unwrap();
-        }
+        } // 这里连接的借用结束
 
         // 订阅事件
         let mut receiver = integration.event_manager.subscribe().await;
@@ -557,7 +591,7 @@ mod tests {
                  VALUES ('msg1', 'channel1', 1, 'user1', 'Hello', 2, 1)",
                 [],
             ).unwrap();
-        }
+        } // 这里连接的借用结束
 
         // 订阅事件
         let mut receiver = integration.event_manager.subscribe().await;
@@ -655,7 +689,7 @@ mod tests {
                     rusqlite::params![format!("msg{}", i), i],
                 ).unwrap();
             }
-        }
+        } // 这里连接的借用结束
 
         // 订阅事件
         let mut receiver = integration.event_manager.subscribe().await;
