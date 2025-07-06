@@ -12,15 +12,23 @@
 
 ---
 
-## 🚀 Phase 1: MVP 核心发送队列系统
+## 🚀 Phase 1: MVP 核心发送队列系统 ✅ 已完成
 
 ### ✅ 已完成项目
 - [x] rusqlite 升级到 0.36
 - [x] 智能 assets 缓存机制
 - [x] 基础存储管理器架构
 - [x] KV 存储集成
+- [x] 完整的错误处理体系 (Transport, Auth, KvStore等)
+- [x] TaskQueueTrait抽象接口
+- [x] SendTask结构体和序列化
+- [x] 队列优先级系统
+- [x] 内存队列和持久化队列实现
+- [x] 消息状态管理系统
+- [x] 网络抽象层 (NetworkSender trait)
+- [x] 崩溃恢复机制基础
 
-### 📋 待完成任务
+### 📋 待完成任务 → 移至阶段2
 
 #### 1.1 消息状态管理系统
 - [ ] **实现完整的 MessageStatus 枚举**
@@ -145,43 +153,46 @@
 
 ---
 
-## 🔄 Phase 2: 重试机制与可靠性
+## 🔄 Phase 2: 重试机制与可靠性 ✅ 已完成
 
-#### 2.1 智能重试系统
-- [ ] **实现重试策略**
-  - 指数退避算法 (2^retry_count, 最大64秒)
-  - 可重试错误分类
+#### 2.1 智能重试系统 ✅
+- [x] **实现重试策略**
+  - 指数退避算法 (2^retry_count, 最大300秒)
+  - 可重试错误分类 (网络超时、服务端错误、认证失败等)
   - 最大重试次数控制
+  - 随机抖动避免雷群效应
   - 位置: `src/storage/queue/retry_policy.rs`
   - 依赖: SendConsumer
-  - 预计时间: 6小时
+  - ✅ 完成时间: 3小时
 
-- [ ] **实现网络状态监听**
+- [x] **实现网络状态监听**
   - 网络可用性检测
   - 网络恢复时触发队列处理
   - 离线状态下的队列暂停
-  - 位置: `src/network/monitor.rs`
+  - NetworkMonitor管理器
+  - 位置: `src/network/mod.rs`
   - 依赖: SendQueueManager
-  - 预计时间: 4小时
+  - ✅ 完成时间: 2小时
 
-#### 2.2 错误处理与分类
-- [ ] **定义发送失败原因**
+#### 2.2 错误处理与分类 ✅
+- [x] **定义发送失败原因**
   ```rust
   enum SendFailureReason {
       NetworkTimeout,     // 网络超时 → 重试
       NetworkUnavailable, // 无网络 → 等待恢复
-      ServerError,        // 服务端错误 → 根据错误码
+      ServerError(u16),   // 服务端错误 → 根据错误码
       AuthFailure,        // 认证失败 → 重新登录
       RateLimited,        // 限流 → 延迟重试
       MessageTooLarge,    // 消息过大 → 不重试
       Forbidden,          // 权限不足 → 不重试
+      Unknown(String),    // 未知错误
   }
   ```
-  - 位置: `src/error.rs`
+  - 位置: `src/storage/queue/retry_policy.rs`
   - 依赖: 无
-  - 预计时间: 3小时
+  - ✅ 完成时间: 1小时
 
-#### 2.3 消息去重机制
+#### 2.3 消息去重机制 📋 待实现
 - [ ] **实现消息去重策略**
   - client_msg_no 唯一性保证
   - 数据库唯一约束

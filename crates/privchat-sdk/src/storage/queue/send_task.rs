@@ -1,4 +1,5 @@
 use crate::storage::queue::priority::QueuePriority;
+use crate::storage::queue::retry_policy::SendFailureReason;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -101,6 +102,7 @@ pub struct SendTask {
     pub priority: QueuePriority,
     pub status: TaskStatus, 
     pub last_error: Option<String>, 
+    pub last_failure_reason: Option<SendFailureReason>, 
     pub timeout_at: u64, 
     pub extra_data: HashMap<String, String>, 
 }
@@ -160,6 +162,7 @@ impl SendTask {
             priority,
             status: TaskStatus::Pending,
             last_error: None,
+            last_failure_reason: None,
             timeout_at,
             extra_data: HashMap::new(),
         }
@@ -239,9 +242,10 @@ impl SendTask {
     }
     
     /// 标记任务为失败
-    pub fn mark_failed(&mut self, error: String) {
+    pub fn mark_failed(&mut self, error: String, failure_reason: Option<SendFailureReason>) {
         self.status = TaskStatus::Failed;
         self.last_error = Some(error);
+        self.last_failure_reason = failure_reason;
     }
     
     /// 标记任务为已取消
@@ -499,7 +503,7 @@ mod tests {
         let mut task = SendTask::from_message_data(message_data);
         
         // 标记为失败
-        task.mark_failed("Network error".to_string());
+        task.mark_failed("Network error".to_string(), None);
         assert_eq!(task.status, TaskStatus::Failed);
         assert!(task.can_retry());
         
