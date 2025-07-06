@@ -537,9 +537,8 @@ mod tests {
         // 检查是否收到未读数变更事件
         let event = receiver.recv().await.unwrap();
         match event {
-            SDKEvent::UnreadCountChanged { channel_id, user_id, unread_count, .. } => {
+            SDKEvent::UnreadCountChanged { channel_id, unread_count, .. } => {
                 assert_eq!(channel_id, "channel1");
-                assert_eq!(user_id, "user2");
                 assert_eq!(unread_count, 0);
             }
             _ => panic!("Expected UnreadCountChanged event"),
@@ -623,10 +622,10 @@ mod tests {
         // 检查是否收到正在输入事件
         let event = receiver.recv().await.unwrap();
         match event {
-            SDKEvent::TypingIndicator { channel_id, user_id, is_typing, .. } => {
-                assert_eq!(channel_id, "channel1");
-                assert_eq!(user_id, "user1");
-                assert!(is_typing);
+            SDKEvent::TypingIndicator(typing_event) => {
+                assert_eq!(typing_event.channel_id, "channel1");
+                assert_eq!(typing_event.user_id, "user1");
+                assert!(typing_event.is_typing);
             }
             _ => panic!("Expected TypingIndicator event"),
         }
@@ -666,9 +665,8 @@ mod tests {
         // 检查是否收到连接状态变更事件
         let event = receiver.recv().await.unwrap();
         match event {
-            SDKEvent::ConnectionStateChanged { is_connected, reason, .. } => {
-                assert!(!is_connected);
-                assert_eq!(reason, "Network error");
+            SDKEvent::ConnectionStateChanged { new_state, .. } => {
+                assert_eq!(new_state, crate::events::ConnectionState::Disconnected);
             }
             _ => panic!("Expected ConnectionStateChanged event"),
         }

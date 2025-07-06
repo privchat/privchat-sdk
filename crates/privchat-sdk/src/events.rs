@@ -181,7 +181,7 @@ impl SDKEvent {
 }
 
 /// 事件过滤器
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventFilter {
     /// 事件类型过滤器
     pub event_types: Option<Vec<String>>,

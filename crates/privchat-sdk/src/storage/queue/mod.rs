@@ -192,35 +192,40 @@ impl MemoryTaskQueue {
 #[async_trait::async_trait]
 impl TaskQueueTrait for MemoryTaskQueue {
     async fn push(&self, task: SendTask) -> Result<()> {
-        let mut tasks = self.tasks.write().await;
-        tasks.push(task);
-        
-        // 按优先级排序
-        tasks.sort();
+        {
+            let mut tasks = self.tasks.write().await;
+            tasks.push(task);
+            
+            // 按优先级排序
+            tasks.sort();
+            
+            debug!("任务已推送到队列，当前队列大小: {}", tasks.len());
+        } // 释放写锁
         
         self.update_stats().await;
         
-        debug!("任务已推送到队列，当前队列大小: {}", tasks.len());
         Ok(())
     }
     
     async fn pop(&self) -> Result<Option<SendTask>> {
-        let mut tasks = self.tasks.write().await;
-        
-        // 寻找第一个可处理的任务
-        let mut task_index = None;
-        for (i, task) in tasks.iter().enumerate() {
-            if task.status == TaskStatus::Pending && !task.is_expired() {
-                task_index = Some(i);
-                break;
+        let task = {
+            let mut tasks = self.tasks.write().await;
+            
+            // 寻找第一个可处理的任务
+            let mut task_index = None;
+            for (i, task) in tasks.iter().enumerate() {
+                if task.status == TaskStatus::Pending && !task.is_expired() {
+                    task_index = Some(i);
+                    break;
+                }
             }
-        }
-        
-        let task = if let Some(index) = task_index {
-            Some(tasks.remove(index))
-        } else {
-            None
-        };
+            
+            if let Some(index) = task_index {
+                Some(tasks.remove(index))
+            } else {
+                None
+            }
+        }; // 释放写锁
         
         if task.is_some() {
             self.update_stats().await;
@@ -230,31 +235,38 @@ impl TaskQueueTrait for MemoryTaskQueue {
     }
     
     async fn batch_push(&self, new_tasks: Vec<SendTask>) -> Result<()> {
-        let mut tasks = self.tasks.write().await;
-        tasks.extend(new_tasks);
-        
-        // 按优先级排序
-        tasks.sort();
+        {
+            let mut tasks = self.tasks.write().await;
+            tasks.extend(new_tasks);
+            
+            // 按优先级排序
+            tasks.sort();
+            
+            debug!("批量推送任务到队列，当前队列大小: {}", tasks.len());
+        } // 释放写锁
         
         self.update_stats().await;
         
-        debug!("批量推送任务到队列，当前队列大小: {}", tasks.len());
         Ok(())
     }
     
     async fn batch_pop(&self, limit: usize) -> Result<Vec<SendTask>> {
-        let mut tasks = self.tasks.write().await;
-        let mut result = Vec::new();
-        
-        // 寻找可处理的任务
-        let mut i = 0;
-        while i < tasks.len() && result.len() < limit {
-            if tasks[i].status == TaskStatus::Pending && !tasks[i].is_expired() {
-                result.push(tasks.remove(i));
-            } else {
-                i += 1;
+        let result = {
+            let mut tasks = self.tasks.write().await;
+            let mut result = Vec::new();
+            
+            // 寻找可处理的任务
+            let mut i = 0;
+            while i < tasks.len() && result.len() < limit {
+                if tasks[i].status == TaskStatus::Pending && !tasks[i].is_expired() {
+                    result.push(tasks.remove(i));
+                } else {
+                    i += 1;
+                }
             }
-        }
+            
+            result
+        }; // 释放写锁
         
         if !result.is_empty() {
             self.update_stats().await;
@@ -264,15 +276,21 @@ impl TaskQueueTrait for MemoryTaskQueue {
     }
 
     async fn remove(&self, task_id: &str) -> Result<()> {
-        let mut tasks = self.tasks.write().await;
-        tasks.retain(|task| task.task_id != task_id);
+        {
+            let mut tasks = self.tasks.write().await;
+            tasks.retain(|task| task.task_id != task_id);
+        } // 释放写锁
+        
         self.update_stats().await;
         Ok(())
     }
     
     async fn clear(&self) -> Result<()> {
-        let mut tasks = self.tasks.write().await;
-        tasks.clear();
+        {
+            let mut tasks = self.tasks.write().await;
+            tasks.clear();
+        } // 释放写锁
+        
         self.update_stats().await;
         Ok(())
     }
@@ -497,7 +515,7 @@ mod tests {
         
         // 弹出的应该是高优先级任务
         let popped_task = queue.pop().await.unwrap().unwrap();
-        assert_eq!(popped_task.task_id, "msg_high");
+        assert_eq!(popped_task.client_msg_no, "msg_high");
         assert_eq!(popped_task.priority, QueuePriority::High);
     }
 } 

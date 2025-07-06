@@ -624,9 +624,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manager = MigrationManager::new(temp_dir.path()).await.unwrap();
         
-        // 注册自定义升级脚本
+        // 注册自定义升级脚本（版本4，紧跟内置脚本）
         let custom_migration = Migration {
-            version: 100,
+            version: 4,
             name: "自定义升级".to_string(),
             description: "测试自定义升级脚本".to_string(),
             up_script: MigrationScript::Function(|| {
@@ -643,10 +643,10 @@ mod tests {
         
         manager.register_migration(custom_migration).await.unwrap();
         
-        assert_eq!(manager.get_latest_version().await, 100);
+        assert_eq!(manager.get_latest_version().await, 4);
         
         // 测试升级计划
-        let plan = manager.create_migration_plan(Some(100)).await.unwrap();
+        let plan = manager.create_migration_plan(Some(4)).await.unwrap();
         assert_eq!(plan.migrations.len(), 4); // 3个内置 + 1个自定义
     }
     

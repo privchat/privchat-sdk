@@ -22,6 +22,11 @@ pub enum PrivchatSDKError {
     InvalidInput(String),
     InvalidOperation(String),
     Timeout(String),
+    // SDK 相关错误
+    Runtime(String),        // 运行时错误
+    Config(String),         // 配置错误
+    NotInitialized(String), // 未初始化错误
+    ShuttingDown(String),   // 正在关闭错误
 }
 
 impl fmt::Display for PrivchatSDKError {
@@ -45,6 +50,10 @@ impl fmt::Display for PrivchatSDKError {
             PrivchatSDKError::InvalidInput(e) => write!(f, "Invalid input: {}", e),
             PrivchatSDKError::InvalidOperation(e) => write!(f, "Invalid operation: {}", e),
             PrivchatSDKError::Timeout(e) => write!(f, "Timeout: {}", e),
+            PrivchatSDKError::Runtime(e) => write!(f, "Runtime error: {}", e),
+            PrivchatSDKError::Config(e) => write!(f, "Config error: {}", e),
+            PrivchatSDKError::NotInitialized(e) => write!(f, "Not initialized: {}", e),
+            PrivchatSDKError::ShuttingDown(e) => write!(f, "Shutting down: {}", e),
         }
     }
 }

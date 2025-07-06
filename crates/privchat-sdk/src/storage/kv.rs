@@ -215,15 +215,16 @@ impl KvStore {
         let tree = self.get_current_tree().await?;
         
         loop {
-            let current_value = match tree.get(key)
+            let (current_value, current_bytes) = match tree.get(key)
                 .map_err(|e| PrivchatSDKError::KvStore(format!("获取计数器失败: {}", e)))? {
                 Some(bytes) => {
                     let value_str = std::str::from_utf8(&bytes)
                         .map_err(|e| PrivchatSDKError::KvStore(format!("计数器值格式错误: {}", e)))?;
-                    value_str.parse::<i64>()
-                        .map_err(|e| PrivchatSDKError::KvStore(format!("计数器值解析失败: {}", e)))?
+                    let value = value_str.parse::<i64>()
+                        .map_err(|e| PrivchatSDKError::KvStore(format!("计数器值解析失败: {}", e)))?;
+                    (value, Some(bytes))
                 }
-                None => 0,
+                None => (0, None),
             };
             
             let new_value = current_value + delta;
@@ -232,7 +233,7 @@ impl KvStore {
             // 使用 compare_and_swap 实现原子性
             let result = tree.compare_and_swap(
                 key,
-                Some(current_value.to_string().into_bytes()),
+                current_bytes,
                 Some(new_value_bytes),
             ).map_err(|e| PrivchatSDKError::KvStore(format!("原子增加失败: {}", e)))?;
             

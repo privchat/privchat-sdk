@@ -188,8 +188,8 @@ impl SendTask {
     /// 检查是否可以重试
     pub fn can_retry(&self) -> bool {
         self.retry_count < self.max_retries && 
-        self.status == TaskStatus::Failed &&
-        !self.is_expired()
+        !self.is_expired() &&
+        matches!(self.status, TaskStatus::Pending | TaskStatus::Failed)
     }
     
     /// 检查是否应该重试 (到达重试时间)

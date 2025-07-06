@@ -1,33 +1,44 @@
-//! Privchat SDK - 基于 msgtrans 的私聊通信 SDK
+//! Privchat SDK - 现代化即时通讯 SDK
 //! 
-//! 本 SDK 提供了基于 msgtrans 传输层架构的私聊功能，包括：
-//! - 用户认证和连接管理
-//! - 消息发送和接收
-//! - 数据库存储和缓存
-//! - 媒体文件管理
-//! - 心跳机制
-//! - 订阅功能
+//! 本 SDK 提供了完整的即时通讯功能，包括：
+//! - 🔗 消息发送和接收队列系统
+//! - 📡 网络状态监控和智能重试
+//! - 🧠 高级特性：已读回执、消息撤回、消息编辑
+//! - 💬 实时交互：输入状态指示器、表情反馈
+//! - ⚙️ 事件系统：统一的事件管理和回调机制
+//! - 🔐 数据安全：SQLCipher 加密存储
+//! - 🧵 并发安全：异步优先设计，支持多线程
 //! 
-//! # 基本使用
+//! # 快速开始
 //! 
 //! ```rust,no_run
-//! use privchat_sdk::PrivchatClient;
-//! use std::sync::Arc;
+//! use privchat_sdk::{PrivchatSDK, SDKConfig};
 //! 
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // 创建传输层实例（实际使用中需要真实的Transport）
-//!     // let transport = Arc::new(Transport::new(...));
+//!     // 配置 SDK
+//!     let config = SDKConfig::builder()
+//!         .data_dir("/path/to/data")
+//!         .user_id("user123")
+//!         .server_url("wss://chat.example.com")
+//!         .build();
 //!     
-//!     // 创建客户端
-//!     // let mut client = PrivchatClient::new("/path/to/data", transport).await?;
+//!     // 初始化 SDK
+//!     let sdk = PrivchatSDK::initialize(config).await?;
 //!     
-//!     // 连接并登录
-//!     // client.connect("phone_or_username", "password_or_token").await?;
+//!     // 注册事件回调
+//!     sdk.on_message_received(|message| {
+//!         println!("收到消息: {}", message.content);
+//!     });
 //!     
 //!     // 发送消息
-//!     // let message = SendRequest::new();
-//!     // client.send_chat_message(&message).await?;
+//!     let message_id = sdk.send_message("Hello, World!", "session123").await?;
+//!     
+//!     // 标记已读
+//!     sdk.mark_as_read("session123", message_id).await?;
+//!     
+//!     // 关闭 SDK
+//!     sdk.shutdown().await?;
 //!     
 //!     Ok(())
 //! }
@@ -39,6 +50,7 @@ pub mod client;
 pub mod storage;
 pub mod network;
 pub mod events;
+pub mod sdk;
 
 // 重新导出核心类型，方便使用
 pub use client::{PrivchatClient, UserSession};
@@ -46,6 +58,9 @@ pub use error::{PrivchatSDKError, Result};
 pub use storage::{StorageManager, StorageStats};
 pub use network::{NetworkMonitor, NetworkStatus, NetworkSender};
 pub use events::{EventManager, SDKEvent, EventFilter};
+
+// 重新导出统一 SDK 接口
+pub use sdk::{PrivchatSDK, SDKConfig, SDKConfigBuilder, MessageInput, MessageOutput};
 
 // 重新导出协议层的类型，避免用户需要单独导入 privchat-protocol
 pub use privchat_protocol::*;
