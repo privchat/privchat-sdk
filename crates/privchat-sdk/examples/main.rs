@@ -1,215 +1,289 @@
-use privchat_sdk::storage::StorageManager;
+use privchat_sdk::{
+    PrivchatSDK, SDKConfig, 
+    events::{SDKEvent, EventFilter, ConnectionState},
+    error::Result,
+};
 use std::path::PathBuf;
 use tokio;
-use tracing;
+use tracing::{info, warn, error};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     // 初始化日志
     tracing_subscriber::fmt::init();
     
-    println!("=== PrivChat SDK 存储管理器示例 ===\n");
+    println!("🚀 PrivChat SDK 统一接口示例");
+    println!("================================\n");
     
-    // 示例1：使用嵌入式 SQL 初始化数据库
-    println!("📁 示例1: 使用嵌入式 SQL 初始化数据库");
-    let user_data_dir = PathBuf::from("./test_data");
-    let storage_manager = StorageManager::new_simple(&user_data_dir).await?;
+    // 示例1：SDK 初始化和配置
+    println!("📋 示例1: SDK 初始化和配置");
+    let config = SDKConfig::builder()
+        .server_url("wss://api.privchat.com/ws")
+        .user_id("demo_user_123")
+        .data_dir("./demo_data")
+        .connection_timeout(30)
+        .heartbeat_interval(30)
+        .debug_mode(true)
+        .build();
     
-    // 初始化用户数据库（使用嵌入式 SQL）
-    let uid = "user123";
-    storage_manager.init_user(uid).await?;
-    storage_manager.switch_user(uid).await?;
+    let sdk = PrivchatSDK::initialize(config).await?;
     
-    println!("✅ 用户数据库初始化完成: {}", uid);
-    println!("📍 用户数据目录: {}", storage_manager.user_dir(uid).display());
-    println!("📍 基础数据目录: {}", storage_manager.base_path().display());
+    println!("✅ SDK 初始化完成");
+    println!("📍 用户ID: {}", sdk.user_id());
+    println!("📍 服务器地址: {}", sdk.config().server_url);
+    println!("📍 存储路径: {}", sdk.config().data_dir.display());
     println!();
     
-    // 示例2：使用预设的外部 assets 目录初始化数据库（智能缓存）
-    println!("📁 示例2: 使用预设的外部 assets 目录初始化数据库（智能缓存）");
-    let user_data_dir = PathBuf::from("./test_data2");
-    let assets_dir = PathBuf::from("./assets");
+    // 示例2：事件监听设置
+    println!("📋 示例2: 事件监听设置");
     
-    // 先创建示例迁移文件
-    create_sample_migration_files(&assets_dir).await?;
+    // 创建事件接收器
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     
-    let storage_manager2 = StorageManager::new_with_assets(&user_data_dir, &assets_dir).await?;
+    // 注册各种事件监听器
+    sdk.on_message_received({
+        let tx = event_tx.clone();
+        move |message| {
+            let _ = tx.send(format!("📨 收到消息: {} -> {}", message.sender_id, message.content));
+        }
+    });
     
-    // 初始化用户数据库（使用预设的外部 assets 目录）
-    let uid2 = "user456";
+    sdk.on_connection_state_changed({
+        let tx = event_tx.clone();
+        move |is_connected| {
+            let status = if is_connected { "🟢 已连接" } else { "🔴 已断开" };
+            let _ = tx.send(format!("🔗 连接状态变化: {}", status));
+        }
+    });
     
-    // 第一次初始化 - 会扫描 assets 目录
-    println!("🔍 第一次初始化 - 扫描 assets 目录");
-    storage_manager2.init_user_with_assets(uid2).await?;
-    storage_manager2.switch_user(uid2).await?;
+    sdk.on_typing_indicator({
+        let tx = event_tx.clone();
+        move |user_id, session_id, is_typing| {
+            let action = if is_typing { "开始输入" } else { "停止输入" };
+            let _ = tx.send(format!("⌨️  {} 在 {} 中{}", user_id, session_id, action));
+        }
+    });
     
-    // 查看缓存信息
-    if let Some(cache_info) = storage_manager2.get_assets_cache_info().await? {
-        println!("📋 缓存信息:");
-        println!("   SDK 版本: {}", cache_info.sdk_version);
-        println!("   Assets 路径: {}", cache_info.assets_path);
-        println!("   文件数量: {}", cache_info.file_timestamps.len());
-        for (filename, timestamp) in &cache_info.file_timestamps {
-            println!("   文件: {} (时间戳: {})", filename, timestamp);
+    sdk.on_reaction_changed({
+        let tx = event_tx.clone();
+        move |message_id, user_id, emoji, is_added| {
+            let action = if is_added { "添加" } else { "移除" };
+            let _ = tx.send(format!("😊 {} {}了表情 {} 在消息 {}", user_id, action, emoji, message_id));
+        }
+    });
+    
+    println!("✅ 事件监听器注册完成");
+    println!();
+    
+    // 示例3：连接和认证
+    println!("📋 示例3: 连接和认证");
+    
+    // 启动事件监听任务
+    let event_task = tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            println!("🔔 {}", event);
+        }
+    });
+    
+    // 连接到服务器
+    println!("🔗 正在连接到服务器...");
+    match sdk.connect("demo_token_456").await {
+        Ok(_) => println!("✅ 连接成功"),
+        Err(e) => {
+            warn!("⚠️  连接失败: {}", e);
+            println!("💡 这是演示模式，连接失败是正常的");
         }
     }
     
-    // 第二次初始化 - 应该使用缓存，跳过扫描
-    println!("\n🚀 第二次初始化 - 使用缓存，跳过扫描");
-    storage_manager2.init_user_with_assets(uid2).await?;
-    
-    println!("✅ 用户数据库初始化完成: {}", uid2);
-    println!("📍 用户数据目录: {}", storage_manager2.user_dir(uid2).display());
-    println!("📍 基础数据目录: {}", storage_manager2.base_path().display());
-    println!("📍 Assets 目录: {}", storage_manager2.assets_path().unwrap().display());
+    // 等待一下让连接状态稳定
+    tokio::time::sleep(Duration::from_millis(100)).await;
     println!();
     
-    // 示例3：演示缓存管理
-    println!("📁 示例3: 演示缓存管理");
+    // 示例4：消息发送和接收
+    println!("📋 示例4: 消息发送和接收");
     
-    // 清理缓存
-    println!("🧹 清理 assets 缓存");
-    storage_manager2.clear_assets_cache().await?;
-    
-    // 再次初始化应该重新扫描
-    println!("🔍 清理缓存后再次初始化 - 重新扫描");
-    storage_manager2.init_user_with_assets(uid2).await?;
-    
-    // 手动刷新缓存
-    println!("🔄 手动刷新缓存");
-    storage_manager2.refresh_assets_cache(&assets_dir).await?;
-    
-    println!("✅ 缓存管理演示完成");
-    println!();
-    
-    // 示例4：使用自定义 assets 目录
-    println!("📁 示例4: 使用自定义 assets 目录");
-    let user_data_dir = PathBuf::from("./test_data3");
-    let storage_manager3 = StorageManager::new_simple(&user_data_dir).await?;
-    
-    // 初始化用户数据库（使用自定义 assets 目录）
-    let uid3 = "user789";
-    let custom_assets_dir = PathBuf::from("./custom_assets");
-    create_sample_migration_files(&custom_assets_dir).await?;
-    
-    storage_manager3.init_user_with_custom_assets(uid3, &custom_assets_dir).await?;
-    storage_manager3.switch_user(uid3).await?;
-    
-    println!("✅ 用户数据库初始化完成: {}", uid3);
-    println!("📍 用户数据目录: {}", storage_manager3.user_dir(uid3).display());
-    println!("📍 基础数据目录: {}", storage_manager3.base_path().display());
-    println!("📍 使用的 Assets 目录: {}", custom_assets_dir.display());
-    println!();
-    
-    // 示例5：演示文件变化检测
-    println!("📁 示例5: 演示文件变化检测");
-    
-    // 添加新的迁移文件
-    let new_migration = r#"
--- 新增的迁移文件
-CREATE TABLE IF NOT EXISTS test_table (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"#;
-    
-    let new_file = assets_dir.join("20240401000001.sql");
-    tokio::fs::write(&new_file, new_migration).await?;
-    
-    println!("📝 添加新的迁移文件: {}", new_file.display());
-    
-    // 再次初始化应该检测到变化
-    println!("🔍 检测到文件变化，执行迁移");
-    storage_manager2.init_user_with_assets(uid2).await?;
-    
-    println!("✅ 文件变化检测演示完成");
-    println!();
-    
-    println!("🎉 所有示例执行完成！");
-    println!("\n💡 性能优化说明:");
-    println!("1. 首次运行时会扫描 assets 目录并缓存文件信息");
-    println!("2. 后续运行时只有在以下情况才会重新扫描:");
-    println!("   - SDK 版本变化");
-    println!("   - assets 目录路径变化");
-    println!("   - assets 目录中的文件发生变化");
-    println!("3. 缓存存储在每个用户的 KV 存储中，与用户数据隔离");
-    println!("4. 可以手动清理或刷新缓存");
-    
-    Ok(())
-}
-
-/// 创建示例 SQL 迁移文件
-async fn create_sample_migration_files(assets_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    // 确保 assets 目录存在
-    tokio::fs::create_dir_all(assets_dir).await?;
-    
-    // 创建基础表结构（较早的时间戳）
-    let init_sql = r#"
--- 初始化基础表结构
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT NOT NULL UNIQUE,
-    channel_id TEXT NOT NULL,
-    from_uid TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id TEXT NOT NULL UNIQUE,
-    channel_type INTEGER NOT NULL DEFAULT 0,
-    title TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"#;
-    
-    let init_file = assets_dir.join("20240101000001.sql");
-    if !init_file.exists() {
-        tokio::fs::write(&init_file, init_sql).await?;
+    // 发送文本消息
+    println!("📤 发送文本消息...");
+    let message_result = sdk.send_message("channel_demo", "你好，这是一条测试消息！").await;
+    match message_result {
+        Ok(message_id) => {
+            println!("✅ 消息发送成功，ID: {}", message_id);
+            
+            // 等待一下，然后标记为已读
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            
+            println!("👁️  标记消息为已读...");
+            if let Err(e) = sdk.mark_as_read("channel_demo", message_id.clone()).await {
+                warn!("⚠️  标记已读失败: {}", e);
+            } else {
+                println!("✅ 消息已标记为已读");
+            }
+        }
+        Err(e) => {
+            warn!("⚠️  消息发送失败: {}", e);
+            println!("💡 这是演示模式，发送失败是正常的");
+        }
     }
     
-    // 创建扩展表结构（较晚的时间戳）
-    let extension_sql = r#"
--- 添加消息扩展字段
-ALTER TABLE messages ADD COLUMN message_type INTEGER DEFAULT 0;
-ALTER TABLE messages ADD COLUMN status INTEGER DEFAULT 0;
-ALTER TABLE messages ADD COLUMN extra TEXT DEFAULT '{}';
-
--- 添加用户表
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    uid TEXT NOT NULL UNIQUE,
-    username TEXT NOT NULL,
-    avatar TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"#;
-    
-    let extension_file = assets_dir.join("20240201000001.sql");
-    if !extension_file.exists() {
-        tokio::fs::write(&extension_file, extension_sql).await?;
+    // 发送另一条消息用于演示撤回
+    println!("📤 发送消息用于演示撤回...");
+    let rich_message_result = sdk.send_message("channel_demo", "这条消息将被撤回").await;
+    match rich_message_result {
+        Ok(message_id) => {
+            println!("✅ 消息发送成功，ID: {}", message_id);
+            
+            // 演示消息撤回
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            println!("🔄 撤回消息...");
+            if let Err(e) = sdk.recall_message(&message_id).await {
+                warn!("⚠️  消息撤回失败: {}", e);
+            } else {
+                println!("✅ 消息撤回成功");
+            }
+        }
+        Err(e) => {
+            warn!("⚠️  消息发送失败: {}", e);
+        }
     }
     
-    // 创建索引优化（更晚的时间戳）
-    let index_sql = r#"
--- 创建性能优化索引
-CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel_id);
-CREATE INDEX IF NOT EXISTS idx_messages_from_uid ON messages(from_uid);
-CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
-CREATE INDEX IF NOT EXISTS idx_conversations_channel_id ON conversations(channel_id);
-"#;
+    println!();
     
-    let index_file = assets_dir.join("20240301000001.sql");
-    if !index_file.exists() {
-        tokio::fs::write(&index_file, index_sql).await?;
+    // 示例5：实时交互功能
+    println!("📋 示例5: 实时交互功能");
+    
+    // 演示正在输入指示器
+    println!("⌨️  开始输入指示器...");
+    if let Err(e) = sdk.start_typing("channel_demo").await {
+        warn!("⚠️  开始输入失败: {}", e);
+    } else {
+        println!("✅ 输入指示器已启动");
+        
+        // 模拟输入过程
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        
+        println!("⌨️  停止输入指示器...");
+        if let Err(e) = sdk.stop_typing("channel_demo").await {
+            warn!("⚠️  停止输入失败: {}", e);
+        } else {
+            println!("✅ 输入指示器已停止");
+        }
     }
     
-    println!("📝 已创建示例迁移文件:");
-    println!("   - {}", init_file.display());
-    println!("   - {}", extension_file.display());
-    println!("   - {}", index_file.display());
+    // 演示表情反馈
+    println!("😊 添加表情反馈...");
+    if let Err(e) = sdk.add_reaction("demo_message_123", "👍").await {
+        warn!("⚠️  添加表情失败: {}", e);
+    } else {
+        println!("✅ 表情反馈添加成功");
+        
+        // 等待一下，然后移除表情
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        
+        println!("😊 移除表情反馈...");
+        if let Err(e) = sdk.remove_reaction("demo_message_123", "👍").await {
+            warn!("⚠️  移除表情失败: {}", e);
+        } else {
+            println!("✅ 表情反馈移除成功");
+        }
+    }
+    
+    println!();
+    
+    // 示例6：高级功能演示
+    println!("📋 示例6: 高级功能演示");
+    
+    // 演示消息编辑
+    println!("✏️  演示消息编辑...");
+    let edit_result = sdk.edit_message("demo_message_456", "这是编辑后的消息内容").await;
+    match edit_result {
+        Ok(_) => println!("✅ 消息编辑成功"),
+        Err(e) => warn!("⚠️  消息编辑失败: {}", e),
+    }
+    
+    // 演示事件过滤
+    println!("🔍 演示事件过滤...");
+    let filter = EventFilter::new()
+        .with_channel_ids(vec!["channel_demo".to_string()])
+        .with_event_types(vec!["message_received".to_string(), "typing_indicator".to_string()]);
+    
+    println!("✅ 事件过滤器配置完成: {:?}", filter);
+    
+    println!();
+    
+    // 示例7：SDK 状态查询
+    println!("📋 示例7: SDK 状态查询");
+    
+    println!("📊 SDK 状态信息:");
+    println!("   初始化状态: {}", sdk.is_initialized().await);
+    println!("   连接状态: {}", sdk.is_connected().await);
+    println!("   用户ID: {}", sdk.user_id());
+    println!("   服务器地址: {}", sdk.config().server_url);
+    
+    // 显示配置信息
+    println!("📈 配置信息:");
+    println!("   连接超时: {} 秒", sdk.config().connection_timeout);
+    println!("   心跳间隔: {} 秒", sdk.config().heartbeat_interval);
+    println!("   调试模式: {}", sdk.config().debug_mode);
+    
+    println!();
+    
+    // 示例8：错误处理和恢复
+    println!("📋 示例8: 错误处理和恢复");
+    
+    // 演示网络错误恢复
+    println!("🔧 模拟网络错误...");
+    // 这里可以添加网络错误模拟代码
+    
+    println!("🔄 SDK 会自动处理网络错误和重连");
+    println!("💡 所有操作都有超时和重试机制");
+    
+    println!();
+    
+    // 示例9：资源清理
+    println!("📋 示例9: 资源清理");
+    
+    println!("🔌 断开连接...");
+    if let Err(e) = sdk.disconnect().await {
+        warn!("⚠️  断开连接失败: {}", e);
+    } else {
+        println!("✅ 连接已断开");
+    }
+    
+    println!("🛑 关闭 SDK...");
+    if let Err(e) = sdk.shutdown().await {
+        warn!("⚠️  SDK 关闭失败: {}", e);
+    } else {
+        println!("✅ SDK 已关闭");
+    }
+    
+    // 停止事件监听任务
+    event_task.abort();
+    
+    println!();
+    
+    // 总结
+    println!("🎉 PrivChat SDK 演示完成！");
+    println!("================================");
+    println!();
+    println!("💡 功能特性总结:");
+    println!("✅ 统一的 SDK 接口，简化集成");
+    println!("✅ 完整的生命周期管理");
+    println!("✅ 事件驱动的架构");
+    println!("✅ 自动重连和错误恢复");
+    println!("✅ 实时交互功能（输入指示器、表情反馈）");
+    println!("✅ 高级消息功能（编辑、撤回、已读回执）");
+    println!("✅ 灵活的配置系统");
+    println!("✅ 异步优先设计");
+    println!("✅ FFI 兼容接口");
+    println!();
+    println!("📚 接下来可以:");
+    println!("1. 集成到实际的应用中");
+    println!("2. 通过 FFI 接口在其他语言中使用");
+    println!("3. 根据需要扩展更多功能");
+    println!("4. 优化性能和资源使用");
     
     Ok(())
 }
