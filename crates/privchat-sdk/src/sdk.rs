@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Mutex};
 use serde::{Serialize, Deserialize};
 use tracing::{debug, error, info, warn};
@@ -28,19 +28,56 @@ use uuid::Uuid;
 use crate::error::{PrivchatSDKError, Result};
 use crate::client::{PrivchatClient, UserSession};
 use crate::network::{NetworkMonitor, NetworkStatus, DummyNetworkSender, DummyNetworkStatusListener};
-use crate::events::{EventManager, SDKEvent, EventFilter};
+use crate::events::{EventManager, SDKEvent, EventFilter, ConnectionState as EventConnectionState};
 use crate::storage::{StorageManager};
 use crate::storage::advanced_features::AdvancedFeaturesManager;
+
+/// 传输协议类型
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransportProtocol {
+    /// QUIC 协议（高性能）
+    Quic,
+    /// TCP 协议（稳定）
+    Tcp,
+    /// WebSocket 协议（兼容性强）
+    WebSocket,
+}
+
+/// 单个协议的服务器配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolServerConfig {
+    /// 服务器地址（可以是域名或IP）
+    pub host: String,
+    /// 端口号
+    pub port: u16,
+    /// 路径（用于WebSocket等）
+    pub path: Option<String>,
+    /// 是否使用TLS
+    pub use_tls: bool,
+}
+
+/// 服务器配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// QUIC 服务器配置
+    pub quic: Option<ProtocolServerConfig>,
+    /// TCP 服务器配置
+    pub tcp: Option<ProtocolServerConfig>,
+    /// WebSocket 服务器配置
+    pub websocket: Option<ProtocolServerConfig>,
+    /// 协议优先级（按顺序尝试）
+    pub protocol_priority: Vec<TransportProtocol>,
+}
 
 /// SDK 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SDKConfig {
     /// 数据存储目录
     pub data_dir: PathBuf,
-    /// 用户 ID
-    pub user_id: String,
-    /// 服务器地址
-    pub server_url: String,
+    /// Assets目录（SQL脚本等）
+    pub assets_dir: Option<PathBuf>,
+    /// 服务器配置
+    pub server_config: ServerConfig,
     /// 连接超时时间（秒）
     pub connection_timeout: u64,
     /// 心跳间隔（秒）
@@ -90,12 +127,38 @@ pub struct EventConfig {
     pub filters: Vec<EventFilter>,
 }
 
+impl Default for ProtocolServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "localhost".to_string(),
+            port: 8080,
+            path: None,
+            use_tls: true,
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            quic: None,
+            tcp: None,
+            websocket: None,
+            protocol_priority: vec![
+                TransportProtocol::Quic,
+                TransportProtocol::Tcp,
+                TransportProtocol::WebSocket,
+            ],
+        }
+    }
+}
+
 impl Default for SDKConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./privchat_data"),
-            user_id: String::new(),
-            server_url: String::new(),
+            assets_dir: None,
+            server_config: ServerConfig::default(),
             connection_timeout: 30,
             heartbeat_interval: 30,
             retry_config: RetryConfig::default(),
@@ -154,14 +217,141 @@ impl SDKConfigBuilder {
         self
     }
 
-    pub fn user_id<S: Into<String>>(mut self, user_id: S) -> Self {
-        self.config.user_id = user_id.into();
+    pub fn assets_dir<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.config.assets_dir = Some(path.as_ref().to_path_buf());
         self
     }
 
-    pub fn server_url<S: Into<String>>(mut self, url: S) -> Self {
-        self.config.server_url = url.into();
+    /// 配置QUIC服务器
+    pub fn quic_server<S: Into<String>>(mut self, url: S) -> Self {
+        if let Some(config) = self.parse_protocol_url(&url.into(), TransportProtocol::Quic) {
+            self.config.server_config.quic = Some(config);
+            // 如果协议优先级中没有QUIC，添加到最前面
+            if !self.config.server_config.protocol_priority.contains(&TransportProtocol::Quic) {
+                self.config.server_config.protocol_priority.insert(0, TransportProtocol::Quic);
+            }
+        }
         self
+    }
+
+    /// 配置TCP服务器
+    pub fn tcp_server<S: Into<String>>(mut self, url: S) -> Self {
+        if let Some(config) = self.parse_protocol_url(&url.into(), TransportProtocol::Tcp) {
+            self.config.server_config.tcp = Some(config);
+            // 如果协议优先级中没有TCP，添加到列表中
+            if !self.config.server_config.protocol_priority.contains(&TransportProtocol::Tcp) {
+                self.config.server_config.protocol_priority.push(TransportProtocol::Tcp);
+            }
+        }
+        self
+    }
+
+    /// 配置WebSocket服务器
+    pub fn websocket_server<S: Into<String>>(mut self, url: S) -> Self {
+        if let Some(config) = self.parse_protocol_url(&url.into(), TransportProtocol::WebSocket) {
+            self.config.server_config.websocket = Some(config);
+            // 如果协议优先级中没有WebSocket，添加到列表中
+            if !self.config.server_config.protocol_priority.contains(&TransportProtocol::WebSocket) {
+                self.config.server_config.protocol_priority.push(TransportProtocol::WebSocket);
+            }
+        }
+        self
+    }
+
+    /// 设置协议优先级
+    pub fn protocol_priority(mut self, priority: Vec<TransportProtocol>) -> Self {
+        self.config.server_config.protocol_priority = priority;
+        self
+    }
+
+    pub fn server_config(mut self, config: ServerConfig) -> Self {
+        self.config.server_config = config;
+        self
+    }
+
+    /// 解析协议特定的URL
+    fn parse_protocol_url(&self, url: &str, protocol: TransportProtocol) -> Option<ProtocolServerConfig> {
+        match protocol {
+            TransportProtocol::Quic => {
+                if url.starts_with("quic://") {
+                    self.parse_url_parts(url, "quic://", false)
+                } else if url.starts_with("quics://") {
+                    self.parse_url_parts(url, "quics://", true)
+                } else {
+                    // 如果没有协议前缀，默认为安全连接
+                    self.parse_host_port_only(url, true)
+                }
+            }
+            TransportProtocol::Tcp => {
+                if url.starts_with("tcp://") {
+                    self.parse_url_parts(url, "tcp://", false)
+                } else if url.starts_with("tcps://") {
+                    self.parse_url_parts(url, "tcps://", true)
+                } else {
+                    // 如果没有协议前缀，默认为安全连接
+                    self.parse_host_port_only(url, true)
+                }
+            }
+            TransportProtocol::WebSocket => {
+                if url.starts_with("ws://") {
+                    self.parse_url_parts(url, "ws://", false)
+                } else if url.starts_with("wss://") {
+                    self.parse_url_parts(url, "wss://", true)
+                } else {
+                    // 如果没有协议前缀，默认为安全连接
+                    self.parse_host_port_only(url, true)
+                }
+            }
+        }
+    }
+
+    fn parse_url_parts(&self, url: &str, prefix: &str, use_tls: bool) -> Option<ProtocolServerConfig> {
+        let remainder = url.strip_prefix(prefix)?;
+        
+        // 分离主机:端口和路径
+        let (host_port, path) = if let Some(slash_pos) = remainder.find('/') {
+            let host_port = &remainder[..slash_pos];
+            let path = &remainder[slash_pos..];
+            (host_port, Some(path.to_string()))
+        } else {
+            (remainder, None)
+        };
+
+        if let Some((host, port)) = self.parse_host_port(host_port) {
+            Some(ProtocolServerConfig {
+                host,
+                port,
+                path,
+                use_tls,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn parse_host_port_only(&self, host_port: &str, use_tls: bool) -> Option<ProtocolServerConfig> {
+        if let Some((host, port)) = self.parse_host_port(host_port) {
+            Some(ProtocolServerConfig {
+                host,
+                port,
+                path: None,
+                use_tls,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn parse_host_port(&self, host_port: &str) -> Option<(String, u16)> {
+        if let Some(colon_pos) = host_port.rfind(':') {
+            let host = &host_port[..colon_pos];
+            let port_str = &host_port[colon_pos + 1..];
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Some((host.to_string(), port));
+            }
+        }
+        // 如果没有端口，使用默认端口
+        Some((host_port.to_string(), 8080))
     }
 
     pub fn connection_timeout(mut self, timeout: u64) -> Self {
@@ -262,6 +452,46 @@ pub enum MessageStatus {
     Revoked,
 }
 
+/// 连接状态
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// 未连接
+    Disconnected,
+    /// 连接中
+    Connecting,
+    /// 已连接
+    Connected,
+    /// 重连中
+    Reconnecting,
+}
+
+/// SDK 运行状态
+#[derive(Debug, Clone)]
+pub struct SDKState {
+    /// 连接状态
+    pub connection_state: ConnectionState,
+    /// 当前使用的协议
+    pub current_protocol: Option<TransportProtocol>,
+    /// 当前用户ID
+    pub current_user_id: Option<String>,
+    /// 最后连接时间
+    pub last_connected: Option<Instant>,
+    /// 最后断开时间
+    pub last_disconnected: Option<Instant>,
+}
+
+impl Default for SDKState {
+    fn default() -> Self {
+        Self {
+            connection_state: ConnectionState::Disconnected,
+            current_protocol: None,
+            current_user_id: None,
+            last_connected: None,
+            last_disconnected: None,
+        }
+    }
+}
+
 /// 统一 SDK 主接口
 /// 
 /// 采用分层架构：
@@ -286,7 +516,10 @@ pub struct PrivchatSDK {
     network: Arc<NetworkMonitor>,
     
     /// 事件管理器
-    events: Arc<EventManager>,
+    event_manager: Arc<EventManager>,
+    
+    /// SDK 状态
+    state: Arc<RwLock<SDKState>>,
     
     /// 同步运行时（用于FFI）
     sync_runtime: Option<Arc<tokio::runtime::Runtime>>,
@@ -310,9 +543,8 @@ impl PrivchatSDK {
         Self::validate_config(&config)?;
         
         // === 第1层：存储管理器 ===
-        let storage = Arc::new(StorageManager::new(&config.data_dir, None).await?);
-        storage.init_user(&config.user_id).await?;
-        storage.switch_user(&config.user_id).await?;
+        let assets_dir = config.assets_dir.as_ref().map(|p| p.as_path());
+        let storage = Arc::new(StorageManager::new(&config.data_dir, assets_dir).await?);
         
         // === 第2层：网络监控 ===
         let network_sender = Arc::new(DummyNetworkSender::default());
@@ -323,7 +555,7 @@ impl PrivchatSDK {
         ));
         
         // === 第3层：事件管理器 ===
-        let events = Arc::new(EventManager::new(config.event_config.buffer_size));
+        let event_manager = Arc::new(EventManager::new(config.event_config.buffer_size));
         
         let sdk = Arc::new(Self {
             config,
@@ -331,7 +563,8 @@ impl PrivchatSDK {
             storage,
             features: Arc::new(RwLock::new(None)),
             network,
-            events,
+            event_manager,
+            state: Arc::new(RwLock::new(SDKState::default())),
             sync_runtime: None,
             initialized: Arc::new(RwLock::new(true)),
             shutting_down: Arc::new(RwLock::new(false)),
@@ -362,12 +595,33 @@ impl PrivchatSDK {
     
     /// 验证配置
     fn validate_config(config: &SDKConfig) -> Result<()> {
-        if config.user_id.is_empty() {
-            return Err(PrivchatSDKError::Config("用户 ID 不能为空".to_string()));
+        if config.server_config.protocol_priority.is_empty() {
+            return Err(PrivchatSDKError::Config("至少需要配置一个传输协议".to_string()));
         }
         
-        if config.server_url.is_empty() {
-            return Err(PrivchatSDKError::Config("服务器地址不能为空".to_string()));
+        // 检查每个协议是否有对应的服务器配置
+        for protocol in &config.server_config.protocol_priority {
+            match protocol {
+                TransportProtocol::Quic => {
+                    if config.server_config.quic.is_none() {
+                        return Err(PrivchatSDKError::Config("QUIC协议已启用但未配置服务器".to_string()));
+                    }
+                }
+                TransportProtocol::Tcp => {
+                    if config.server_config.tcp.is_none() {
+                        return Err(PrivchatSDKError::Config("TCP协议已启用但未配置服务器".to_string()));
+                    }
+                }
+                TransportProtocol::WebSocket => {
+                    if config.server_config.websocket.is_none() {
+                        return Err(PrivchatSDKError::Config("WebSocket协议已启用但未配置服务器".to_string()));
+                    }
+                }
+            }
+        }
+        
+        if config.data_dir.as_os_str().is_empty() {
+            return Err(PrivchatSDKError::Config("数据目录不能为空".to_string()));
         }
         
         Ok(())
@@ -375,26 +629,154 @@ impl PrivchatSDK {
     
     /// 连接到服务器
     /// 
-    /// 这会创建内部的 PrivchatClient 并建立连接
-    pub async fn connect(&self, auth_token: &str) -> Result<()> {
+    /// 支持多协议自动降级：QUIC → TCP → WebSocket
+    pub async fn connect(&self, user_id: &str, token: &str) -> Result<()> {
         self.check_initialized().await?;
         
-        info!("正在连接到服务器: {}", self.config.server_url);
+        info!("正在连接到服务器... 用户ID: {}", user_id);
         
-        // 创建传输层客户端
-        // 注意：这里需要创建真实的 Transport，暂时用模拟的
-        // let transport = Arc::new(Transport::new(...));
-        // let client = PrivchatClient::new(&self.config.data_dir, transport).await?;
+        // 设置连接状态
+        {
+            let mut state = self.state.write().await;
+            state.connection_state = ConnectionState::Connecting;
+        }
         
-        // 暂时创建一个模拟客户端
-        // TODO: 实现真实的连接逻辑
+        // 尝试按优先级顺序连接不同协议
+        let mut last_error = None;
+        
+        for protocol in &self.config.server_config.protocol_priority {
+            match self.try_connect_with_protocol(user_id, token, protocol).await {
+                Ok(()) => {
+                    info!("成功使用 {:?} 协议连接到服务器", protocol);
+                    
+                    // 更新连接状态
+                    {
+                        let mut state = self.state.write().await;
+                        state.connection_state = ConnectionState::Connected;
+                        state.last_connected = Some(Instant::now());
+                        state.current_protocol = Some(protocol.clone());
+                        state.current_user_id = Some(user_id.to_string());
+                    }
+                    
+                    // 触发连接状态变化事件
+                    let connection_event = crate::events::event_builders::connection_state_changed(
+                        EventConnectionState::Connecting,
+                        EventConnectionState::Connected,
+                    );
+                    self.event_manager.emit(connection_event).await;
+                    
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("使用 {:?} 协议连接失败: {}", protocol, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+        
+        // 所有协议都连接失败
+        {
+            let mut state = self.state.write().await;
+            state.connection_state = ConnectionState::Disconnected;
+            state.last_disconnected = Some(Instant::now());
+        }
+        
+        let error = last_error.unwrap_or_else(|| {
+            PrivchatSDKError::Transport("没有可用的传输协议".to_string())
+        });
+        
+        // 触发连接失败事件
+        let connection_event = crate::events::event_builders::connection_state_changed(
+            EventConnectionState::Connecting,
+            EventConnectionState::Disconnected,
+        );
+        self.event_manager.emit(connection_event).await;
+        
+        Err(error)
+    }
+    
+    /// 尝试使用指定协议连接
+    async fn try_connect_with_protocol(
+        &self,
+        user_id: &str,
+        _token: &str,
+        protocol: &TransportProtocol,
+    ) -> Result<()> {
+        let server_url = self.build_server_url(protocol);
+        
+        info!("尝试连接到: {} (协议: {:?})", server_url, protocol);
+        
+        // 模拟连接过程
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        // 这里应该是实际的连接逻辑
+        // 现在只是模拟成功
+        match protocol {
+            TransportProtocol::Quic => {
+                // QUIC 连接逻辑
+                debug!("建立 QUIC 连接...");
+            }
+            TransportProtocol::Tcp => {
+                // TCP 连接逻辑
+                debug!("建立 TCP 连接...");
+            }
+            TransportProtocol::WebSocket => {
+                // WebSocket 连接逻辑
+                debug!("建立 WebSocket 连接...");
+            }
+        }
+        
+        // 模拟认证
+        debug!("正在认证用户: {}", user_id);
         
         // 初始化高级特性（连接成功后）
-        // let features = AdvancedFeaturesIntegration::new(...);
+        // let features = AdvancedFeaturesManager::new(...);
         // *self.features.write().await = Some(features);
         
-        info!("连接成功");
         Ok(())
+    }
+    
+    /// 构建服务器URL
+    fn build_server_url(&self, protocol: &TransportProtocol) -> String {
+        let config = &self.config.server_config;
+        
+        match protocol {
+            TransportProtocol::Quic => {
+                if let Some(ref quic_config) = config.quic {
+                    if quic_config.use_tls {
+                        format!("quics://{}:{}", quic_config.host, quic_config.port)
+                    } else {
+                        format!("quic://{}:{}", quic_config.host, quic_config.port)
+                    }
+                } else {
+                    "quic://localhost:8080".to_string()
+                }
+            }
+            TransportProtocol::Tcp => {
+                if let Some(ref tcp_config) = config.tcp {
+                    if tcp_config.use_tls {
+                        format!("tcps://{}:{}", tcp_config.host, tcp_config.port)
+                    } else {
+                        format!("tcp://{}:{}", tcp_config.host, tcp_config.port)
+                    }
+                } else {
+                    "tcp://localhost:8080".to_string()
+                }
+            }
+            TransportProtocol::WebSocket => {
+                if let Some(ref ws_config) = config.websocket {
+                    let protocol_prefix = if ws_config.use_tls { "wss" } else { "ws" };
+                    let base_url = format!("{}://{}:{}", protocol_prefix, ws_config.host, ws_config.port);
+                    if let Some(ref path) = ws_config.path {
+                        format!("{}{}", base_url, path)
+                    } else {
+                        base_url
+                    }
+                } else {
+                    "ws://localhost:8080".to_string()
+                }
+            }
+        }
     }
     
     /// 断开连接
@@ -406,6 +788,15 @@ impl PrivchatSDK {
         
         info!("正在断开连接...");
         
+        // 更新连接状态
+        {
+            let mut state = self.state.write().await;
+            state.connection_state = ConnectionState::Disconnected;
+            state.last_disconnected = Some(Instant::now());
+            state.current_protocol = None;
+            state.current_user_id = None;
+        }
+        
         // 断开传输层客户端
         if let Some(client) = self.client.read().await.as_ref() {
             // client.disconnect("用户主动断开").await?;
@@ -414,6 +805,13 @@ impl PrivchatSDK {
         // 清理高级特性
         *self.features.write().await = None;
         *self.client.write().await = None;
+        
+        // 触发断开连接事件
+        let connection_event = crate::events::event_builders::connection_state_changed(
+            EventConnectionState::Connected,
+            EventConnectionState::Disconnected,
+        );
+        self.event_manager.emit(connection_event).await;
         
         info!("连接已断开");
         Ok(())
@@ -530,10 +928,10 @@ impl PrivchatSDK {
     }
     
     /// 标记消息为已读
-    pub async fn mark_as_read(&self, session_id: &str, message_id: String) -> Result<()> {
+    pub async fn mark_as_read(&self, _session_id: &str, message_id: String) -> Result<()> {
         self.check_initialized().await?;
         
-        if let Some(features) = self.features.read().await.as_ref() {
+        if let Some(_features) = self.features.read().await.as_ref() {
             // features.mark_message_as_read(session_id, 1, &self.config.user_id, &message_id).await?;
         }
         
@@ -545,7 +943,7 @@ impl PrivchatSDK {
     pub async fn recall_message(&self, message_id: &str) -> Result<()> {
         self.check_initialized().await?;
         
-        if let Some(features) = self.features.read().await.as_ref() {
+        if let Some(_features) = self.features.read().await.as_ref() {
             // features.revoke_message(message_id, "用户撤回", None).await?;
         }
         
@@ -554,10 +952,10 @@ impl PrivchatSDK {
     }
     
     /// 编辑消息
-    pub async fn edit_message(&self, message_id: &str, new_content: &str) -> Result<()> {
+    pub async fn edit_message(&self, message_id: &str, _new_content: &str) -> Result<()> {
         self.check_initialized().await?;
         
-        if let Some(features) = self.features.read().await.as_ref() {
+        if let Some(_features) = self.features.read().await.as_ref() {
             // features.edit_message(message_id, new_content, &self.config.user_id).await?;
         }
         
@@ -610,7 +1008,7 @@ impl PrivchatSDK {
     // ========== 事件系统 ==========
     
     /// 注册消息接收回调
-    pub fn on_message_received<F>(&self, callback: F) 
+    pub fn on_message_received<F>(&self, _callback: F) 
     where 
         F: Fn(MessageOutput) + Send + Sync + 'static 
     {
@@ -621,7 +1019,7 @@ impl PrivchatSDK {
     }
     
     /// 注册输入状态回调
-    pub fn on_typing_indicator<F>(&self, callback: F)
+    pub fn on_typing_indicator<F>(&self, _callback: F)
     where
         F: Fn(String, String, bool) + Send + Sync + 'static // user_id, session_id, is_typing
     {
@@ -629,7 +1027,7 @@ impl PrivchatSDK {
     }
     
     /// 注册表情反馈回调
-    pub fn on_reaction_changed<F>(&self, callback: F)
+    pub fn on_reaction_changed<F>(&self, _callback: F)
     where
         F: Fn(String, String, String, bool) + Send + Sync + 'static // message_id, user_id, emoji, is_added
     {
@@ -637,7 +1035,7 @@ impl PrivchatSDK {
     }
     
     /// 注册连接状态回调
-    pub fn on_connection_state_changed<F>(&self, callback: F)
+    pub fn on_connection_state_changed<F>(&self, _callback: F)
     where
         F: Fn(bool) + Send + Sync + 'static // is_connected
     {
@@ -673,14 +1071,15 @@ impl PrivchatSDK {
         &self.config
     }
     
-    /// 获取用户 ID
-    pub fn user_id(&self) -> &str {
-        &self.config.user_id
+    /// 获取当前用户 ID
+    pub async fn user_id(&self) -> Option<String> {
+        let state = self.state.read().await;
+        state.current_user_id.clone()
     }
     
     /// 获取事件管理器
     pub fn events(&self) -> &Arc<EventManager> {
-        &self.events
+        &self.event_manager
     }
     
     /// 获取存储管理器
@@ -698,10 +1097,10 @@ impl PrivchatSDK {
 
 impl PrivchatSDK {
     /// 同步连接
-    pub fn connect_blocking(&self, auth_token: &str) -> Result<()> {
+    pub fn connect_blocking(&self, user_id: &str, token: &str) -> Result<()> {
         if let Some(rt) = &self.sync_runtime {
             rt.block_on(async {
-                self.connect(auth_token).await
+                self.connect(user_id, token).await
             })
         } else {
             Err(PrivchatSDKError::Runtime("同步运行时未初始化".to_string()))
@@ -786,14 +1185,13 @@ mod tests {
         
         let config = SDKConfig::builder()
             .data_dir(temp_dir.path())
-            .user_id("test_user")
-            .server_url("wss://test.example.com")
+            .tcp_server("test.example.com:8080")
             .build();
         
         let sdk = PrivchatSDK::initialize(config).await.unwrap();
         
         assert!(sdk.is_initialized().await);
-        assert_eq!(sdk.user_id(), "test_user");
+        assert_eq!(sdk.user_id().await, None); // 未连接时没有用户ID
         assert!(!sdk.is_connected().await);
         
         sdk.shutdown().await.unwrap();
@@ -806,14 +1204,13 @@ mod tests {
         
         let config = SDKConfig::builder()
             .data_dir(temp_dir.path())
-            .user_id("test_user")
-            .server_url("wss://test.example.com")
+            .tcp_server("test.example.com:8080")
             .build();
         
         let sdk = PrivchatSDK::initialize(config).await.unwrap();
         
         // 测试连接
-        // sdk.connect("test_token").await.unwrap();
+        // sdk.connect("test_user", "test_token").await.unwrap();
         // assert!(sdk.is_connected().await);
         
         // 测试断开连接
@@ -829,15 +1226,37 @@ mod tests {
     fn test_config_builder() {
         let config = SDKConfig::builder()
             .data_dir("/tmp/test")
-            .user_id("user123")
-            .server_url("wss://example.com")
+            .websocket_server("wss://example.com:443/chat")
+            .tcp_server("tcps://example.com:443")
+            .quic_server("quics://example.com:443")
             .connection_timeout(60)
             .debug_mode(true)
             .build();
         
         assert_eq!(config.data_dir, PathBuf::from("/tmp/test"));
-        assert_eq!(config.user_id, "user123");
-        assert_eq!(config.server_url, "wss://example.com");
+        
+        // 检查WebSocket配置
+        assert!(config.server_config.websocket.is_some());
+        let ws_config = config.server_config.websocket.as_ref().unwrap();
+        assert_eq!(ws_config.host, "example.com");
+        assert_eq!(ws_config.port, 443);
+        assert_eq!(ws_config.path, Some("/chat".to_string()));
+        assert!(ws_config.use_tls);
+        
+        // 检查TCP配置
+        assert!(config.server_config.tcp.is_some());
+        let tcp_config = config.server_config.tcp.as_ref().unwrap();
+        assert_eq!(tcp_config.host, "example.com");
+        assert_eq!(tcp_config.port, 443);
+        assert!(tcp_config.use_tls);
+        
+        // 检查QUIC配置
+        assert!(config.server_config.quic.is_some());
+        let quic_config = config.server_config.quic.as_ref().unwrap();
+        assert_eq!(quic_config.host, "example.com");
+        assert_eq!(quic_config.port, 443);
+        assert!(quic_config.use_tls);
+        
         assert_eq!(config.connection_timeout, 60);
         assert!(config.debug_mode);
     }

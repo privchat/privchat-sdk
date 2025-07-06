@@ -1,6 +1,7 @@
 use privchat_sdk::{
-    PrivchatSDK, SDKConfig, 
-    events::{SDKEvent, EventFilter, ConnectionState},
+    PrivchatSDK, SDKConfig,
+    sdk::TransportProtocol,
+    events::EventFilter,
     error::Result,
 };
 use std::path::PathBuf;
@@ -21,9 +22,16 @@ async fn main() -> Result<()> {
     // 示例1：SDK 初始化和配置
     println!("📋 示例1: SDK 初始化和配置");
     let config = SDKConfig::builder()
-        .server_url("wss://api.privchat.com/ws")
-        .user_id("demo_user_123")
         .data_dir("./demo_data")
+        .assets_dir("./assets")  // 设置SQL脚本目录
+        .websocket_server("wss://127.0.0.1:8002/path")
+        .tcp_server("demo.privchat.com:8001")
+        .quic_server("chat.privchat.com:8003")
+        .protocol_priority(vec![
+            TransportProtocol::Quic,    // 优先使用QUIC
+            TransportProtocol::Tcp,     // 降级到TCP
+            TransportProtocol::WebSocket // 最后使用WebSocket
+        ])
         .connection_timeout(30)
         .heartbeat_interval(30)
         .debug_mode(true)
@@ -32,9 +40,25 @@ async fn main() -> Result<()> {
     let sdk = PrivchatSDK::initialize(config).await?;
     
     println!("✅ SDK 初始化完成");
-    println!("📍 用户ID: {}", sdk.user_id());
-    println!("📍 服务器地址: {}", sdk.config().server_url);
+    
+    // 显示服务器配置信息
+    let server_config = &sdk.config().server_config;
+    if let Some(ref quic_config) = server_config.quic {
+        println!("📍 QUIC 服务器: {}:{} (TLS: {})", quic_config.host, quic_config.port, quic_config.use_tls);
+    }
+    if let Some(ref tcp_config) = server_config.tcp {
+        println!("📍 TCP 服务器: {}:{} (TLS: {})", tcp_config.host, tcp_config.port, tcp_config.use_tls);
+    }
+    if let Some(ref ws_config) = server_config.websocket {
+        let path = ws_config.path.as_deref().unwrap_or("");
+        println!("📍 WebSocket 服务器: {}:{}{} (TLS: {})", ws_config.host, ws_config.port, path, ws_config.use_tls);
+    }
+    
+    println!("📍 协议优先级: {:?}", server_config.protocol_priority);
     println!("📍 存储路径: {}", sdk.config().data_dir.display());
+    if let Some(assets_dir) = &sdk.config().assets_dir {
+        println!("📍 Assets目录: {}", assets_dir.display());
+    }
     println!();
     
     // 示例2：事件监听设置
@@ -88,10 +112,16 @@ async fn main() -> Result<()> {
         }
     });
     
-    // 连接到服务器
+    // 连接到服务器（现在需要提供用户ID和token）
     println!("🔗 正在连接到服务器...");
-    match sdk.connect("demo_token_456").await {
-        Ok(_) => println!("✅ 连接成功"),
+    println!("💡 尝试协议降级: QUIC → TCP → WebSocket");
+    match sdk.connect("demo_user_123", "demo_token_456").await {
+        Ok(_) => {
+            println!("✅ 连接成功");
+            if let Some(user_id) = sdk.user_id().await {
+                println!("👤 当前用户: {}", user_id);
+            }
+        }
         Err(e) => {
             warn!("⚠️  连接失败: {}", e);
             println!("💡 这是演示模式，连接失败是正常的");
@@ -200,90 +230,109 @@ async fn main() -> Result<()> {
     let edit_result = sdk.edit_message("demo_message_456", "这是编辑后的消息内容").await;
     match edit_result {
         Ok(_) => println!("✅ 消息编辑成功"),
-        Err(e) => warn!("⚠️  消息编辑失败: {}", e),
+        Err(e) => {
+            warn!("⚠️  消息编辑失败: {}", e);
+            println!("💡 这是演示模式，编辑失败是正常的");
+        }
     }
     
     // 演示事件过滤
     println!("🔍 演示事件过滤...");
-    let filter = EventFilter::new()
-        .with_channel_ids(vec!["channel_demo".to_string()])
-        .with_event_types(vec!["message_received".to_string(), "typing_indicator".to_string()]);
+    let event_filter = EventFilter::new()
+        .with_event_types(vec!["message_received".to_string(), "typing_indicator".to_string()])
+        .with_channel_ids(vec!["channel_demo".to_string()]);
     
-    println!("✅ 事件过滤器配置完成: {:?}", filter);
+    let mut filtered_receiver = sdk.events().subscribe_filtered(event_filter).await;
     
+    // 启动过滤事件监听任务
+    let filtered_task = tokio::spawn(async move {
+        if let Ok(event) = tokio::time::timeout(Duration::from_millis(100), filtered_receiver.recv()).await {
+            if let Ok(event) = event {
+                println!("🔍 过滤事件: {}", event.event_type());
+            }
+        }
+    });
+    
+    println!("✅ 事件过滤器设置完成");
     println!();
     
-    // 示例7：SDK 状态查询
-    println!("📋 示例7: SDK 状态查询");
+    // 示例7：SDK状态查询
+    println!("📋 示例7: SDK状态查询");
     
-    println!("📊 SDK 状态信息:");
-    println!("   初始化状态: {}", sdk.is_initialized().await);
-    println!("   连接状态: {}", sdk.is_connected().await);
-    println!("   用户ID: {}", sdk.user_id());
-    println!("   服务器地址: {}", sdk.config().server_url);
+    println!("📊 SDK 运行状态:");
+    println!("  - 已初始化: {}", sdk.is_initialized().await);
+    println!("  - 已连接: {}", sdk.is_connected().await);
+    println!("  - 正在关闭: {}", sdk.is_shutting_down().await);
     
-    // 显示配置信息
-    println!("📈 配置信息:");
-    println!("   连接超时: {} 秒", sdk.config().connection_timeout);
-    println!("   心跳间隔: {} 秒", sdk.config().heartbeat_interval);
-    println!("   调试模式: {}", sdk.config().debug_mode);
+    if let Some(user_id) = sdk.user_id().await {
+        println!("  - 当前用户: {}", user_id);
+    } else {
+        println!("  - 当前用户: 未登录");
+    }
+    
+    println!("📊 配置信息:");
+    println!("  - 连接超时: {}秒", sdk.config().connection_timeout);
+    println!("  - 心跳间隔: {}秒", sdk.config().heartbeat_interval);
+    println!("  - 调试模式: {}", sdk.config().debug_mode);
+    println!("  - 队列大小: {}", sdk.config().queue_config.send_queue_size);
+    println!("  - 工作线程: {}", sdk.config().queue_config.worker_threads);
+    
+    println!("📊 事件统计:");
+    let event_stats = sdk.events().get_stats().await;
+    println!("  - 总事件数: {}", event_stats.total_events);
+    println!("  - 监听器数: {}", event_stats.listener_count);
+    println!("  - 订阅者数: {}", sdk.events().subscriber_count());
     
     println!();
     
     // 示例8：错误处理和恢复
     println!("📋 示例8: 错误处理和恢复");
     
-    // 演示网络错误恢复
-    println!("🔧 模拟网络错误...");
-    // 这里可以添加网络错误模拟代码
+    // 演示错误处理
+    println!("🔧 测试错误处理...");
     
-    println!("🔄 SDK 会自动处理网络错误和重连");
-    println!("💡 所有操作都有超时和重试机制");
+    // 尝试在未连接状态下发送消息
+    sdk.disconnect().await?;
+    match sdk.send_message("test_channel", "这应该会失败").await {
+        Ok(_) => println!("❌ 意外成功"),
+        Err(e) => println!("✅ 正确捕获错误: {}", e),
+    }
+    
+    // 演示重连机制（模拟）
+    println!("🔄 模拟重连机制...");
+    match sdk.connect("demo_user_123", "demo_token_456").await {
+        Ok(_) => println!("✅ 重连成功"),
+        Err(e) => {
+            warn!("⚠️  重连失败: {}", e);
+            println!("💡 这是演示模式，重连失败是正常的");
+        }
+    }
     
     println!();
     
     // 示例9：资源清理
     println!("📋 示例9: 资源清理");
     
-    println!("🔌 断开连接...");
-    if let Err(e) = sdk.disconnect().await {
-        warn!("⚠️  断开连接失败: {}", e);
-    } else {
-        println!("✅ 连接已断开");
-    }
-    
-    println!("🛑 关闭 SDK...");
-    if let Err(e) = sdk.shutdown().await {
-        warn!("⚠️  SDK 关闭失败: {}", e);
-    } else {
-        println!("✅ SDK 已关闭");
-    }
+    println!("🧹 正在清理资源...");
     
     // 停止事件监听任务
     event_task.abort();
+    filtered_task.abort();
     
-    println!();
+    // 断开连接
+    sdk.disconnect().await?;
+    println!("✅ 连接已断开");
     
-    // 总结
-    println!("🎉 PrivChat SDK 演示完成！");
+    // 关闭SDK
+    sdk.shutdown().await?;
+    println!("✅ SDK 已关闭");
+    
+    println!("📊 最终状态:");
+    println!("  - 已初始化: {}", sdk.is_initialized().await);
+    println!("  - 已连接: {}", sdk.is_connected().await);
+    
+    println!("\n🎉 示例演示完成！");
     println!("================================");
-    println!();
-    println!("💡 功能特性总结:");
-    println!("✅ 统一的 SDK 接口，简化集成");
-    println!("✅ 完整的生命周期管理");
-    println!("✅ 事件驱动的架构");
-    println!("✅ 自动重连和错误恢复");
-    println!("✅ 实时交互功能（输入指示器、表情反馈）");
-    println!("✅ 高级消息功能（编辑、撤回、已读回执）");
-    println!("✅ 灵活的配置系统");
-    println!("✅ 异步优先设计");
-    println!("✅ FFI 兼容接口");
-    println!();
-    println!("📚 接下来可以:");
-    println!("1. 集成到实际的应用中");
-    println!("2. 通过 FFI 接口在其他语言中使用");
-    println!("3. 根据需要扩展更多功能");
-    println!("4. 优化性能和资源使用");
     
     Ok(())
 }
