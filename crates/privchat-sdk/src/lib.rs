@@ -38,11 +38,14 @@ pub mod error;
 pub mod client;
 pub mod storage;
 pub mod network;
+pub mod events;
 
 // 重新导出核心类型，方便使用
 pub use client::{PrivchatClient, UserSession};
 pub use error::{PrivchatSDKError, Result};
 pub use storage::{StorageManager, StorageStats};
+pub use network::{NetworkMonitor, NetworkStatus, NetworkSender};
+pub use events::{EventManager, SDKEvent, EventFilter};
 
 // 重新导出协议层的类型，避免用户需要单独导入 privchat-protocol
 pub use privchat_protocol::*;

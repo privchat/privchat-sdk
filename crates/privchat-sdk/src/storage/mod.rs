@@ -26,11 +26,18 @@ pub mod message_state;
 pub mod queue;
 pub mod media;
 pub mod migration;
+pub mod advanced_features;
+pub mod advanced_features_integration;
 
 // 重新导出核心类型
 pub use entities::*;
 pub use dao::{DaoFactory, TransactionManager};
 pub use dao::migration::MigrationDao;
+pub use advanced_features::{
+    AdvancedFeaturesManager, ReadReceiptEvent, MessageRevokeEvent, 
+    MessageEditEvent, ConversationReadState
+};
+pub use advanced_features_integration::AdvancedFeaturesIntegration;
 
 /// SDK 版本号 - 用于缓存失效检查
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
