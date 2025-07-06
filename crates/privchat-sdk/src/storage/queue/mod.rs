@@ -15,6 +15,11 @@ pub mod send_task;
 pub mod retry_policy;
 pub mod send_consumer;
 
+// 接收相关模块
+pub mod receive_task;
+pub mod receive_queue;
+pub mod receive_consumer;
+
 // 重新导出核心类型
 pub use priority::{QueuePriority, PriorityComparator};
 pub use send_task::{SendTask, MessageData, TaskStatus, TaskFilter};
@@ -43,6 +48,15 @@ pub trait TaskQueueTrait: Debug + Send + Sync {
     async fn size(&self) -> Result<usize>;
     async fn is_empty(&self) -> Result<bool>;
     async fn stats(&self) -> Result<QueueStats>;
+    
+    // SendConsumer需要的方法
+    async fn enqueue(&self, task: SendTask) -> Result<()> {
+        self.push(task).await
+    }
+    
+    async fn dequeue_batch(&self, limit: usize) -> Result<Vec<SendTask>> {
+        self.batch_pop(limit).await
+    }
 }
 
 /// 任务队列枚举 - 支持内存队列和持久化队列

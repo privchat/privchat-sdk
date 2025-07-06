@@ -338,6 +338,7 @@ pub enum MessageStatus {
     Burned = 7,        // 已焚烧
     Retrying = 8,      // 重试中
     Expired = 9,       // 过期
+    Received = 10,     // 已接收
 }
 
 impl MessageStatus {
@@ -406,6 +407,7 @@ impl MessageStatus {
             MessageStatus::Burned => "已焚烧",
             MessageStatus::Retrying => "重试中",
             MessageStatus::Expired => "已过期",
+            MessageStatus::Received => "已接收",
         }
     }
     
@@ -422,6 +424,7 @@ impl MessageStatus {
             7 => Some(MessageStatus::Burned),
             8 => Some(MessageStatus::Retrying),
             9 => Some(MessageStatus::Expired),
+            10 => Some(MessageStatus::Received),
             _ => None,
         }
     }

@@ -18,6 +18,10 @@ pub enum PrivchatSDKError {
     NotConnected,
     Transport(String),  // 添加传输层错误
     Auth(String),       // 添加认证错误
+    QueueFull(String),
+    InvalidInput(String),
+    InvalidOperation(String),
+    Timeout(String),
 }
 
 impl fmt::Display for PrivchatSDKError {
@@ -37,6 +41,10 @@ impl fmt::Display for PrivchatSDKError {
             PrivchatSDKError::NotConnected => write!(f, "Not connected"),
             PrivchatSDKError::Transport(e) => write!(f, "Transport error: {}", e),
             PrivchatSDKError::Auth(e) => write!(f, "Authentication error: {}", e),
+            PrivchatSDKError::QueueFull(e) => write!(f, "Queue is full: {}", e),
+            PrivchatSDKError::InvalidInput(e) => write!(f, "Invalid input: {}", e),
+            PrivchatSDKError::InvalidOperation(e) => write!(f, "Invalid operation: {}", e),
+            PrivchatSDKError::Timeout(e) => write!(f, "Timeout: {}", e),
         }
     }
 }
