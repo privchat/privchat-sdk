@@ -758,6 +758,11 @@ impl AdvancedFeaturesManager {
     pub fn get_connection(&self) -> std::sync::MutexGuard<Connection> {
         self.conn.lock().unwrap()
     }
+
+    /// 获取数据库连接（供集成模块使用）
+    pub(crate) fn get_db_connection(&self) -> std::sync::MutexGuard<Connection> {
+        self.conn.lock().unwrap()
+    }
 }
 
 impl Clone for AdvancedFeaturesManager {

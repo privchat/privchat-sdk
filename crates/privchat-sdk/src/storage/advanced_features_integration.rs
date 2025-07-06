@@ -7,7 +7,7 @@ use crate::storage::advanced_features::{
     AdvancedFeaturesManager, ReadReceiptEvent, MessageRevokeEvent, MessageEditEvent
 };
 use crate::storage::message_state::MessageStateManager;
-use crate::events::{EventManager, SDKEvent, event_builders};
+use crate::events::{EventManager, SDKEvent, event_builders, ConnectionState};
 use crate::error::{Result, PrivchatSDKError};
 use std::sync::Arc;
 use tracing::{info, warn, error};
@@ -59,7 +59,7 @@ impl AdvancedFeaturesIntegration {
 
         // 获取消息序列号，用于更新会话已读状态
         let message_seq = {
-            let conn = self.features_manager.get_connection();
+            let conn = (*self.features_manager).get_db_connection();
             conn.query_row(
                 "SELECT message_seq FROM messages WHERE message_id = ?1",
                 rusqlite::params![message_id],
@@ -86,7 +86,6 @@ impl AdvancedFeaturesIntegration {
         let unread_event = event_builders::unread_count_changed(
             channel_id.to_string(),
             channel_type,
-            reader_uid.to_string(),
             unread_count,
         );
         self.event_manager.emit(unread_event).await;
@@ -121,7 +120,6 @@ impl AdvancedFeaturesIntegration {
         let unread_event = event_builders::unread_count_changed(
             channel_id.to_string(),
             channel_type,
-            reader_uid.to_string(),
             unread_count,
         );
         self.event_manager.emit(unread_event).await;
@@ -148,7 +146,6 @@ impl AdvancedFeaturesIntegration {
         let unread_event = event_builders::unread_count_changed(
             channel_id.to_string(),
             channel_type,
-            user_id.to_string(),
             read_state.unread_count,
         );
         self.event_manager.emit(unread_event).await;
@@ -281,9 +278,11 @@ impl AdvancedFeaturesIntegration {
     /// 更新连接状态
     pub async fn update_connection_state(&self, is_connected: bool, reason: &str) -> Result<()> {
         // 创建连接状态变更事件
+        let old_state = if is_connected { ConnectionState::Disconnected } else { ConnectionState::Connected };
+        let new_state = if is_connected { ConnectionState::Connected } else { ConnectionState::Disconnected };
         let connection_event = event_builders::connection_state_changed(
-            is_connected,
-            reason.to_string(),
+            old_state,
+            new_state,
         );
 
         // 发布事件

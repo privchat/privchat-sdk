@@ -28,6 +28,8 @@ pub mod media;
 pub mod migration;
 pub mod advanced_features;
 pub mod advanced_features_integration;
+pub mod typing;
+pub mod reaction;
 
 // 重新导出核心类型
 pub use entities::*;

@@ -10,43 +10,41 @@
 
 use crate::storage::advanced_features::{ReadReceiptEvent, MessageRevokeEvent, MessageEditEvent};
 use crate::storage::entities::MessageStatus;
+use crate::storage::typing::TypingEvent;
+use crate::storage::reaction::ReactionEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 /// SDK 事件类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SDKEvent {
-    /// 消息状态变更事件
+    /// 消息状态变更
     MessageStatusChanged {
         message_id: String,
-        channel_id: String,
-        channel_type: i32,
         old_status: MessageStatus,
         new_status: MessageStatus,
         timestamp: u64,
     },
-    
-    /// 已读回执事件
+    /// 已读回执接收
     ReadReceiptReceived(ReadReceiptEvent),
-    
-    /// 消息撤回事件
+    /// 消息撤回
     MessageRevoked(MessageRevokeEvent),
-    
-    /// 消息编辑事件
+    /// 消息编辑
     MessageEdited(MessageEditEvent),
-    
-    /// 正在输入事件
-    TypingIndicator {
-        channel_id: String,
-        channel_type: i32,
-        user_id: String,
-        is_typing: bool,
-        timestamp: u64,
-    },
-    
+    /// 用户开始输入
+    TypingStarted(TypingEvent),
+    /// 用户停止输入
+    TypingStopped(TypingEvent),
+    /// 表情反馈添加
+    ReactionAdded(ReactionEvent),
+    /// 表情反馈移除
+    ReactionRemoved(ReactionEvent),
+    /// 正在输入指示器（通用）
+    TypingIndicator(TypingEvent),
     /// 用户在线状态变更
     UserPresenceChanged {
         user_id: String,
@@ -54,24 +52,20 @@ pub enum SDKEvent {
         last_seen: Option<u64>,
         timestamp: u64,
     },
-    
-    /// 会话未读数变更
+    /// 未读数变更
     UnreadCountChanged {
         channel_id: String,
         channel_type: i32,
-        user_id: String,
         unread_count: i32,
         timestamp: u64,
     },
-    
     /// 连接状态变更
     ConnectionStateChanged {
-        is_connected: bool,
-        reason: String,
+        old_state: ConnectionState,
+        new_state: ConnectionState,
         timestamp: u64,
     },
-    
-    /// 消息接收事件
+    /// 消息接收
     MessageReceived {
         message_id: String,
         channel_id: String,
@@ -79,16 +73,14 @@ pub enum SDKEvent {
         from_uid: String,
         timestamp: u64,
     },
-    
-    /// 消息发送成功事件
+    /// 消息发送成功
     MessageSent {
         message_id: String,
         channel_id: String,
         channel_type: i32,
         timestamp: u64,
     },
-    
-    /// 消息发送失败事件
+    /// 消息发送失败
     MessageSendFailed {
         message_id: String,
         channel_id: String,
@@ -98,15 +90,28 @@ pub enum SDKEvent {
     },
 }
 
+/// 连接状态枚举
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ConnectionState {
+    Connected,
+    Disconnected,
+    Connecting,
+    Reconnecting,
+}
+
 impl SDKEvent {
-    /// 获取事件类型名称
+    /// 获取事件类型字符串
     pub fn event_type(&self) -> &'static str {
         match self {
             SDKEvent::MessageStatusChanged { .. } => "message_status_changed",
             SDKEvent::ReadReceiptReceived(_) => "read_receipt_received",
             SDKEvent::MessageRevoked(_) => "message_revoked",
             SDKEvent::MessageEdited(_) => "message_edited",
-            SDKEvent::TypingIndicator { .. } => "typing_indicator",
+            SDKEvent::TypingStarted(_) => "typing_started",
+            SDKEvent::TypingStopped(_) => "typing_stopped",
+            SDKEvent::ReactionAdded(_) => "reaction_added",
+            SDKEvent::ReactionRemoved(_) => "reaction_removed",
+            SDKEvent::TypingIndicator(_) => "typing_indicator",
             SDKEvent::UserPresenceChanged { .. } => "user_presence_changed",
             SDKEvent::UnreadCountChanged { .. } => "unread_count_changed",
             SDKEvent::ConnectionStateChanged { .. } => "connection_state_changed",
@@ -116,14 +121,18 @@ impl SDKEvent {
         }
     }
 
-    /// 获取事件相关的频道ID（如果有）
+    /// 获取事件关联的频道ID
     pub fn channel_id(&self) -> Option<&str> {
         match self {
-            SDKEvent::MessageStatusChanged { channel_id, .. } => Some(channel_id),
+            SDKEvent::MessageStatusChanged { .. } => None, // 消息状态变更事件可能没有频道信息
             SDKEvent::ReadReceiptReceived(event) => Some(&event.channel_id),
             SDKEvent::MessageRevoked(event) => Some(&event.channel_id),
             SDKEvent::MessageEdited(event) => Some(&event.channel_id),
-            SDKEvent::TypingIndicator { channel_id, .. } => Some(channel_id),
+            SDKEvent::TypingStarted(event) => Some(&event.channel_id),
+            SDKEvent::TypingStopped(event) => Some(&event.channel_id),
+            SDKEvent::ReactionAdded(event) => Some(&event.channel_id),
+            SDKEvent::ReactionRemoved(event) => Some(&event.channel_id),
+            SDKEvent::TypingIndicator(event) => Some(&event.channel_id),
             SDKEvent::UnreadCountChanged { channel_id, .. } => Some(channel_id),
             SDKEvent::MessageReceived { channel_id, .. } => Some(channel_id),
             SDKEvent::MessageSent { channel_id, .. } => Some(channel_id),
@@ -139,13 +148,34 @@ impl SDKEvent {
             SDKEvent::ReadReceiptReceived(event) => event.read_at,
             SDKEvent::MessageRevoked(event) => event.revoked_at,
             SDKEvent::MessageEdited(event) => event.edited_at,
-            SDKEvent::TypingIndicator { timestamp, .. } => *timestamp,
+            SDKEvent::TypingStarted(event) => event.timestamp,
+            SDKEvent::TypingStopped(event) => event.timestamp,
+            SDKEvent::ReactionAdded(event) => event.timestamp,
+            SDKEvent::ReactionRemoved(event) => event.timestamp,
+            SDKEvent::TypingIndicator(event) => event.timestamp,
             SDKEvent::UserPresenceChanged { timestamp, .. } => *timestamp,
             SDKEvent::UnreadCountChanged { timestamp, .. } => *timestamp,
             SDKEvent::ConnectionStateChanged { timestamp, .. } => *timestamp,
             SDKEvent::MessageReceived { timestamp, .. } => *timestamp,
             SDKEvent::MessageSent { timestamp, .. } => *timestamp,
             SDKEvent::MessageSendFailed { timestamp, .. } => *timestamp,
+        }
+    }
+
+    /// 获取事件相关的用户ID
+    pub fn user_id(&self) -> Option<&str> {
+        match self {
+            SDKEvent::ReadReceiptReceived(e) => Some(&e.reader_uid),
+            SDKEvent::MessageRevoked(e) => Some(&e.revoker_uid),
+            SDKEvent::MessageEdited(e) => Some(&e.editor_uid),
+            SDKEvent::TypingStarted(e) => Some(&e.user_id),
+            SDKEvent::TypingStopped(e) => Some(&e.user_id),
+            SDKEvent::ReactionAdded(e) => Some(&e.user_id),
+            SDKEvent::ReactionRemoved(e) => Some(&e.user_id),
+            SDKEvent::TypingIndicator(e) => Some(&e.user_id),
+            SDKEvent::UserPresenceChanged { user_id, .. } => Some(user_id),
+            SDKEvent::MessageReceived { from_uid, .. } => Some(from_uid),
+            _ => None,
         }
     }
 }
@@ -215,9 +245,12 @@ impl EventFilter {
                 SDKEvent::ReadReceiptReceived(e) => Some(&e.reader_uid),
                 SDKEvent::MessageRevoked(e) => Some(&e.revoker_uid),
                 SDKEvent::MessageEdited(e) => Some(&e.editor_uid),
-                SDKEvent::TypingIndicator { user_id, .. } => Some(user_id),
+                SDKEvent::TypingStarted(e) => Some(&e.user_id),
+                SDKEvent::TypingStopped(e) => Some(&e.user_id),
+                SDKEvent::ReactionAdded(e) => Some(&e.user_id),
+                SDKEvent::ReactionRemoved(e) => Some(&e.user_id),
+                SDKEvent::TypingIndicator(e) => Some(&e.user_id),
                 SDKEvent::UserPresenceChanged { user_id, .. } => Some(user_id),
-                SDKEvent::UnreadCountChanged { user_id, .. } => Some(user_id),
                 SDKEvent::MessageReceived { from_uid, .. } => Some(from_uid),
                 _ => None,
             };
@@ -243,9 +276,9 @@ pub struct EventManager {
     /// 广播发送器
     sender: broadcast::Sender<SDKEvent>,
     /// 事件监听器映射
-    listeners: Arc<RwLock<HashMap<String, Vec<EventListener>>>>,
+    listeners: Arc<tokio::sync::RwLock<HashMap<String, Vec<EventListener>>>>,
     /// 事件统计
-    stats: Arc<RwLock<EventStats>>,
+    stats: Arc<tokio::sync::RwLock<EventStats>>,
 }
 
 /// 事件统计信息
@@ -268,8 +301,8 @@ impl EventManager {
         
         Self {
             sender,
-            listeners: Arc::new(RwLock::new(HashMap::new())),
-            stats: Arc::new(RwLock::new(EventStats::default())),
+            listeners: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            stats: Arc::new(tokio::sync::RwLock::new(EventStats::default())),
         }
     }
 
@@ -352,6 +385,42 @@ impl EventManager {
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }
+
+    /// 创建一个示例 typing 事件
+    pub fn create_typing_event(
+        channel_id: &str,
+        channel_type: i32,
+        user_id: &str,
+        is_typing: bool,
+    ) -> SDKEvent {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        SDKEvent::TypingIndicator(TypingEvent {
+            channel_id: channel_id.to_string(),
+            channel_type,
+            user_id: user_id.to_string(),
+            is_typing,
+            timestamp,
+            session_id: None,
+        })
+    }
+
+    /// 创建一个示例连接状态变更事件
+    pub fn create_connection_event(old_state: ConnectionState, new_state: ConnectionState) -> SDKEvent {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        SDKEvent::ConnectionStateChanged {
+            old_state,
+            new_state,
+            timestamp,
+        }
+    }
 }
 
 /// 过滤事件接收器
@@ -395,8 +464,6 @@ pub mod event_builders {
     /// 创建消息状态变更事件
     pub fn message_status_changed(
         message_id: String,
-        channel_id: String,
-        channel_type: i32,
         old_status: MessageStatus,
         new_status: MessageStatus,
     ) -> SDKEvent {
@@ -407,8 +474,6 @@ pub mod event_builders {
 
         SDKEvent::MessageStatusChanged {
             message_id,
-            channel_id,
-            channel_type,
             old_status,
             new_status,
             timestamp,
@@ -427,13 +492,14 @@ pub mod event_builders {
             .unwrap()
             .as_secs();
 
-        SDKEvent::TypingIndicator {
+        SDKEvent::TypingIndicator(TypingEvent {
             channel_id,
             channel_type,
             user_id,
             is_typing,
             timestamp,
-        }
+            session_id: None,
+        })
     }
 
     /// 创建用户在线状态变更事件
@@ -459,7 +525,6 @@ pub mod event_builders {
     pub fn unread_count_changed(
         channel_id: String,
         channel_type: i32,
-        user_id: String,
         unread_count: i32,
     ) -> SDKEvent {
         let timestamp = SystemTime::now()
@@ -470,22 +535,21 @@ pub mod event_builders {
         SDKEvent::UnreadCountChanged {
             channel_id,
             channel_type,
-            user_id,
             unread_count,
             timestamp,
         }
     }
 
     /// 创建连接状态变更事件
-    pub fn connection_state_changed(is_connected: bool, reason: String) -> SDKEvent {
+    pub fn connection_state_changed(old_state: ConnectionState, new_state: ConnectionState) -> SDKEvent {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
         SDKEvent::ConnectionStateChanged {
-            is_connected,
-            reason,
+            old_state,
+            new_state,
             timestamp,
         }
     }
@@ -617,8 +681,8 @@ mod tests {
         
         // 应该只接收到匹配的事件
         let received_event = filtered_receiver.recv().await.unwrap();
-        if let SDKEvent::TypingIndicator { channel_id, .. } = received_event {
-            assert_eq!(channel_id, "channel1");
+        if let SDKEvent::TypingIndicator(_) = received_event {
+            assert_eq!(received_event.channel_id(), Some("channel1"));
         } else {
             panic!("Expected typing indicator event");
         }
