@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         .servers(vec![
             "quic://127.0.0.1:8803",        // 优先使用QUIC（高性能）
             "tcp://127.0.0.1:8801",         // 降级到TCP（稳定）
-            "wss://127.0.0.1:8802/path"     // 最后使用WebSocket（兼容性强）
+            "ws://127.0.0.1:8802/"     // 最后使用WebSocket（兼容性强）
         ])
         .connection_timeout(30)
         .heartbeat_interval(30)
