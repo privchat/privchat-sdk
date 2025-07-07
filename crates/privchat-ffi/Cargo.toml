@@ -11,7 +11,7 @@ lazy_static = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
 privchat-sdk = { path = "../privchat-sdk" }
 privchat-protocol = { path = "../../../privchat-protocol" }
-msgtrans = { path = "../../../msgtrans-rust" }
+msgtrans = { path = "../../../msgtrans" }
 
 [lib]
 crate-type = ["cdylib"]

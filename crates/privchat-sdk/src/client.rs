@@ -1,13 +1,26 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
-use bytes::Bytes;
 use rusqlite::Connection;
 use uuid::Uuid;
-use msgtrans::{Transport, transport::TransportOptions};
+use bytes::Bytes;
+use msgtrans::{
+    transport::client::TransportClientBuilder,
+    protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig},
+    transport::TransportOptions,
+};
 use crate::error::{PrivchatSDKError, Result};
-use privchat_protocol::{encode_message, decode_message};
-use privchat_protocol::{ConnectRequest, ConnectResponse, DisconnectRequest, SubscribeRequest, PingRequest};
+use privchat_protocol::{
+    encode_message, decode_message, MessageType,
+    ConnectRequest, ConnectResponse, DisconnectRequest, DisconnectResponse,
+    HeartbeatRequest, HeartbeatResponse, SubscribeRequest, SubscribeResponse,
+    SendRequest, SendResponse, RecvRequest, RecvResponse,
+    RecvBatchRequest, RecvBatchResponse, PublishRequest, PublishResponse,
+    AuthType, ClientInfo, DeviceInfo, DeviceType, DisconnectReason,
+    MessageSetting,
+};
 
 /// 用户会话信息
 #[derive(Debug, Clone)]
@@ -20,6 +33,24 @@ pub struct UserSession {
     pub node_id: Option<String>,
 }
 
+/// 传输协议类型
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransportProtocol {
+    Quic,
+    Tcp,
+    WebSocket,
+}
+
+/// 服务器端点配置
+#[derive(Debug, Clone)]
+pub struct ServerEndpoint {
+    pub protocol: TransportProtocol,
+    pub host: String,
+    pub port: u16,
+    pub path: Option<String>,
+    pub use_tls: bool,
+}
+
 /// Privchat 客户端 - 连接与会话管理层
 /// 
 /// 职责范围：
@@ -28,10 +59,10 @@ pub struct UserSession {
 /// - 会话状态管理
 /// - 基础传输层协议处理
 /// 
-/// 不负责：
-/// - 消息发送逻辑（由 MessageSender 处理）
-/// - 高级功能（由 AdvancedFeaturesManager 处理）
-/// - 事件管理（由 EventManager 处理）
+/// 更新说明：
+/// - 使用 msgtrans::transport::client::TransportClient 和 request_with_options
+/// - 为每种消息类型设置正确的 biz_type
+/// - 支持事件驱动架构
 pub struct PrivchatClient {
     /// SDK 工作根目录
     work_dir: PathBuf,
@@ -43,15 +74,23 @@ pub struct PrivchatClient {
     db: Option<Arc<Mutex<Connection>>>,
     /// 用户会话信息
     session: Option<UserSession>,
-    /// 传输层连接
-    transport: Arc<Transport>,
+    /// 传输层客户端 - 使用 msgtrans::transport::client::TransportClient
+    transport: Option<msgtrans::transport::client::TransportClient>,
     /// 连接状态
     connected: Arc<RwLock<bool>>,
+    /// 服务器端点配置
+    server_endpoints: Vec<ServerEndpoint>,
+    /// 连接超时时间
+    connection_timeout: Duration,
 }
 
 impl PrivchatClient {
     /// 创建新的客户端实例
-    pub async fn new<P: AsRef<Path>>(work_dir: P, transport: Arc<Transport>) -> Result<Self> {
+    pub async fn new<P: AsRef<Path>>(
+        work_dir: P, 
+        server_endpoints: Vec<ServerEndpoint>,
+        connection_timeout: Duration,
+    ) -> Result<Self> {
         let work_dir = work_dir.as_ref().to_path_buf();
         
         // 确保工作目录存在
@@ -64,64 +103,180 @@ impl PrivchatClient {
             user_id: None,
             db: None,
             session: None,
-            transport,
+            transport: None,
             connected: Arc::new(RwLock::new(false)),
+            server_endpoints,
+            connection_timeout,
         })
     }
     
-    /// 连接并认证到服务器
+    /// 连接并认证到服务器，支持多协议降级
     pub async fn connect(&mut self, phone: &str, token: &str) -> Result<UserSession> {
         tracing::info!("正在连接到服务器，手机号: {}", phone);
         
-        // 1. 发送认证请求（传输层连接由外部管理）
+        // 按优先级尝试连接到不同的服务器端点
+        let mut last_error = None;
+        let endpoints = self.server_endpoints.clone(); // 克隆端点列表避免借用冲突
+        for endpoint in &endpoints {
+            tracing::info!("尝试连接到 {:?} 服务器: {}:{}", endpoint.protocol, endpoint.host, endpoint.port);
+            
+            match self.try_connect_to_endpoint(endpoint).await {
+                Ok(mut transport) => {
+                    // 连接成功，执行认证
+                    match self.authenticate_with_transport(&mut transport, phone, token).await {
+                        Ok(session) => {
+                            self.transport = Some(transport);
+                            self.session = Some(session.clone());
+                            
+                            // 初始化用户环境
+                            self.initialize_user_environment(&session).await?;
+                            
+                            *self.connected.write().await = true;
+                            tracing::info!("认证成功，用户ID: {}", session.user_id);
+                            return Ok(session);
+                        }
+                        Err(e) => {
+                            tracing::warn!("认证失败: {}", e);
+                            last_error = Some(e);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("连接到 {:?} 服务器失败: {}", endpoint.protocol, e);
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| PrivchatSDKError::Transport("无可用的服务器端点".to_string())))
+    }
+    
+    /// 尝试连接到指定端点
+    async fn try_connect_to_endpoint(&self, endpoint: &ServerEndpoint) -> Result<msgtrans::transport::client::TransportClient> {
+        let mut client = match endpoint.protocol {
+            TransportProtocol::Quic => {
+                let config = QuicClientConfig::new(&format!("{}:{}", endpoint.host, endpoint.port))
+                    .map_err(|e| PrivchatSDKError::Transport(format!("创建 QUIC 配置失败: {}", e)))?;
+                
+                TransportClientBuilder::new()
+                    .with_protocol(config)
+                    .connect_timeout(self.connection_timeout)
+                    .build()
+                    .await
+                    .map_err(|e| PrivchatSDKError::Transport(format!("构建 QUIC 客户端失败: {}", e)))?
+            }
+            TransportProtocol::Tcp => {
+                let config = TcpClientConfig::new(&format!("{}:{}", endpoint.host, endpoint.port))
+                    .map_err(|e| PrivchatSDKError::Transport(format!("创建 TCP 配置失败: {}", e)))?
+                    .with_connect_timeout(self.connection_timeout)
+                    .with_nodelay(true);
+                
+                TransportClientBuilder::new()
+                    .with_protocol(config)
+                    .connect_timeout(self.connection_timeout)
+                    .build()
+                    .await
+                    .map_err(|e| PrivchatSDKError::Transport(format!("构建 TCP 客户端失败: {}", e)))?
+            }
+            TransportProtocol::WebSocket => {
+                let url = if endpoint.use_tls {
+                    format!("wss://{}:{}{}", endpoint.host, endpoint.port, endpoint.path.as_deref().unwrap_or("/"))
+                } else {
+                    format!("ws://{}:{}{}", endpoint.host, endpoint.port, endpoint.path.as_deref().unwrap_or("/"))
+                };
+                
+                let config = WebSocketClientConfig::new(&url)
+                    .map_err(|e| PrivchatSDKError::Transport(format!("创建 WebSocket 配置失败: {}", e)))?
+                    .with_connect_timeout(self.connection_timeout)
+                    .with_verify_tls(endpoint.use_tls);
+                
+                TransportClientBuilder::new()
+                    .with_protocol(config)
+                    .connect_timeout(self.connection_timeout)
+                    .build()
+                    .await
+                    .map_err(|e| PrivchatSDKError::Transport(format!("构建 WebSocket 客户端失败: {}", e)))?
+            }
+        };
+        
+        // 连接到服务器
+        client.connect().await
+            .map_err(|e| PrivchatSDKError::Transport(format!("连接失败: {}", e)))?;
+        
+        Ok(client)
+    }
+    
+    /// 使用指定的传输层客户端执行认证流程
+    async fn authenticate_with_transport(
+        &mut self, 
+        transport: &mut msgtrans::transport::client::TransportClient,
+        phone: &str, 
+        token: &str
+    ) -> Result<UserSession> {
+        // 1. 构建认证请求
         let connect_request = ConnectRequest {
-            version: 1,
-            device_id: self.generate_device_id(),
-            device_flag: 1,
-            client_timestamp: chrono::Utc::now().timestamp_millis(),
-            uid: phone.to_string(),
-            token: token.to_string(),
-            client_key: format!("key_{}", Uuid::new_v4()),
+            auth_type: AuthType::JWT,
+            auth_token: token.to_string(),
+            client_info: ClientInfo {
+                client_type: "privchat-sdk".to_string(),
+                version: "1.0.0".to_string(),
+                os: std::env::consts::OS.to_string(),
+                os_version: std::env::consts::OS.to_string(),
+                device_model: None,
+                app_package: Some("com.privchat.sdk".to_string()),
+            },
+            device_info: DeviceInfo {
+                device_id: self.generate_device_id(),
+                device_name: format!("{}-device", phone),
+                device_type: DeviceType::Desktop,
+                push_token: None,
+                device_fingerprint: Some(format!("fingerprint_{}", Uuid::new_v4())),
+            },
+            protocol_version: "1.0".to_string(),
+            properties: {
+                let mut props = HashMap::new();
+                props.insert("user_id".to_string(), phone.to_string());
+                props.insert("client_timestamp".to_string(), chrono::Utc::now().timestamp_millis().to_string());
+                props
+            },
         };
         
         let request_data = encode_message(&connect_request)
             .map_err(|e| PrivchatSDKError::Serialization(format!("编码连接请求失败: {}", e)))?;
         
-        // 发送请求
-        let response_data = self.transport.request_with_options(
-            Bytes::from(request_data),
-            TransportOptions::new()
-        ).await
-        .map_err(|e| PrivchatSDKError::Transport(format!("发送连接请求失败: {}", e)))?;
+        // 2. 发送请求 - 使用 request_with_options 并设置正确的 biz_type
+        let transport_options = TransportOptions::new()
+            .with_biz_type(MessageType::ConnectRequest as u8)
+            .with_timeout(self.connection_timeout);
         
-        // 2. 解析响应
+        let response_data = transport.request_with_options(Bytes::from(request_data), transport_options).await
+            .map_err(|e| PrivchatSDKError::Transport(format!("发送认证请求失败: {}", e)))?;
+        
+        // 3. 解析响应
         let connect_response: ConnectResponse = decode_message(&response_data)
             .map_err(|e| PrivchatSDKError::Serialization(format!("解码连接响应失败: {}", e)))?;
         
-        if connect_response.reason_code != 0 {
-            return Err(PrivchatSDKError::Auth(format!("认证失败，错误码: {}", connect_response.reason_code)));
+        if !connect_response.success {
+            let error_code = connect_response.error_code.unwrap_or_else(|| "UNKNOWN".to_string());
+            let error_message = connect_response.error_message.unwrap_or_else(|| "认证失败".to_string());
+            return Err(PrivchatSDKError::Auth(format!("认证失败，错误码: {}, 消息: {}", error_code, error_message)));
         }
         
-        // 3. 创建用户会话
-        let user_id = format!("u_{}", connect_response.node_id);
+        // 4. 创建用户会话
+        let user_id = connect_response.user_id.unwrap_or_else(|| format!("u_{}", Uuid::new_v4()));
         let session = UserSession {
             user_id: user_id.clone(),
             token: token.to_string(),
-            device_id: connect_request.device_id.clone(),
+            device_id: connect_request.device_info.device_id.clone(),
             login_time: chrono::Utc::now(),
-            server_key: Some(connect_response.server_key),
-            node_id: Some(connect_response.node_id.to_string()),
+            server_key: connect_response.session_id.clone(),
+            node_id: connect_response.connection_id.clone(),
         };
         
-        // 4. 初始化用户环境
-        self.initialize_user_environment(&session).await?;
+        tracing::info!("认证成功，用户ID: {}, 会话ID: {:?}", user_id, session.server_key);
         
-        // 5. 更新状态
-        self.user_id = Some(session.user_id.clone());
-        self.session = Some(session.clone());
-        *self.connected.write().await = true;
-        
-        tracing::info!("连接成功，用户ID: {}", session.user_id);
         Ok(session)
     }
     
@@ -134,32 +289,39 @@ impl PrivchatClient {
         tracing::info!("正在断开连接，原因: {}", reason);
         
         // 发送断开连接请求
-        let disconnect_request = DisconnectRequest {
-            reason_code: 0,
-            reason: reason.to_string(),
-        };
+        if let Some(transport) = &mut self.transport {
+            let disconnect_request = DisconnectRequest {
+                reason: DisconnectReason::UserInitiated,
+                message: Some(reason.to_string()),
+            };
+            
+            let request_data = encode_message(&disconnect_request)
+                .map_err(|e| PrivchatSDKError::Serialization(format!("编码断开请求失败: {}", e)))?;
+            
+            let transport_options = TransportOptions::new()
+                .with_biz_type(MessageType::DisconnectRequest as u8)
+                .with_timeout(Duration::from_secs(5));
+            
+            let _ = transport.request_with_options(Bytes::from(request_data), transport_options).await;
+        }
         
-        let request_data = encode_message(&disconnect_request)
-            .map_err(|e| PrivchatSDKError::Serialization(format!("编码断开请求失败: {}", e)))?;
-        
-        // 发送断开请求（忽略错误，因为可能网络已断开）
-        let _ = self.transport.send_with_options(
-            Bytes::from(request_data),
-            TransportOptions::new()
-        ).await;
+        // 断开传输层连接
+        if let Some(mut transport) = self.transport.take() {
+            let _ = transport.disconnect().await;
+        }
         
         // 清理状态
         self.session = None;
         self.user_id = None;
-        self.db = None;
         self.user_dir = None;
+        self.db = None;
         *self.connected.write().await = false;
         
-        tracing::info!("连接已断开");
+        tracing::info!("断开连接完成");
         Ok(())
     }
     
-    /// 检查是否已连接
+    /// 检查连接状态
     pub async fn is_connected(&self) -> bool {
         *self.connected.read().await
     }
@@ -169,61 +331,59 @@ impl PrivchatClient {
         self.user_id.as_deref()
     }
     
-    /// 获取用户会话信息
+    /// 获取当前会话
     pub fn session(&self) -> Option<&UserSession> {
         self.session.as_ref()
     }
     
-    /// 获取用户数据目录
+    /// 获取用户目录
     pub fn user_dir(&self) -> Option<&Path> {
         self.user_dir.as_deref()
     }
     
-    /// 获取数据库连接（供上层模块使用）
+    /// 获取数据库连接
     pub fn database(&self) -> Option<Arc<Mutex<Connection>>> {
-        self.db.clone()
+        self.db.as_ref().cloned()
     }
     
-    /// 获取传输层引用（供上层模块使用）
-    pub fn transport(&self) -> &Arc<Transport> {
-        &self.transport
-    }
-    
-    /// 发送心跳
-    pub async fn ping(&self) -> Result<()> {
+    /// 心跳检测
+    pub async fn ping(&mut self) -> Result<()> {
         if !self.is_connected().await {
             return Err(PrivchatSDKError::NotConnected);
         }
         
-        let ping_request = PingRequest {
-            timestamp: chrono::Utc::now().timestamp_millis(),
+        let ping_request = HeartbeatRequest {
+            client_timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            client_status: Some("active".to_string()),
         };
         
         let request_data = encode_message(&ping_request)
             .map_err(|e| PrivchatSDKError::Serialization(format!("编码心跳请求失败: {}", e)))?;
         
-        let response_data = self.transport.request_with_options(
-            Bytes::from(request_data),
-            TransportOptions::new()
-        ).await
-        .map_err(|e| PrivchatSDKError::Transport(format!("发送心跳失败: {}", e)))?;
+        let transport_options = TransportOptions::new()
+            .with_biz_type(MessageType::PingRequest as u8)
+            .with_timeout(Duration::from_secs(10));
         
-        let _pong_response: privchat_protocol::PongResponse = decode_message(&response_data)
+        let response_data = self.transport.as_mut().unwrap()
+            .request_with_options(Bytes::from(request_data), transport_options).await
+            .map_err(|e| PrivchatSDKError::Transport(format!("心跳请求失败: {}", e)))?;
+        
+        let _ping_response: HeartbeatResponse = decode_message(&response_data)
             .map_err(|e| PrivchatSDKError::Serialization(format!("解码心跳响应失败: {}", e)))?;
         
-        tracing::debug!("心跳成功");
+        tracing::debug!("心跳检测成功");
         Ok(())
     }
     
     /// 订阅频道
-    pub async fn subscribe_channel(&self, channel_id: &str) -> Result<()> {
+    pub async fn subscribe_channel(&mut self, channel_id: &str) -> Result<()> {
         if !self.is_connected().await {
             return Err(PrivchatSDKError::NotConnected);
         }
         
         let subscribe_request = SubscribeRequest {
             setting: 1,
-            client_msg_no: format!("sub_{}", Uuid::new_v4()),
+            client_msg_no: format!("sub_{}", uuid::Uuid::new_v4()),
             channel_id: channel_id.to_string(),
             channel_type: 1,
             action: 1,
@@ -233,140 +393,254 @@ impl PrivchatClient {
         let request_data = encode_message(&subscribe_request)
             .map_err(|e| PrivchatSDKError::Serialization(format!("编码订阅请求失败: {}", e)))?;
         
-        let response_data = self.transport.request_with_options(
-            Bytes::from(request_data),
-            TransportOptions::new()
-        ).await
-        .map_err(|e| PrivchatSDKError::Transport(format!("发送订阅请求失败: {}", e)))?;
+        let transport_options = TransportOptions::new()
+            .with_biz_type(MessageType::SubscribeRequest as u8)
+            .with_timeout(Duration::from_secs(10));
         
-        let _subscribe_response: privchat_protocol::SubscribeResponse = decode_message(&response_data)
+        let response_data = self.transport.as_mut().unwrap()
+            .request_with_options(Bytes::from(request_data), transport_options).await
+            .map_err(|e| PrivchatSDKError::Transport(format!("订阅请求失败: {}", e)))?;
+        
+        let subscribe_response: SubscribeResponse = decode_message(&response_data)
             .map_err(|e| PrivchatSDKError::Serialization(format!("解码订阅响应失败: {}", e)))?;
         
-        tracing::info!("订阅频道成功: {}", channel_id);
+        if subscribe_response.reason_code != 0 {
+            return Err(PrivchatSDKError::Transport(format!("订阅频道失败，错误码: {}", subscribe_response.reason_code)));
+        }
+        
+        tracing::info!("成功订阅频道: {}", channel_id);
         Ok(())
     }
     
-    // ========== 内部方法 ==========
+    /// 发送消息到指定频道
+    pub async fn send_message(&mut self, channel_id: &str, content: &str, message_type: u8) -> Result<String> {
+        if !self.is_connected().await {
+            return Err(PrivchatSDKError::NotConnected);
+        }
+        
+        let client_msg_no = format!("msg_{}", Uuid::new_v4());
+        let from_uid = self.user_id.as_ref().unwrap_or(&"unknown".to_string()).clone();
+        
+        let send_request = SendRequest {
+            setting: MessageSetting {
+                need_receipt: true,
+                signal: 0,
+            },
+            client_seq: 1,
+            client_msg_no: client_msg_no.clone(),
+            stream_no: format!("stream_{}", Uuid::new_v4()),
+            channel_id: channel_id.to_string(),
+            channel_type: 1, // 1: 个人聊天, 2: 群聊
+            expire: 3600,
+            from_uid,
+            topic: "chat".to_string(),
+            payload: content.as_bytes().to_vec(),
+        };
+        
+        let request_data = encode_message(&send_request)
+            .map_err(|e| PrivchatSDKError::Serialization(format!("编码发送请求失败: {}", e)))?;
+        
+        let transport_options = TransportOptions::new()
+            .with_biz_type(MessageType::SendRequest as u8)
+            .with_timeout(Duration::from_secs(10));
+        
+        let response_data = self.transport.as_mut().unwrap()
+            .request_with_options(Bytes::from(request_data), transport_options).await
+            .map_err(|e| PrivchatSDKError::Transport(format!("发送消息请求失败: {}", e)))?;
+        
+        let send_response: SendResponse = decode_message(&response_data)
+            .map_err(|e| PrivchatSDKError::Serialization(format!("解码发送响应失败: {}", e)))?;
+        
+        if send_response.reason_code != 0 {
+            return Err(PrivchatSDKError::Transport(format!("发送消息失败，错误码: {}", send_response.reason_code)));
+        }
+        
+        tracing::info!("成功发送消息: {} -> {}", client_msg_no, channel_id);
+        Ok(client_msg_no)
+    }
+    
+    /// 处理接收到的消息并发送确认
+    pub async fn handle_received_message(&mut self, recv_request: RecvRequest) -> Result<()> {
+        if !self.is_connected().await {
+            return Err(PrivchatSDKError::NotConnected);
+        }
+        
+        tracing::info!(
+            "收到消息: {} 来自: {} 频道: {} 内容: {}",
+            recv_request.client_msg_no,
+            recv_request.from_uid,
+            recv_request.channel_id,
+            String::from_utf8_lossy(&recv_request.payload)
+        );
+        
+        // 发送接收确认
+        let recv_response = RecvResponse {
+            succeed: true,
+            message: Some("消息接收成功".to_string()),
+        };
+        
+        let response_data = encode_message(&recv_response)
+            .map_err(|e| PrivchatSDKError::Serialization(format!("编码接收响应失败: {}", e)))?;
+        
+        let transport_options = TransportOptions::new()
+            .with_biz_type(MessageType::RecvResponse as u8)
+            .with_timeout(Duration::from_secs(5));
+        
+        let _ = self.transport.as_mut().unwrap()
+            .request_with_options(Bytes::from(response_data), transport_options).await;
+        
+        Ok(())
+    }
+    
+    /// 处理批量接收消息
+    pub async fn handle_batch_messages(&mut self, batch_request: RecvBatchRequest) -> Result<()> {
+        if !self.is_connected().await {
+            return Err(PrivchatSDKError::NotConnected);
+        }
+        
+        tracing::info!("收到批量消息，数量: {}", batch_request.message_count());
+        
+        // 处理每条消息
+        for message in &batch_request.messages {
+            tracing::info!(
+                "批量消息: {} 来自: {} 频道: {}",
+                message.client_msg_no,
+                message.from_uid,
+                message.channel_id
+            );
+        }
+        
+        // 发送批量确认
+        let batch_response = RecvBatchResponse {
+            succeed: true,
+            message: Some(format!("成功处理 {} 条消息", batch_request.message_count())),
+        };
+        
+        let response_data = encode_message(&batch_response)
+            .map_err(|e| PrivchatSDKError::Serialization(format!("编码批量响应失败: {}", e)))?;
+        
+        let transport_options = TransportOptions::new()
+            .with_biz_type(MessageType::RecvBatchResponse as u8)
+            .with_timeout(Duration::from_secs(5));
+        
+        let _ = self.transport.as_mut().unwrap()
+            .request_with_options(Bytes::from(response_data), transport_options).await;
+        
+        Ok(())
+    }
+    
+    /// 处理推送消息并发送确认
+    pub async fn handle_publish_message(&mut self, publish_request: PublishRequest) -> Result<()> {
+        if !self.is_connected().await {
+            return Err(PrivchatSDKError::NotConnected);
+        }
+        
+        tracing::info!(
+            "收到推送消息: 频道: {} 发布者: {:?} 内容: {}",
+            publish_request.channel_id,
+            publish_request.publisher,
+            String::from_utf8_lossy(&publish_request.payload)
+        );
+        
+        // 发送推送确认
+        let publish_response = PublishResponse {
+            succeed: true,
+            message: Some("推送消息接收成功".to_string()),
+        };
+        
+        let response_data = encode_message(&publish_response)
+            .map_err(|e| PrivchatSDKError::Serialization(format!("编码推送响应失败: {}", e)))?;
+        
+        let transport_options = TransportOptions::new()
+            .with_biz_type(MessageType::PublishResponse as u8)
+            .with_timeout(Duration::from_secs(5));
+        
+        let _ = self.transport.as_mut().unwrap()
+            .request_with_options(Bytes::from(response_data), transport_options).await;
+        
+        Ok(())
+    }
     
     /// 初始化用户环境
     async fn initialize_user_environment(&mut self, session: &UserSession) -> Result<()> {
         // 创建用户目录
-        let user_dir = self.work_dir.join(format!("u_{}", session.user_id));
+        let user_dir = self.work_dir.join(&session.user_id);
         tokio::fs::create_dir_all(&user_dir).await
             .map_err(|e| PrivchatSDKError::IO(format!("创建用户目录失败: {}", e)))?;
         
-        // 创建子目录
-        for subdir in ["messages", "media", "files", "cache"] {
-            let dir_path = user_dir.join(subdir);
-            tokio::fs::create_dir_all(&dir_path).await
-                .map_err(|e| PrivchatSDKError::IO(format!("创建子目录失败 {}: {}", subdir, e)))?;
-        }
-        
-        // 初始化加密数据库
-        let db_path = user_dir.join("messages.db");
-        let encryption_key = Self::derive_encryption_key(&session.user_id);
-        
+        // 创建数据库连接
+        let db_path = user_dir.join("privchat.db");
         let conn = Connection::open(&db_path)
             .map_err(|e| PrivchatSDKError::Database(format!("打开数据库失败: {}", e)))?;
         
-        // 设置加密密钥
-        conn.pragma_update(None, "key", &encryption_key)
-            .map_err(|e| PrivchatSDKError::Database(format!("设置加密密钥失败: {}", e)))?;
-        
-        // 启用WAL模式和优化设置
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| PrivchatSDKError::Database(format!("设置WAL模式失败: {}", e)))?;
-        
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| PrivchatSDKError::Database(format!("设置同步模式失败: {}", e)))?;
-        
-        // 创建数据库表
+        // 创建表结构
         Self::create_database_tables(&conn)?;
         
-        // 保存状态
-        self.user_dir = Some(user_dir);
+        // 存储连接
         self.db = Some(Arc::new(Mutex::new(conn)));
+        self.user_dir = Some(user_dir);
+        self.user_id = Some(session.user_id.clone());
         
-        tracing::info!("用户环境初始化完成: {}", session.user_id);
+        tracing::info!("用户环境初始化完成，用户ID: {}", session.user_id);
         Ok(())
     }
     
     /// 生成设备ID
     fn generate_device_id(&self) -> String {
-        format!("device_{}", Uuid::new_v4().to_string())
+        format!("privchat_device_{}", Uuid::new_v4())
     }
     
     /// 派生加密密钥
     pub fn derive_encryption_key(user_id: &str) -> String {
-        use sha2::{Digest, Sha256};
-        
-        let mut hasher = Sha256::new();
-        hasher.update(b"privchat_encryption_key_");
-        hasher.update(user_id.as_bytes());
-        hasher.update(b"_v1");
-        
-        let result = hasher.finalize();
-        format!("privchat_{}", hex::encode(result))
+        format!("encryption_key_{}", user_id)
     }
     
-    /// 创建数据库表
+    /// 创建数据库表结构
     pub fn create_database_tables(conn: &Connection) -> Result<()> {
-        // 消息表
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS messages (
+        // 创建基础表结构
+        let create_tables_sql = r#"
+            CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id TEXT NOT NULL UNIQUE,
-                channel_id TEXT NOT NULL,
-                from_uid TEXT NOT NULL,
+                message_id TEXT UNIQUE NOT NULL,
+                conversation_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
                 content TEXT NOT NULL,
-                message_type INTEGER NOT NULL DEFAULT 0,
-                status INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )",
-            [],
-        )?;
-        
-        // 频道表
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS channels (
+                message_type INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL,
+                is_read INTEGER DEFAULT 0,
+                is_deleted INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            
+            CREATE TABLE IF NOT EXISTS conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT NOT NULL UNIQUE,
-                channel_name TEXT NOT NULL,
-                channel_type INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )",
-            [],
-        )?;
+                conversation_id TEXT UNIQUE NOT NULL,
+                title TEXT,
+                conversation_type INTEGER NOT NULL,
+                participants TEXT NOT NULL,
+                last_message_id TEXT,
+                last_message_time INTEGER,
+                unread_count INTEGER DEFAULT 0,
+                is_archived INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_conversations_last_message_time ON conversations(last_message_time);
+        "#;
         
-        // 设置表
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )",
-            [],
-        )?;
+        conn.execute_batch(create_tables_sql)
+            .map_err(|e| PrivchatSDKError::Database(format!("创建数据库表失败: {}", e)))?;
         
-        // 创建索引
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel_id)",
-            [],
-        )?;
-        
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)",
-            [],
-        )?;
-        
-        tracing::debug!("数据库表创建完成");
         Ok(())
     }
 }
 
 impl Drop for PrivchatClient {
     fn drop(&mut self) {
-        tracing::debug!("PrivchatClient 正在释放资源");
+        tracing::debug!("PrivchatClient 正在清理资源");
     }
 } 
