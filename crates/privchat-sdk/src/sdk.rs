@@ -43,30 +43,26 @@ pub enum TransportProtocol {
     WebSocket,
 }
 
-/// 单个协议的服务器配置
+/// 服务器配置项
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProtocolServerConfig {
+pub struct ServerEndpoint {
+    /// 协议类型
+    pub protocol: TransportProtocol,
     /// 服务器地址（可以是域名或IP）
     pub host: String,
     /// 端口号
     pub port: u16,
-    /// 路径（用于WebSocket等）
+    /// 路径（用于WebSocket）
     pub path: Option<String>,
-    /// 是否使用TLS
+    /// 是否使用TLS（仅对WebSocket有效，QUIC强制TLS，TCP通常不使用TLS）
     pub use_tls: bool,
 }
 
 /// 服务器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// QUIC 服务器配置
-    pub quic: Option<ProtocolServerConfig>,
-    /// TCP 服务器配置
-    pub tcp: Option<ProtocolServerConfig>,
-    /// WebSocket 服务器配置
-    pub websocket: Option<ProtocolServerConfig>,
-    /// 协议优先级（按顺序尝试）
-    pub protocol_priority: Vec<TransportProtocol>,
+    /// 服务器端点列表（按优先级顺序）
+    pub endpoints: Vec<ServerEndpoint>,
 }
 
 /// SDK 配置
@@ -127,13 +123,14 @@ pub struct EventConfig {
     pub filters: Vec<EventFilter>,
 }
 
-impl Default for ProtocolServerConfig {
+impl Default for ServerEndpoint {
     fn default() -> Self {
         Self {
+            protocol: TransportProtocol::Tcp,
             host: "localhost".to_string(),
             port: 8080,
             path: None,
-            use_tls: true,
+            use_tls: false,
         }
     }
 }
@@ -141,13 +138,28 @@ impl Default for ProtocolServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            quic: None,
-            tcp: None,
-            websocket: None,
-            protocol_priority: vec![
-                TransportProtocol::Quic,
-                TransportProtocol::Tcp,
-                TransportProtocol::WebSocket,
+            endpoints: vec![
+                ServerEndpoint {
+                    protocol: TransportProtocol::Quic,
+                    host: "localhost".to_string(),
+                    port: 8803,
+                    path: None,
+                    use_tls: true, // QUIC强制TLS
+                },
+                ServerEndpoint {
+                    protocol: TransportProtocol::Tcp,
+                    host: "localhost".to_string(),
+                    port: 8801,
+                    path: None,
+                    use_tls: false, // TCP通常不使用TLS
+                },
+                ServerEndpoint {
+                    protocol: TransportProtocol::WebSocket,
+                    host: "localhost".to_string(),
+                    port: 8802,
+                    path: Some("/".to_string()),
+                    use_tls: true, // 默认使用wss
+                },
             ],
         }
     }
@@ -222,45 +234,27 @@ impl SDKConfigBuilder {
         self
     }
 
-    /// 配置QUIC服务器
-    pub fn quic_server<S: Into<String>>(mut self, url: S) -> Self {
-        if let Some(config) = self.parse_protocol_url(&url.into(), TransportProtocol::Quic) {
-            self.config.server_config.quic = Some(config);
-            // 如果协议优先级中没有QUIC，添加到最前面
-            if !self.config.server_config.protocol_priority.contains(&TransportProtocol::Quic) {
-                self.config.server_config.protocol_priority.insert(0, TransportProtocol::Quic);
-            }
+    /// 添加服务器端点
+    pub fn add_server<S: Into<String>>(mut self, url: S) -> Self {
+        if let Some(endpoint) = self.parse_server_url(&url.into()) {
+            self.config.server_config.endpoints.push(endpoint);
         }
         self
     }
 
-    /// 配置TCP服务器
-    pub fn tcp_server<S: Into<String>>(mut self, url: S) -> Self {
-        if let Some(config) = self.parse_protocol_url(&url.into(), TransportProtocol::Tcp) {
-            self.config.server_config.tcp = Some(config);
-            // 如果协议优先级中没有TCP，添加到列表中
-            if !self.config.server_config.protocol_priority.contains(&TransportProtocol::Tcp) {
-                self.config.server_config.protocol_priority.push(TransportProtocol::Tcp);
+    /// 设置服务器端点列表（按优先级顺序）
+    pub fn servers<I, S>(mut self, urls: I) -> Self 
+    where 
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut endpoints = Vec::new();
+        for url in urls {
+            if let Some(endpoint) = self.parse_server_url(&url.into()) {
+                endpoints.push(endpoint);
             }
         }
-        self
-    }
-
-    /// 配置WebSocket服务器
-    pub fn websocket_server<S: Into<String>>(mut self, url: S) -> Self {
-        if let Some(config) = self.parse_protocol_url(&url.into(), TransportProtocol::WebSocket) {
-            self.config.server_config.websocket = Some(config);
-            // 如果协议优先级中没有WebSocket，添加到列表中
-            if !self.config.server_config.protocol_priority.contains(&TransportProtocol::WebSocket) {
-                self.config.server_config.protocol_priority.push(TransportProtocol::WebSocket);
-            }
-        }
-        self
-    }
-
-    /// 设置协议优先级
-    pub fn protocol_priority(mut self, priority: Vec<TransportProtocol>) -> Self {
-        self.config.server_config.protocol_priority = priority;
+        self.config.server_config.endpoints = endpoints;
         self
     }
 
@@ -269,43 +263,22 @@ impl SDKConfigBuilder {
         self
     }
 
-    /// 解析协议特定的URL
-    fn parse_protocol_url(&self, url: &str, protocol: TransportProtocol) -> Option<ProtocolServerConfig> {
-        match protocol {
-            TransportProtocol::Quic => {
-                if url.starts_with("quic://") {
-                    self.parse_url_parts(url, "quic://", false)
-                } else if url.starts_with("quics://") {
-                    self.parse_url_parts(url, "quics://", true)
-                } else {
-                    // 如果没有协议前缀，默认为安全连接
-                    self.parse_host_port_only(url, true)
-                }
-            }
-            TransportProtocol::Tcp => {
-                if url.starts_with("tcp://") {
-                    self.parse_url_parts(url, "tcp://", false)
-                } else if url.starts_with("tcps://") {
-                    self.parse_url_parts(url, "tcps://", true)
-                } else {
-                    // 如果没有协议前缀，默认为安全连接
-                    self.parse_host_port_only(url, true)
-                }
-            }
-            TransportProtocol::WebSocket => {
-                if url.starts_with("ws://") {
-                    self.parse_url_parts(url, "ws://", false)
-                } else if url.starts_with("wss://") {
-                    self.parse_url_parts(url, "wss://", true)
-                } else {
-                    // 如果没有协议前缀，默认为安全连接
-                    self.parse_host_port_only(url, true)
-                }
-            }
+    /// 解析服务器URL
+    fn parse_server_url(&self, url: &str) -> Option<ServerEndpoint> {
+        if url.starts_with("quic://") {
+            self.parse_url_parts(url, "quic://", TransportProtocol::Quic, true) // QUIC强制TLS
+        } else if url.starts_with("tcp://") {
+            self.parse_url_parts(url, "tcp://", TransportProtocol::Tcp, false) // TCP通常不使用TLS
+        } else if url.starts_with("ws://") {
+            self.parse_url_parts(url, "ws://", TransportProtocol::WebSocket, false) // 明确的非安全WebSocket
+        } else if url.starts_with("wss://") {
+            self.parse_url_parts(url, "wss://", TransportProtocol::WebSocket, true) // 安全WebSocket
+        } else {
+            None
         }
     }
 
-    fn parse_url_parts(&self, url: &str, prefix: &str, use_tls: bool) -> Option<ProtocolServerConfig> {
+    fn parse_url_parts(&self, url: &str, prefix: &str, protocol: TransportProtocol, use_tls: bool) -> Option<ServerEndpoint> {
         let remainder = url.strip_prefix(prefix)?;
         
         // 分离主机:端口和路径
@@ -318,23 +291,11 @@ impl SDKConfigBuilder {
         };
 
         if let Some((host, port)) = self.parse_host_port(host_port) {
-            Some(ProtocolServerConfig {
+            Some(ServerEndpoint {
+                protocol,
                 host,
                 port,
                 path,
-                use_tls,
-            })
-        } else {
-            None
-        }
-    }
-
-    fn parse_host_port_only(&self, host_port: &str, use_tls: bool) -> Option<ProtocolServerConfig> {
-        if let Some((host, port)) = self.parse_host_port(host_port) {
-            Some(ProtocolServerConfig {
-                host,
-                port,
-                path: None,
                 use_tls,
             })
         } else {
@@ -595,28 +556,23 @@ impl PrivchatSDK {
     
     /// 验证配置
     fn validate_config(config: &SDKConfig) -> Result<()> {
-        if config.server_config.protocol_priority.is_empty() {
-            return Err(PrivchatSDKError::Config("至少需要配置一个传输协议".to_string()));
+        if config.server_config.endpoints.is_empty() {
+            return Err(PrivchatSDKError::Config("至少需要配置一个服务器端点".to_string()));
         }
         
-        // 检查每个协议是否有对应的服务器配置
-        for protocol in &config.server_config.protocol_priority {
-            match protocol {
-                TransportProtocol::Quic => {
-                    if config.server_config.quic.is_none() {
-                        return Err(PrivchatSDKError::Config("QUIC协议已启用但未配置服务器".to_string()));
-                    }
-                }
-                TransportProtocol::Tcp => {
-                    if config.server_config.tcp.is_none() {
-                        return Err(PrivchatSDKError::Config("TCP协议已启用但未配置服务器".to_string()));
-                    }
-                }
-                TransportProtocol::WebSocket => {
-                    if config.server_config.websocket.is_none() {
-                        return Err(PrivchatSDKError::Config("WebSocket协议已启用但未配置服务器".to_string()));
-                    }
-                }
+        // 验证每个端点配置
+        for endpoint in &config.server_config.endpoints {
+            if endpoint.host.is_empty() {
+                return Err(PrivchatSDKError::Config("服务器主机名不能为空".to_string()));
+            }
+            
+            if endpoint.port == 0 {
+                return Err(PrivchatSDKError::Config("服务器端口不能为0".to_string()));
+            }
+            
+            // 验证QUIC强制TLS
+            if endpoint.protocol == TransportProtocol::Quic && !endpoint.use_tls {
+                return Err(PrivchatSDKError::Config("QUIC协议必须使用TLS".to_string()));
             }
         }
         
@@ -644,17 +600,17 @@ impl PrivchatSDK {
         // 尝试按优先级顺序连接不同协议
         let mut last_error = None;
         
-        for protocol in &self.config.server_config.protocol_priority {
-            match self.try_connect_with_protocol(user_id, token, protocol).await {
+        for endpoint in &self.config.server_config.endpoints {
+            match self.try_connect_with_endpoint(user_id, token, endpoint).await {
                 Ok(()) => {
-                    info!("成功使用 {:?} 协议连接到服务器", protocol);
+                    info!("成功使用 {:?} 协议连接到服务器", endpoint.protocol);
                     
                     // 更新连接状态
                     {
                         let mut state = self.state.write().await;
                         state.connection_state = ConnectionState::Connected;
                         state.last_connected = Some(Instant::now());
-                        state.current_protocol = Some(protocol.clone());
+                        state.current_protocol = Some(endpoint.protocol.clone());
                         state.current_user_id = Some(user_id.to_string());
                     }
                     
@@ -668,7 +624,7 @@ impl PrivchatSDK {
                     return Ok(());
                 }
                 Err(e) => {
-                    warn!("使用 {:?} 协议连接失败: {}", protocol, e);
+                    warn!("使用 {:?} 协议连接失败: {}", endpoint.protocol, e);
                     last_error = Some(e);
                 }
             }
@@ -695,23 +651,23 @@ impl PrivchatSDK {
         Err(error)
     }
     
-    /// 尝试使用指定协议连接
-    async fn try_connect_with_protocol(
+    /// 尝试使用指定端点连接
+    async fn try_connect_with_endpoint(
         &self,
         user_id: &str,
         _token: &str,
-        protocol: &TransportProtocol,
+        endpoint: &ServerEndpoint,
     ) -> Result<()> {
-        let server_url = self.build_server_url(protocol);
+        let server_url = self.build_server_url_from_endpoint(endpoint);
         
-        info!("尝试连接到: {} (协议: {:?})", server_url, protocol);
+        info!("尝试连接到: {} (协议: {:?})", server_url, endpoint.protocol);
         
         // 模拟连接过程
         tokio::time::sleep(Duration::from_millis(100)).await;
         
         // 这里应该是实际的连接逻辑
         // 现在只是模拟成功
-        match protocol {
+        match endpoint.protocol {
             TransportProtocol::Quic => {
                 // QUIC 连接逻辑
                 debug!("建立 QUIC 连接...");
@@ -736,44 +692,24 @@ impl PrivchatSDK {
         Ok(())
     }
     
-    /// 构建服务器URL
-    fn build_server_url(&self, protocol: &TransportProtocol) -> String {
-        let config = &self.config.server_config;
-        
-        match protocol {
+    /// 从端点构建服务器URL
+    fn build_server_url_from_endpoint(&self, endpoint: &ServerEndpoint) -> String {
+        match endpoint.protocol {
             TransportProtocol::Quic => {
-                if let Some(ref quic_config) = config.quic {
-                    if quic_config.use_tls {
-                        format!("quics://{}:{}", quic_config.host, quic_config.port)
-                    } else {
-                        format!("quic://{}:{}", quic_config.host, quic_config.port)
-                    }
-                } else {
-                    "quic://localhost:8080".to_string()
-                }
+                // QUIC强制使用TLS
+                format!("quic://{}:{}", endpoint.host, endpoint.port)
             }
             TransportProtocol::Tcp => {
-                if let Some(ref tcp_config) = config.tcp {
-                    if tcp_config.use_tls {
-                        format!("tcps://{}:{}", tcp_config.host, tcp_config.port)
-                    } else {
-                        format!("tcp://{}:{}", tcp_config.host, tcp_config.port)
-                    }
-                } else {
-                    "tcp://localhost:8080".to_string()
-                }
+                // TCP通常不使用TLS前缀
+                format!("tcp://{}:{}", endpoint.host, endpoint.port)
             }
             TransportProtocol::WebSocket => {
-                if let Some(ref ws_config) = config.websocket {
-                    let protocol_prefix = if ws_config.use_tls { "wss" } else { "ws" };
-                    let base_url = format!("{}://{}:{}", protocol_prefix, ws_config.host, ws_config.port);
-                    if let Some(ref path) = ws_config.path {
-                        format!("{}{}", base_url, path)
-                    } else {
-                        base_url
-                    }
+                let protocol_prefix = if endpoint.use_tls { "wss" } else { "ws" };
+                let base_url = format!("{}://{}:{}", protocol_prefix, endpoint.host, endpoint.port);
+                if let Some(ref path) = endpoint.path {
+                    format!("{}{}", base_url, path)
                 } else {
-                    "ws://localhost:8080".to_string()
+                    base_url
                 }
             }
         }
@@ -1185,7 +1121,7 @@ mod tests {
         
         let config = SDKConfig::builder()
             .data_dir(temp_dir.path())
-            .tcp_server("test.example.com:8080")
+            .add_server("tcp://test.example.com:8080")
             .build();
         
         let sdk = PrivchatSDK::initialize(config).await.unwrap();
@@ -1204,7 +1140,7 @@ mod tests {
         
         let config = SDKConfig::builder()
             .data_dir(temp_dir.path())
-            .tcp_server("test.example.com:8080")
+            .add_server("tcp://test.example.com:8080")
             .build();
         
         let sdk = PrivchatSDK::initialize(config).await.unwrap();
@@ -1226,36 +1162,39 @@ mod tests {
     fn test_config_builder() {
         let config = SDKConfig::builder()
             .data_dir("/tmp/test")
-            .websocket_server("wss://example.com:443/chat")
-            .tcp_server("tcps://example.com:443")
-            .quic_server("quics://example.com:443")
+            .servers(vec![
+                "quic://127.0.0.1:8803",
+                "tcp://127.0.0.1:8801", 
+                "wss://127.0.0.1:8802/path"
+            ])
             .connection_timeout(60)
             .debug_mode(true)
             .build();
         
         assert_eq!(config.data_dir, PathBuf::from("/tmp/test"));
+        assert_eq!(config.server_config.endpoints.len(), 3);
         
-        // 检查WebSocket配置
-        assert!(config.server_config.websocket.is_some());
-        let ws_config = config.server_config.websocket.as_ref().unwrap();
-        assert_eq!(ws_config.host, "example.com");
-        assert_eq!(ws_config.port, 443);
-        assert_eq!(ws_config.path, Some("/chat".to_string()));
-        assert!(ws_config.use_tls);
+        // 检查QUIC配置（第一个端点）
+        let quic_endpoint = &config.server_config.endpoints[0];
+        assert_eq!(quic_endpoint.protocol, TransportProtocol::Quic);
+        assert_eq!(quic_endpoint.host, "127.0.0.1");
+        assert_eq!(quic_endpoint.port, 8803);
+        assert!(quic_endpoint.use_tls); // QUIC强制TLS
         
-        // 检查TCP配置
-        assert!(config.server_config.tcp.is_some());
-        let tcp_config = config.server_config.tcp.as_ref().unwrap();
-        assert_eq!(tcp_config.host, "example.com");
-        assert_eq!(tcp_config.port, 443);
-        assert!(tcp_config.use_tls);
+        // 检查TCP配置（第二个端点）
+        let tcp_endpoint = &config.server_config.endpoints[1];
+        assert_eq!(tcp_endpoint.protocol, TransportProtocol::Tcp);
+        assert_eq!(tcp_endpoint.host, "127.0.0.1");
+        assert_eq!(tcp_endpoint.port, 8801);
+        assert!(!tcp_endpoint.use_tls); // TCP通常不使用TLS
         
-        // 检查QUIC配置
-        assert!(config.server_config.quic.is_some());
-        let quic_config = config.server_config.quic.as_ref().unwrap();
-        assert_eq!(quic_config.host, "example.com");
-        assert_eq!(quic_config.port, 443);
-        assert!(quic_config.use_tls);
+        // 检查WebSocket配置（第三个端点）
+        let ws_endpoint = &config.server_config.endpoints[2];
+        assert_eq!(ws_endpoint.protocol, TransportProtocol::WebSocket);
+        assert_eq!(ws_endpoint.host, "127.0.0.1");
+        assert_eq!(ws_endpoint.port, 8802);
+        assert_eq!(ws_endpoint.path, Some("/path".to_string()));
+        assert!(ws_endpoint.use_tls); // wss://使用TLS
         
         assert_eq!(config.connection_timeout, 60);
         assert!(config.debug_mode);

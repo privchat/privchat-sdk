@@ -24,13 +24,10 @@ async fn main() -> Result<()> {
     let config = SDKConfig::builder()
         .data_dir("./demo_data")
         .assets_dir("./assets")  // 设置SQL脚本目录
-        .websocket_server("wss://127.0.0.1:8002/path")
-        .tcp_server("demo.privchat.com:8001")
-        .quic_server("chat.privchat.com:8003")
-        .protocol_priority(vec![
-            TransportProtocol::Quic,    // 优先使用QUIC
-            TransportProtocol::Tcp,     // 降级到TCP
-            TransportProtocol::WebSocket // 最后使用WebSocket
+        .servers(vec![
+            "quic://127.0.0.1:8803",        // 优先使用QUIC（高性能）
+            "tcp://127.0.0.1:8801",         // 降级到TCP（稳定）
+            "wss://127.0.0.1:8802/path"     // 最后使用WebSocket（兼容性强）
         ])
         .connection_timeout(30)
         .heartbeat_interval(30)
@@ -43,18 +40,17 @@ async fn main() -> Result<()> {
     
     // 显示服务器配置信息
     let server_config = &sdk.config().server_config;
-    if let Some(ref quic_config) = server_config.quic {
-        println!("📍 QUIC 服务器: {}:{} (TLS: {})", quic_config.host, quic_config.port, quic_config.use_tls);
+    println!("📍 配置的服务器端点:");
+    for (index, endpoint) in server_config.endpoints.iter().enumerate() {
+        let protocol_name = match endpoint.protocol {
+            TransportProtocol::Quic => "QUIC",
+            TransportProtocol::Tcp => "TCP",
+            TransportProtocol::WebSocket => "WebSocket",
+        };
+        let path = endpoint.path.as_deref().unwrap_or("");
+        println!("  {}. {} 服务器: {}:{}{} (TLS: {})", 
+            index + 1, protocol_name, endpoint.host, endpoint.port, path, endpoint.use_tls);
     }
-    if let Some(ref tcp_config) = server_config.tcp {
-        println!("📍 TCP 服务器: {}:{} (TLS: {})", tcp_config.host, tcp_config.port, tcp_config.use_tls);
-    }
-    if let Some(ref ws_config) = server_config.websocket {
-        let path = ws_config.path.as_deref().unwrap_or("");
-        println!("📍 WebSocket 服务器: {}:{}{} (TLS: {})", ws_config.host, ws_config.port, path, ws_config.use_tls);
-    }
-    
-    println!("📍 协议优先级: {:?}", server_config.protocol_priority);
     println!("📍 存储路径: {}", sdk.config().data_dir.display());
     if let Some(assets_dir) = &sdk.config().assets_dir {
         println!("📍 Assets目录: {}", assets_dir.display());
