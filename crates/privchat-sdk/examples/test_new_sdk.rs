@@ -79,7 +79,11 @@ async fn main() -> Result<()> {
             
             // 示例5: 发送消息
             println!("\n📤 示例5: 发送消息（使用 SendRequest biz_type）");
-            match client.send_message("test_channel_001", "Hello, PrivChat!", 1).await {
+            
+            // 使用私聊频道格式，这样服务器会自动创建频道
+            let private_channel = "private_demo_user_123_friend_456";
+            
+            match client.send_message(private_channel, "你好，这是一条私聊消息！", 1).await {
                 Ok(msg_id) => println!("✅ 发送消息成功，消息ID: {}", msg_id),
                 Err(e) => println!("❌ 发送消息失败: {}", e),
             }
@@ -87,10 +91,10 @@ async fn main() -> Result<()> {
             // 示例6: 再发送几条不同类型的消息
             println!("\n📤 示例6: 发送多条消息测试");
             let messages = vec![
-                ("test_channel_001", "这是第二条消息", 1),
-                ("test_channel_002", "发送到不同频道", 1),
-                ("test_channel_001", "📷 图片消息", 2),
-                ("test_channel_001", "🎵 语音消息", 3),
+                (private_channel, "这是第二条私聊消息", 1),
+                ("private_demo_user_123_another_friend", "发送给另一个朋友的消息", 1),
+                (private_channel, "📷 图片消息", 2),
+                (private_channel, "🎵 语音消息", 3),
             ];
             
             for (channel, content, msg_type) in messages {
