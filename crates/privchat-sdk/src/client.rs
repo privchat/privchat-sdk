@@ -15,7 +15,7 @@ use crate::error::{PrivchatSDKError, Result};
 use privchat_protocol::{
     encode_message, decode_message, MessageType,
     ConnectRequest, ConnectResponse, DisconnectRequest, DisconnectResponse,
-    HeartbeatRequest, HeartbeatResponse, SubscribeRequest, SubscribeResponse,
+    SubscribeRequest, SubscribeResponse,
     SendRequest, SendResponse, RecvRequest, RecvResponse,
     RecvBatchRequest, RecvBatchResponse, PublishRequest, PublishResponse,
     AuthType, ClientInfo, DeviceInfo, DeviceType, DisconnectReason,
@@ -352,9 +352,8 @@ impl PrivchatClient {
             return Err(PrivchatSDKError::NotConnected);
         }
         
-        let ping_request = HeartbeatRequest {
-            client_timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            client_status: Some("active".to_string()),
+        let ping_request = privchat_protocol::message::PingRequest {
+            timestamp: chrono::Utc::now().timestamp_millis(),
         };
         
         let request_data = encode_message(&ping_request)
@@ -368,7 +367,7 @@ impl PrivchatClient {
             .request_with_options(Bytes::from(request_data), transport_options).await
             .map_err(|e| PrivchatSDKError::Transport(format!("心跳请求失败: {}", e)))?;
         
-        let _ping_response: HeartbeatResponse = decode_message(&response_data)
+        let _ping_response: privchat_protocol::message::PongResponse = decode_message(&response_data)
             .map_err(|e| PrivchatSDKError::Serialization(format!("解码心跳响应失败: {}", e)))?;
         
         tracing::debug!("心跳检测成功");
