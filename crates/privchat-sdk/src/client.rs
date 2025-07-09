@@ -6,6 +6,8 @@ use tokio::sync::RwLock;
 use rusqlite::Connection;
 use uuid::Uuid;
 use bytes::Bytes;
+use serde::{Serialize, Deserialize};
+use serde::de::DeserializeOwned;
 use msgtrans::{
     transport::client::TransportClientBuilder,
     protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig},
@@ -21,6 +23,41 @@ use privchat_protocol::{
     AuthType, ClientInfo, DeviceInfo, DeviceType, DisconnectReason,
     MessageSetting,
 };
+
+// ========== RPC 调用相关类型定义 ==========
+
+/// RPC 调用结果类型
+pub type RpcResult<T> = std::result::Result<T, RpcError>;
+
+/// RPC 错误信息结构体
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[code={}] {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+/// RPC 请求消息
+#[derive(Serialize, Deserialize)]
+pub struct RPCMessageRequest {
+    pub route: String,
+    pub body: serde_json::Value,
+}
+
+/// RPC 响应消息
+#[derive(Serialize, Deserialize)]
+pub struct RPCMessageResponse {
+    pub code: i32,
+    pub message: String,
+    pub data: Option<serde_json::Value>,
+}
 
 /// 用户会话信息
 #[derive(Debug, Clone)]
@@ -558,6 +595,114 @@ impl PrivchatClient {
             .request_with_options(Bytes::from(response_data), transport_options).await;
         
         Ok(())
+    }
+    
+    // ========== RPC 调用方法 ==========
+    
+    /// 通用 RPC 调用方法
+    /// 
+    /// # 参数
+    /// - `route`: RPC 路由路径，格式：system/module/action（如：account/user/get）
+    /// - `body`: 请求参数的 JSON 值
+    /// 
+    /// # 返回值
+    /// - `RpcResult<T>`: 自动反序列化为指定类型 T 的结果
+    /// 
+    /// # 示例
+    /// ```rust,no_run
+    /// use serde::Deserialize;
+    /// use serde_json::json;
+    /// 
+    /// #[derive(Deserialize)]
+    /// struct UserInfo {
+    ///     id: String,
+    ///     username: String,
+    ///     avatar_url: Option<String>,
+    /// }
+    /// 
+    /// let user: RpcResult<UserInfo> = client
+    ///     .call("account/user/get", json!({ "id": "123" }))
+    ///     .await;
+    /// 
+    /// match user {
+    ///     Ok(user_info) => println!("用户名: {}", user_info.username),
+    ///     Err(err) => eprintln!("调用失败: {}", err),
+    /// }
+    /// ```
+    pub async fn call<T: DeserializeOwned>(
+        &mut self,
+        route: &str,
+        body: serde_json::Value,
+    ) -> RpcResult<T> {
+        // 检查连接状态
+        if !self.is_connected().await {
+            return Err(RpcError {
+                code: -1,
+                message: "客户端未连接到服务器".to_string(),
+            });
+        }
+        
+        // 构建 RPC 请求
+        let request = RPCMessageRequest {
+            route: route.to_string(),
+            body,
+        };
+        
+        tracing::debug!("🚀 发送 RPC 请求: route={}, body={}", route, request.body);
+        
+        // 序列化请求
+        let request_data = serde_json::to_vec(&request)
+            .map_err(|e| RpcError {
+                code: -2,
+                message: format!("请求序列化失败: {}", e),
+            })?;
+        
+        // 设置传输选项 - 使用 RPCRequest 消息类型
+        let transport_options = TransportOptions::new()
+            .with_biz_type(MessageType::RPCRequest as u8)
+            .with_timeout(self.connection_timeout);
+        
+        // 发送请求并等待响应
+        let response_data = self.transport.as_mut()
+            .ok_or_else(|| RpcError {
+                code: -1,
+                message: "传输层客户端未初始化".to_string(),
+            })?
+            .request_with_options(Bytes::from(request_data), transport_options)
+            .await
+            .map_err(|e| RpcError {
+                code: -3,
+                message: format!("传输层错误: {}", e),
+            })?;
+        
+        // 反序列化响应
+        let rpc_response: RPCMessageResponse = serde_json::from_slice(&response_data)
+            .map_err(|e| RpcError {
+                code: -4,
+                message: format!("响应反序列化失败: {}", e),
+            })?;
+        
+        tracing::debug!("📥 收到 RPC 响应: route={}, code={}, message={}", 
+                       route, rpc_response.code, rpc_response.message);
+        
+        // 检查响应状态码
+        if rpc_response.code != 200 {
+            return Err(RpcError {
+                code: rpc_response.code,
+                message: rpc_response.message,
+            });
+        }
+        
+        // 提取数据并反序列化为目标类型
+        let data = rpc_response.data.ok_or_else(|| RpcError {
+            code: -5,
+            message: "成功响应中缺少数据字段".to_string(),
+        })?;
+        
+        serde_json::from_value(data).map_err(|e| RpcError {
+            code: -6,
+            message: format!("数据反序列化失败: {}", e),
+        })
     }
     
     /// 初始化用户环境

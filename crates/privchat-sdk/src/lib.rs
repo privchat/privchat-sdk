@@ -54,7 +54,10 @@ pub mod sdk;
 
 // 重新导出核心类型，方便使用
 pub use error::{PrivchatSDKError, Result};
-pub use client::{PrivchatClient, UserSession, ServerEndpoint, TransportProtocol};
+pub use client::{
+    PrivchatClient, UserSession, ServerEndpoint, TransportProtocol,
+    RpcResult, RpcError, RPCMessageRequest, RPCMessageResponse
+};
 pub use sdk::{PrivchatSDK, SDKConfig};
 
 // 重新导出协议层的类型，避免用户需要单独导入 privchat-protocol
