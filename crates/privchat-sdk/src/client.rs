@@ -685,8 +685,8 @@ impl PrivchatClient {
         tracing::debug!("📥 收到 RPC 响应: route={}, code={}, message={}", 
                        route, rpc_response.code, rpc_response.message);
         
-        // 检查响应状态码
-        if rpc_response.code != 200 {
+        // 检查响应状态码 (0 表示成功)
+        if rpc_response.code != 0 {
             return Err(RpcError {
                 code: rpc_response.code,
                 message: rpc_response.message,

@@ -1,10 +1,65 @@
 use privchat_sdk::{
     client::{PrivchatClient, ServerEndpoint, TransportProtocol},
     error::Result,
+    RpcResult,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::time::Duration;
 use tokio;
 use tracing::{info, warn, error};
+
+// ========== RPC 响应结构体定义 ==========
+
+#[derive(Debug, Deserialize)]
+struct UserInfo {
+    pub id: String,
+    pub username: String,
+    pub avatar_url: Option<String>,
+    pub email: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginResponse {
+    pub user_id: String,
+    pub token: String,
+    pub expires_at: String,
+    pub refresh_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupInfo {
+    pub group_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub member_count: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FriendInfo {
+    pub user_id: String,
+    pub username: String,
+    pub status: String,
+    pub added_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageHistory {
+    pub messages: Vec<HistoryMessage>,
+    pub total_count: u64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryMessage {
+    pub message_id: String,
+    pub sender_id: String,
+    pub content: String,
+    pub timestamp: String,
+    pub message_type: u8,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,21 +76,21 @@ async fn main() -> Result<()> {
         ServerEndpoint {
             protocol: TransportProtocol::Quic,
             host: "127.0.0.1".to_string(),
-            port: 8803,
+            port: 8082,
             path: None,
             use_tls: false,
         },
         ServerEndpoint {
             protocol: TransportProtocol::Tcp,
             host: "127.0.0.1".to_string(),
-            port: 8801,
+            port: 8080,
             path: None,
             use_tls: false,
         },
         ServerEndpoint {
             protocol: TransportProtocol::WebSocket,
             host: "127.0.0.1".to_string(),
-            port: 8802,
+            port: 8081,
             path: Some("/".to_string()),
             use_tls: false,
         },
@@ -113,8 +168,112 @@ async fn main() -> Result<()> {
             println!("   用户ID: {:?}", client.user_id());
             println!("   用户目录: {:?}", client.user_dir());
             
-            // 示例8: 断开连接
-            println!("\n🔌 示例8: 断开连接（使用 DisconnectRequest biz_type）");
+            // 示例8: RPC 功能测试
+            println!("\n🔧 示例8: RPC 功能测试");
+            
+            // RPC 测试1: 用户登录
+            println!("\n📋 RPC测试1: 用户登录");
+            let login_result: RpcResult<LoginResponse> = client.call(
+                "account/user/login",
+                json!({
+                    "username": "alice",
+                    "password": "secret123"
+                })
+            ).await;
+            
+            match login_result {
+                Ok(login_resp) => {
+                    println!("✅ 登录成功: user_id={}, token={}", login_resp.user_id, login_resp.token);
+                }
+                Err(err) => {
+                    println!("❌ 登录失败: {}", err);
+                }
+            }
+            
+            // RPC 测试2: 获取用户信息
+            println!("\n📋 RPC测试2: 获取用户信息");
+            let user_result: RpcResult<UserInfo> = client.call(
+                "account/user/find",
+                json!({ "user_id": "alice" })
+            ).await;
+            
+            match user_result {
+                Ok(user) => {
+                    println!("✅ 用户信息: username={}, email={:?}", user.username, user.email);
+                }
+                Err(err) => {
+                    println!("❌ 获取用户信息失败: {}", err);
+                }
+            }
+            
+            // RPC 测试3: 创建群组
+            println!("\n📋 RPC测试3: 创建群组");
+            let group_result: RpcResult<GroupInfo> = client.call(
+                "group/group/create",
+                json!({
+                    "name": "RPC测试群组",
+                    "description": "这是一个RPC测试群组",
+                    "creator_id": "alice"
+                })
+            ).await;
+            
+            match group_result {
+                Ok(group) => {
+                    println!("✅ 群组创建成功: group_id={}, name={}", group.group_id, group.name);
+                }
+                Err(err) => {
+                    println!("❌ 创建群组失败: {}", err);
+                }
+            }
+            
+            // RPC 测试4: 添加好友
+            println!("\n📋 RPC测试4: 添加好友");
+            let friend_result: RpcResult<FriendInfo> = client.call(
+                "contact/friend/add",
+                json!({
+                    "from_user_id": "alice",
+                    "to_user_id": "bob",
+                    "message": "你好，我想添加你为好友"
+                })
+            ).await;
+            
+            match friend_result {
+                Ok(friend) => {
+                    println!("✅ 好友申请成功: user_id={}, status={}", friend.user_id, friend.status);
+                }
+                Err(err) => {
+                    println!("❌ 添加好友失败: {}", err);
+                }
+            }
+            
+            // RPC 测试5: 获取消息历史
+            println!("\n📋 RPC测试5: 获取消息历史");
+            let history_result: RpcResult<MessageHistory> = client.call(
+                "message/history/get",
+                json!({
+                    "channel_id": "private_demo_user_123_friend_456",
+                    "limit": 10,
+                    "offset": 0
+                })
+            ).await;
+            
+            match history_result {
+                Ok(history) => {
+                    println!("✅ 消息历史获取成功: 共{}条消息，has_more={}", 
+                            history.messages.len(), history.has_more);
+                    for msg in history.messages.iter().take(3) {
+                        println!("   - {}: {}", msg.sender_id, msg.content);
+                    }
+                }
+                Err(err) => {
+                    println!("❌ 获取消息历史失败: {}", err);
+                }
+            }
+            
+            println!("✅ RPC 功能测试完成");
+            
+            // 示例9: 断开连接
+            println!("\n🔌 示例9: 断开连接（使用 DisconnectRequest biz_type）");
             match client.disconnect("测试完成").await {
                 Ok(_) => println!("✅ 断开连接成功"),
                 Err(e) => println!("❌ 断开连接失败: {}", e),
