@@ -1,0 +1,7 @@
+# UniFFI Configuration for Privchat SDK - Android
+
+[bindings.kotlin]
+package_name = "io.privchat.ffi"
+cdylib_name = "privchat_ffi"
+# Enable Android-specific memory management
+android_cleaner = true

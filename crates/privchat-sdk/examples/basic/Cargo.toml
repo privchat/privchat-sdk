@@ -1,0 +1,28 @@
+[package]
+name = "basic"
+version = "0.1.0"
+edition = "2021"
+authors = ["PrivChat Team"]
+description = "PrivChat SDK 基础使用示例"
+
+# 独立项目，不参与 workspace
+[workspace]
+
+[[bin]]
+name = "basic"
+path = "src/main.rs"
+
+[dependencies]
+# PrivChat SDK 依赖
+privchat-sdk = { path = "../.." }
+privchat-protocol = { path = "../../../../../privchat-protocol" }
+
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID（device_id 必须为 UUID，注册与 auth 使用同一 device_id）
+uuid = { version = "1.0", features = ["v4"] }

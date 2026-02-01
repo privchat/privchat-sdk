@@ -1,0 +1,21 @@
+// Privchat SDK FFI - Unified Interface
+// UniFFI 0.31: Using proc-macro mode (setup_scaffolding!)
+//
+// Note: We're using proc-macro mode, so most definitions are in Rust:
+// - Objects: #[derive(uniffi::Object)]
+// - Records: #[derive(uniffi::Record)]
+// - Enums: #[derive(uniffi::Enum)]
+// - Callback interfaces: #[uniffi::export(callback_interface)]
+// - Async functions: #[uniffi::export] on async fn
+//
+// UDL file is kept minimal - only namespace-level functions if needed.
+// Most functionality is defined directly in Rust using proc-macros.
+
+namespace privchat_sdk {
+    string sdk_version();
+    string git_sha();
+    string build_time();
+    
+    [Throws=PrivchatError]
+    ServerEndpoint parse_server_url(string url);
+};

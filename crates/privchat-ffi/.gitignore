@@ -1,0 +1,20 @@
+# Build artifacts
+/target/
+/bindings/
+
+# UniFFI generated files
+**/*.h
+**/*.swift
+**/*.kt
+**/*.py
+**/*.rb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

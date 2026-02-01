@@ -1,0 +1,55 @@
+[package]
+name = "privchat-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "FFI bindings for Privchat SDK using UniFFI"
+
+[lib]
+crate-type = [
+    # Needed by uniffi for Android bindings
+    "cdylib",
+    # Needed by uniffi for iOS bindings
+    "staticlib",
+    # Needed for testing and intermediate language bindings
+    "lib"
+]
+
+[features]
+default = []
+
+[dependencies]
+privchat-sdk = { path = "../privchat-sdk" }
+privchat-protocol = { path = "../../../privchat-protocol" }
+privchat-ffi-macros = { path = "../privchat-ffi-macros" }
+
+# UniFFI and async runtime
+# Upgraded to 0.31 for direct async/await support and type-safe callbacks
+uniffi = { version = "0.31", features = ["tokio"] }
+async-compat = "0.2"
+
+# Error handling and utilities
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { version = "1", features = ["sync", "macros"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-compat = "0.2"
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }
+
+[dev-dependencies]
+tempfile = "3.0"
+uuid = { version = "1.0", features = ["v4"] }
+
+# Note: UniFFI-generated code uses #[no_mangle] which requires unsafe,
+# so we cannot forbid unsafe_code in this crate

@@ -1,0 +1,12 @@
+# UniFFI Configuration for Privchat SDK
+
+[bindings.kotlin]
+package_name = "io.privchat.ffi"
+cdylib_name = "privchat_ffi"
+# Enable Android-specific memory management
+android_cleaner = true
+
+[bindings.swift]
+module_name = "PrivchatSDK"
+# Generate async/await wrappers for Swift
+generate_immutable_records = true
