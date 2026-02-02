@@ -72,7 +72,7 @@ pub use client::{
 pub use sdk::{PrivchatSDK, PrivchatConfig, ServerConfig, ServerEndpoint, TransportProtocol, HttpClientConfig};
 pub use storage::media_preprocess::{VideoProcessHook, MediaProcessOp, SendMode};
 pub use http_client::{FileHttpClient, FileUploadResponse};
-pub use message_type::{ChatMessageType, ParsedMessage};
+pub use message_type::{ChatMessageType, ParsedMessage, message_type_from_u32, message_type_str_to_u32};
 pub use rpc_client::RpcClientExt;
 pub use utils::{TimeFormatter, TimezoneConfig};
 pub use connection_state::{

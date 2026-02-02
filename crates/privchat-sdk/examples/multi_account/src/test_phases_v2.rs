@@ -507,9 +507,9 @@ impl TestPhasesV2 {
             
             sleep(Duration::from_millis(300)).await;
             
-            // Step 3: 群组内发送消息
+            // Step 3: 群组内发送消息（使用 channel_id 直接发送，避免误走 get_or_create_direct_channel）
             info!("💬 Step 3: 群组内发送消息");
-            match account_manager.send_message("alice", gid, "欢迎加入群组! 🎉").await {
+            match account_manager.send_message_to_channel("alice", gid, "欢迎加入群组! 🎉").await {
                 Ok(msg_no) => {
                     info!("✅ 群组消息已发送: {}", msg_no);
                     metrics.messages_sent += 1;
@@ -983,9 +983,10 @@ impl TestPhasesV2 {
         let start_time = Instant::now();
         let mut metrics = PhaseMetrics::default();
         
+        let alice_id = account_manager.get_user_id("alice").unwrap();
         let bob_id = account_manager.get_user_id("bob").unwrap();
         
-        // 发送一条普通消息
+        // 发送一条普通消息（Alice -> Bob）
         info!("💬 发送原始消息");
         match account_manager.send_message("alice", bob_id, "这是原始消息").await {
             Ok(_) => metrics.messages_sent += 1,
@@ -994,9 +995,9 @@ impl TestPhasesV2 {
         
         sleep(Duration::from_millis(300)).await;
         
-        // 发送回复消息（这里简化为普通消息）
+        // 发送回复消息（Bob -> Alice，不能发给自己）
         info!("💬 发送回复消息");
-        match account_manager.send_message("bob", bob_id, "回复: 收到!").await {
+        match account_manager.send_message("bob", alice_id, "回复: 收到!").await {
             Ok(_) => metrics.messages_sent += 1,
             Err(e) => metrics.errors.push(format!("回复消息: {}", e)),
         }

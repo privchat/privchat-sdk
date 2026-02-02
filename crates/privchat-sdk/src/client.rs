@@ -15,6 +15,7 @@ use msgtrans::{
     event::ClientEvent,
 };
 use crate::error::{PrivchatSDKError, Result};
+use crate::message_type::message_type_str_to_u32;
 use crate::storage::deduplication::DeduplicationManager;
 use privchat_protocol::{
     encode_message, decode_message, MessageType,
@@ -79,7 +80,7 @@ pub struct UserSession {
     pub login_time: chrono::DateTime<chrono::Utc>,
     pub server_key: Option<String>,
     pub node_id: Option<String>,
-    pub server_info: Option<privchat_protocol::message::ServerInfo>,
+    pub server_info: Option<privchat_protocol::protocol::ServerInfo>,
 }
 
 /// 传输协议类型
@@ -527,7 +528,7 @@ impl PrivchatClient {
             return Err(PrivchatSDKError::NotConnected);
         }
         
-        let ping_request = privchat_protocol::message::PingRequest {
+        let ping_request = privchat_protocol::protocol::PingRequest {
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         
@@ -542,7 +543,7 @@ impl PrivchatClient {
             .request_with_options(Bytes::from(request_data), transport_options).await
             .map_err(|e| PrivchatSDKError::Transport(format!("心跳请求失败: {}", e)))?;
         
-        let _ping_response: privchat_protocol::message::PongResponse = decode_message(&response_data)
+        let _ping_response: privchat_protocol::protocol::PongResponse = decode_message(&response_data)
             .map_err(|e| PrivchatSDKError::Serialization(format!("解码心跳响应失败: {}", e)))?;
         
         tracing::debug!("心跳检测成功");
@@ -641,12 +642,9 @@ impl PrivchatClient {
         
         let from_uid = self.user_id.ok_or(PrivchatSDKError::NotConnected)?;
         
-        // 构造 payload JSON，包含 message_type, content, metadata
-        // 注意：reply_to_message_id, mentioned_user_ids, message_source 需要通过 metadata 传递
-        // 因为服务端会从 payload 的顶层解析这些字段
+        // 消息类型由协议层 SendMessageRequest.message_type（u32）提供，payload 仅含 MessagePayloadEnvelope
         let metadata_value = metadata.as_ref().cloned().unwrap_or(serde_json::Value::Null);
         let mut payload_json = serde_json::json!({
-            "message_type": message_type,
             "content": content,
             "metadata": metadata_value.clone(),
         });
@@ -682,10 +680,11 @@ impl PrivchatClient {
             stream_no: format!("stream_{}", Uuid::new_v4()),
             channel_id: channel_id_u64,
             channel_type: 1, // 1: 个人聊天, 2: 群聊
+            message_type: message_type_str_to_u32(message_type),
             expire: 3600,
             from_uid,
             topic: "chat".to_string(),
-            payload,  // JSON 格式的 payload
+            payload,
         };
         
         let request_data = encode_message(&send_message_request)

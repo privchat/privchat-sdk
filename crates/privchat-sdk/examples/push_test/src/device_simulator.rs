@@ -4,8 +4,8 @@
 
 use privchat_sdk::{PrivchatSDK, PrivchatConfig, ServerEndpoint, TransportProtocol, ServerConfig};
 use privchat_sdk::error::Result;
-use privchat_protocol::message::DeviceInfo;
-use privchat_protocol::message::DeviceType;
+use privchat_protocol::protocol::DeviceInfo;
+use privchat_protocol::protocol::DeviceType;
 use tracing::{info, debug, warn};
 use std::time::Duration;
 use std::path::PathBuf;

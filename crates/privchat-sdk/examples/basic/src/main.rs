@@ -11,7 +11,7 @@ use privchat_sdk::{
     Result,
 };
 use privchat_sdk::storage::entities::ChannelQuery;
-use privchat_protocol::message::{DeviceInfo, DeviceType};
+use privchat_protocol::protocol::{DeviceInfo, DeviceType};
 use std::path::PathBuf;
 use uuid::Uuid;
 use tracing::{info, error, warn};

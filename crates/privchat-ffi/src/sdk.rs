@@ -721,9 +721,9 @@ impl PrivchatSDK {
         get_runtime().block_on(async move {
             let guard = inner.read().await;
             if let Some(sdk) = guard.as_ref() {
-                let device_info = privchat_protocol::message::DeviceInfo {
+                let device_info = privchat_protocol::protocol::DeviceInfo {
                     device_id: device_id.clone(),
-                    device_type: privchat_protocol::message::DeviceType::Web,
+                    device_type: privchat_protocol::protocol::DeviceType::Web,
                     app_id: "privchat_ffi".to_string(),
                     push_token: None,
                     push_channel: None,
@@ -780,9 +780,9 @@ impl PrivchatSDK {
         get_runtime().block_on(async move {
             let guard = inner.read().await;
             if let Some(sdk) = guard.as_ref() {
-                let device_info = privchat_protocol::message::DeviceInfo {
+                let device_info = privchat_protocol::protocol::DeviceInfo {
                     device_id,
-                    device_type: privchat_protocol::message::DeviceType::Web,
+                    device_type: privchat_protocol::protocol::DeviceType::Web,
                     app_id: "privchat_ffi".to_string(),
                     push_token: None,
                     push_channel: None,

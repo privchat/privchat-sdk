@@ -1,11 +1,8 @@
 //! SDK 消息类型定义
-//! 
-//! 这个模块定义了 SDK 中使用的消息类型，使用字符串表示，支持：
-//! - 已知消息类型的常量定义（提供类型安全和 IDE 补全）
-//! - 未知消息类型的优雅降级（显示【未知消息类型】占位符）
-//! - 从 channel_type (u8) 和 payload 解析消息类型
-//! - 无限扩展：业务系统可以定义任意消息类型
+//!
+//! 与 protocol 层 ContentMessageType（u32）对齐：发送时字符串转 u32 填协议字段，接收时从协议 message_type 取 u32 转字符串。
 
+use privchat_protocol::ContentMessageType;
 use serde_json::Value;
 use std::fmt;
 
@@ -101,28 +98,35 @@ pub fn message_type_placeholder(msg_type: &str) -> String {
         }
     }
 
-/// 从 channel_type (u8) 解析消息类型字符串
-/// 
-/// channel_type 是服务端定义的消息类型数值
-pub fn message_type_from_channel_type(channel_type: u8) -> String {
-        match channel_type {
-            0 => message_types::TEXT.to_string(),
-            1 => message_types::IMAGE.to_string(),
-            2 => message_types::FILE.to_string(),
-            3 => message_types::AUDIO.to_string(),
-            4 => message_types::VIDEO.to_string(),
-            5 => message_types::SYSTEM.to_string(),
-            6 => message_types::LOCATION.to_string(),
-            // 扩展类型（需要与服务端保持一致）
-            10 => message_types::CONTACT_CARD.to_string(),
-            11 => message_types::STICKER.to_string(),
-            12 => message_types::FORWARD.to_string(),
-            // 自定义类型范围：100-255，转换为字符串
-            n @ 100..=255 => format!("custom_{}", n),
-            // 未知类型，返回字符串表示
-            n => format!("unknown_{}", n),
-        }
+/// 协议层 message_type（u32）转字符串（用于显示、存储）
+pub fn message_type_from_u32(value: u32) -> String {
+    ContentMessageType::from_u32(value)
+        .map(|t| t.as_str().to_string())
+        .unwrap_or_else(|| message_types::TEXT.to_string())
+}
+
+/// 字符串转协议层 message_type（u32），用于发送时填 SendMessageRequest.message_type
+pub fn message_type_str_to_u32(s: &str) -> u32 {
+    match s.to_lowercase().as_str() {
+        message_types::TEXT => ContentMessageType::Text.as_u32(),
+        message_types::IMAGE => ContentMessageType::Image.as_u32(),
+        message_types::FILE => ContentMessageType::File.as_u32(),
+        "voice" => ContentMessageType::Voice.as_u32(),
+        message_types::VIDEO => ContentMessageType::Video.as_u32(),
+        message_types::SYSTEM => ContentMessageType::System.as_u32(),
+        message_types::AUDIO => ContentMessageType::Audio.as_u32(),
+        message_types::LOCATION => ContentMessageType::Location.as_u32(),
+        message_types::CONTACT_CARD => ContentMessageType::ContactCard.as_u32(),
+        message_types::STICKER => ContentMessageType::Sticker.as_u32(),
+        message_types::FORWARD => ContentMessageType::Forward.as_u32(),
+        _ => ContentMessageType::Text.as_u32(),
     }
+}
+
+/// 从 channel_type (u8) 解析消息类型字符串（兼容旧逻辑，优先使用协议 message_type）
+pub fn message_type_from_channel_type(channel_type: u8) -> String {
+    message_type_from_u32(channel_type as u32)
+}
 
 /// 从 payload JSON 中解析消息类型
 /// 

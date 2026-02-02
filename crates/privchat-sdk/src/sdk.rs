@@ -944,7 +944,7 @@ impl PrivchatSDK {
         username: String,
         password: String,
         device_id: String,
-        device_info: Option<privchat_protocol::message::DeviceInfo>,
+        device_info: Option<privchat_protocol::protocol::DeviceInfo>,
     ) -> Result<(u64, String)> {
         use privchat_protocol::rpc::auth::UserRegisterRequest;
         
@@ -1001,7 +1001,7 @@ impl PrivchatSDK {
         username: String,
         password: String,
         device_id: String,
-        device_info: Option<privchat_protocol::message::DeviceInfo>,
+        device_info: Option<privchat_protocol::protocol::DeviceInfo>,
     ) -> Result<(u64, String)> {
         use privchat_protocol::rpc::auth::AuthLoginRequest;
         
@@ -1056,7 +1056,7 @@ impl PrivchatSDK {
         &self,
         user_id: u64,
         token: &str,
-        device_info: privchat_protocol::message::DeviceInfo,
+        device_info: privchat_protocol::protocol::DeviceInfo,
     ) -> Result<()> {
         self.check_initialized().await?;
         
@@ -1276,15 +1276,7 @@ impl PrivchatSDK {
                         String::from_utf8_lossy(&push_msg.payload).to_string()
                     };
 
-                    let message_type_str = if let Ok(payload_json) = serde_json::from_slice::<serde_json::Value>(&push_msg.payload) {
-                        payload_json.get("message_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("text")
-                            .to_string()
-                    } else {
-                        "text".to_string()
-                    };
-
+                    // 消息类型来自协议层 PushMessageRequest.message_type（u32），不再从 payload 解析
                     use crate::storage::entities::Message;
                     use chrono::Utc;
 
@@ -1311,7 +1303,7 @@ impl PrivchatSDK {
                         channel_type: push_msg.channel_type as i32,
                         timestamp: Some(timestamp_ms),
                         from_uid: push_msg.from_uid,
-                        message_type: if message_type_str == "text" { 1 } else { 2 },
+                        message_type: push_msg.message_type as i32,
                         content: content.clone(),
                         status: 2,
                         voice_status: 0,
@@ -1418,7 +1410,7 @@ impl PrivchatSDK {
                         channel_type: push_msg.channel_type as i32,
                         from_uid: push_msg.from_uid,
                         content: content.clone(),
-                        message_type: if message_type_str == "text" { 1 } else { 2 },
+                        message_type: push_msg.message_type as i32,
                         timestamp: timestamp_ms_u64,
                         pts: push_msg.message_seq as u64,
                     };
@@ -2598,54 +2590,28 @@ impl PrivchatSDK {
         Ok(())
     }
 
-    /// 收到消息后后台下载缩略图到 {data_dir}/users/{uid}/files/{yyyymm}/{message.id}/
-    /// 由 push 流程在保存消息后 spawn 调用；content 为消息 content JSON 字符串。
-    /// content 中应有 file_id（及可选的 thumbnail_file_id、storage_source_id），未来多存储源时可按 storage_source_id 区分。
+    /// 收到消息后从 Payload 提取缩略图 file_id 并打印；不执行实际下载。
+    /// 由 push 流程在保存消息后 spawn 调用。content 可能为纯文本或 JSON（有 file_id / thumbnail_file_id 时为附件消息）。
+    /// 仅当 content 能解析为 JSON 且含 file_id 或 thumbnail_file_id 时打印；纯文本直接跳过。
     async fn download_thumbnail_after_receive(
-        data_dir: PathBuf,
-        base_url: Option<String>,
-        http_client: Arc<RwLock<Option<Arc<crate::http_client::FileHttpClient>>>>,
-        user_id: String,
+        _data_dir: PathBuf,
+        _base_url: Option<String>,
+        _http_client: Arc<RwLock<Option<Arc<crate::http_client::FileHttpClient>>>>,
+        _user_id: String,
         message_id: i64,
         content: String,
-        created_at_ms: i64,
+        _created_at_ms: i64,
     ) -> Result<()> {
-        use crate::storage::media_preprocess::{message_files_dir, yyyymm_from_timestamp_ms};
-        let content_json: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| PrivchatSDKError::Serialization(format!("解析 content JSON 失败: {}", e)))?;
-        // file_id、thumbnail_file_id 必取；storage_source_id 可选，未来多源时可用
+        let content_json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // 纯文本 content，跳过
+        };
         let thumb_file_id = content_json.get("thumbnail_file_id")
-            .and_then(|v| v.as_str())
-            .or_else(|| content_json.get("file_id").and_then(|v| v.as_str()));
-        let thumb_file_id = match thumb_file_id.and_then(|s| s.parse::<u64>().ok()) {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-        let base_url = match base_url.as_deref().filter(|s| !s.is_empty()) {
-            Some(u) => u,
-            None => return Ok(()),
-        };
-        let uid_u64: u64 = user_id.parse().unwrap_or(0);
-        let http_guard = http_client.read().await;
-        let http = match http_guard.as_ref() {
-            Some(h) => h,
-            None => return Ok(()),
-        };
-        let url_resp = http.get_file_url(base_url, thumb_file_id, uid_u64).await?;
-        drop(http_guard);
-        let thumb_url = url_resp.file_url;
-        let yyyymm = yyyymm_from_timestamp_ms(created_at_ms);
-        let dir = message_files_dir(&data_dir, &user_id, &yyyymm, message_id);
-        tokio::fs::create_dir_all(&dir).await
-            .map_err(|e| PrivchatSDKError::IO(format!("创建消息文件目录失败: {}", e)))?;
-        let ext = url_resp.mime_type.as_deref()
-            .and_then(|m| if m.contains("png") { Some("png") } else { None })
-            .unwrap_or("jpg");
-        let thumb_path = dir.join(format!("thumb.{}", ext));
-        let http_guard2 = http_client.read().await;
-        let http2 = http_guard2.as_ref().ok_or_else(|| PrivchatSDKError::Other("HTTP 客户端未初始化".to_string()))?;
-        http2.download_file(&thumb_url, &thumb_path, None).await?;
-        info!("✅ 消息缩略图已下载: message_id={}, path={}", message_id, thumb_path.display());
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+            .or_else(|| content_json.get("file_id").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))));
+        if let Some(file_id) = thumb_file_id {
+            info!("消息缩略图 file_id: message_id={}, file_id={}", message_id, file_id);
+        }
         Ok(())
     }
 
@@ -7055,7 +7021,7 @@ mod tests {
         let sdk = PrivchatSDK::initialize(config).await.expect("sdk init");
         sdk.connect().await.expect("first connect");
 
-        use privchat_protocol::message::{DeviceInfo, DeviceType};
+        use privchat_protocol::protocol::{DeviceInfo, DeviceType};
         let device_info = DeviceInfo {
             device_id: format!("test-device-{}", user_id),
             device_type: DeviceType::Android,

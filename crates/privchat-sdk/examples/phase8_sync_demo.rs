@@ -68,9 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     
     println!("\n🔐 正在认证...");
-    let device_info = privchat_protocol::message::DeviceInfo {
+    let device_info = privchat_protocol::protocol::DeviceInfo {
         device_id: device_id.clone(),
-        device_type: privchat_protocol::message::DeviceType::Web,
+        device_type: privchat_protocol::protocol::DeviceType::Web,
         app_id: "phase8_demo".to_string(),
         push_token: None,
         push_channel: None,

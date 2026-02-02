@@ -116,10 +116,10 @@ impl MultiAccountManager {
         let device_id = uuid::Uuid::new_v4().to_string();
         
         // 构造 DeviceInfo
-        let device_info = privchat_protocol::message::DeviceInfo {
+        let device_info = privchat_protocol::protocol::DeviceInfo {
             device_id: device_id.clone(),
             device_name: format!("{}'s Device", name),
-            device_type: privchat_protocol::message::DeviceType::MacOS,
+            device_type: privchat_protocol::protocol::DeviceType::MacOS,
             app_id: "macos".to_string(),
             device_model: Some("MacBook Pro".to_string()),
             push_token: None,
@@ -215,15 +215,21 @@ impl MultiAccountManager {
                 format!("账号 {} 不存在", from_account)
             ))?;
         
-        // ✅ 从数据库查询对应的 channel_id（username 存储对方的 user_id）
+        // ✅ 从数据库查询对应的 channel_id；若无则通过 RPC 获取或创建私聊会话，禁止用 to_user_id 当 channel_id
         let channel_id = match sdk.storage().find_channel_id_by_user(to_user_id).await? {
             Some(ch_id) => {
                 info!("📤 [{}] 从数据库查询到 channel_id={} (user={}): {}", from_account, ch_id, to_user_id, content);
                 ch_id
             }
             None => {
-                warn!("⚠️ [{}] 未找到与 user_id={} 对应的 channel，使用 user_id 作为 channel_id", from_account, to_user_id);
-                to_user_id
+                info!("📤 [{}] 未找到与 user_id={} 对应的会话，调用 get_or_create_direct_channel", from_account, to_user_id);
+                let (ch_id, created) = sdk.get_or_create_direct_channel(to_user_id, None, None).await?;
+                if created {
+                    info!("📤 [{}] 已创建新私聊会话 channel_id={} (user={})", from_account, ch_id, to_user_id);
+                } else {
+                    info!("📤 [{}] 使用已有私聊会话 channel_id={} (user={})", from_account, ch_id, to_user_id);
+                }
+                ch_id
             }
         };
         
@@ -231,6 +237,23 @@ impl MultiAccountManager {
         let local_message_id = sdk.send_message(channel_id, content).await?;
         
         info!("✅ [{}] 消息已加入队列: {}", from_account, local_message_id);
+        Ok(local_message_id)
+    }
+    
+    /// 向指定频道/会话发送消息（channel_id 已知，如群组 ID）
+    /// 不经过 find_channel_id_by_user / get_or_create_direct_channel，直接发到该 channel_id
+    pub async fn send_message_to_channel(
+        &mut self,
+        from_account: &str,
+        channel_id: u64,
+        content: &str,
+    ) -> Result<u64> {
+        let sdk = self.sdks.get(from_account)
+            .ok_or_else(|| privchat_sdk::error::PrivchatSDKError::Other(
+                format!("账号 {} 不存在", from_account)
+            ))?;
+        let local_message_id = sdk.send_message(channel_id, content).await?;
+        info!("✅ [{}] 已向频道 {} 发送消息: {}", from_account, channel_id, local_message_id);
         Ok(local_message_id)
     }
     
@@ -868,10 +891,10 @@ impl MultiAccountManager {
             .map_err(|e| privchat_sdk::error::PrivchatSDKError::IO(format!("创建目录失败: {}", e)))?;
         
         // 构造 DeviceInfo
-        let device_info = privchat_protocol::message::DeviceInfo {
+        let device_info = privchat_protocol::protocol::DeviceInfo {
             device_id: device_id.clone(),
             device_name: format!("{}'s Login Device", account_name),
-            device_type: privchat_protocol::message::DeviceType::MacOS,
+            device_type: privchat_protocol::protocol::DeviceType::MacOS,
             app_id: "macos".to_string(),
             device_model: Some("MacBook Pro".to_string()),
             push_token: None,
