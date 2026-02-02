@@ -132,7 +132,7 @@ mod tests {
         let endpoint = ServerEndpoint {
             protocol: TransportProtocol::Tcp,
             host: "localhost".to_string(),
-            port: 8080,
+            port: 9001,
             path: None,
             use_tls: false,
         };

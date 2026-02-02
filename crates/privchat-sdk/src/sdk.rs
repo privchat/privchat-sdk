@@ -231,7 +231,7 @@ impl Default for ServerEndpoint {
         Self {
             protocol: TransportProtocol::Tcp,
             host: "localhost".to_string(),
-            port: 8080,
+            port: 9001,
             path: None,
             use_tls: false,
         }
@@ -245,21 +245,21 @@ impl Default for ServerConfig {
                 ServerEndpoint {
                     protocol: TransportProtocol::Quic,
                     host: "localhost".to_string(),
-                    port: 8803,
+                    port: 9001,
                     path: None,
                     use_tls: true, // QUIC强制TLS
                 },
                 ServerEndpoint {
                     protocol: TransportProtocol::Tcp,
                     host: "localhost".to_string(),
-                    port: 8801,
+                    port: 9001,
                     path: None,
                     use_tls: false, // TCP通常不使用TLS
                 },
                 ServerEndpoint {
                     protocol: TransportProtocol::WebSocket,
                     host: "localhost".to_string(),
-                    port: 8802,
+                    port: 9080,
                     path: Some("/".to_string()),
                     use_tls: true, // 默认使用wss
                 },
@@ -432,8 +432,8 @@ impl PrivchatConfigBuilder {
                 return Some((host.to_string(), port));
             }
         }
-        // 如果没有端口，使用默认端口
-        Some((host_port.to_string(), 8080))
+        // 如果没有端口，使用默认端口（PrivChat Gateway 9001）
+        Some((host_port.to_string(), 9001))
     }
 
     pub fn connection_timeout(mut self, timeout: u64) -> Self {
@@ -6891,7 +6891,7 @@ mod tests {
         
         let config = PrivchatConfig::builder()
             .data_dir(temp_dir.path())
-            .add_server("tcp://test.example.com:8080")
+            .add_server("tcp://test.example.com:9001")
             .build();
         
         let sdk = PrivchatSDK::initialize(config).await.unwrap();
@@ -6910,7 +6910,7 @@ mod tests {
         
         let config = PrivchatConfig::builder()
             .data_dir(temp_dir.path())
-            .add_server("tcp://test.example.com:8080")
+            .add_server("tcp://test.example.com:9001")
             .build();
         
         let sdk = PrivchatSDK::initialize(config).await.unwrap();
@@ -6933,9 +6933,9 @@ mod tests {
         let config = PrivchatConfig::builder()
             .data_dir("/tmp/test")
             .servers(vec![
-                "quic://127.0.0.1:8803",
-                "tcp://127.0.0.1:8801", 
-                "wss://127.0.0.1:8802/path"
+                "quic://127.0.0.1:9001",
+                "tcp://127.0.0.1:9001",
+                "wss://127.0.0.1:9080/path"
             ])
             .connection_timeout(60)
             .debug_mode(true)
@@ -6948,21 +6948,21 @@ mod tests {
         let quic_endpoint = &config.server_config.endpoints[0];
         assert_eq!(quic_endpoint.protocol, TransportProtocol::Quic);
         assert_eq!(quic_endpoint.host, "127.0.0.1");
-        assert_eq!(quic_endpoint.port, 8803);
+        assert_eq!(quic_endpoint.port, 9001);
         assert!(quic_endpoint.use_tls); // QUIC强制TLS
         
         // 检查TCP配置（第二个端点）
         let tcp_endpoint = &config.server_config.endpoints[1];
         assert_eq!(tcp_endpoint.protocol, TransportProtocol::Tcp);
         assert_eq!(tcp_endpoint.host, "127.0.0.1");
-        assert_eq!(tcp_endpoint.port, 8801);
+        assert_eq!(tcp_endpoint.port, 9001);
         assert!(!tcp_endpoint.use_tls); // TCP通常不使用TLS
         
         // 检查WebSocket配置（第三个端点）
         let ws_endpoint = &config.server_config.endpoints[2];
         assert_eq!(ws_endpoint.protocol, TransportProtocol::WebSocket);
         assert_eq!(ws_endpoint.host, "127.0.0.1");
-        assert_eq!(ws_endpoint.port, 8802);
+        assert_eq!(ws_endpoint.port, 9080);
         assert_eq!(ws_endpoint.path, Some("/path".to_string()));
         assert!(ws_endpoint.use_tls); // wss://使用TLS
         
@@ -6974,7 +6974,7 @@ mod tests {
     /// 需能连真实或 mock 服务端时运行。
     ///
     /// 环境变量（缺一则跳过）：
-    /// - `PRIVCHAT_TEST_SERVER_URL`: 服务端地址，如 `tcp://127.0.0.1:8801`
+    /// - `PRIVCHAT_TEST_SERVER_URL`: 服务端地址，如 `tcp://127.0.0.1:9001`
     /// - `PRIVCHAT_TEST_USER_ID`: 测试用户 ID
     /// - `PRIVCHAT_TEST_TOKEN`: 测试用户 JWT token
     ///

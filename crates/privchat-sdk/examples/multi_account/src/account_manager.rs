@@ -1,15 +1,14 @@
 //! 多账号管理器 - 管理多个 PrivchatSDK 实例
 
 use crate::types::AccountConfig;
-use crate::event_system::{EventBus, AccountEvent};
+use crate::event_system::EventBus;
 use privchat_sdk::{PrivchatSDK, PrivchatConfig, ServerEndpoint, TransportProtocol, ServerConfig};
 use privchat_sdk::error::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::PathBuf;
 use tempfile::TempDir;
-use tracing::{info, error, warn};
-use uuid::Uuid;
+use tracing::{info, warn};
 
 /// 多账号管理器
 pub struct MultiAccountManager {
@@ -46,21 +45,21 @@ impl MultiAccountManager {
             ServerEndpoint {
                 protocol: TransportProtocol::Quic,
                 host: "127.0.0.1".to_string(),
-                port: 8082,
+                port: 9001,
                 path: None,
                 use_tls: false,
             },
             ServerEndpoint {
                 protocol: TransportProtocol::Tcp,
                 host: "127.0.0.1".to_string(),
-                port: 8080,
+                port: 9001,
                 path: None,
                 use_tls: false,
             },
             ServerEndpoint {
                 protocol: TransportProtocol::WebSocket,
                 host: "127.0.0.1".to_string(),
-                port: 8081,
+                port: 9080,
                 path: Some("/".to_string()),
                 use_tls: false,
             },
@@ -298,7 +297,7 @@ impl MultiAccountManager {
     
     /// 验证所有账号已连接
     pub async fn verify_all_connected(&self) -> Result<()> {
-        for (account_name, sdk) in &self.sdks {
+        for (_account_name, sdk) in &self.sdks {
             if !sdk.is_connected().await {
                 return Err(privchat_sdk::error::PrivchatSDKError::NotConnected);
             }

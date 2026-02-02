@@ -225,7 +225,7 @@ impl FileHttpClient {
     
     /// 获取文件访问 URL（GET /api/app/files/{file_id}/url?user_id=xxx）
     /// 
-    /// * `base_url` - 文件 API 基础 URL（如 http://localhost:8083）
+    /// * `base_url` - 文件 API 基础 URL（如 http://localhost:9083）
     /// * `file_id` - 文件 ID
     /// * `user_id` - 当前用户 ID（用于鉴权）
     pub async fn get_file_url(

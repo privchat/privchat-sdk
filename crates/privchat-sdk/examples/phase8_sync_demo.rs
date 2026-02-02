@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ServerEndpoint {
                     protocol: TransportProtocol::Tcp,
                     host: "127.0.0.1".to_string(),
-                    port: 8080,
+                    port: 9001,
                     path: None,
                     use_tls: false,
                 }

@@ -47,21 +47,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .server_endpoint(ServerEndpoint {
             protocol: TransportProtocol::Quic,
             host: "127.0.0.1".to_string(),
-            port: 8082,
+            port: 9001,
             path: None,
             use_tls: false,
         })
         .server_endpoint(ServerEndpoint {
             protocol: TransportProtocol::Tcp,
             host: "127.0.0.1".to_string(),
-            port: 8080,
+            port: 9001,
             path: None,
             use_tls: false,
         })
         .server_endpoint(ServerEndpoint {
             protocol: TransportProtocol::WebSocket,
             host: "127.0.0.1".to_string(),
-            port: 8081,
+            port: 9080,
             path: Some("/".to_string()),
             use_tls: false,
         })
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let sdk = Arc::new(PrivchatSDK::new(config)?);
     println!("✅ SDK 初始化完成");
-    println!("   服务器端点: QUIC:8082, TCP:8080, WebSocket:8081\n");
+    println!("   服务器端点: QUIC:9001, TCP:9001, WebSocket:9080\n");
     
     // ===========================================================
     // 步骤 1: 注册账号（首次使用）

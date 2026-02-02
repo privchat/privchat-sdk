@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
             endpoints: vec![ServerEndpoint {
                 protocol: TransportProtocol::Quic,
                 host: "127.0.0.1".to_string(),
-                port: 8082,
+                port: 9001,
                 path: None,
                 use_tls: false,
             }],
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     let sdk = PrivchatSDK::initialize(config).await?;
     info!("✅ SDK 初始化成功");
     info!("   数据目录: {}", data_dir.display());
-    info!("   服务器: QUIC 127.0.0.1:8082\n");
+    info!("   服务器: QUIC 127.0.0.1:9001\n");
 
     // 步骤 2: 建立网络连接
     info!("📝 步骤 2: 建立网络连接");

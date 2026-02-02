@@ -346,7 +346,7 @@ mod tests {
         
         // 设置连接信息
         manager.set_protocol(ConnectionProtocol::Quic).await;
-        manager.set_server_info("127.0.0.1:8082".to_string(), true).await;
+        manager.set_server_info("127.0.0.1:9001".to_string(), true).await;
         manager.mark_connected().await;
         
         // 设置用户信息

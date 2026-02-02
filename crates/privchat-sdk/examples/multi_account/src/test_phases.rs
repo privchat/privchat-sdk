@@ -844,7 +844,7 @@ impl TestPhases {
                                 "file_id": "mock_file_id_123",
                                 "width": 1920,
                                 "height": 1080,
-                                "thumbnail_url": "http://localhost:8083/files/thumbnails/mock.jpg",
+                                "thumbnail_url": "http://localhost:9083/files/thumbnails/mock.jpg",
                                 "file_size": 102400,
                                 "mime_type": "image/jpeg"
                             }

@@ -27,7 +27,7 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             server_url: std::env::var("PRIVCHAT_SERVER_URL")
-                .unwrap_or_else(|_| "ws://127.0.0.1:8080".to_string()),
+                .unwrap_or_else(|_| "ws://127.0.0.1:9080".to_string()),
             user_a_username: "push_test_user_a".to_string(),
             user_a_password: "test_password_123".to_string(),
             user_b_username: "push_test_user_b".to_string(),

@@ -64,7 +64,7 @@ use std::sync::Arc;
 let endpoint = ServerEndpoint {
     protocol: TransportProtocol::Tcp,
     host: "127.0.0.1".to_string(),
-    port: 8080,
+    port: 9001,
     path: None,
     use_tls: false,
 };
@@ -149,7 +149,7 @@ val statusesJson = sdk.subscribePresence(listOf(100u, 200u, 300u))
 let endpoint = ServerEndpoint(
     protocol: .tcp,
     host: "127.0.0.1",
-    port: 8080,
+    port: 9001,
     path: nil,
     useTls: false
 )

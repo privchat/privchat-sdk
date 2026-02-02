@@ -81,8 +81,8 @@ fn parse_host_port(host_port: &str) -> Option<(String, u16)> {
             return Some((host.to_string(), port));
         }
     }
-    // 无端口时使用默认端口
-    Some((host_port.to_string(), 8080))
+    // 无端口时使用默认端口（PrivChat Gateway 9001）
+    Some((host_port.to_string(), 9001))
 }
 
 impl From<ServerEndpoint> for privchat_sdk::ServerEndpoint {

@@ -58,7 +58,7 @@ impl DeviceSimulator {
                     ServerEndpoint {
                         protocol: TransportProtocol::WebSocket,
                         host: server_url.replace("ws://", "").replace("http://", "").split(':').next().unwrap_or("127.0.0.1").to_string(),
-                        port: server_url.split(':').last().unwrap_or("8081").parse().unwrap_or(8081),
+                        port: server_url.split(':').last().unwrap_or("9080").parse().unwrap_or(9080),
                         path: Some("/".to_string()),
                         use_tls: false,
                     },
@@ -129,7 +129,7 @@ impl DeviceSimulator {
                     ServerEndpoint {
                         protocol: TransportProtocol::WebSocket,
                         host: server_url.replace("ws://", "").replace("http://", "").split(':').next().unwrap_or("127.0.0.1").to_string(),
-                        port: server_url.split(':').last().unwrap_or("8081").parse().unwrap_or(8081),
+                        port: server_url.split(':').last().unwrap_or("9080").parse().unwrap_or(9080),
                         path: Some("/".to_string()),
                         use_tls: false,
                     },

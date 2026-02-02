@@ -2,7 +2,6 @@
 
 use serde::Deserialize;
 use std::time::Duration;
-use uuid::Uuid;
 
 // ========== RPC 响应结构体 ==========
 

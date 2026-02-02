@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .server_endpoint(ServerEndpoint {
             protocol: TransportProtocol::WebSocket,
             host: "127.0.0.1".to_string(),
-            port: 8081,
+            port: 9080,
             path: Some("/".to_string()),
             use_tls: false,
         })
@@ -555,14 +555,14 @@ let config = PrivchatConfigBuilder::new()
     .server_endpoint(ServerEndpoint {
         protocol: TransportProtocol::Quic,
         host: "127.0.0.1".to_string(),
-        port: 8082,
+        port: 9001,
         path: None,
         use_tls: false,
     })
     .server_endpoint(ServerEndpoint {
         protocol: TransportProtocol::WebSocket,
         host: "127.0.0.1".to_string(),
-        port: 8081,
+        port: 9080,
         path: Some("/".to_string()),
         use_tls: false,
     })

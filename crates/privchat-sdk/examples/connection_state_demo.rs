@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ServerEndpoint {
                     protocol: TransportProtocol::Quic,
                     host: "127.0.0.1".to_string(),
-                    port: 8082,
+                    port: 9001,
                     path: None,
                     use_tls: false, // 测试环境
                 },
@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             println!("❌ 连接失败: {}\n", e);
-            println!("💡 请确保服务器正在运行（端口 8082）\n");
+            println!("💡 请确保服务器正在运行（端口 9001）\n");
         }
     }
     

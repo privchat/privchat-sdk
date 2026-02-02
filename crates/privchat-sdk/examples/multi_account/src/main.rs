@@ -1,10 +1,13 @@
 //! PrivChat 多账号协作测试 - V2版本（使用新SDK API）
-//! 
+//!
 //! V2版本：完整的20阶段测试，使用统一的 PrivchatSDK API
-//! 
+//!
 //! 历史版本：
 //! - realistic_test_phases.rs (原版 3900+行) - 保留作为参考
 //! - simple_test.rs (简化版 3阶段) - 用于快速验证
+
+#![allow(dead_code)]
+#![allow(unused)]
 
 mod account_manager;
 mod event_system;

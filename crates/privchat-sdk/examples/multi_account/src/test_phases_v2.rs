@@ -577,7 +577,7 @@ impl TestPhasesV2 {
     
     /// Phase 5: 消息接收验证
     pub async fn phase5_message_reception(
-        account_manager: &mut MultiAccountManager,
+        _account_manager: &mut MultiAccountManager,
     ) -> Result<PhaseResult> {
         info!("📨 Phase 5: 消息接收验证");
         
@@ -1167,7 +1167,7 @@ impl TestPhasesV2 {
     
     /// Phase 20: 非好友消息
     pub async fn phase20_stranger_messages(
-        account_manager: &mut MultiAccountManager,
+        _account_manager: &mut MultiAccountManager,
     ) -> Result<PhaseResult> {
         info!("👤 Phase 20: 非好友消息");
         
@@ -1432,7 +1432,7 @@ impl TestPhasesV2 {
     
     /// Phase 23: 系统通知（System Notifications）
     pub async fn phase23_system_notifications(
-        account_manager: &mut MultiAccountManager,
+        _account_manager: &mut MultiAccountManager,
     ) -> Result<PhaseResult> {
         info!("🔔 Phase 23: 系统通知测试");
         
@@ -1598,7 +1598,7 @@ impl TestPhasesV2 {
         let mut metrics = PhaseMetrics::default();
         
         // 获取用户ID
-        let alice_id = account_manager.get_user_id("alice").ok_or_else(|| {
+        let _alice_id = account_manager.get_user_id("alice").ok_or_else(|| {
             privchat_sdk::error::PrivchatSDKError::NotFound("Alice 用户ID未找到".to_string())
         })?;
         let bob_id = account_manager.get_user_id("bob").ok_or_else(|| {
@@ -1710,7 +1710,7 @@ impl TestPhasesV2 {
         info!("📊 Phase 22: 统计信息汇总");
         
         let start_time = Instant::now();
-        let mut metrics = PhaseMetrics::default();
+        let metrics = PhaseMetrics::default();
         
         // Step 1: 获取在线状态统计
         info!("📈 Step 1: 获取在线状态统计");
