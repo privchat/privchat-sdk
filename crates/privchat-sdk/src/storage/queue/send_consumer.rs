@@ -412,7 +412,7 @@ impl SendConsumerRunner {
         // 🔥 检查消息发送限流
         let is_group = task.message_data.channel_type != 0; // 假设 0 = 私聊，其他 = 群聊
         if let Err(wait_duration) = message_rate_limiter.check_send(is_group) {
-            info!(
+            debug!(
                 "Worker {} 消息发送受限（{}），等待 {}ms",
                 worker_id,
                 if is_group { "群聊" } else { "私聊" },

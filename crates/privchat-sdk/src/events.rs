@@ -633,9 +633,9 @@ impl EventManager {
             stats.last_event_time = Some(event.timestamp());
         }
 
-        // 广播事件
+        // 广播事件（无订阅者时 send 会失败，属正常场景如压测/无 UI 客户端，仅打 debug）
         if let Err(e) = self.sender.send(event.clone()) {
-            warn!("Failed to broadcast event: {}", e);
+            debug!("Failed to broadcast event (no active receivers): {}", e);
         }
 
         // 调用监听器

@@ -299,7 +299,8 @@ impl PrivchatClient {
                 let addr = Self::resolve_to_socket_addr(&endpoint.host, endpoint.port).await
                     .map_err(|e| PrivchatSDKError::Transport(format!("解析服务器地址失败 {}:{}: {}", endpoint.host, endpoint.port, e)))?;
                 let config = QuicClientConfig::new(&addr.to_string())
-                    .map_err(|e| PrivchatSDKError::Transport(format!("创建 QUIC 配置失败: {}", e)))?;
+                    .map_err(|e| PrivchatSDKError::Transport(format!("创建 QUIC 配置失败: {}", e)))?
+                    .with_connect_timeout(self.connection_timeout);
                 
                 TransportClientBuilder::new()
                     .with_protocol(config)

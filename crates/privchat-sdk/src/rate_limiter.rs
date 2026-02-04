@@ -189,7 +189,7 @@ impl MessageRateLimiter {
 
         if !success {
             if let Some(wait) = wait_duration {
-                warn!(
+                debug!(
                     "消息发送超限（{}），需要等待 {}ms",
                     if is_group { "群聊" } else { "私聊" },
                     wait.as_millis()
