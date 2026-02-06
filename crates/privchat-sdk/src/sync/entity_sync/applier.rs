@@ -1,9 +1,9 @@
 //! 同步结果应用器 - 将 SyncEntityItem 写入本地表（ENTITY_SYNC_V1 SyncApplier）
 
-use crate::error::{PrivchatSDKError, Result};
-use crate::storage::{StorageManager, entities};
-use privchat_protocol::rpc::sync::SyncEntityItem;
 use super::EntityType;
+use crate::error::{PrivchatSDKError, Result};
+use crate::storage::{entities, StorageManager};
+use privchat_protocol::rpc::sync::SyncEntityItem;
 use tracing::debug;
 
 /// 将单条同步项应用到本地 DB
@@ -21,10 +21,9 @@ pub async fn apply(
                 let _ = kv.delete(key.as_bytes()).await;
             }
         } else {
-            let payload = item
-                .payload
-                .as_ref()
-                .ok_or_else(|| PrivchatSDKError::Other("user_settings 非 tombstone 时应有 payload".to_string()))?;
+            let payload = item.payload.as_ref().ok_or_else(|| {
+                PrivchatSDKError::Other("user_settings 非 tombstone 时应有 payload".to_string())
+            })?;
             apply_user_settings(storage, &item.entity_id, payload).await?;
         }
         return Ok(());
@@ -39,10 +38,9 @@ pub async fn apply(
         return apply_deleted(storage, entity_type, _scope, entity_id).await;
     }
 
-    let payload = item
-        .payload
-        .as_ref()
-        .ok_or_else(|| PrivchatSDKError::Other("tombstone 外 deleted=false 时应有 payload".to_string()))?;
+    let payload = item.payload.as_ref().ok_or_else(|| {
+        PrivchatSDKError::Other("tombstone 外 deleted=false 时应有 payload".to_string())
+    })?;
 
     match entity_type {
         EntityType::Friend => apply_friend(storage, entity_id, payload).await,
@@ -70,13 +68,19 @@ async fn apply_deleted(
             if let Ok(Some(mut g)) = storage.get_group(entity_id).await {
                 g.is_dismissed = true;
                 if storage.save_groups(vec![g]).await.is_ok() {
-                    debug!("entity_sync applier: group tombstone entity_id={} 已标记 is_dismissed", entity_id);
+                    debug!(
+                        "entity_sync applier: group tombstone entity_id={} 已标记 is_dismissed",
+                        entity_id
+                    );
                 }
             }
         }
         EntityType::Channel => {
             // 频道删除：需 channel_type，当前 tombstone 无携带；仅打日志，后续可扩展
-            debug!("entity_sync applier: channel tombstone entity_id={}", entity_id);
+            debug!(
+                "entity_sync applier: channel tombstone entity_id={}",
+                entity_id
+            );
         }
         EntityType::GroupMember => {
             // scope 为逻辑范围（group_id），分页 cursor 形如 "cursor:xxx" 不作为 group_id
@@ -85,11 +89,17 @@ async fn apply_deleted(
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
             if group_id != 0 {
-                storage.delete_channel_member(group_id, 2, entity_id).await?;
+                storage
+                    .delete_channel_member(group_id, 2, entity_id)
+                    .await?;
             }
         }
         EntityType::User | EntityType::UserSettings | EntityType::UserBlock => {
-            debug!("entity_sync applier: {} tombstone entity_id={}", entity_type.as_str(), entity_id);
+            debug!(
+                "entity_sync applier: {} tombstone entity_id={}",
+                entity_type.as_str(),
+                entity_id
+            );
         }
     }
     Ok(())
@@ -143,7 +153,10 @@ fn parse_group_from_payload(group_id: u64, payload: &serde_json::Value) -> Resul
         .unwrap_or(now);
     Ok(entities::Group {
         group_id,
-        name: payload.get("name").and_then(|x| x.as_str()).map(String::from),
+        name: payload
+            .get("name")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         avatar: payload
             .get("avatar_url")
             .and_then(|x| x.as_str())
@@ -156,10 +169,7 @@ fn parse_group_from_payload(group_id: u64, payload: &serde_json::Value) -> Resul
     })
 }
 
-fn parse_user_from_payload(
-    user_id: u64,
-    v: Option<&serde_json::Value>,
-) -> Result<entities::User> {
+fn parse_user_from_payload(user_id: u64, v: Option<&serde_json::Value>) -> Result<entities::User> {
     let v = v.ok_or_else(|| PrivchatSDKError::Other("缺少 user 字段".to_string()))?;
     let now = chrono::Utc::now().timestamp_millis();
     Ok(entities::User {
@@ -167,7 +177,11 @@ fn parse_user_from_payload(
         username: v.get("username").and_then(|x| x.as_str()).map(String::from),
         nickname: v.get("nickname").and_then(|x| x.as_str()).map(String::from),
         alias: None,
-        avatar: v.get("avatar").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        avatar: v
+            .get("avatar")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         user_type: v.get("user_type").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
         is_deleted: false,
         channel_id: String::new(),
@@ -185,11 +199,11 @@ fn parse_friend_from_payload(
     Ok(entities::Friend {
         user_id,
         tags: v.get("tags").and_then(|x| x.as_str()).map(String::from),
-        is_pinned: v.get("is_pinned").and_then(|x| x.as_bool()).unwrap_or(false),
-        created_at: v
-            .get("created_at")
-            .and_then(|x| x.as_i64())
-            .unwrap_or(now),
+        is_pinned: v
+            .get("is_pinned")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        created_at: v.get("created_at").and_then(|x| x.as_i64()).unwrap_or(now),
         updated_at: now,
     })
 }
@@ -204,18 +218,38 @@ async fn apply_channel(
     Ok(())
 }
 
-fn parse_channel_from_payload(channel_id: u64, payload: &serde_json::Value) -> Result<entities::Channel> {
+fn parse_channel_from_payload(
+    channel_id: u64,
+    payload: &serde_json::Value,
+) -> Result<entities::Channel> {
     let now = chrono::Utc::now().timestamp_millis();
-    let channel_type = payload.get("channel_type").or(payload.get("type")).and_then(|x| x.as_i64()).unwrap_or(1) as i32;
-    let channel_name = payload.get("channel_name").or(payload.get("name")).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let avatar = payload.get("avatar").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let channel_type = payload
+        .get("channel_type")
+        .or(payload.get("type"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(1) as i32;
+    let channel_name = payload
+        .get("channel_name")
+        .or(payload.get("name"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let avatar = payload
+        .get("avatar")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     Ok(entities::Channel {
         id: None,
         channel_id,
         channel_type,
         last_local_message_id: 0,
         last_msg_timestamp: None,
-        unread_count: payload.get("unread_count").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
+        last_msg_content: String::new(),
+        unread_count: payload
+            .get("unread_count")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0) as i32,
         last_msg_pts: 0,
         show_nick: 0,
         username: String::new(),
@@ -255,9 +289,9 @@ async fn apply_group_member(
     user_id: u64,
     payload: &serde_json::Value,
 ) -> Result<()> {
-    let group_id = scope
-        .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| PrivchatSDKError::Other("group_member 同步缺少 scope (group_id)".to_string()))?;
+    let group_id = scope.and_then(|s| s.parse::<u64>().ok()).ok_or_else(|| {
+        PrivchatSDKError::Other("group_member 同步缺少 scope (group_id)".to_string())
+    })?;
     let member = parse_channel_member_from_payload(group_id, 2, user_id, payload)?;
     storage.save_channel_member(&member).await?;
     Ok(())
@@ -275,9 +309,19 @@ fn parse_channel_member_from_payload(
         channel_id,
         channel_type,
         member_uid,
-        member_name: payload.get("member_name").or(payload.get("nickname")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        member_name: payload
+            .get("member_name")
+            .or(payload.get("nickname"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         member_remark: String::new(),
-        member_avatar: payload.get("member_avatar").or(payload.get("avatar")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        member_avatar: payload
+            .get("member_avatar")
+            .or(payload.get("avatar"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         member_invite_uid: 0,
         role: payload.get("role").and_then(|x| x.as_i64()).unwrap_or(2) as i32,
         status: payload.get("status").and_then(|x| x.as_i64()).unwrap_or(0) as i32,

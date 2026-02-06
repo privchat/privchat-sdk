@@ -1,7 +1,7 @@
 # Privchat FFI - UniFFI 跨语言绑定层
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
-[![UniFFI](https://img.shields.io/badge/UniFFI-0.27-blue.svg)](https://mozilla.github.io/uniffi-rs/)
+[![UniFFI](https://img.shields.io/badge/UniFFI-0.31%2Fmain-blue.svg)](https://mozilla.github.io/uniffi-rs/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-green.svg)](LICENSE)
 
 完整的即时通讯 SDK FFI 层，使用 **UniFFI** 框架生成 Kotlin、Swift、Python、Ruby 等多语言绑定。
@@ -51,6 +51,17 @@
 │  └─ RPC 客户端: 服务端通信                  │
 └─────────────────────────────────────────────┘
 ```
+
+## UniFFI 版本
+
+当前使用 **UniFFI main**（`git = "https://github.com/mozilla/uniffi-rs", branch = "main"`），以获取最新修复（例如 [v0.31 中修复的 completing foreign futures 段错误 #2733](https://github.com/mozilla/uniffi-rs/pull/2733)）。  
+若需锁定到发布版，可在 `Cargo.toml` 中改回：
+
+```toml
+uniffi = { version = "0.31", features = ["tokio"] }
+```
+
+升级或切换 UniFFI 后需**重新生成 C/Swift 绑定**并重新编译各目标静态库，否则 Kotlin cinterop 可能 ABI 不一致。参见 [privchat-sdk-kotlin/README.md](../../../privchat-sdk-kotlin/README.md) 中「重新生成 C 头文件」步骤。
 
 ## 🚀 快速开始
 

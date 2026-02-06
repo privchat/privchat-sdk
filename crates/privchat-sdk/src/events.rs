@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// 发送消息选项（v1 冻结设计）
 /// 

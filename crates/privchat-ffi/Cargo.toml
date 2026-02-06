@@ -24,8 +24,9 @@ privchat-protocol = { path = "../../../privchat-protocol" }
 privchat-ffi-macros = { path = "../privchat-ffi-macros" }
 
 # UniFFI and async runtime
-# Upgraded to 0.31 for direct async/await support and type-safe callbacks
-uniffi = { version = "0.31", features = ["tokio"] }
+# Use main branch for latest fixes (e.g. segfault when completing foreign futures #2733 in 0.31).
+# To pin back to release: uniffi = { version = "0.31", features = ["tokio"] }
+uniffi = { git = "https://github.com/mozilla/uniffi-rs", branch = "main", features = ["tokio"] }
 async-compat = "0.2"
 
 # Error handling and utilities
@@ -45,7 +46,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 async-compat = "0.2"
 
 [build-dependencies]
-uniffi = { version = "0.31", features = ["build"] }
+uniffi = { git = "https://github.com/mozilla/uniffi-rs", branch = "main", features = ["build"] }
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS channel (
     flame_second INTEGER NOT NULL DEFAULT 0,
     device_flag INTEGER NOT NULL DEFAULT 0,
     parent_channel_id INTEGER NOT NULL DEFAULT 0,
-    parent_channel_type INT DEFAULT 0
+    parent_channel_type INT DEFAULT 0,
+    last_msg_content TEXT NOT NULL DEFAULT ''
 );
 
 -- 频道成员表 - 群组成员管理
@@ -321,4 +322,4 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 -- 插入当前版本信息
-INSERT INTO schema_version (version) VALUES ('20241119070909'); 
+INSERT INTO schema_version (version) VALUES ('20241119070909');

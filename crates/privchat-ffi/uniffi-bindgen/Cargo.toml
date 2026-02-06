@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-uniffi = { version = "0.31", features = ["cli"] }
+uniffi = { git = "https://github.com/mozilla/uniffi-rs", branch = "main", features = ["cli"] }
 
 [[bin]]
 name = "uniffi-bindgen"

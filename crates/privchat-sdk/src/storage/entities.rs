@@ -1,5 +1,5 @@
 //! 数据实体定义 - 对应数据库表结构
-//! 
+//!
 //! 这里定义了所有数据库表对应的 Rust 结构体，用于：
 //! - 类型安全的数据传输
 //! - 统一的数据表示
@@ -11,31 +11,31 @@ use std::fmt;
 /// 消息实体 - 对应 message 表
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
-    pub id: Option<i64>,  // 本地主键（SQLite 自增）
-    pub server_message_id: Option<u64>,  // 服务端消息ID（发送/同步成功后赋值）
-    pub pts: i64,  // ⭐ 改名：message_seq -> pts（服务器顺序，per-channel）
-    pub channel_id: u64,  // u64，与服务端一致
+    pub id: Option<i64>,                // 本地主键（SQLite 自增）
+    pub server_message_id: Option<u64>, // 服务端消息ID（发送/同步成功后赋值）
+    pub pts: i64,                       // ⭐ 改名：message_seq -> pts（服务器顺序，per-channel）
+    pub channel_id: u64,                // u64，与服务端一致
     pub channel_type: i32,
     pub timestamp: Option<i64>,
-    pub from_uid: u64,  // u64，与服务端一致
+    pub from_uid: u64, // u64，与服务端一致
     pub message_type: i32,
     pub content: String,
     pub status: i32,
     pub voice_status: i32,
-    pub created_at: i64,  // 毫秒时间戳（与服务端一致）
-    pub updated_at: i64,  // 毫秒时间戳（与服务端一致）
+    pub created_at: i64, // 毫秒时间戳（与服务端一致）
+    pub updated_at: i64, // 毫秒时间戳（与服务端一致）
     pub searchable_word: String,
     /// 客户端消息编号（local_message_id）
-    /// 
+    ///
     /// ⚠️ 重要：local_message_id 设计原则
-    /// 
+    ///
     /// local_message_id is a local transport identifier,
     /// it MUST NOT be persisted, synced, or relied on across devices.
-    /// 
+    ///
     /// - 作用域：仅发送端本地
     /// - 用途：发送队列、重试匹配、ACK 匹配、失败回滚
     /// - 禁止：进入 FFI Message Model、跨端同步、业务逻辑依赖
-    /// 
+    ///
     /// 注意：这是 SDK 内部存储字段，用于本地数据库存储和发送队列管理。
     /// FFI 层的 Message 结构体不包含此字段。
     pub local_message_id: u64,
@@ -56,20 +56,21 @@ pub struct Message {
     // 消息撤回状态
     pub revoked: i16,
     pub revoked_at: i64,
-    pub revoked_by: Option<u64>,  // 撤回者用户ID（u64），可选（客户端可能不需要知道是谁撤回的）
+    pub revoked_by: Option<u64>, // 撤回者用户ID（u64），可选（客户端可能不需要知道是谁撤回的）
 }
 
 /// 频道实体 - 对应 channel 表
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     pub id: Option<i64>,
-    pub channel_id: u64,  // u64，与服务端一致
+    pub channel_id: u64, // u64，与服务端一致
     pub channel_type: i32,
     // 会话列表相关字段
     pub last_local_message_id: u64,
     pub last_msg_timestamp: Option<i64>,
+    pub last_msg_content: String, // 最后消息内容预览
     pub unread_count: i32,
-    pub last_msg_pts: i64,  // ⭐ last_msg_seq -> last_msg_pts（会话最后消息的 pts）
+    pub last_msg_pts: i64, // ⭐ last_msg_seq -> last_msg_pts（会话最后消息的 pts）
     // 频道信息字段
     pub show_nick: i32,
     pub username: String,
@@ -91,8 +92,8 @@ pub struct Channel {
     pub avatar: String,
     pub category: String,
     pub extra: String,
-    pub created_at: i64,  // 毫秒时间戳（与服务端一致）
-    pub updated_at: i64,  // 毫秒时间戳（与服务端一致）
+    pub created_at: i64, // 毫秒时间戳（与服务端一致）
+    pub updated_at: i64, // 毫秒时间戳（与服务端一致）
     pub avatar_cache_key: String,
     pub remote_extra: Option<String>,
     // 阅后即焚功能
@@ -100,7 +101,7 @@ pub struct Channel {
     pub flame_second: i32,
     pub device_flag: i32,
     // 父频道支持
-    pub parent_channel_id: u64,  // u64，与服务端一致
+    pub parent_channel_id: u64, // u64，与服务端一致
     pub parent_channel_type: i32,
 }
 
@@ -108,20 +109,20 @@ pub struct Channel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelMember {
     pub id: Option<i64>,
-    pub channel_id: u64,  // u64，与服务端一致
+    pub channel_id: u64, // u64，与服务端一致
     pub channel_type: i32,
-    pub member_uid: u64,  // u64，与服务端一致
+    pub member_uid: u64, // u64，与服务端一致
     pub member_name: String,
     pub member_remark: String,
     pub member_avatar: String,
-    pub member_invite_uid: u64,  // u64，与服务端一致
+    pub member_invite_uid: u64, // u64，与服务端一致
     pub role: i32,
     pub status: i32,
     pub is_deleted: i32,
     pub robot: i32,
     pub version: i64,
-    pub created_at: i64,  // 毫秒时间戳（与服务端一致）
-    pub updated_at: i64,  // 毫秒时间戳（与服务端一致）
+    pub created_at: i64, // 毫秒时间戳（与服务端一致）
+    pub updated_at: i64, // 毫秒时间戳（与服务端一致）
     pub extra: String,
     pub forbidden_expiration_time: i64,
     pub member_avatar_cache_key: String,
@@ -131,14 +132,14 @@ pub struct ChannelMember {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageExtra {
     pub id: Option<i64>,
-    pub message_id: Option<u64>,  // u64，与服务端一致
-    pub channel_id: Option<u64>,  // u64，与服务端一致
+    pub message_id: Option<u64>, // u64，与服务端一致
+    pub channel_id: Option<u64>, // u64，与服务端一致
     pub channel_type: i16,
     pub readed: i32,
     pub readed_count: i32,
     pub unread_count: i32,
     pub revoke: i16,
-    pub revoker: Option<u64>,  // u64，与服务端一致
+    pub revoker: Option<u64>, // u64，与服务端一致
     pub extra_version: i64,
     pub is_mutual_deleted: i16,
     pub content_edit: Option<String>,
@@ -151,12 +152,12 @@ pub struct MessageExtra {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageReaction {
     pub id: Option<i64>,
-    pub channel_id: u64,  // u64，与服务端一致
+    pub channel_id: u64, // u64，与服务端一致
     pub channel_type: i32,
-    pub uid: u64,  // u64，与服务端一致
+    pub uid: u64, // u64，与服务端一致
     pub name: String,
     pub emoji: String,
-    pub message_id: u64,  // u64，与服务端一致
+    pub message_id: u64, // u64，与服务端一致
     pub seq: i64,
     pub is_deleted: i32,
     pub created_at: Option<String>,
@@ -167,11 +168,11 @@ pub struct MessageReaction {
 pub struct Reminder {
     pub id: Option<i64>,
     pub reminder_id: i32,
-    pub message_id: u64,  // u64，与服务端一致
-    pub pts: u64,  // ⭐ message_seq -> pts（消息顺序）
-    pub channel_id: u64,  // u64，与服务端一致
+    pub message_id: u64, // u64，与服务端一致
+    pub pts: u64,        // ⭐ message_seq -> pts（消息顺序）
+    pub channel_id: u64, // u64，与服务端一致
     pub channel_type: i16,
-    pub uid: u64,  // u64，与服务端一致
+    pub uid: u64, // u64，与服务端一致
     pub reminder_type: i32,
     pub text: String,
     pub data: String,
@@ -179,7 +180,7 @@ pub struct Reminder {
     pub version: i64,
     pub done: i16,
     pub need_upload: i16,
-    pub publisher: Option<u64>,  // u64，与服务端一致
+    pub publisher: Option<u64>, // u64，与服务端一致
 }
 
 /// 机器人实体 - 对应 robot 表
@@ -193,7 +194,7 @@ pub struct Robot {
     pub placeholder: String,
     pub username: String,
     pub created_at: Option<String>,
-    pub updated_at: Option<i64>,  // 毫秒时间戳（与服务端一致）
+    pub updated_at: Option<i64>, // 毫秒时间戳（与服务端一致）
 }
 
 /// 机器人菜单实体 - 对应 robot_menu 表
@@ -205,17 +206,17 @@ pub struct RobotMenu {
     pub remark: String,
     pub menu_type: String,
     pub created_at: Option<String>,
-    pub updated_at: Option<i64>,  // 毫秒时间戳（与服务端一致）
+    pub updated_at: Option<i64>, // 毫秒时间戳（与服务端一致）
 }
 
 /// 会话扩展实体 - 对应 channel_extra 表
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelExtra {
     pub id: Option<i64>,
-    pub channel_id: u64,  // u64，与服务端一致
+    pub channel_id: u64, // u64，与服务端一致
     pub channel_type: i16,
     pub browse_to: u64,
-    pub keep_pts: u64,  // ⭐ keep_message_seq -> keep_pts（保持的消息位置）
+    pub keep_pts: u64, // ⭐ keep_message_seq -> keep_pts（保持的消息位置）
     pub keep_offset_y: i32,
     pub draft: String,
     pub version: i64,
@@ -227,9 +228,9 @@ pub struct ChannelExtra {
 /// 消息查询参数
 #[derive(Debug, Clone, Default)]
 pub struct MessageQuery {
-    pub channel_id: Option<u64>,  // u64，与服务端一致
+    pub channel_id: Option<u64>, // u64，与服务端一致
     pub channel_type: Option<i32>,
-    pub from_uid: Option<u64>,  // u64，与服务端一致
+    pub from_uid: Option<u64>, // u64，与服务端一致
     pub message_type: Option<i32>,
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
@@ -242,7 +243,7 @@ pub struct MessageQuery {
 /// 频道查询参数
 #[derive(Debug, Clone, Default)]
 pub struct ChannelQuery {
-    pub channel_id: Option<u64>,  // u64，与服务端一致
+    pub channel_id: Option<u64>, // u64，与服务端一致
     pub channel_type: Option<i32>,
     pub status: Option<i32>,
     pub is_deleted: Option<i32>,
@@ -278,86 +279,76 @@ impl<T> PageResult<T> {
 // 频道类型：仅 1=私聊、2=群聊；客服/系统视为私聊（对端为机器人/系统用户），不再单独枚举。
 
 /// 消息状态枚举
-/// 
+///
 /// 状态流转图：
 /// Draft → Sending → Sent → Delivered → Read
 ///           ↓        ↓
 ///       Retrying → Failed
 ///           ↓
 ///       Expired
-/// 
+///
 /// 特殊状态：
 /// - Revoked: 可以从 Sent/Delivered/Read 状态转换而来
 /// - Burned: 阅后即焚消息的最终状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(i32)]
 pub enum MessageStatus {
-    Draft = 0,         // 草稿
-    Sending = 1,       // 发送中
-    Sent = 2,          // 已发送
-    Delivered = 3,     // 已投递
-    Read = 4,          // 已读
-    Failed = 5,        // 发送失败
-    Revoked = 6,       // 已撤回
-    Burned = 7,        // 已焚烧
-    Retrying = 8,      // 重试中
-    Expired = 9,       // 过期
-    Received = 10,     // 已接收
+    Draft = 0,     // 草稿
+    Sending = 1,   // 发送中
+    Sent = 2,      // 已发送
+    Delivered = 3, // 已投递
+    Read = 4,      // 已读
+    Failed = 5,    // 发送失败
+    Revoked = 6,   // 已撤回
+    Burned = 7,    // 已焚烧
+    Retrying = 8,  // 重试中
+    Expired = 9,   // 过期
+    Received = 10, // 已接收
 }
 
 impl MessageStatus {
     /// 检查状态是否为最终状态（不能再转换）
     pub fn is_final_state(&self) -> bool {
-        matches!(self, 
-            MessageStatus::Read | 
-            MessageStatus::Revoked | 
-            MessageStatus::Burned
+        matches!(
+            self,
+            MessageStatus::Read | MessageStatus::Revoked | MessageStatus::Burned
         )
     }
-    
+
     /// 检查状态是否表示发送成功
     pub fn is_sent_successfully(&self) -> bool {
-        matches!(self, 
-            MessageStatus::Sent | 
-            MessageStatus::Delivered | 
-            MessageStatus::Read
+        matches!(
+            self,
+            MessageStatus::Sent | MessageStatus::Delivered | MessageStatus::Read
         )
     }
-    
+
     /// 检查状态是否表示发送失败
     pub fn is_send_failed(&self) -> bool {
-        matches!(self, 
-            MessageStatus::Failed | 
-            MessageStatus::Expired
-        )
+        matches!(self, MessageStatus::Failed | MessageStatus::Expired)
     }
-    
+
     /// 检查状态是否需要网络处理
     pub fn needs_network_processing(&self) -> bool {
-        matches!(self, 
-            MessageStatus::Sending | 
-            MessageStatus::Retrying
-        )
+        matches!(self, MessageStatus::Sending | MessageStatus::Retrying)
     }
-    
+
     /// 检查状态是否可以重试
     pub fn can_retry(&self) -> bool {
-        matches!(self, 
-            MessageStatus::Failed | 
-            MessageStatus::Expired |
-            MessageStatus::Retrying
+        matches!(
+            self,
+            MessageStatus::Failed | MessageStatus::Expired | MessageStatus::Retrying
         )
     }
-    
+
     /// 检查状态是否可以撤回
     pub fn can_revoke(&self) -> bool {
-        matches!(self, 
-            MessageStatus::Sent | 
-            MessageStatus::Delivered | 
-            MessageStatus::Read
+        matches!(
+            self,
+            MessageStatus::Sent | MessageStatus::Delivered | MessageStatus::Read
         )
     }
-    
+
     /// 获取状态的显示名称
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -374,7 +365,7 @@ impl MessageStatus {
             MessageStatus::Received => "已接收",
         }
     }
-    
+
     /// 从数据库整数值转换
     pub fn from_i32(value: i32) -> Option<Self> {
         match value {
@@ -392,7 +383,7 @@ impl MessageStatus {
             _ => None,
         }
     }
-    
+
     /// 转换为数据库整数值
     pub fn to_i32(&self) -> i32 {
         *self as i32
@@ -421,7 +412,11 @@ pub struct StatusTransitionError {
 
 impl fmt::Display for StatusTransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "不能从状态 '{}' 转换到 '{}': {}", self.from, self.to, self.reason)
+        write!(
+            f,
+            "不能从状态 '{}' 转换到 '{}': {}",
+            self.from, self.to, self.reason
+        )
     }
 }
 
@@ -443,26 +438,25 @@ impl StatusTransition {
             })
         }
     }
-    
+
     /// 验证状态转换并提供详细原因
     pub fn validate_with_reason(
-        from: MessageStatus, 
+        from: MessageStatus,
         to: MessageStatus,
-        context: Option<&str>
+        context: Option<&str>,
     ) -> Result<(), StatusTransitionError> {
         if from.can_transition_to(to) {
             Ok(())
         } else {
             let reason = match (from, to) {
-                (MessageStatus::Read, MessageStatus::Sending) => 
-                    "已读消息不能重新发送".to_string(),
-                (MessageStatus::Revoked, _) => 
-                    "已撤回的消息不能改变状态".to_string(),
-                (MessageStatus::Burned, _) => 
-                    "已焚烧的消息不能改变状态".to_string(),
-                _ => context.map(|c| c.to_string()).unwrap_or_else(|| "无效的状态转换".to_string()),
+                (MessageStatus::Read, MessageStatus::Sending) => "已读消息不能重新发送".to_string(),
+                (MessageStatus::Revoked, _) => "已撤回的消息不能改变状态".to_string(),
+                (MessageStatus::Burned, _) => "已焚烧的消息不能改变状态".to_string(),
+                _ => context
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "无效的状态转换".to_string()),
             };
-            
+
             Err(StatusTransitionError { from, to, reason })
         }
     }
@@ -472,9 +466,9 @@ impl StatusTransition {
 /// 与服务端保持一致：0: Owner, 1: Admin, 2: Member
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberRole {
-    Owner = 0,       // 群主
-    Admin = 1,       // 管理员
-    Member = 2,      // 普通成员
+    Owner = 0,  // 群主
+    Admin = 1,  // 管理员
+    Member = 2, // 普通成员
 }
 
 /// 群成员状态：0=active, 1=left, 2=kicked

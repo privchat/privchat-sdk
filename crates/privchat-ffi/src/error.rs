@@ -81,6 +81,12 @@ impl PrivchatError {
     }
 }
 
+/// 保证错误文案非空，避免 Kotlin/iOS 上显示空白
+fn ensure_non_empty(s: String, fallback: &'static str) -> String {
+    let t = s.trim();
+    if t.is_empty() { fallback.to_string() } else { s }
+}
+
 /// Convert SDK errors to FFI errors (UniFFI 0.31: with detailed information)
 impl From<privchat_sdk::PrivchatSDKError> for PrivchatError {
     fn from(error: privchat_sdk::PrivchatSDKError) -> Self {
@@ -94,77 +100,58 @@ impl From<privchat_sdk::PrivchatSDKError> for PrivchatError {
             PrivchatSDKError::Rpc { code, message } => {
                 use privchat_protocol::ErrorCode;
                 
-                // 根据错误码类型映射到不同的 FFI 错误类型
                 let error_code = code.code() as i32;
+                let msg = ensure_non_empty(message, "RPC error");
                 
-                // 认证相关错误
                 if code == ErrorCode::AuthRequired
                     || code == ErrorCode::InvalidToken
                     || code == ErrorCode::TokenExpired
                     || code == ErrorCode::TokenRevoked {
-                    Self::Authentication {
-                        reason: message,
-                    }
+                    Self::Authentication { reason: msg }
                 }
-                // 网络相关错误
-                else if code == ErrorCode::NetworkError
-                    || code == ErrorCode::Timeout {
-                    Self::Network {
-                        msg: message,
-                        code: error_code,
-                    }
+                else if code == ErrorCode::NetworkError || code == ErrorCode::Timeout {
+                    Self::Network { msg, code: error_code }
                 }
-                // 参数错误
                 else if code == ErrorCode::InvalidParams
                     || code == ErrorCode::MissingRequiredParam
                     || code == ErrorCode::InvalidParamType {
                     Self::InvalidParameter {
                         field: "parameter".to_string(),
-                        msg: message,
+                        msg,
                     }
                 }
-                // 其他 RPC 错误使用 Network 类型，但包含错误码
                 else {
-                    Self::Network {
-                        msg: message,
-                        code: error_code,
-                    }
+                    Self::Network { msg, code: error_code }
                 }
             },
             PrivchatSDKError::Database(e) => Self::Database {
-                msg: e.to_string(),
+                msg: ensure_non_empty(e.to_string(), "Database error"),
             },
             PrivchatSDKError::IO(e) => Self::Generic {
-                msg: e.to_string(),
+                msg: ensure_non_empty(e.to_string(), "IO error"),
             },
             PrivchatSDKError::Serialization(e) => Self::Generic {
                 msg: format!("Serialization error: {}", e),
             },
             PrivchatSDKError::Timeout(e) => {
-                // Timeout error may be a string or Duration, handle both cases
-                let timeout_secs = if let Ok(duration) = e.parse::<u64>() {
-                    duration
-                } else {
-                    // Default to 30 seconds if cannot parse
-                    30
-                };
+                let timeout_secs = if let Ok(duration) = e.parse::<u64>() { duration } else { 30 };
                 Self::Timeout { timeout_secs }
             }
             PrivchatSDKError::Transport(e) => Self::Network {
-                msg: e.to_string(),
-                code: -1, // Default code, can be enhanced
+                msg: ensure_non_empty(e.to_string(), "Transport error"),
+                code: -1,
             },
             PrivchatSDKError::Auth(e) => Self::Authentication {
-                reason: e.to_string(),
+                reason: ensure_non_empty(e.to_string(), "Authentication failed"),
             },
             PrivchatSDKError::InvalidInput(e) => Self::InvalidParameter {
                 field: "input".to_string(),
-                msg: e.to_string(),
+                msg: ensure_non_empty(e.to_string(), "Invalid input"),
             },
             PrivchatSDKError::NotConnected => Self::Disconnected,
             PrivchatSDKError::NotInitialized(_) => Self::NotInitialized,
             _ => Self::Generic {
-                msg: error_msg,
+                msg: ensure_non_empty(error_msg, "Unknown error"),
             },
         }
     }
@@ -194,9 +181,9 @@ impl PrivchatError {
         matches!(self, Self::Authentication { .. })
     }
     
-    /// Get error message (for backward compatibility)
+    /// Get error message (for backward compatibility)，保证非空
     pub fn message(&self) -> String {
-        match self {
+        let s = match self {
             Self::Generic { msg } => msg.clone(),
             Self::Database { msg } => msg.clone(),
             Self::Network { msg, .. } => msg.clone(),
@@ -205,6 +192,7 @@ impl PrivchatError {
             Self::Timeout { timeout_secs } => format!("Operation timed out after {}s", timeout_secs),
             Self::Disconnected => "Client is disconnected".to_string(),
             Self::NotInitialized => "SDK not initialized".to_string(),
-        }
+        };
+        ensure_non_empty(s, "Unknown error")
     }
 }
