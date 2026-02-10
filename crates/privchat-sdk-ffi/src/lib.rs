@@ -20,8 +20,10 @@ use privchat_protocol::rpc::{
     MessageStatusCountResponse,
     AccountPrivacyGetRequest, AccountPrivacyGetResponse, AccountPrivacyUpdateRequest, AccountPrivacyUpdateResponse,
     QRCodeGenerateRequest, QRCodeGenerateResponse, QRCodeResolveRequest, QRCodeResolveResponse, QRCodeListRequest,
-    UserQRCodeGetRequest, UserQRCodeGenerateRequest, UserQRCodeRefreshRequest, QRCodeRefreshRequest,
-    QRCodeRevokeRequest, AccountSearchByQRCodeRequest, AccountUserDetailRequest, AccountUserDetailResponse,
+    QRCodeListResponse, UserQRCodeGetRequest, UserQRCodeGetResponse, UserQRCodeGenerateRequest,
+    UserQRCodeGenerateResponse, UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
+    QRCodeRefreshRequest, QRCodeRefreshResponse, QRCodeRevokeRequest, QRCodeRevokeResponse,
+    AccountSearchByQRCodeRequest, AccountUserDetailRequest, AccountUserDetailResponse,
     AccountUserShareCardRequest, AccountUserShareCardResponse, AccountUserUpdateRequest,
     AccountUserUpdateResponse, GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberRemoveRequest,
     GroupMemberRemoveResponse, GroupMemberLeaveRequest, GroupMemberLeaveResponse, GroupMemberMuteRequest,
@@ -35,7 +37,6 @@ use privchat_protocol::rpc::{
     BatchGetChannelPtsRequest, BatchGetChannelPtsResponse, FileRequestUploadTokenRequest,
     FileRequestUploadTokenResponse, FileUploadCallbackRequest, FileUploadCallbackResponse,
     ChannelBroadcastSubscribeRequest, ChannelBroadcastSubscribeResponse,
-    AuthLogoutRequest, AuthLogoutResponse, AuthRefreshRequest, AuthRefreshResponse,
     AccountProfileGetRequest, AccountProfileGetResponse, AccountProfileUpdateRequest,
     AccountProfileUpdateResponse,
     ChannelBroadcastCreateRequest, ChannelBroadcastCreateResponse, ChannelBroadcastListRequest,
@@ -46,7 +47,7 @@ use privchat_protocol::rpc::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -78,6 +79,26 @@ use privchat_sdk::{
 };
 
 const USER_SETTINGS_KEY: &str = "__user_settings_json__";
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthLogoutRequest {}
+
+type AuthLogoutResponse = bool;
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthRefreshRequest {
+    refresh_token: String,
+    device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AuthRefreshResponse {
+    user_id: u64,
+    token: String,
+    refresh_token: Option<String>,
+    expires_at: String,
+    device_id: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ChannelPrefsState {
@@ -193,43 +214,134 @@ pub struct SeenByEntry {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ProfileView {
-    pub profile_json: String,
+    pub status: String,
+    pub action: String,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ProfileUpdateInput {
-    pub fields_json: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub bio: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PrivacySettingsView {
-    pub settings_json: String,
+    pub user_id: u64,
+    pub allow_add_by_group: bool,
+    pub allow_search_by_phone: bool,
+    pub allow_search_by_username: bool,
+    pub allow_search_by_email: bool,
+    pub allow_search_by_qrcode: bool,
+    pub allow_view_by_non_friend: bool,
+    pub allow_receive_message_from_non_friend: bool,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AccountUserDetailView {
-    pub user_json: String,
+    pub user_id: u64,
+    pub username: String,
+    pub nickname: String,
+    pub avatar_url: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub user_type: i16,
+    pub is_friend: bool,
+    pub can_send_message: bool,
+    pub source_type: String,
+    pub source_id: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct QrCodeJsonView {
-    pub json: String,
+pub struct QrCodeListView {
+    pub qr_keys: Vec<QrCodeEntryView>,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct QrCodeEntryView {
+    pub qr_key: String,
+    pub qr_code: String,
+    pub qr_type: String,
+    pub target_id: String,
+    pub created_at: String,
+    pub expire_at: Option<String>,
+    pub used_count: u32,
+    pub max_usage: Option<u32>,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct QrCodeRefreshView {
+    pub old_qr_key: String,
+    pub new_qr_key: String,
+    pub new_qr_code: String,
+    pub revoked_at: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct QrCodeRevokeView {
+    pub success: bool,
+    pub qr_key: String,
+    pub revoked_at: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UserQrCodeGetView {
+    pub qr_key: String,
+    pub qr_code: String,
+    pub created_at: String,
+    pub used_count: u32,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UserQrCodeGenerateView {
+    pub qr_key: String,
+    pub qr_code: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GroupSettingsView {
-    pub settings_json: String,
+    pub group_id: u64,
+    pub join_need_approval: bool,
+    pub member_can_invite: bool,
+    pub all_muted: bool,
+    pub max_members: u64,
+    pub announcement: Option<String>,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GroupMuteAllView {
-    pub response_json: String,
+    pub success: bool,
+    pub group_id: String,
+    pub all_muted: bool,
+    pub message: String,
+    pub operator_id: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GroupApprovalListView {
-    pub approvals_json: String,
+    pub group_id: String,
+    pub approvals: Vec<GroupApprovalItemView>,
     pub total: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GroupApprovalItemView {
+    pub request_id: String,
+    pub user_id: u64,
+    pub inviter_id: Option<String>,
+    pub qr_code_id: Option<String>,
+    pub message: Option<String>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -298,9 +410,15 @@ pub struct SyncSubmitInput {
     pub channel_type: u8,
     pub last_pts: u64,
     pub command_type: String,
-    pub payload_json: String,
+    pub payload_entries: Vec<SyncPayloadEntry>,
     pub client_timestamp: i64,
     pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SyncPayloadEntry {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -393,12 +511,16 @@ pub struct BatchGetChannelPtsView {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChannelBroadcastCreateInput {
-    pub fields_json: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChannelBroadcastCreateView {
-    pub response_json: String,
+    pub status: String,
+    pub action: String,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -408,42 +530,52 @@ pub struct ChannelBroadcastSubscribeInput {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChannelBroadcastListInput {
-    pub fields_json: String,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChannelBroadcastListView {
-    pub response_json: String,
+    pub status: String,
+    pub action: String,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChannelContentPublishInput {
-    pub fields_json: String,
+    pub channel_id: u64,
+    pub content: String,
+    pub title: Option<String>,
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChannelContentPublishView {
-    pub response_json: String,
+    pub status: String,
+    pub action: String,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChannelContentListInput {
-    pub fields_json: String,
+    pub channel_id: u64,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChannelContentListView {
-    pub response_json: String,
+    pub status: String,
+    pub action: String,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct StickerPackageListInput {
-    pub fields_json: String,
-}
+pub struct StickerPackageListInput {}
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct StickerPackageListView {
-    pub response_json: String,
+    pub packages: Vec<StickerPackageInfoView>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -453,7 +585,30 @@ pub struct StickerPackageDetailInput {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct StickerPackageDetailView {
-    pub response_json: String,
+    pub package: StickerPackageInfoView,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct StickerPackageInfoView {
+    pub package_id: String,
+    pub name: String,
+    pub thumbnail_url: String,
+    pub author: String,
+    pub description: String,
+    pub sticker_count: u64,
+    pub stickers: Vec<StickerInfoView>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct StickerInfoView {
+    pub sticker_id: String,
+    pub package_id: String,
+    pub image_url: String,
+    pub alt_text: String,
+    pub emoji: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub mime_type: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -497,18 +652,30 @@ pub struct GroupMemberRemoteList {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MessageReactionListView {
-    pub reactions_json: String,
+    pub success: bool,
+    pub total_count: u64,
+    pub reactions: Vec<MessageReactionEmojiUsersView>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MessageReactionStatsView {
-    pub stats_json: String,
+    pub success: bool,
+    pub total_count: u64,
+    pub reactions: Vec<MessageReactionEmojiUsersView>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ReactionsBatchItemView {
     pub server_message_id: u64,
-    pub reactions_json: String,
+    pub success: bool,
+    pub total_count: u64,
+    pub reactions: Vec<MessageReactionEmojiUsersView>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageReactionEmojiUsersView {
+    pub emoji: String,
+    pub user_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -540,14 +707,38 @@ pub struct DevicePushUpdateView {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MessageHistoryView {
-    pub messages_json: String,
+    pub messages: Vec<MessageHistoryItemView>,
     pub has_more: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageHistoryItemView {
+    pub message_id: u64,
+    pub channel_id: u64,
+    pub sender_id: u64,
+    pub content: String,
+    pub message_type: String,
+    pub timestamp: String,
+    pub reply_to_message_id: Option<u64>,
+    pub metadata_json: Option<String>,
+    pub revoked: bool,
+    pub revoked_at: Option<i64>,
+    pub revoked_by: Option<u64>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct MessageReadListView {
-    pub readers_json: String,
+    pub readers: Vec<MessageReadUserView>,
     pub total: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageReadUserView {
+    pub user_id: u64,
+    pub username: Option<String>,
+    pub nickname: Option<String>,
+    pub avatar_url: Option<String>,
+    pub read_at: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -581,7 +772,7 @@ pub struct QrCodeResolveView {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AccountSearchResultView {
-    pub users_json: String,
+    pub users: Vec<SearchUserEntry>,
     pub total: u64,
     pub query: String,
 }
@@ -1346,63 +1537,6 @@ fn parse_read_list_user_ids(raw: &str) -> Vec<u64> {
         .collect()
 }
 
-fn parse_profile_user(raw: &str) -> Option<SdkUpsertUserInput> {
-    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let data = json.get("data").unwrap_or(&json);
-    let user = data.get("user").unwrap_or(data);
-
-    let user_id = user
-        .get("user_id")
-        .and_then(|v| v.as_u64())
-        .or_else(|| user.get("uid").and_then(|v| v.as_u64()))?;
-
-    let username = user
-        .get("username")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-    let nickname = user
-        .get("nickname")
-        .or_else(|| user.get("name"))
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-    let alias = user
-        .get("alias")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-    let avatar = user
-        .get("avatar")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let user_type = user
-        .get("user_type")
-        .or_else(|| user.get("type"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0) as i32;
-    let channel_id = user
-        .get("channel_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let updated_at = user
-        .get("updated_at")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(now_millis);
-
-    Some(SdkUpsertUserInput {
-        user_id,
-        username,
-        nickname,
-        alias,
-        avatar,
-        user_type,
-        is_deleted: false,
-        channel_id,
-        updated_at,
-    })
-}
-
-
 fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
     match v {
         privchat_sdk::SdkEvent::ConnectionStateChanged { from, to } => {
@@ -1825,6 +1959,41 @@ fn map_storage_paths(v: SdkUserStoragePaths) -> UserStoragePaths {
     }
 }
 
+fn map_reactions_map(
+    reactions: HashMap<String, Vec<u64>>,
+) -> Vec<MessageReactionEmojiUsersView> {
+    reactions
+        .into_iter()
+        .map(|(emoji, user_ids)| MessageReactionEmojiUsersView { emoji, user_ids })
+        .collect()
+}
+
+fn map_sticker_package_info(v: privchat_protocol::rpc::StickerPackageInfo) -> StickerPackageInfoView {
+    StickerPackageInfoView {
+        package_id: v.package_id,
+        name: v.name,
+        thumbnail_url: v.thumbnail_url,
+        author: v.author,
+        description: v.description,
+        sticker_count: v.sticker_count as u64,
+        stickers: v
+            .stickers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| StickerInfoView {
+                sticker_id: s.sticker_id,
+                package_id: s.package_id,
+                image_url: s.image_url,
+                alt_text: s.alt_text,
+                emoji: s.emoji,
+                width: s.width,
+                height: s.height,
+                mime_type: s.mime_type,
+            })
+            .collect(),
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct PrivchatClient {
     inner: InnerSdk,
@@ -1889,7 +2058,7 @@ impl PrivchatClient {
         })
     }
 
-    async fn current_user_id(&self) -> Result<u64, PrivchatFfiError> {
+    async fn require_current_user_id(&self) -> Result<u64, PrivchatFfiError> {
         let snapshot = self
             .inner
             .session_snapshot()
@@ -2692,7 +2861,7 @@ impl PrivchatClient {
         from_user_id: u64,
         message: Option<String>,
     ) -> Result<bool, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: FriendRejectResponse = rpc_call_typed(
                 &self.inner,
                 routes::friend::REJECT,
@@ -2810,37 +2979,40 @@ impl PrivchatClient {
         let now = now_millis();
         let mut out_members = Vec::with_capacity(resp.members.len());
         for entry in &resp.members {
-            if let Some(user_id) = entry.get("user_id").and_then(|v| v.as_u64()) {
-                let role = entry.get("role").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let status = entry.get("status").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let alias = entry.get("alias").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let is_muted = entry.get("is_muted").and_then(|v| v.as_bool()).unwrap_or(false);
-                let joined_at = entry.get("joined_at").and_then(|v| v.as_i64()).unwrap_or(now);
-                let updated_at = entry.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(now);
-                let _ = self
-                    .inner
-                    .upsert_group_member(SdkUpsertGroupMemberInput {
-                        group_id,
-                        user_id,
-                        role,
-                        status,
-                        alias: alias.clone(),
-                        is_muted,
-                        joined_at,
-                        updated_at,
-                    })
-                    .await;
-                out_members.push(GroupMemberRemoteEntry {
+            let user_id = entry.user_id;
+            let role = match entry.role.to_ascii_lowercase().as_str() {
+                "owner" => 1,
+                "admin" => 2,
+                _ => 0,
+            };
+            let status = 0;
+            let alias = Some(entry.nickname.clone());
+            let is_muted = entry.is_muted;
+            let joined_at = now;
+            let updated_at = now;
+            let _ = self
+                .inner
+                .upsert_group_member(SdkUpsertGroupMemberInput {
+                    group_id,
                     user_id,
                     role,
                     status,
-                    alias,
+                    alias: alias.clone(),
                     is_muted,
                     joined_at,
                     updated_at,
-                    raw_json: entry.to_string(),
-                });
-            }
+                })
+                .await;
+            out_members.push(GroupMemberRemoteEntry {
+                user_id,
+                role,
+                status,
+                alias,
+                is_muted,
+                joined_at,
+                updated_at,
+                raw_json: json_encode(entry, "group member item")?,
+            });
         }
         Ok(GroupMemberRemoteList {
             members: out_members,
@@ -2849,7 +3021,7 @@ impl PrivchatClient {
     }
 
     pub async fn delete_friend(&self, friend_id: u64) -> Result<bool, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: FriendRemoveResponse = rpc_call_typed(
                 &self.inner,
                 routes::friend::DELETE,
@@ -2870,7 +3042,7 @@ impl PrivchatClient {
         &self,
         blocked_user_id: u64,
     ) -> Result<bool, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: BlacklistAddResponse = rpc_call_typed(
                 &self.inner,
                 routes::blacklist::ADD,
@@ -2896,7 +3068,7 @@ impl PrivchatClient {
         &self,
         blocked_user_id: u64,
     ) -> Result<bool, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: BlacklistRemoveResponse = rpc_call_typed(
                 &self.inner,
                 routes::blacklist::REMOVE,
@@ -2914,7 +3086,7 @@ impl PrivchatClient {
     }
 
     pub async fn get_blacklist(&self) -> Result<Vec<StoredBlacklistEntry>, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: BlacklistListResponse = rpc_call_typed(
                 &self.inner,
                 routes::blacklist::LIST,
@@ -2950,7 +3122,7 @@ impl PrivchatClient {
         &self,
         target_user_id: u64,
     ) -> Result<BlacklistCheckResult, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: BlacklistCheckResponse = rpc_call_typed(
                 &self.inner,
                 routes::blacklist::CHECK,
@@ -2983,7 +3155,7 @@ impl PrivchatClient {
         channel_id: u64,
         server_message_id: u64,
     ) -> Result<bool, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: MessageStatusReadResponse = rpc_call_typed(
             &self.inner,
             routes::message_status::READ,
@@ -3034,7 +3206,7 @@ impl PrivchatClient {
             .resolve_local_message_id_by_server_message_id(channel_id, channel_type, server_message_id)
             .await?
         {
-            let revoker = self.current_user_id().await.ok();
+            let revoker = self.require_current_user_id().await.ok();
             let _ = self.set_message_revoke(local_message_id, true, revoker).await;
         }
         Ok(resp)
@@ -3072,7 +3244,7 @@ impl PrivchatClient {
                 .await?
             {
                 let now = now_millis();
-                let uid = self.current_user_id().await?;
+                let uid = self.require_current_user_id().await?;
                 let _ = self
                     .upsert_message_reaction(UpsertMessageReactionInput {
                         channel_id: cid,
@@ -3117,7 +3289,7 @@ impl PrivchatClient {
         .await?;
         // Best-effort local reaction tombstone update for local-first consistency.
         // When channel/message cannot be resolved from local cache, remote result is still returned.
-        let uid = self.current_user_id().await?;
+        let uid = self.require_current_user_id().await?;
         let channels = self.list_channels(500, 0).await?;
         for ch in channels {
             if let Some(local_message_id) = self
@@ -3162,7 +3334,9 @@ impl PrivchatClient {
         )
         .await?;
         Ok(MessageReactionListView {
-            reactions_json: json_encode(&resp.reactions, "list_reactions response")?,
+            success: resp.success,
+            total_count: resp.total_count as u64,
+            reactions: map_reactions_map(resp.reactions),
         })
     }
 
@@ -3180,7 +3354,9 @@ impl PrivchatClient {
         )
         .await?;
         Ok(MessageReactionStatsView {
-            stats_json: resp.stats.to_string(),
+            success: resp.success,
+            total_count: resp.stats.total_count as u64,
+            reactions: map_reactions_map(resp.stats.reactions),
         })
     }
 
@@ -3208,7 +3384,9 @@ impl PrivchatClient {
             .await?;
             items.push(ReactionsBatchItemView {
                 server_message_id: id,
-                reactions_json: json_encode(&value.reactions, "reactions_batch item")?,
+                success: value.success,
+                total_count: value.total_count as u64,
+                reactions: map_reactions_map(value.reactions),
             });
         }
         Ok(ReactionsBatchView { items })
@@ -3219,7 +3397,7 @@ impl PrivchatClient {
         channel_id: u64,
         pinned: bool,
     ) -> Result<bool, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: ChannelPinResponse = rpc_call_typed(
             &self.inner,
             routes::channel::PIN,
@@ -3353,7 +3531,7 @@ impl PrivchatClient {
         before_server_message_id: Option<u64>,
         limit: Option<u32>,
     ) -> Result<MessageHistoryView, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: MessageHistoryResponse = rpc_call_typed(
             &self.inner,
             routes::message_history::GET,
@@ -3366,7 +3544,23 @@ impl PrivchatClient {
         )
         .await?;
         Ok(MessageHistoryView {
-            messages_json: json_encode(&resp.messages, "get_messages_remote response")?,
+            messages: resp
+                .messages
+                .into_iter()
+                .map(|m| MessageHistoryItemView {
+                    message_id: m.message_id,
+                    channel_id: m.channel_id,
+                    sender_id: m.sender_id,
+                    content: m.content,
+                    message_type: m.message_type,
+                    timestamp: m.timestamp,
+                    reply_to_message_id: m.reply_to_message_id,
+                    metadata_json: m.metadata.map(|v| serde_json::Value::Object(v).to_string()),
+                    revoked: m.revoked,
+                    revoked_at: m.revoked_at,
+                    revoked_by: m.revoked_by,
+                })
+                .collect(),
             has_more: resp.has_more,
         })
     }
@@ -3386,7 +3580,17 @@ impl PrivchatClient {
         )
         .await?;
         Ok(MessageReadListView {
-            readers_json: json_encode(&resp.readers, "message_read_list response")?,
+            readers: resp
+                .readers
+                .into_iter()
+                .map(|r| MessageReadUserView {
+                    user_id: r.user_id,
+                    username: r.username,
+                    nickname: r.nickname,
+                    avatar_url: r.avatar_url,
+                    read_at: r.read_at,
+                })
+                .collect(),
             total: resp.total as u64,
         })
     }
@@ -3412,7 +3616,7 @@ impl PrivchatClient {
     }
 
     pub async fn check_friend(&self, friend_id: u64) -> Result<bool, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: FriendCheckResponse = rpc_call_typed(
                 &self.inner,
                 routes::friend::CHECK,
@@ -3444,27 +3648,31 @@ impl PrivchatClient {
             &AccountProfileGetRequest { user_id: 0 },
         )
         .await?;
-        let out = json_encode(&resp, "get_profile response")?;
-        if let Some(user) = parse_profile_user(&out) {
-            let _ = self.inner.upsert_user(user).await;
-        }
-        Ok(ProfileView { profile_json: out })
+        Ok(ProfileView {
+            status: resp.status,
+            action: resp.action,
+            timestamp: resp.timestamp,
+        })
     }
 
     pub async fn update_profile(
         &self,
         payload: ProfileUpdateInput,
     ) -> Result<ProfileView, PrivchatFfiError> {
-        let fields: serde_json::Map<String, serde_json::Value> =
-            json_decode(&payload.fields_json, "update_profile request fields_json")?;
-        let req = AccountProfileUpdateRequest { fields, user_id: 0 };
+        let req = AccountProfileUpdateRequest {
+            display_name: payload.display_name,
+            avatar_url: payload.avatar_url,
+            bio: payload.bio,
+            extra_fields: HashMap::new(),
+            user_id: 0,
+        };
         let resp: AccountProfileUpdateResponse =
             rpc_call_typed(&self.inner, routes::account_profile::UPDATE, &req).await?;
-        let out = json_encode(&resp, "update_profile response")?;
-        if let Some(user) = parse_profile_user(&out) {
-            let _ = self.inner.upsert_user(user).await;
-        }
-        Ok(ProfileView { profile_json: out })
+        Ok(ProfileView {
+            status: resp.status,
+            action: resp.action,
+            timestamp: resp.timestamp,
+        })
     }
 
     pub async fn get_privacy_settings(&self) -> Result<PrivacySettingsView, PrivchatFfiError> {
@@ -3475,7 +3683,15 @@ impl PrivchatClient {
         )
         .await?;
         Ok(PrivacySettingsView {
-            settings_json: json_encode(&resp, "get_privacy_settings response")?,
+            user_id: resp.user_id,
+            allow_add_by_group: resp.allow_add_by_group,
+            allow_search_by_phone: resp.allow_search_by_phone,
+            allow_search_by_username: resp.allow_search_by_username,
+            allow_search_by_email: resp.allow_search_by_email,
+            allow_search_by_qrcode: resp.allow_search_by_qrcode,
+            allow_view_by_non_friend: resp.allow_view_by_non_friend,
+            allow_receive_message_from_non_friend: resp.allow_receive_message_from_non_friend,
+            updated_at: resp.updated_at,
         })
     }
 
@@ -3496,7 +3712,7 @@ impl PrivchatClient {
         req.user_id = 0;
         let resp: AccountPrivacyUpdateResponse =
             rpc_call_typed(&self.inner, routes::privacy::UPDATE, &req).await?;
-        Ok(resp)
+        Ok(resp.success)
     }
 
     pub async fn qrcode_generate(
@@ -3558,28 +3774,51 @@ impl PrivchatClient {
 
     pub async fn qrcode_list(
         &self,
-        qr_type: Option<String>,
-    ) -> Result<QrCodeJsonView, PrivchatFfiError> {
-        let resp: serde_json::Value = rpc_call_typed(
+        include_revoked: Option<bool>,
+    ) -> Result<QrCodeListView, PrivchatFfiError> {
+        let creator_id = self.require_current_user_id().await?.to_string();
+        let resp: QRCodeListResponse = rpc_call_typed(
             &self.inner,
             routes::qrcode::LIST,
-            &QRCodeListRequest { qr_type, user_id: 0 },
+            &QRCodeListRequest {
+                creator_id,
+                include_revoked: include_revoked.unwrap_or(false),
+            },
         )
         .await?;
-        Ok(QrCodeJsonView {
-            json: json_encode(&resp, "qrcode_list response")?,
+        Ok(QrCodeListView {
+            qr_keys: resp
+                .qr_keys
+                .into_iter()
+                .map(|q| QrCodeEntryView {
+                    qr_key: q.qr_key,
+                    qr_code: q.qr_code,
+                    qr_type: q.qr_type,
+                    target_id: q.target_id,
+                    created_at: q.created_at,
+                    expire_at: q.expire_at,
+                    used_count: q.used_count,
+                    max_usage: q.max_usage,
+                    revoked: q.revoked,
+                })
+                .collect(),
+            total: resp.total as u64,
         })
     }
 
-    pub async fn user_qrcode_get(&self) -> Result<QrCodeJsonView, PrivchatFfiError> {
-        let resp: serde_json::Value = rpc_call_typed(
+    pub async fn user_qrcode_get(&self) -> Result<UserQrCodeGetView, PrivchatFfiError> {
+        let user_id = self.require_current_user_id().await?.to_string();
+        let resp: UserQRCodeGetResponse = rpc_call_typed(
             &self.inner,
             routes::user_qrcode::GET,
-            &UserQRCodeGetRequest { user_id: 0 },
+            &UserQRCodeGetRequest { user_id },
         )
         .await?;
-        Ok(QrCodeJsonView {
-            json: json_encode(&resp, "user_qrcode_get response")?,
+        Ok(UserQrCodeGetView {
+            qr_key: resp.qr_key,
+            qr_code: resp.qr_code,
+            created_at: resp.created_at,
+            used_count: resp.used_count,
         })
     }
 
@@ -3599,7 +3838,20 @@ impl PrivchatClient {
         )
         .await?;
         Ok(AccountSearchResultView {
-            users_json: json_encode(&resp.users, "search_user_by_qrcode users")?,
+            users: resp
+                .users
+                .into_iter()
+                .map(|u| SearchUserEntry {
+                    user_id: u.user_id,
+                    username: u.username,
+                    nickname: u.nickname,
+                    avatar_url: u.avatar_url,
+                    user_type: i32::from(u.user_type),
+                    search_session_id: u.search_session_id,
+                    is_friend: u.is_friend,
+                    can_send_message: u.can_send_message,
+                })
+                .collect(),
             total: resp.total as u64,
             query: resp.query,
         })
@@ -3621,7 +3873,17 @@ impl PrivchatClient {
         )
         .await?;
         Ok(AccountUserDetailView {
-            user_json: json_encode(&resp.user, "account_user_detail_remote response")?,
+            user_id: resp.user_id,
+            username: resp.username,
+            nickname: resp.nickname,
+            avatar_url: resp.avatar_url,
+            phone: resp.phone,
+            email: resp.email,
+            user_type: resp.user_type,
+            is_friend: resp.is_friend,
+            can_send_message: resp.can_send_message,
+            source_type: resp.source_type,
+            source_id: resp.source_id,
         })
     }
 
@@ -3629,7 +3891,7 @@ impl PrivchatClient {
         &self,
         user_id: u64,
     ) -> Result<AccountUserShareCardView, PrivchatFfiError> {
-        let receiver_id = self.current_user_id().await?;
+        let receiver_id = self.require_current_user_id().await?;
         let resp: AccountUserShareCardResponse = rpc_call_typed(
             &self.inner,
             routes::account_user::SHARE_CARD,
@@ -3642,8 +3904,8 @@ impl PrivchatClient {
         )
         .await?;
         Ok(AccountUserShareCardView {
-            share_key: resp.share_key,
-            share_url: resp.share_url,
+            share_key: resp.share_key.unwrap_or_default(),
+            share_url: resp.share_url.unwrap_or_default(),
             expire_at: resp.expire_at,
         })
     }
@@ -3661,7 +3923,7 @@ impl PrivchatClient {
         req.user_id = 0;
         let resp: AccountUserUpdateResponse =
             rpc_call_typed(&self.inner, routes::account_user::UPDATE, &req).await?;
-        Ok(resp)
+        Ok(resp.status.eq_ignore_ascii_case("success"))
     }
 
     pub async fn auth_logout_remote(&self) -> Result<bool, PrivchatFfiError> {
@@ -3691,41 +3953,47 @@ impl PrivchatClient {
 
     pub async fn qrcode_refresh(
         &self,
-        qr_key: String,
-        expire_seconds: Option<u64>,
-    ) -> Result<QrCodeJsonView, PrivchatFfiError> {
-        let _ = expire_seconds;
-        let resp: serde_json::Value = rpc_call_typed(
+        qr_type: String,
+        target_id: String,
+    ) -> Result<QrCodeRefreshView, PrivchatFfiError> {
+        let creator_id = self.require_current_user_id().await?.to_string();
+        let resp: QRCodeRefreshResponse = rpc_call_typed(
             &self.inner,
             routes::qrcode::REFRESH,
             &QRCodeRefreshRequest {
-                old_qr_key: qr_key,
-                user_id: 0,
+                qr_type,
+                target_id,
+                creator_id,
             },
         )
         .await?;
-        Ok(QrCodeJsonView {
-            json: json_encode(&resp, "qrcode_refresh response")?,
+        Ok(QrCodeRefreshView {
+            old_qr_key: resp.old_qr_key,
+            new_qr_key: resp.new_qr_key,
+            new_qr_code: resp.new_qr_code,
+            revoked_at: resp.revoked_at,
         })
     }
 
-    pub async fn qrcode_revoke(&self, qr_key: String) -> Result<QrCodeJsonView, PrivchatFfiError> {
-        let resp: serde_json::Value = rpc_call_typed(
+    pub async fn qrcode_revoke(&self, qr_key: String) -> Result<QrCodeRevokeView, PrivchatFfiError> {
+        let resp: QRCodeRevokeResponse = rpc_call_typed(
             &self.inner,
             routes::qrcode::REVOKE,
             &QRCodeRevokeRequest { qr_key, user_id: 0 },
         )
         .await?;
-        Ok(QrCodeJsonView {
-            json: json_encode(&resp, "qrcode_revoke response")?,
+        Ok(QrCodeRevokeView {
+            success: resp.success,
+            qr_key: resp.qr_key,
+            revoked_at: resp.revoked_at,
         })
     }
 
     pub async fn user_qrcode_generate(
         &self,
         expire_seconds: Option<u64>,
-    ) -> Result<QrCodeJsonView, PrivchatFfiError> {
-        let resp: serde_json::Value = rpc_call_typed(
+    ) -> Result<UserQrCodeGenerateView, PrivchatFfiError> {
+        let resp: UserQRCodeGenerateResponse = rpc_call_typed(
             &self.inner,
             routes::user_qrcode::GENERATE,
             &UserQRCodeGenerateRequest {
@@ -3734,24 +4002,28 @@ impl PrivchatClient {
             },
         )
         .await?;
-        Ok(QrCodeJsonView {
-            json: json_encode(&resp, "user_qrcode_generate response")?,
+        Ok(UserQrCodeGenerateView {
+            qr_key: resp.qr_key,
+            qr_code: resp.qr_code,
+            created_at: resp.created_at,
         })
     }
 
     pub async fn user_qrcode_refresh(
         &self,
-        expire_seconds: Option<u64>,
-    ) -> Result<QrCodeJsonView, PrivchatFfiError> {
-        let _ = expire_seconds;
-        let resp: serde_json::Value = rpc_call_typed(
+    ) -> Result<QrCodeRefreshView, PrivchatFfiError> {
+        let user_id = self.require_current_user_id().await?.to_string();
+        let resp: UserQRCodeRefreshResponse = rpc_call_typed(
             &self.inner,
             routes::user_qrcode::REFRESH,
-            &UserQRCodeRefreshRequest { user_id: 0 },
+            &UserQRCodeRefreshRequest { user_id },
         )
         .await?;
-        Ok(QrCodeJsonView {
-            json: json_encode(&resp, "user_qrcode_refresh response")?,
+        Ok(QrCodeRefreshView {
+            old_qr_key: resp.old_qr_key,
+            new_qr_key: resp.new_qr_key,
+            new_qr_code: resp.new_qr_code,
+            revoked_at: resp.revoked_at,
         })
     }
 
@@ -3817,7 +4089,7 @@ impl PrivchatClient {
         group_id: u64,
         user_id: u64,
     ) -> Result<bool, PrivchatFfiError> {
-        let operator_id = self.current_user_id().await?;
+        let operator_id = self.require_current_user_id().await?;
         let resp: GroupMemberRemoveResponse = rpc_call_typed(
             &self.inner,
             routes::group_member::REMOVE,
@@ -3847,7 +4119,7 @@ impl PrivchatClient {
             &GroupMemberLeaveRequest { group_id, user_id: 0 },
         )
         .await?;
-        if let Ok(current_uid) = self.current_user_id().await {
+        if let Ok(Some(current_uid)) = self.user_id().await {
             let _ = self.inner.delete_group_member(group_id, current_uid).await;
         }
         Ok(resp)
@@ -3871,7 +4143,7 @@ impl PrivchatClient {
         user_id: u64,
         duration_seconds: Option<u64>,
     ) -> Result<u64, PrivchatFfiError> {
-        let operator_id = self.current_user_id().await?;
+        let operator_id = self.require_current_user_id().await?;
         let resp: GroupMemberMuteResponse = rpc_call_typed(
             &self.inner,
             routes::group_member::MUTE,
@@ -3905,7 +4177,7 @@ impl PrivchatClient {
         group_id: u64,
         user_id: u64,
     ) -> Result<bool, PrivchatFfiError> {
-        let operator_id = self.current_user_id().await?;
+        let operator_id = self.require_current_user_id().await?;
         let resp: GroupMemberUnmuteResponse = rpc_call_typed(
             &self.inner,
             routes::group_member::UNMUTE,
@@ -3938,7 +4210,7 @@ impl PrivchatClient {
         group_id: u64,
         target_user_id: u64,
     ) -> Result<GroupTransferOwnerView, PrivchatFfiError> {
-        let current_owner_id = self.current_user_id().await?;
+        let current_owner_id = self.require_current_user_id().await?;
         let resp: GroupTransferOwnerResponse = rpc_call_typed(
             &self.inner,
             routes::group_role::TRANSFER_OWNER,
@@ -3980,7 +4252,7 @@ impl PrivchatClient {
         role: String,
     ) -> Result<GroupRoleSetView, PrivchatFfiError> {
         let role_code = parse_group_role_to_code(&role);
-        let operator_id = self.current_user_id().await?;
+        let operator_id = self.require_current_user_id().await?;
         let resp: GroupRoleSetResponse = rpc_call_typed(
             &self.inner,
             routes::group_role::SET,
@@ -4018,18 +4290,30 @@ impl PrivchatClient {
         &self,
         group_id: u64,
     ) -> Result<GroupSettingsView, PrivchatFfiError> {
-        let user_id = self.current_user_id().await?;
+        let user_id = self.require_current_user_id().await?;
         let resp: GroupSettingsGetResponse = rpc_call_typed(
             &self.inner,
             routes::group_settings::GET,
             &GroupSettingsGetRequest { group_id, user_id },
         )
         .await?;
-        let out = json_encode(&resp, "group_get_settings_remote response")?;
         let _ = self
-            .kv_put(group_settings_key(group_id), out.clone().into_bytes())
+            .kv_put(
+                group_settings_key(group_id),
+                json_encode(&resp, "group_get_settings cache")?.into_bytes(),
+            )
             .await;
-        Ok(GroupSettingsView { settings_json: out })
+        Ok(GroupSettingsView {
+            group_id: resp.group_id,
+            join_need_approval: resp.settings.join_need_approval,
+            member_can_invite: resp.settings.member_can_invite,
+            all_muted: resp.settings.all_muted,
+            max_members: resp.settings.max_members as u64,
+            announcement: resp.settings.announcement,
+            description: resp.settings.description,
+            created_at: resp.settings.created_at,
+            updated_at: resp.settings.updated_at,
+        })
     }
 
     pub async fn group_update_settings_remote(
@@ -4039,11 +4323,16 @@ impl PrivchatClient {
         let mut req = GroupSettingsUpdateRequest {
             group_id: payload.group_id,
             operator_id: 0,
-            name: payload.name,
-            description: payload.description,
-            avatar_url: payload.avatar_url,
+            settings: privchat_protocol::rpc::GroupSettingsPatch {
+                join_need_approval: None,
+                member_can_invite: None,
+                all_muted: None,
+                max_members: None,
+                announcement: None,
+                description: payload.description,
+            },
         };
-        req.operator_id = self.current_user_id().await?;
+        req.operator_id = self.require_current_user_id().await?;
         let resp: GroupSettingsUpdateResponse =
             rpc_call_typed(&self.inner, routes::group_settings::UPDATE, &req).await?;
         if req.group_id > 0 {
@@ -4052,7 +4341,7 @@ impl PrivchatClient {
                 .kv_put(group_settings_key(req.group_id), settings_json.into_bytes())
                 .await;
         }
-        Ok(resp)
+        Ok(resp.success)
     }
 
     pub async fn group_mute_all_remote(
@@ -4060,18 +4349,17 @@ impl PrivchatClient {
         group_id: u64,
         enabled: bool,
     ) -> Result<GroupMuteAllView, PrivchatFfiError> {
-        let operator_id = self.current_user_id().await?;
-        let resp: serde_json::Value = rpc_call_typed(
+        let operator_id = self.require_current_user_id().await?;
+        let resp: privchat_protocol::rpc::GroupMuteAllResponse = rpc_call_typed(
             &self.inner,
             routes::group_settings::MUTE_ALL,
             &GroupMuteAllRequest {
                 group_id,
                 operator_id,
-                mute_all: enabled,
+                muted: enabled,
             },
         )
         .await?;
-        let out = json_encode(&resp, "group_mute_all_remote response")?;
         let key = group_settings_key(group_id);
         let raw = self.kv_get(key.clone()).await?;
         let mut state = decode_group_settings_cache(raw);
@@ -4081,7 +4369,14 @@ impl PrivchatClient {
         let _ = self
             .kv_put(key, payload)
             .await;
-        Ok(GroupMuteAllView { response_json: out })
+        Ok(GroupMuteAllView {
+            success: resp.success,
+            group_id: resp.group_id,
+            all_muted: resp.all_muted,
+            message: resp.message,
+            operator_id: resp.operator_id,
+            updated_at: resp.updated_at,
+        })
     }
 
     pub async fn group_approval_list_remote(
@@ -4092,7 +4387,7 @@ impl PrivchatClient {
     ) -> Result<GroupApprovalListView, PrivchatFfiError> {
         let _ = page;
         let _ = page_size;
-        let operator_id = self.current_user_id().await?;
+        let operator_id = self.require_current_user_id().await?;
         let resp: GroupApprovalListResponse = rpc_call_typed(
             &self.inner,
             routes::group_approval::LIST,
@@ -4103,7 +4398,23 @@ impl PrivchatClient {
         )
         .await?;
         Ok(GroupApprovalListView {
-            approvals_json: json_encode(&resp.approvals, "group_approval_list_remote approvals")?,
+            group_id: resp.group_id,
+            approvals: resp
+                .requests
+                .into_iter()
+                .map(|it| GroupApprovalItemView {
+                    request_id: it.request_id,
+                    user_id: it.user_id,
+                    inviter_id: it
+                        .method
+                        .member_invite
+                        .map(|m| m.inviter_id),
+                    qr_code_id: it.method.qr_code.map(|q| q.qr_code_id),
+                    message: it.message,
+                    created_at: it.created_at,
+                    expires_at: it.expires_at,
+                })
+                .collect(),
             total: resp.total as u64,
         })
     }
@@ -4114,19 +4425,23 @@ impl PrivchatClient {
         approved: bool,
         reason: Option<String>,
     ) -> Result<bool, PrivchatFfiError> {
-        let operator_id = self.current_user_id().await?;
+        let operator_id = self.require_current_user_id().await?;
         let resp: GroupApprovalHandleResponse = rpc_call_typed(
             &self.inner,
             routes::group_approval::HANDLE,
             &GroupApprovalHandleRequest {
-                approval_id,
+                request_id: approval_id.to_string(),
                 operator_id,
-                approved,
+                action: if approved {
+                    "approve".to_string()
+                } else {
+                    "reject".to_string()
+                },
                 reject_reason: reason,
             },
         )
         .await?;
-        Ok(resp)
+        Ok(resp.success)
     }
 
     pub async fn group_qrcode_generate_remote(
@@ -4184,13 +4499,17 @@ impl PrivchatClient {
         &self,
         payload: ChannelBroadcastCreateInput,
     ) -> Result<ChannelBroadcastCreateView, PrivchatFfiError> {
-        let fields: serde_json::Map<String, serde_json::Value> =
-            json_decode(&payload.fields_json, "channel_broadcast_create_remote request fields_json")?;
-        let req = ChannelBroadcastCreateRequest { fields };
+        let req = ChannelBroadcastCreateRequest {
+            name: payload.name,
+            description: payload.description,
+            avatar_url: payload.avatar_url,
+        };
         let resp: ChannelBroadcastCreateResponse =
             rpc_call_typed(&self.inner, routes::channel_broadcast::CREATE, &req).await?;
         Ok(ChannelBroadcastCreateView {
-            response_json: json_encode(&resp, "channel_broadcast_create_remote response")?,
+            status: resp.status,
+            action: resp.action,
+            timestamp: resp.timestamp,
         })
     }
 
@@ -4204,20 +4523,23 @@ impl PrivchatClient {
         };
         let resp: ChannelBroadcastSubscribeResponse =
             rpc_call_typed(&self.inner, routes::channel_broadcast::SUBSCRIBE, &req).await?;
-        Ok(resp)
+        Ok(resp.status.eq_ignore_ascii_case("success"))
     }
 
     pub async fn channel_broadcast_list_remote(
         &self,
         payload: ChannelBroadcastListInput,
     ) -> Result<ChannelBroadcastListView, PrivchatFfiError> {
-        let fields: serde_json::Map<String, serde_json::Value> =
-            json_decode(&payload.fields_json, "channel_broadcast_list_remote request fields_json")?;
-        let req = ChannelBroadcastListRequest { fields };
+        let req = ChannelBroadcastListRequest {
+            page: payload.page,
+            page_size: payload.page_size,
+        };
         let resp: ChannelBroadcastListResponse =
             rpc_call_typed(&self.inner, routes::channel_broadcast::LIST, &req).await?;
         Ok(ChannelBroadcastListView {
-            response_json: json_encode(&resp, "channel_broadcast_list_remote response")?,
+            status: resp.status,
+            action: resp.action,
+            timestamp: resp.timestamp,
         })
     }
 
@@ -4225,13 +4547,18 @@ impl PrivchatClient {
         &self,
         payload: ChannelContentPublishInput,
     ) -> Result<ChannelContentPublishView, PrivchatFfiError> {
-        let fields: serde_json::Map<String, serde_json::Value> =
-            json_decode(&payload.fields_json, "channel_content_publish_remote request fields_json")?;
-        let req = ChannelContentPublishRequest { fields };
+        let req = ChannelContentPublishRequest {
+            channel_id: payload.channel_id,
+            content: payload.content,
+            title: payload.title,
+            content_type: payload.content_type,
+        };
         let resp: ChannelContentPublishResponse =
             rpc_call_typed(&self.inner, routes::channel_content::PUBLISH, &req).await?;
         Ok(ChannelContentPublishView {
-            response_json: json_encode(&resp, "channel_content_publish_remote response")?,
+            status: resp.status,
+            action: resp.action,
+            timestamp: resp.timestamp,
         })
     }
 
@@ -4239,13 +4566,17 @@ impl PrivchatClient {
         &self,
         payload: ChannelContentListInput,
     ) -> Result<ChannelContentListView, PrivchatFfiError> {
-        let fields: serde_json::Map<String, serde_json::Value> =
-            json_decode(&payload.fields_json, "channel_content_list_remote request fields_json")?;
-        let req = ChannelContentListRequest { fields };
+        let req = ChannelContentListRequest {
+            channel_id: payload.channel_id,
+            page: payload.page,
+            page_size: payload.page_size,
+        };
         let resp: ChannelContentListResponse =
             rpc_call_typed(&self.inner, routes::channel_content::LIST, &req).await?;
         Ok(ChannelContentListView {
-            response_json: json_encode(&resp, "channel_content_list_remote response")?,
+            status: resp.status,
+            action: resp.action,
+            timestamp: resp.timestamp,
         })
     }
 
@@ -4253,13 +4584,16 @@ impl PrivchatClient {
         &self,
         payload: StickerPackageListInput,
     ) -> Result<StickerPackageListView, PrivchatFfiError> {
-        let fields: serde_json::Map<String, serde_json::Value> =
-            json_decode(&payload.fields_json, "sticker_package_list_remote request fields_json")?;
-        let req = StickerPackageListRequest { fields };
+        let _ = payload;
+        let req = StickerPackageListRequest {};
         let resp: StickerPackageListResponse =
             rpc_call_typed(&self.inner, routes::sticker::PACKAGE_LIST, &req).await?;
         Ok(StickerPackageListView {
-            response_json: json_encode(&resp, "sticker_package_list_remote response")?,
+            packages: resp
+                .packages
+                .into_iter()
+                .map(map_sticker_package_info)
+                .collect(),
         })
     }
 
@@ -4273,7 +4607,7 @@ impl PrivchatClient {
         let resp: StickerPackageDetailResponse =
             rpc_call_typed(&self.inner, routes::sticker::PACKAGE_DETAIL, &req).await?;
         Ok(StickerPackageDetailView {
-            response_json: json_encode(&resp, "sticker_package_detail_remote response")?,
+            package: map_sticker_package_info(resp.package),
         })
     }
 
@@ -4281,19 +4615,17 @@ impl PrivchatClient {
         &self,
         payload: SyncSubmitInput,
     ) -> Result<SyncSubmitView, PrivchatFfiError> {
-        let payload_value = serde_json::from_str(&payload.payload_json).map_err(|e| {
-            PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InvalidParams as u32,
-                detail: format!("sync_submit_remote payload_json invalid: {e}"),
-            }
-        })?;
+        let mut payload_obj = serde_json::Map::new();
+        for entry in payload.payload_entries {
+            payload_obj.insert(entry.key, serde_json::Value::String(entry.value));
+        }
         let req = ClientSubmitRequest {
             local_message_id: payload.local_message_id,
             channel_id: payload.channel_id,
             channel_type: payload.channel_type,
             last_pts: payload.last_pts,
             command_type: payload.command_type,
-            payload: payload_value,
+            payload: serde_json::Value::Object(payload_obj),
             client_timestamp: payload.client_timestamp,
             device_id: payload.device_id,
         };
@@ -5390,7 +5722,7 @@ impl PrivchatClient {
     }
 
     pub async fn dm_peer_user_id(&self, channel_id: u64) -> Result<Option<u64>, PrivchatFfiError> {
-        let me = self.current_user_id().await?;
+        let me = self.require_current_user_id().await?;
         // Try common channel types and return the first non-self member.
         for channel_type in [1_i32, 2_i32, 3_i32] {
             let members = self
@@ -5589,13 +5921,7 @@ impl PrivchatClient {
             },
         )
         .await?;
-        Ok(resp.readers.into_iter().any(|entry| {
-            entry
-                .get("user_id")
-                .or_else(|| entry.get("uid"))
-                .and_then(|v| v.as_u64())
-                == Some(user_id)
-        }))
+        Ok(resp.readers.into_iter().any(|entry| entry.user_id == user_id))
     }
 
     pub async fn seen_by_for_event(
@@ -5616,20 +5942,8 @@ impl PrivchatClient {
             .readers
             .into_iter()
             .filter_map(|entry| {
-                let user_id = entry
-                    .get("user_id")
-                    .or_else(|| entry.get("uid"))
-                    .and_then(|v| v.as_u64())?;
-                let read_at = entry
-                    .get("read_at")
-                    .or_else(|| entry.get("timestamp"))
-                    .map(|v| {
-                        if let Some(s) = v.as_str() {
-                            s.to_string()
-                        } else {
-                            v.to_string()
-                        }
-                    });
+                let user_id = entry.user_id;
+                let read_at = entry.read_at;
                 Some(SeenByEntry { user_id, read_at })
             })
             .collect())
@@ -5808,6 +6122,22 @@ impl PrivchatClient {
 #[uniffi::export]
 pub fn sdk_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[uniffi::export]
+pub fn git_sha() -> String {
+    option_env!("GIT_SHA")
+        .or(option_env!("VERGEN_GIT_SHA"))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+#[uniffi::export]
+pub fn build_time() -> String {
+    option_env!("FFI_BUILD_TIMESTAMP")
+        .or(option_env!("BUILD_TIME"))
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 #[cfg(test)]
