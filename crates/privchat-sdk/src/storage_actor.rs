@@ -394,6 +394,16 @@ impl StorageHandle {
         Ok(Self { tx })
     }
 
+    pub fn start_at(base_dir: std::path::PathBuf) -> Result<Self> {
+        let store = LocalStore::open_at(base_dir)?;
+        let (tx, rx) = mpsc::channel::<StorageCmd>();
+        thread::Builder::new()
+            .name("privchat-db-actor".to_string())
+            .spawn(move || run_loop(store, rx))
+            .map_err(|e| Error::Storage(format!("spawn db actor: {e}")))?;
+        Ok(Self { tx })
+    }
+
     pub async fn save_login(&self, uid: String, login: LoginResult) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx

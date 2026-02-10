@@ -13,6 +13,12 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(9001);
+    let data_dir = std::env::var("PRIVCHAT_DATA_DIR").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("privchat-rust-basic")
+            .to_string_lossy()
+            .to_string()
+    });
 
     let config = PrivchatConfig {
         endpoints: vec![
@@ -39,6 +45,7 @@ async fn main() {
             },
         ],
         connection_timeout_secs: 15,
+        data_dir,
     };
 
     eprintln!("[basic] create");

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -50,6 +51,7 @@ pub struct ServerEndpoint {
 pub struct PrivchatConfig {
     pub endpoints: Vec<ServerEndpoint>,
     pub connection_timeout_secs: u64,
+    pub data_dir: String,
 }
 
 impl Default for PrivchatConfig {
@@ -63,6 +65,7 @@ impl Default for PrivchatConfig {
                 use_tls: false,
             }],
             connection_timeout_secs: 10,
+            data_dir: String::new(),
         }
     }
 }
@@ -82,12 +85,14 @@ impl PrivchatConfig {
         if endpoints.is_empty() {
             return Self {
                 connection_timeout_secs,
+                data_dir: String::new(),
                 ..Self::default()
             };
         }
         Self {
             endpoints,
             connection_timeout_secs,
+            data_dir: String::new(),
         }
     }
 }
@@ -2162,6 +2167,7 @@ pub struct PrivchatSdk {
     task_registry: TaskRegistry,
     shutting_down: Arc<AtomicBool>,
     supervised_sync_running: Arc<AtomicBool>,
+    startup_error: Arc<StdMutex<Option<Error>>>,
 }
 
 impl PrivchatSdk {
@@ -2170,6 +2176,7 @@ impl PrivchatSdk {
     }
 
     pub fn with_runtime(config: PrivchatConfig, runtime_provider: RuntimeProvider) -> Self {
+        let configured_data_dir = config.data_dir.clone();
         let (tx, mut rx) = mpsc::channel::<Command>(64);
         let (event_tx, _) = broadcast::channel::<SdkEvent>(256);
         let actor_event_tx = event_tx.clone();
@@ -2179,11 +2186,25 @@ impl PrivchatSdk {
         let actor_event_history = event_history.clone();
         let event_history_limit = DEFAULT_EVENT_HISTORY_LIMIT;
         let task_registry = TaskRegistry::new();
+        let startup_error = Arc::new(StdMutex::new(None));
+        let actor_startup_error = startup_error.clone();
         let actor_task = runtime_provider.spawn(async move {
             eprintln!("[SDK.actor] loop: started");
-            let storage = match StorageHandle::start() {
+            if configured_data_dir.trim().is_empty() {
+                eprintln!("[SDK.actor] storage base: <default>");
+            } else {
+                eprintln!("[SDK.actor] storage base: {}", configured_data_dir);
+            }
+            let storage = match if configured_data_dir.trim().is_empty() {
+                StorageHandle::start()
+            } else {
+                StorageHandle::start_at(PathBuf::from(configured_data_dir))
+            } {
                 Ok(s) => s,
                 Err(e) => {
+                    if let Ok(mut locked) = actor_startup_error.lock() {
+                        *locked = Some(Error::Storage(format!("storage init failed: {e}")));
+                    }
                     eprintln!("[SDK.actor] storage init failed: {e}");
                     return;
                 }
@@ -2197,6 +2218,11 @@ impl PrivchatSdk {
             {
                 Ok(v) => Arc::new(v),
                 Err(e) => {
+                    if let Ok(mut locked) = actor_startup_error.lock() {
+                        *locked = Some(Error::InvalidState(format!(
+                            "snowflake init failed: {e:?}"
+                        )));
+                    }
                     eprintln!("[SDK.actor] snowflake init failed: {e:?}");
                     return;
                 }
@@ -3465,6 +3491,20 @@ impl PrivchatSdk {
             task_registry,
             shutting_down: Arc::new(AtomicBool::new(false)),
             supervised_sync_running: Arc::new(AtomicBool::new(false)),
+            startup_error,
+        }
+    }
+
+    fn actor_channel_error(&self) -> Error {
+        if let Ok(locked) = self.startup_error.lock() {
+            if let Some(err) = locked.clone() {
+                return err;
+            }
+        }
+        if self.shutting_down.load(Ordering::Acquire) {
+            Error::Shutdown
+        } else {
+            Error::ActorClosed
         }
     }
 
@@ -3482,8 +3522,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::Connect { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        let out = resp_rx.await.map_err(|_| Error::ActorClosed)?;
+            .map_err(|_| self.actor_channel_error())?;
+        let out = resp_rx.await.map_err(|_| self.actor_channel_error())?;
         eprintln!("[SDK.api] connect: recv");
         out
     }
@@ -3494,8 +3534,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::Disconnect { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn is_connected(&self) -> Result<bool> {
@@ -3504,8 +3544,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::IsConnected { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn connection_state(&self) -> Result<ConnectionState> {
@@ -3514,8 +3554,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::GetConnectionState { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<SdkEvent> {
@@ -3567,8 +3607,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::Ping { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn login(
@@ -3588,8 +3628,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        let out = resp_rx.await.map_err(|_| Error::ActorClosed)?;
+            .map_err(|_| self.actor_channel_error())?;
+        let out = resp_rx.await.map_err(|_| self.actor_channel_error())?;
         eprintln!("[SDK.api] login: recv");
         out
     }
@@ -3610,8 +3650,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn authenticate(&self, user_id: u64, token: String, device_id: String) -> Result<()> {
@@ -3626,8 +3666,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        let out = resp_rx.await.map_err(|_| Error::ActorClosed)?;
+            .map_err(|_| self.actor_channel_error())?;
+        let out = resp_rx.await.map_err(|_| self.actor_channel_error())?;
         eprintln!("[SDK.api] authenticate: recv");
         out
     }
@@ -3653,8 +3693,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn sync_channel(&self, channel_id: u64, channel_type: i32) -> Result<usize> {
@@ -3667,8 +3707,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn sync_all_channels(&self) -> Result<usize> {
@@ -3677,8 +3717,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::SyncAllChannels { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn subscribe_presence(&self, user_ids: Vec<u64>) -> Result<Vec<PresenceStatus>> {
@@ -3690,8 +3730,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn unsubscribe_presence(&self, user_ids: Vec<u64>) -> Result<()> {
@@ -3703,8 +3743,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn fetch_presence(&self, user_ids: Vec<u64>) -> Result<Vec<PresenceStatus>> {
@@ -3716,8 +3756,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn send_typing(
@@ -3738,8 +3778,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn rpc_call(&self, route: String, body_json: String) -> Result<String> {
@@ -3752,8 +3792,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn is_bootstrap_completed(&self) -> Result<bool> {
@@ -3762,8 +3802,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::IsBootstrapCompleted { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn run_bootstrap_sync(&self) -> Result<()> {
@@ -3772,8 +3812,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::RunBootstrapSync { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn session_snapshot(&self) -> Result<Option<SessionSnapshot>> {
@@ -3782,8 +3822,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::GetSessionSnapshot { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn clear_local_state(&self) -> Result<()> {
@@ -3792,8 +3832,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::ClearLocalState { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub fn is_supervised_sync_running(&self) -> bool {
@@ -3840,8 +3880,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn peek_outbound_messages(&self, limit: usize) -> Result<Vec<QueueMessage>> {
@@ -3853,8 +3893,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn ack_outbound_messages(&self, message_ids: Vec<u64>) -> Result<usize> {
@@ -3866,8 +3906,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn enqueue_outbound_file(
@@ -3886,8 +3926,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn peek_outbound_files(
@@ -3904,8 +3944,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn ack_outbound_files(
@@ -3922,8 +3962,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn create_local_message(&self, input: NewMessage) -> Result<u64> {
@@ -3935,8 +3975,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_message_by_id(&self, message_id: u64) -> Result<Option<StoredMessage>> {
@@ -3948,8 +3988,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_messages(
@@ -3970,8 +4010,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_channel(&self, input: UpsertChannelInput) -> Result<()> {
@@ -3983,8 +4023,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_channel_by_id(&self, channel_id: u64) -> Result<Option<StoredChannel>> {
@@ -3996,8 +4036,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_channels(&self, limit: usize, offset: usize) -> Result<Vec<StoredChannel>> {
@@ -4010,8 +4050,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_channel_extra(&self, input: UpsertChannelExtraInput) -> Result<()> {
@@ -4023,8 +4063,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_channel_extra(
@@ -4041,8 +4081,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn mark_message_sent(&self, message_id: u64, server_message_id: u64) -> Result<()> {
@@ -4055,8 +4095,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn update_message_status(&self, message_id: u64, status: i32) -> Result<()> {
@@ -4069,8 +4109,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn set_message_read(
@@ -4091,8 +4131,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn set_message_revoke(
@@ -4111,8 +4151,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn edit_message(
@@ -4131,8 +4171,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn set_message_pinned(&self, message_id: u64, is_pinned: bool) -> Result<()> {
@@ -4145,8 +4185,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_message_extra(&self, message_id: u64) -> Result<Option<StoredMessageExtra>> {
@@ -4158,8 +4198,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn mark_channel_read(&self, channel_id: u64, channel_type: i32) -> Result<()> {
@@ -4172,8 +4212,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_channel_unread_count(
@@ -4190,8 +4230,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_total_unread_count(&self, exclude_muted: bool) -> Result<i32> {
@@ -4203,8 +4243,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_user(&self, input: UpsertUserInput) -> Result<()> {
@@ -4216,8 +4256,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_user_by_id(&self, user_id: u64) -> Result<Option<StoredUser>> {
@@ -4229,8 +4269,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_users_by_ids(&self, user_ids: Vec<u64>) -> Result<Vec<StoredUser>> {
@@ -4242,8 +4282,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_friend(&self, input: UpsertFriendInput) -> Result<()> {
@@ -4255,8 +4295,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn delete_friend(&self, user_id: u64) -> Result<()> {
@@ -4268,8 +4308,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_friends(&self, limit: usize, offset: usize) -> Result<Vec<StoredFriend>> {
@@ -4282,8 +4322,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_blacklist_entry(&self, input: UpsertBlacklistInput) -> Result<()> {
@@ -4295,8 +4335,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn delete_blacklist_entry(&self, blocked_user_id: u64) -> Result<()> {
@@ -4308,8 +4348,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_blacklist_entries(
@@ -4326,8 +4366,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_group(&self, input: UpsertGroupInput) -> Result<()> {
@@ -4339,8 +4379,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_group_by_id(&self, group_id: u64) -> Result<Option<StoredGroup>> {
@@ -4352,8 +4392,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_groups(&self, limit: usize, offset: usize) -> Result<Vec<StoredGroup>> {
@@ -4366,8 +4406,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_group_member(&self, input: UpsertGroupMemberInput) -> Result<()> {
@@ -4379,8 +4419,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_channel_member(&self, input: UpsertChannelMemberInput) -> Result<()> {
@@ -4392,8 +4432,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_channel_members(
@@ -4414,8 +4454,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn delete_channel_member(
@@ -4434,8 +4474,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_group_members(
@@ -4454,8 +4494,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn delete_group_member(&self, group_id: u64, user_id: u64) -> Result<()> {
@@ -4468,8 +4508,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_message_reaction(&self, input: UpsertMessageReactionInput) -> Result<()> {
@@ -4481,8 +4521,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_message_reactions(
@@ -4501,8 +4541,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn record_mention(&self, input: MentionInput) -> Result<u64> {
@@ -4514,8 +4554,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_unread_mention_count(
@@ -4534,8 +4574,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_unread_mention_message_ids(
@@ -4556,8 +4596,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn mark_mention_read(&self, message_id: u64, user_id: u64) -> Result<()> {
@@ -4570,8 +4610,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn mark_all_mentions_read(
@@ -4590,8 +4630,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn get_all_unread_mention_counts(
@@ -4606,8 +4646,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn upsert_reminder(&self, input: UpsertReminderInput) -> Result<()> {
@@ -4619,8 +4659,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn list_pending_reminders(
@@ -4639,8 +4679,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn mark_reminder_done(&self, reminder_id: u64, done: bool) -> Result<()> {
@@ -4653,8 +4693,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn kv_put(&self, key: String, value: Vec<u8>) -> Result<()> {
@@ -4667,8 +4707,8 @@ impl PrivchatSdk {
                 resp: resp_tx,
             })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn kv_get(&self, key: String) -> Result<Option<Vec<u8>>> {
@@ -4677,8 +4717,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::KvGet { key, resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn user_storage_paths(&self) -> Result<UserStoragePaths> {
@@ -4687,8 +4727,8 @@ impl PrivchatSdk {
         self.tx
             .send(Command::GetUserStoragePaths { resp: resp_tx })
             .await
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 }
 

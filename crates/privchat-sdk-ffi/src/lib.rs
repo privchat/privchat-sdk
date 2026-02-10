@@ -753,6 +753,7 @@ pub struct ServerEndpoint {
 pub struct PrivchatConfig {
     pub endpoints: Vec<ServerEndpoint>,
     pub connection_timeout_secs: u64,
+    pub data_dir: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1253,6 +1254,7 @@ fn map_config(c: PrivchatConfig) -> SdkConfig {
             })
             .collect(),
         connection_timeout_secs: c.connection_timeout_secs,
+        data_dir: c.data_dir,
     }
 }
 
@@ -1990,6 +1992,7 @@ impl PrivchatClient {
             .unwrap_or(PrivchatConfig {
                 endpoints: vec![],
                 connection_timeout_secs: 30,
+                data_dir: String::new(),
             })
     }
 
@@ -5849,6 +5852,7 @@ mod tests {
                 use_tls: false,
             }],
             connection_timeout_secs: 1,
+            data_dir: String::new(),
         }
     }
 
