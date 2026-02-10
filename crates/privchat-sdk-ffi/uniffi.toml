@@ -1,0 +1,7 @@
+[bindings.kotlin]
+package_name = "io.privchat.sdk"
+cdylib_name = "privchat_sdk_ffi"
+
+[bindings.swift]
+module_name = "PrivchatSDK"
+cdylib_name = "privchat_sdk_ffi"

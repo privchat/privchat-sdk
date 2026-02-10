@@ -1,0 +1,33 @@
+# Rust workspace artifacts
+/target/
+**/*.rs.bk
+
+# Generated bindings / headers
+/crates/privchat-sdk-ffi/bindings/swift/
+/crates/privchat-sdk-ffi/bindings/kotlin/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# IDE / OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Editor temp files
+*.swp
+*.swo
+*~
+
+# Logs and profiling outputs
+*.log
+*.tmp
+*.profraw
+*.profdata
+
+# Runtime/debug artifacts
+*.pid
+*.core

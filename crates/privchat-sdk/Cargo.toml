@@ -1,0 +1,24 @@
+[package]
+name = "privchat-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+msgtrans.workspace = true
+privchat-protocol.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+refinery.workspace = true
+sled.workspace = true
+sha2.workspace = true
+hex.workspace = true
+snowflake_me = { version = "0.5.0", features = ["ip-fallback"] }
