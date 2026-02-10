@@ -39,7 +39,7 @@
 ## 4.1 Generic bridge
 
 - `rpc_call(route, body_json)` -> DONE
-- `entity_sync_remote(payload_json)` -> DONE
+- `entity_sync_remote(payload: SyncEntitiesInput)` -> DONE
 
 Optimization:
 - 所有远端封装统一走同一路径：`PrivchatSdk::rpc_call`（Actor 内执行）

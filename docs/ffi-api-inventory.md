@@ -67,7 +67,7 @@
 - `get_profile()`
 - `update_profile(profile_json)`
 - `get_privacy_settings()`
-- `update_privacy_settings(settings_json)`
+- `update_privacy_settings(payload: AccountPrivacyUpdateInput)`
 - `qrcode_generate(qr_type, payload, expire_seconds)`
 - `qrcode_resolve(qr_key, token)`
 - `qrcode_list(qr_type)`
@@ -75,9 +75,9 @@
 - `search_user_by_qrcode(qr_key, token)`
 - `account_user_detail_remote(user_id)`
 - `account_user_share_card_remote(user_id)`
-- `account_user_update_remote(payload_json)`
+- `account_user_update_remote(payload: AccountUserUpdateInput)`
 - `auth_logout_remote()`
-- `auth_refresh_remote(payload_json)`
+- `auth_refresh_remote(payload: AuthRefreshInput)`
 - `qrcode_refresh(qr_key, expire_seconds)`
 - `qrcode_revoke(qr_key)`
 - `user_qrcode_generate(expire_seconds)`
@@ -91,26 +91,26 @@
 - `group_transfer_owner_remote(group_id, target_user_id)`
 - `group_set_role_remote(group_id, user_id, role)`
 - `group_get_settings_remote(group_id)`
-- `group_update_settings_remote(settings_json)`
+- `group_update_settings_remote(payload: GroupSettingsUpdateInput)`
 - `group_mute_all_remote(group_id, enabled)`
 - `group_approval_list_remote(group_id, page, page_size)`
 - `group_approval_handle_remote(approval_id, approved, reason)`
 - `group_qrcode_generate_remote(group_id, expire_seconds)`
 - `group_qrcode_join_remote(qr_key, token)`
-- `channel_broadcast_create_remote(payload_json)`
-- `channel_broadcast_subscribe_remote(payload_json)`
-- `channel_broadcast_list_remote(payload_json)`
-- `channel_content_publish_remote(payload_json)`
-- `channel_content_list_remote(payload_json)`
-- `sticker_package_list_remote(payload_json)`
-- `sticker_package_detail_remote(payload_json)`
-- `sync_submit_remote(payload_json)`
-- `entity_sync_remote(payload_json)`
-- `sync_get_difference_remote(payload_json)`
-- `sync_get_channel_pts_remote(payload_json)`
-- `sync_batch_get_channel_pts_remote(payload_json)`
-- `file_request_upload_token_remote(payload_json)`
-- `file_upload_callback_remote(payload_json)`
+- `channel_broadcast_create_remote(payload: ChannelBroadcastCreateInput)`
+- `channel_broadcast_subscribe_remote(payload: ChannelBroadcastSubscribeInput)`
+- `channel_broadcast_list_remote(payload: ChannelBroadcastListInput)`
+- `channel_content_publish_remote(payload: ChannelContentPublishInput)`
+- `channel_content_list_remote(payload: ChannelContentListInput)`
+- `sticker_package_list_remote(payload: StickerPackageListInput)`
+- `sticker_package_detail_remote(payload: StickerPackageDetailInput)`
+- `sync_submit_remote(payload: SyncSubmitInput)`
+- `entity_sync_remote(payload: SyncEntitiesInput)`
+- `sync_get_difference_remote(payload: GetDifferenceInput)`
+- `sync_get_channel_pts_remote(payload: GetChannelPtsInput)`
+- `sync_batch_get_channel_pts_remote(payload: BatchGetChannelPtsInput)`
+- `file_request_upload_token_remote(payload: FileRequestUploadTokenInput)`
+- `file_upload_callback_remote(payload: FileUploadCallbackInput)`
 
 ## 4. Outbound Queue (Local-first)
 

@@ -1,5 +1,5 @@
 [bindings.kotlin]
-package_name = "io.privchat.sdk"
+package_name = "uniffi.privchat_sdk_ffi"
 cdylib_name = "privchat_sdk_ffi"
 
 [bindings.swift]

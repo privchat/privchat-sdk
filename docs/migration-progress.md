@@ -54,8 +54,9 @@ Optimization during migration:
 
 ## 7) Compatibility Aliases Added (Latest Batch)
 - bootstrap/init compatibility:
-  - `run_bootstrap_sync_async`, `initialize`, `initialize_blocking`, `run_bootstrap_sync_in_background`
-  - `is_initialized`, `is_shutting_down`
+  - retained: `is_initialized`, `is_shutting_down`
+  - removed after native binding regeneration:
+    `initialize`, `initialize_blocking`, `run_bootstrap_sync_async`, `run_bootstrap_sync_in_background`
 - state/event compatibility:
   - `get_connection_summary`, `subscribe_events`, `subscribe_network_status`
 - presence/typing compatibility:
@@ -99,6 +100,11 @@ Optimization during migration:
   - `enter_foreground/on_app_foreground` now resume supervised sync
   - lifecycle callback bridge methods now emit structured logs
   - `get_connection_summary` now includes `app_in_background` and `supervised_sync_running`
+- background compatibility wrappers hardened:
+  - `run_bootstrap_sync_in_background` / `sync_entities_in_background` / `sync_messages_in_background`
+    no longer depend on ambient Tokio reactor (`tokio::spawn` removed from FFI main path)
+  - wrappers now run on dedicated background thread with explicit runtime bootstrap,
+    preventing "there is no reactor running" regressions on iOS/Kotlin caller threads
 - new ffi unit tests:
   - read-list parsing compatibility tests added in `privchat-sdk-ffi/src/lib.rs`
 - queue control semantics improved:
@@ -193,9 +199,23 @@ Optimization during migration:
     - `channel_content_list_remote` -> `ChannelContentListRequest/ChannelContentListResponse`
     - `sticker_package_list_remote` -> `StickerPackageListRequest/StickerPackageListResponse`
     - `sticker_package_detail_remote` -> `StickerPackageDetailRequest/StickerPackageDetailResponse`
-  - remaining manual `serde_json::json!` callsites in `privchat-sdk-ffi`: `14` (down from `55`)
+  - remaining manual `serde_json::json!` callsites in `privchat-sdk-ffi`: `0` (down from `55`)
   - remaining direct `rpc_call(route, payload_json)` business callsites in `privchat-sdk-ffi`: `0`
   - direct `rpc_call(...)` now only exists in core helpers (`rpc_call_typed` and compatibility `rpc_call` wrapper)
+  - FFI typed-return batch (json wrapper removed on bool-like APIs):
+    - `hide_channel` / `mute_channel`
+    - `reject_friend_request` / `delete_friend`
+    - `invite_to_group` / `remove_group_member` / `leave_group`
+    - `group_add_members_remote` / `group_remove_member_remote` / `group_leave_remote`
+    - `leave_channel`
+  - FFI typed-return batch (json wrapper removed on friend/group/channel flows):
+    - `send_friend_request` -> `FriendRequestResult`
+    - `accept_friend_request` -> `u64` (channel id)
+    - `get_or_create_direct_channel` -> `DirectChannelResult`
+    - `create_group` -> `GroupCreateResult`
+    - `group_qrcode_join_remote` / `join_group_by_qrcode` -> `GroupQrCodeJoinResult`
+    - `get_channel_sync_state` -> `ChannelSyncState`
+  - Kotlin native adapter aligned to typed FFI (removed JSON parsing for above APIs)
 - gate verification:
   - iOS auto-repro (`scripts/ios-auto-repro.sh`) latest run passes full chain:
     `create -> connect -> login -> authenticate -> runBootstrapSync -> MainTabPage`
@@ -205,3 +225,6 @@ Optimization during migration:
     - `/Users/zoujiaqing/projects/privchat/privchat-sdk-kotlin/.repro-logs/ios-app-stdout-20260210-204314.log`
     - `/Users/zoujiaqing/projects/privchat/privchat-sdk-kotlin/.repro-logs/ios-app-stdout-20260210-205058.log`
     - `/Users/zoujiaqing/projects/privchat/privchat-sdk-kotlin/.repro-logs/ios-app-stdout-20260210-210956.log`
+    - `/Users/zoujiaqing/projects/privchat/privchat-sdk-kotlin/.repro-logs/ios-app-stdout-20260210-224156.log`
+    - `/Users/zoujiaqing/projects/privchat/privchat-sdk-kotlin/.repro-logs/ios-app-stdout-20260210-225154.log`
+    - `/Users/zoujiaqing/projects/privchat/privchat-sdk-kotlin/.repro-logs/ios-app-stdout-20260211-002751.log`
