@@ -1,6 +1,8 @@
 # Rust workspace artifacts
 /target/
 **/*.rs.bk
+Cargo.lock
+target/
 
 # Generated bindings / headers
 /crates/privchat-sdk-ffi/bindings/swift/

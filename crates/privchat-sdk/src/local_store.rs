@@ -671,7 +671,11 @@ impl LocalStore {
              ON CONFLICT(blocked_user_id) DO UPDATE SET
                 created_at=excluded.created_at,
                 updated_at=excluded.updated_at",
-            params![input.blocked_user_id as i64, input.created_at, input.updated_at],
+            params![
+                input.blocked_user_id as i64,
+                input.created_at,
+                input.updated_at
+            ],
         )
         .map_err(|e| Error::Storage(format!("upsert blacklist entry: {e}")))?;
         Ok(())
@@ -2194,7 +2198,9 @@ mod tests {
         assert_eq!(friends[0].user_id, 20001);
         assert!(friends[0].is_pinned);
         store.delete_friend(uid, 20001).expect("delete friend");
-        let friends = store.list_friends(uid, 20, 0).expect("list friends after delete");
+        let friends = store
+            .list_friends(uid, 20, 0)
+            .expect("list friends after delete");
         assert!(friends.is_empty());
         store
             .upsert_blacklist_entry(

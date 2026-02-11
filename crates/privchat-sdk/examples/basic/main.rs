@@ -17,11 +17,8 @@ async fn main() -> BoxResult<()> {
     let ws_port = parse_env_u16("PRIVCHAT_WS_PORT", 9080);
 
     let ts = now_millis();
-    let data_dir = std::env::temp_dir().join(format!(
-        "privchat-rust-basic-{}-{}",
-        ts,
-        std::process::id()
-    ));
+    let data_dir =
+        std::env::temp_dir().join(format!("privchat-rust-basic-{}-{}", ts, std::process::id()));
     std::fs::create_dir_all(&data_dir)?;
 
     let sdk = PrivchatSdk::new(PrivchatConfig {
@@ -66,13 +63,21 @@ async fn main() -> BoxResult<()> {
         .await
     {
         Ok(out) => {
-            println!("   registered: user_id={} username={}", out.user_id, username);
+            println!(
+                "   registered: user_id={} username={}",
+                out.user_id, username
+            );
             out
         }
         Err(reg_err) => {
             println!("   register failed ({reg_err}), fallback to login");
-            let out = sdk.login(username.clone(), password, device_id.clone()).await?;
-            println!("   logged in: user_id={} username={}", out.user_id, username);
+            let out = sdk
+                .login(username.clone(), password, device_id.clone())
+                .await?;
+            println!(
+                "   logged in: user_id={} username={}",
+                out.user_id, username
+            );
             out
         }
     };

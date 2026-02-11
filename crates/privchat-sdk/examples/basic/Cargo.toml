@@ -1,0 +1,16 @@
+[package]
+name = "basic"
+version = "0.1.0"
+edition = "2021"
+authors = ["PrivChat Team"]
+description = "PrivChat SDK basic example"
+
+[workspace]
+
+[[bin]]
+name = "basic"
+path = "main.rs"
+
+[dependencies]
+privchat-sdk = { path = "../.." }
+tokio = { version = "1", features = ["full"] }

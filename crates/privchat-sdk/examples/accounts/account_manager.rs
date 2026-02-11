@@ -1,29 +1,48 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::{
-    AccountSearchQueryRequest, AccountSearchResponse, BlacklistAddRequest, BlacklistAddResponse,
-    BlacklistCheckRequest, BlacklistCheckResponse, BlacklistListRequest,
-    BlacklistRemoveRequest, BlacklistRemoveResponse, ClientSubmitRequest, ClientSubmitResponse,
-    FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse,
-    FriendCheckRequest, FriendCheckResponse, FriendPendingRequest, FriendPendingResponse,
-    GetChannelPtsRequest, GetChannelPtsResponse, GetOrCreateDirectChannelRequest,
-    GetOrCreateDirectChannelResponse, GroupCreateRequest, GroupCreateResponse,
-    GroupMemberListRequest, GroupMemberListResponse, MessageHistoryGetRequest,
+    AccountPrivacyGetRequest, AccountPrivacyGetResponse, AccountPrivacyUpdateRequest,
+    AccountPrivacyUpdateResponse, AccountProfileGetRequest, AccountProfileGetResponse,
+    AccountProfileUpdateRequest, AccountProfileUpdateResponse, AccountSearchQueryRequest,
+    AccountSearchResponse, BlacklistAddRequest, BlacklistAddResponse, BlacklistCheckRequest,
+    BlacklistCheckResponse, BlacklistListRequest, BlacklistRemoveRequest, BlacklistRemoveResponse,
+    ChannelHideRequest, ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse,
+    ChannelPinRequest, ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse,
+    FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
+    FileUploadCallbackResponse, FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest,
+    FriendApplyResponse, FriendCheckRequest, FriendCheckResponse, FriendPendingRequest,
+    FriendPendingResponse, FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest,
+    FriendRemoveResponse, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
+    GetDifferenceResponse, GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
+    GroupApprovalListRequest, GroupApprovalListResponse, GroupCreateRequest, GroupCreateResponse,
+    GroupInfoRequest, GroupInfoResponse, GroupMemberAddRequest, GroupMemberAddResponse,
+    GroupMemberLeaveRequest, GroupMemberLeaveResponse, GroupMemberListRequest,
+    GroupMemberListResponse, GroupMemberMuteRequest, GroupMemberRemoveRequest,
+    GroupMemberRemoveResponse, GroupMemberUnmuteRequest, GroupMuteAllRequest, GroupMuteAllResponse,
+    GroupQRCodeGenerateRequest, GroupQRCodeGenerateResponse, GroupRoleSetRequest,
+    GroupRoleSetResponse, GroupSettingsGetRequest, GroupSettingsGetResponse, GroupSettingsPatch,
+    GroupSettingsUpdateRequest, GroupSettingsUpdateResponse, MessageHistoryGetRequest,
     MessageHistoryResponse, MessageReactionAddRequest, MessageReactionAddResponse,
     MessageReactionListRequest, MessageReactionListResponse, MessageReactionRemoveRequest,
-    MessageReactionRemoveResponse, MessageReadListRequest, MessageReadListResponse,
-    MessageStatusReadRequest, MessageStatusReadResponse, UserQRCodeGenerateRequest,
-    UserQRCodeGenerateResponse, UserQRCodeGetRequest, UserQRCodeGetResponse,
-    UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
+    MessageReactionRemoveResponse, MessageReactionStatsRequest, MessageReactionStatsResponse,
+    MessageReadListRequest, MessageReadListResponse, MessageReadStatsRequest,
+    MessageReadStatsResponse, MessageRevokeRequest, MessageRevokeResponse,
+    MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadRequest,
+    MessageStatusReadResponse, ServerDecision, StickerPackageDetailRequest,
+    StickerPackageDetailResponse, StickerPackageListRequest, StickerPackageListResponse,
+    UserQRCodeGenerateRequest, UserQRCodeGenerateResponse, UserQRCodeGetRequest,
+    UserQRCodeGetResponse, UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
 };
-use privchat_sdk::{PrivchatConfig, PrivchatSdk, ServerEndpoint, SessionSnapshot, TransportProtocol};
+use privchat_sdk::{
+    PrivchatConfig, PrivchatSdk, ServerEndpoint, SessionSnapshot, TransportProtocol,
+};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::types::AccountConfig;
 
@@ -42,8 +61,12 @@ pub struct MultiAccountManager {
     direct_channels: HashMap<String, u64>,
     group_channels: HashMap<String, u64>,
     endpoints: Vec<ServerEndpoint>,
+    suffix: String,
     pub base_dir: PathBuf,
 }
+
+pub const DIRECT_SYNC_CHANNEL_TYPE: u8 = 1;
+pub const GROUP_SYNC_CHANNEL_TYPE: u8 = 2;
 
 impl MultiAccountManager {
     pub async fn new() -> BoxResult<Self> {
@@ -77,7 +100,11 @@ impl MultiAccountManager {
         ];
 
         let ts = now_millis();
-        let base_dir = std::env::temp_dir().join(format!("privchat-rust-accounts-{}-{}", ts, std::process::id()));
+        let base_dir = std::env::temp_dir().join(format!(
+            "privchat-rust-accounts-{}-{}",
+            ts,
+            std::process::id()
+        ));
         std::fs::create_dir_all(&base_dir)?;
 
         let mut manager = Self {
@@ -85,10 +112,12 @@ impl MultiAccountManager {
             direct_channels: HashMap::new(),
             group_channels: HashMap::new(),
             endpoints,
+            suffix: String::new(),
             base_dir,
         };
 
         let suffix = format!("{}{}", ts % 100000, std::process::id());
+        manager.suffix = suffix.clone();
         manager.create_and_auth_account("alice", &suffix).await?;
         manager.create_and_auth_account("bob", &suffix).await?;
         manager.create_and_auth_account("charlie", &suffix).await?;
@@ -133,7 +162,21 @@ impl MultiAccountManager {
     }
 
     fn account(&self, key: &str) -> BoxResult<&ManagedAccount> {
-        self.accounts.get(key).ok_or_else(|| boxed_err(format!("account not found: {key}")))
+        self.accounts
+            .get(key)
+            .ok_or_else(|| boxed_err(format!("account not found: {key}")))
+    }
+
+    pub async fn ensure_account(&mut self, key: &str) -> BoxResult<()> {
+        if self.accounts.contains_key(key) {
+            return Ok(());
+        }
+        let suffix = self.suffix.clone();
+        self.create_and_auth_account(key, &suffix).await
+    }
+
+    pub fn account_keys(&self) -> Vec<String> {
+        self.accounts.keys().cloned().collect()
     }
 
     pub fn user_id(&self, key: &str) -> BoxResult<u64> {
@@ -197,7 +240,11 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn send_friend_request(&self, from: &str, to_user_id: u64) -> BoxResult<FriendApplyResponse> {
+    pub async fn send_friend_request(
+        &self,
+        from: &str,
+        to_user_id: u64,
+    ) -> BoxResult<FriendApplyResponse> {
         let sdk = &self.account(from)?.sdk;
         let body = serde_json::to_string(&FriendApplyRequest {
             target_user_id: to_user_id,
@@ -206,37 +253,21 @@ impl MultiAccountManager {
             source_id: Some(to_user_id.to_string()),
             from_user_id: 0,
         })?;
-        let raw = sdk.rpc_call(routes::friend::APPLY.to_string(), body).await?;
-        let value: serde_json::Value = serde_json::from_str(&raw)?;
-        let user_id = value
-            .get("user_id")
-            .and_then(|v| match v {
-                serde_json::Value::Number(n) => n.as_u64(),
-                serde_json::Value::String(s) => s.parse::<u64>().ok(),
-                _ => None,
-            })
-            .unwrap_or(0);
+        let raw = sdk
+            .rpc_call(routes::friend::APPLY.to_string(), body)
+            .await?;
+        let resp: FriendApplyCompat = serde_json::from_str(&raw).map_err(|e| {
+            boxed_err(format!(
+                "decode {} failed: {e}; raw={raw}",
+                routes::friend::APPLY
+            ))
+        })?;
         Ok(FriendApplyResponse {
-            user_id,
-            username: value
-                .get("username")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            status: value
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            added_at: value
-                .get("added_at")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            message: value
-                .get("message")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+            user_id: resp.user_id,
+            username: resp.username,
+            status: resp.status,
+            added_at: resp.added_at,
+            message: resp.message,
         })
     }
 
@@ -249,7 +280,11 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn accept_friend_request(&self, to: &str, from_user_id: u64) -> BoxResult<FriendAcceptResponse> {
+    pub async fn accept_friend_request(
+        &self,
+        to: &str,
+        from_user_id: u64,
+    ) -> BoxResult<FriendAcceptResponse> {
         self.rpc_typed(
             to,
             routes::friend::ACCEPT,
@@ -298,6 +333,49 @@ impl MultiAccountManager {
         self.direct_channels.get(&direct_key(a, b)).copied()
     }
 
+    pub async fn list_local_friends(
+        &self,
+        key: &str,
+    ) -> BoxResult<Vec<privchat_sdk::StoredFriend>> {
+        Ok(self.account(key)?.sdk.list_friends(200, 0).await?)
+    }
+
+    pub async fn refresh_local_views(&self, key: &str) -> BoxResult<()> {
+        let sdk = &self.account(key)?.sdk;
+        let _ = sdk.sync_entities("friend".to_string(), None).await?;
+        let _ = sdk.sync_entities("group".to_string(), None).await?;
+        let _ = sdk.sync_entities("channel".to_string(), None).await?;
+        Ok(())
+    }
+
+    pub async fn refresh_all_local_views(&self) -> BoxResult<()> {
+        for key in ["alice", "bob", "charlie"] {
+            self.refresh_local_views(key).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_local_channels(
+        &self,
+        key: &str,
+    ) -> BoxResult<Vec<privchat_sdk::StoredChannel>> {
+        Ok(self.account(key)?.sdk.list_channels(500, 0).await?)
+    }
+
+    pub async fn list_local_messages(
+        &self,
+        key: &str,
+        channel_id: u64,
+        channel_type: i32,
+        limit: usize,
+    ) -> BoxResult<Vec<privchat_sdk::StoredMessage>> {
+        Ok(self
+            .account(key)?
+            .sdk
+            .list_messages(channel_id, channel_type, limit, 0)
+            .await?)
+    }
+
     pub fn cache_group_channel(&mut self, name: &str, channel_id: u64) {
         self.group_channels.insert(name.to_string(), channel_id);
     }
@@ -306,7 +384,12 @@ impl MultiAccountManager {
         self.group_channels.get(name).copied()
     }
 
-    pub async fn create_group(&self, owner: &str, name: &str, members: Vec<u64>) -> BoxResult<GroupCreateResponse> {
+    pub async fn create_group(
+        &self,
+        owner: &str,
+        name: &str,
+        members: Vec<u64>,
+    ) -> BoxResult<GroupCreateResponse> {
         self.rpc_typed(
             owner,
             routes::group::CREATE,
@@ -320,11 +403,18 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn list_group_members(&self, key: &str, group_id: u64) -> BoxResult<GroupMemberListResponse> {
+    pub async fn list_group_members(
+        &self,
+        key: &str,
+        group_id: u64,
+    ) -> BoxResult<GroupMemberListResponse> {
         self.rpc_typed(
             key,
             routes::group_member::LIST,
-            &GroupMemberListRequest { group_id, user_id: 0 },
+            &GroupMemberListRequest {
+                group_id,
+                user_id: 0,
+            },
         )
         .await
     }
@@ -336,33 +426,68 @@ impl MultiAccountManager {
         channel_type: u8,
         text: &str,
     ) -> BoxResult<ClientSubmitResponse> {
-        let pts_resp: GetChannelPtsResponse = self
-            .rpc_typed(
-                key,
-                routes::sync::GET_CHANNEL_PTS,
-                &GetChannelPtsRequest {
-                    channel_id,
-                    channel_type,
-                },
-            )
-            .await?;
+        for _ in 0..4 {
+            let pts_resp: GetChannelPtsResponse = self
+                .rpc_typed(
+                    key,
+                    routes::sync::GET_CHANNEL_PTS,
+                    &GetChannelPtsRequest {
+                        channel_id,
+                        channel_type,
+                    },
+                )
+                .await?;
 
-        let local_message_id = next_local_message_id();
-        self.rpc_typed(
-            key,
-            routes::sync::SUBMIT,
-            &ClientSubmitRequest {
-                local_message_id,
-                channel_id,
-                channel_type,
-                last_pts: pts_resp.current_pts,
-                command_type: "text".to_string(),
-                payload: serde_json::json!({ "text": text }),
-                client_timestamp: now_millis(),
-                device_id: None,
+            let local_message_id = next_local_message_id();
+            let submit: BoxResult<ClientSubmitResponse> = self
+                .rpc_typed(
+                    key,
+                    routes::sync::SUBMIT,
+                    &ClientSubmitRequest {
+                        local_message_id,
+                        channel_id,
+                        channel_type,
+                        last_pts: pts_resp.current_pts,
+                        command_type: "text".to_string(),
+                        payload: serde_json::json!({ "text": text }),
+                        client_timestamp: now_millis(),
+                        device_id: None,
+                    },
+                )
+                .await;
+            match submit {
+                Ok(v) => {
+                    let should_retry = matches!(
+                        &v.decision,
+                        ServerDecision::Rejected { reason } if reason.contains("Redis ZADD failed")
+                    );
+                    if should_retry {
+                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                        continue;
+                    }
+                    return Ok(v);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("Redis ZADD failed") {
+                        return Err(e);
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        }
+
+        Ok(ClientSubmitResponse {
+            decision: ServerDecision::Rejected {
+                reason: "submit attempts exhausted".to_string(),
             },
-        )
-        .await
+            pts: None,
+            server_msg_id: None,
+            server_timestamp: now_millis(),
+            local_message_id: 0,
+            has_gap: false,
+            current_pts: 0,
+        })
     }
 
     pub async fn message_history(
@@ -384,7 +509,12 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn add_reaction(&self, key: &str, server_message_id: u64, emoji: &str) -> BoxResult<MessageReactionAddResponse> {
+    pub async fn add_reaction(
+        &self,
+        key: &str,
+        server_message_id: u64,
+        emoji: &str,
+    ) -> BoxResult<MessageReactionAddResponse> {
         self.rpc_typed(
             key,
             routes::message_reaction::ADD,
@@ -416,7 +546,11 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn list_reactions(&self, key: &str, server_message_id: u64) -> BoxResult<MessageReactionListResponse> {
+    pub async fn list_reactions(
+        &self,
+        key: &str,
+        server_message_id: u64,
+    ) -> BoxResult<MessageReactionListResponse> {
         self.rpc_typed(
             key,
             routes::message_reaction::LIST,
@@ -428,7 +562,12 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn mark_read(&self, key: &str, channel_id: u64, server_message_id: u64) -> BoxResult<MessageStatusReadResponse> {
+    pub async fn mark_read(
+        &self,
+        key: &str,
+        channel_id: u64,
+        server_message_id: u64,
+    ) -> BoxResult<MessageStatusReadResponse> {
         self.rpc_typed(
             key,
             routes::message_status::READ,
@@ -441,7 +580,12 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn read_list(&self, key: &str, channel_id: u64, server_message_id: u64) -> BoxResult<MessageReadListResponse> {
+    pub async fn read_list(
+        &self,
+        key: &str,
+        channel_id: u64,
+        server_message_id: u64,
+    ) -> BoxResult<MessageReadListResponse> {
         self.rpc_typed(
             key,
             routes::message_status::READ_LIST,
@@ -453,7 +597,11 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn blacklist_add(&self, key: &str, blocked_user_id: u64) -> BoxResult<BlacklistAddResponse> {
+    pub async fn blacklist_add(
+        &self,
+        key: &str,
+        blocked_user_id: u64,
+    ) -> BoxResult<BlacklistAddResponse> {
         self.rpc_typed(
             key,
             routes::blacklist::ADD,
@@ -465,7 +613,11 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn blacklist_remove(&self, key: &str, blocked_user_id: u64) -> BoxResult<BlacklistRemoveResponse> {
+    pub async fn blacklist_remove(
+        &self,
+        key: &str,
+        blocked_user_id: u64,
+    ) -> BoxResult<BlacklistRemoveResponse> {
         self.rpc_typed(
             key,
             routes::blacklist::REMOVE,
@@ -477,7 +629,11 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn blacklist_check(&self, key: &str, target_user_id: u64) -> BoxResult<BlacklistCheckResponse> {
+    pub async fn blacklist_check(
+        &self,
+        key: &str,
+        target_user_id: u64,
+    ) -> BoxResult<BlacklistCheckResponse> {
         let sdk = &self.account(key)?.sdk;
         let body = serde_json::to_string(&BlacklistCheckRequest {
             user_id: 0,
@@ -486,13 +642,15 @@ impl MultiAccountManager {
         let raw = sdk
             .rpc_call(routes::blacklist::CHECK.to_string(), body)
             .await?;
-        let value: serde_json::Value = serde_json::from_str(&raw)?;
-        let is_blocked = value
-            .get("is_blocked")
-            .or_else(|| value.get("blocked"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        Ok(BlacklistCheckResponse { is_blocked })
+        let resp: BlacklistCheckCompat = serde_json::from_str(&raw).map_err(|e| {
+            boxed_err(format!(
+                "decode {} failed: {e}; raw={raw}",
+                routes::blacklist::CHECK
+            ))
+        })?;
+        Ok(BlacklistCheckResponse {
+            is_blocked: resp.is_blocked,
+        })
     }
 
     pub async fn blacklist_list_user_ids(&self, key: &str) -> BoxResult<Vec<u64>> {
@@ -501,21 +659,17 @@ impl MultiAccountManager {
         let raw = sdk
             .rpc_call(routes::blacklist::LIST.to_string(), body)
             .await?;
-        let value: serde_json::Value = serde_json::from_str(&raw)?;
-        let users = value
-            .get("users")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let ids = users
+        let resp: BlacklistListCompat = serde_json::from_str(&raw).map_err(|e| {
+            boxed_err(format!(
+                "decode {} failed: {e}; raw={raw}",
+                routes::blacklist::LIST
+            ))
+        })?;
+        Ok(resp
+            .users
             .into_iter()
-            .filter_map(|u| {
-                u.get("blocked_user_id")
-                    .or_else(|| u.get("user_id"))
-                    .and_then(|v| v.as_u64())
-            })
-            .collect();
-        Ok(ids)
+            .filter_map(|u| u.blocked_user_id.or(u.user_id))
+            .collect())
     }
 
     pub async fn user_qrcode_generate(&self, key: &str) -> BoxResult<UserQRCodeGenerateResponse> {
@@ -554,12 +708,616 @@ impl MultiAccountManager {
         .await
     }
 
+    pub async fn reject_friend_request(
+        &self,
+        to: &str,
+        from_user_id: u64,
+    ) -> BoxResult<FriendRejectResponse> {
+        self.rpc_typed(
+            to,
+            routes::friend::REJECT,
+            &FriendRejectRequest {
+                from_user_id,
+                target_user_id: 0,
+                message: Some("rejected by accounts example".to_string()),
+            },
+        )
+        .await
+    }
+
+    pub async fn remove_friend(
+        &self,
+        key: &str,
+        friend_id: u64,
+    ) -> BoxResult<FriendRemoveResponse> {
+        self.rpc_typed(
+            key,
+            routes::friend::DELETE,
+            &FriendRemoveRequest {
+                friend_id,
+                user_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_info(&self, key: &str, group_id: u64) -> BoxResult<GroupInfoResponse> {
+        let sdk = &self.account(key)?.sdk;
+        let body = serde_json::to_string(&GroupInfoRequest {
+            group_id,
+            user_id: 0,
+        })?;
+        let raw = sdk.rpc_call(routes::group::INFO.to_string(), body).await?;
+        let wrapped: GroupInfoWrapped = serde_json::from_str(&raw).map_err(|e| {
+            boxed_err(format!(
+                "decode {} failed: {e}; raw={raw}",
+                routes::group::INFO
+            ))
+        })?;
+        Ok(wrapped.group_info)
+    }
+
+    pub async fn group_member_add(
+        &self,
+        key: &str,
+        group_id: u64,
+        user_id: u64,
+    ) -> BoxResult<GroupMemberAddResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_member::ADD,
+            &GroupMemberAddRequest {
+                group_id,
+                user_id,
+                role: Some("member".to_string()),
+                inviter_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_member_remove(
+        &self,
+        key: &str,
+        group_id: u64,
+        user_id: u64,
+    ) -> BoxResult<GroupMemberRemoveResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_member::REMOVE,
+            &GroupMemberRemoveRequest {
+                group_id,
+                user_id,
+                operator_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_member_leave(
+        &self,
+        key: &str,
+        group_id: u64,
+    ) -> BoxResult<GroupMemberLeaveResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_member::LEAVE,
+            &GroupMemberLeaveRequest {
+                group_id,
+                user_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_member_mute(
+        &self,
+        key: &str,
+        group_id: u64,
+        user_id: u64,
+        secs: u64,
+    ) -> BoxResult<u64> {
+        self.rpc_typed(
+            key,
+            routes::group_member::MUTE,
+            &GroupMemberMuteRequest {
+                group_id,
+                user_id,
+                mute_duration: secs,
+                operator_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_member_unmute(
+        &self,
+        key: &str,
+        group_id: u64,
+        user_id: u64,
+    ) -> BoxResult<bool> {
+        self.rpc_typed(
+            key,
+            routes::group_member::UNMUTE,
+            &GroupMemberUnmuteRequest {
+                group_id,
+                user_id,
+                operator_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_role_set(
+        &self,
+        key: &str,
+        group_id: u64,
+        operator_id: u64,
+        user_id: u64,
+        role: &str,
+    ) -> BoxResult<GroupRoleSetResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_role::SET,
+            &GroupRoleSetRequest {
+                group_id,
+                operator_id,
+                user_id,
+                role: role.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn group_settings_get(
+        &self,
+        key: &str,
+        group_id: u64,
+    ) -> BoxResult<GroupSettingsGetResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_settings::GET,
+            &GroupSettingsGetRequest {
+                group_id,
+                user_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_settings_update(
+        &self,
+        key: &str,
+        group_id: u64,
+        operator_id: u64,
+        settings: GroupSettingsPatch,
+    ) -> BoxResult<GroupSettingsUpdateResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_settings::UPDATE,
+            &GroupSettingsUpdateRequest {
+                group_id,
+                operator_id,
+                settings,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_mute_all(
+        &self,
+        key: &str,
+        group_id: u64,
+        operator_id: u64,
+        muted: bool,
+    ) -> BoxResult<GroupMuteAllResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_settings::MUTE_ALL,
+            &GroupMuteAllRequest {
+                group_id,
+                operator_id,
+                muted,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_approval_list(
+        &self,
+        key: &str,
+        group_id: u64,
+        operator_id: u64,
+    ) -> BoxResult<GroupApprovalListResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_approval::LIST,
+            &GroupApprovalListRequest {
+                group_id,
+                operator_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn group_qrcode_generate(
+        &self,
+        key: &str,
+        group_id: u64,
+    ) -> BoxResult<GroupQRCodeGenerateResponse> {
+        self.rpc_typed(
+            key,
+            routes::group_qrcode::GENERATE,
+            &GroupQRCodeGenerateRequest {
+                group_id,
+                expire_seconds: Some(3600),
+                operator_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn channel_pin(
+        &self,
+        key: &str,
+        channel_id: u64,
+        pinned: bool,
+    ) -> BoxResult<ChannelPinResponse> {
+        self.rpc_typed(
+            key,
+            routes::channel::PIN,
+            &ChannelPinRequest {
+                user_id: 0,
+                channel_id,
+                pinned,
+            },
+        )
+        .await
+    }
+
+    pub async fn channel_mute(
+        &self,
+        key: &str,
+        channel_id: u64,
+        muted: bool,
+    ) -> BoxResult<ChannelMuteResponse> {
+        self.rpc_typed(
+            key,
+            routes::channel::MUTE,
+            &ChannelMuteRequest {
+                user_id: 0,
+                channel_id,
+                muted,
+            },
+        )
+        .await
+    }
+
+    pub async fn channel_hide(&self, key: &str, channel_id: u64) -> BoxResult<ChannelHideResponse> {
+        self.rpc_typed(
+            key,
+            routes::channel::HIDE,
+            &ChannelHideRequest {
+                user_id: 0,
+                channel_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn sticker_package_list(&self, key: &str) -> BoxResult<StickerPackageListResponse> {
+        self.rpc_typed(
+            key,
+            routes::sticker::PACKAGE_LIST,
+            &StickerPackageListRequest {},
+        )
+        .await
+    }
+
+    pub async fn sticker_package_detail(
+        &self,
+        key: &str,
+        package_id: String,
+    ) -> BoxResult<StickerPackageDetailResponse> {
+        self.rpc_typed(
+            key,
+            routes::sticker::PACKAGE_DETAIL,
+            &StickerPackageDetailRequest { package_id },
+        )
+        .await
+    }
+
+    pub async fn file_request_upload_token(
+        &self,
+        key: &str,
+        filename: &str,
+        size: i64,
+        mime: &str,
+        file_type: &str,
+    ) -> BoxResult<FileRequestUploadTokenResponse> {
+        let sdk = &self.account(key)?.sdk;
+        let body = serde_json::to_string(&FileRequestUploadTokenRequest {
+            user_id: self.user_id(key)?,
+            filename: Some(filename.to_string()),
+            file_size: size,
+            mime_type: mime.to_string(),
+            file_type: file_type.to_string(),
+            business_type: "message".to_string(),
+        })?;
+        let raw = sdk
+            .rpc_call(routes::file::REQUEST_UPLOAD_TOKEN.to_string(), body)
+            .await?;
+        let resp: FileRequestUploadTokenCompat = serde_json::from_str(&raw).map_err(|e| {
+            boxed_err(format!(
+                "decode {} failed: {e}; raw={raw}",
+                routes::file::REQUEST_UPLOAD_TOKEN
+            ))
+        })?;
+        Ok(FileRequestUploadTokenResponse {
+            token: resp.token,
+            upload_url: resp.upload_url,
+            file_id: resp
+                .file_id
+                .unwrap_or_else(|| "unknown-file-id".to_string()),
+        })
+    }
+
+    pub async fn file_upload_callback(
+        &self,
+        key: &str,
+        file_id: &str,
+        status: &str,
+    ) -> BoxResult<FileUploadCallbackResponse> {
+        self.rpc_typed(
+            key,
+            routes::file::UPLOAD_CALLBACK,
+            &FileUploadCallbackRequest {
+                file_id: file_id.to_string(),
+                user_id: self.user_id(key)?,
+                status: status.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn message_revoke(
+        &self,
+        key: &str,
+        channel_id: u64,
+        server_message_id: u64,
+    ) -> BoxResult<MessageRevokeResponse> {
+        self.rpc_typed(
+            key,
+            routes::message::REVOKE,
+            &MessageRevokeRequest {
+                server_message_id,
+                channel_id,
+                user_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn message_status_count(
+        &self,
+        key: &str,
+        channel_id: Option<u64>,
+    ) -> BoxResult<MessageStatusCountResponse> {
+        self.rpc_typed(
+            key,
+            routes::message_status::COUNT,
+            &MessageStatusCountRequest { channel_id },
+        )
+        .await
+    }
+
+    pub async fn message_read_stats(
+        &self,
+        key: &str,
+        channel_id: u64,
+        server_message_id: u64,
+    ) -> BoxResult<MessageReadStatsResponse> {
+        self.rpc_typed(
+            key,
+            routes::message_status::READ_STATS,
+            &MessageReadStatsRequest {
+                message_id: server_message_id,
+                channel_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn reaction_stats(
+        &self,
+        key: &str,
+        server_message_id: u64,
+    ) -> BoxResult<MessageReactionStatsResponse> {
+        self.rpc_typed(
+            key,
+            routes::message_reaction::STATS,
+            &MessageReactionStatsRequest {
+                server_message_id,
+                user_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn get_difference(
+        &self,
+        key: &str,
+        channel_id: u64,
+        channel_type: u8,
+        last_pts: u64,
+        limit: Option<u32>,
+    ) -> BoxResult<GetDifferenceResponse> {
+        self.rpc_typed(
+            key,
+            routes::sync::GET_DIFFERENCE,
+            &GetDifferenceRequest {
+                channel_id,
+                channel_type,
+                last_pts,
+                limit,
+            },
+        )
+        .await
+    }
+
+    pub async fn profile_get(&self, key: &str) -> BoxResult<AccountProfileGetResponse> {
+        self.rpc_typed(
+            key,
+            routes::account_profile::GET,
+            &AccountProfileGetRequest { user_id: 0 },
+        )
+        .await
+    }
+
+    pub async fn profile_update(
+        &self,
+        key: &str,
+        display_name: Option<String>,
+        bio: Option<String>,
+    ) -> BoxResult<AccountProfileUpdateResponse> {
+        self.rpc_typed(
+            key,
+            routes::account_profile::UPDATE,
+            &AccountProfileUpdateRequest {
+                display_name,
+                avatar_url: None,
+                bio,
+                extra_fields: HashMap::new(),
+                user_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn privacy_get(&self, key: &str) -> BoxResult<AccountPrivacyGetResponse> {
+        self.rpc_typed(
+            key,
+            routes::privacy::GET,
+            &AccountPrivacyGetRequest { user_id: 0 },
+        )
+        .await
+    }
+
+    pub async fn privacy_update(
+        &self,
+        key: &str,
+        allow_receive_message_from_non_friend: Option<bool>,
+    ) -> BoxResult<AccountPrivacyUpdateResponse> {
+        self.rpc_typed(
+            key,
+            routes::privacy::UPDATE,
+            &AccountPrivacyUpdateRequest {
+                allow_add_by_group: None,
+                allow_search_by_phone: None,
+                allow_search_by_username: None,
+                allow_search_by_email: None,
+                allow_search_by_qrcode: None,
+                allow_view_by_non_friend: None,
+                allow_receive_message_from_non_friend,
+                user_id: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn login_with_new_sdk(&self, key: &str, suffix: &str) -> BoxResult<bool> {
+        let cfg = self.account_config(key)?;
+        let data_dir = self.base_dir.join(format!("{key}_login_{suffix}"));
+        std::fs::create_dir_all(&data_dir)?;
+        let sdk = PrivchatSdk::new(PrivchatConfig {
+            endpoints: self.endpoints.clone(),
+            connection_timeout_secs: 30,
+            data_dir: data_dir.to_string_lossy().to_string(),
+        });
+        sdk.connect().await?;
+        let login = sdk
+            .login(
+                cfg.username.clone(),
+                cfg.password.clone(),
+                cfg.device_id.clone(),
+            )
+            .await?;
+        sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
+            .await?;
+        let ok = sdk
+            .session_snapshot()
+            .await?
+            .map(|s| s.user_id == cfg.user_id)
+            .unwrap_or(false);
+        let _ = sdk.disconnect().await;
+        sdk.shutdown().await;
+        Ok(ok)
+    }
+
     pub async fn cleanup(&self) -> BoxResult<()> {
         for account in self.accounts.values() {
             let _ = account.sdk.disconnect().await;
             account.sdk.shutdown().await;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FriendApplyCompat {
+    #[serde(deserialize_with = "deserialize_u64_from_string_or_number")]
+    user_id: u64,
+    username: String,
+    status: String,
+    added_at: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlacklistCheckCompat {
+    #[serde(alias = "blocked")]
+    is_blocked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupInfoWrapped {
+    group_info: GroupInfoResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileRequestUploadTokenCompat {
+    #[serde(alias = "upload_token")]
+    token: String,
+    upload_url: String,
+    file_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlacklistListCompat {
+    users: Vec<BlacklistUserCompat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlacklistUserCompat {
+    user_id: Option<u64>,
+    blocked_user_id: Option<u64>,
+}
+
+fn deserialize_u64_from_string_or_number<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| serde::de::Error::custom("invalid numeric u64")),
+        serde_json::Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|e| serde::de::Error::custom(format!("invalid u64 string: {e}"))),
+        _ => Err(serde::de::Error::custom(
+            "expected string or number for u64",
+        )),
     }
 }
 

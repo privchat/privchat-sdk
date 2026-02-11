@@ -1088,6 +1088,24 @@ struct State {
 }
 
 impl State {
+    fn apply_transport_health(
+        &mut self,
+        is_connected: bool,
+    ) -> Option<(ConnectionState, ConnectionState)> {
+        if is_connected {
+            return None;
+        }
+        match self.session_state {
+            SessionState::Connected | SessionState::LoggedIn | SessionState::Authenticated => {
+                let from = self.session_state.as_connection_state();
+                self.session_state = SessionState::New;
+                self.transport = None;
+                Some((from, self.session_state.as_connection_state()))
+            }
+            _ => None,
+        }
+    }
+
     fn json_get_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
         for key in keys {
             if let Some(v) = value.get(*key) {
@@ -1257,12 +1275,10 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let blocked_user_id = Self::json_get_u64(
-                        &payload,
-                        &["blocked_user_id", "user_id", "uid"],
-                    )
-                    .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
-                    .unwrap_or(0);
+                    let blocked_user_id =
+                        Self::json_get_u64(&payload, &["blocked_user_id", "user_id", "uid"])
+                            .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
+                            .unwrap_or(0);
                     if blocked_user_id == 0 {
                         continue;
                     }
@@ -1436,8 +1452,11 @@ impl State {
                                     &["channel_name", "name"],
                                 )
                                 .unwrap_or_default(),
-                                channel_remark: Self::json_get_string(&payload, &["channel_remark"])
-                                    .unwrap_or_default(),
+                                channel_remark: Self::json_get_string(
+                                    &payload,
+                                    &["channel_remark"],
+                                )
+                                .unwrap_or_default(),
                                 avatar: Self::json_get_string(&payload, &["avatar"])
                                     .unwrap_or_default(),
                                 unread_count: Self::json_get_i32(&payload, &["unread_count"])
@@ -1469,16 +1488,22 @@ impl State {
                     let channel_id = Self::json_get_u64(&payload, &["channel_id"])
                         .or_else(|| Self::parse_two_ids(&item.entity_id).map(|v| v.0))
                         .unwrap_or(0);
-                    let member_uid = Self::json_get_u64(&payload, &["member_uid", "user_id", "uid"])
-                        .or_else(|| Self::parse_two_ids(&item.entity_id).map(|v| v.1))
-                        .unwrap_or(0);
+                    let member_uid =
+                        Self::json_get_u64(&payload, &["member_uid", "user_id", "uid"])
+                            .or_else(|| Self::parse_two_ids(&item.entity_id).map(|v| v.1))
+                            .unwrap_or(0);
                     if channel_id == 0 || member_uid == 0 {
                         continue;
                     }
                     let channel_type = Self::json_get_i32(&payload, &["channel_type"]).unwrap_or(0);
                     if item.deleted {
                         self.storage
-                            .delete_channel_member(uid.clone(), channel_id, channel_type, member_uid)
+                            .delete_channel_member(
+                                uid.clone(),
+                                channel_id,
+                                channel_type,
+                                member_uid,
+                            )
                             .await?;
                         continue;
                     }
@@ -1489,8 +1514,11 @@ impl State {
                                 channel_id,
                                 channel_type,
                                 member_uid,
-                                member_name: Self::json_get_string(&payload, &["member_name", "name"])
-                                    .unwrap_or_default(),
+                                member_name: Self::json_get_string(
+                                    &payload,
+                                    &["member_name", "name"],
+                                )
+                                .unwrap_or_default(),
                                 member_remark: Self::json_get_string(
                                     &payload,
                                     &["member_remark", "remark"],
@@ -2219,9 +2247,8 @@ impl PrivchatSdk {
                 Ok(v) => Arc::new(v),
                 Err(e) => {
                     if let Ok(mut locked) = actor_startup_error.lock() {
-                        *locked = Some(Error::InvalidState(format!(
-                            "snowflake init failed: {e:?}"
-                        )));
+                        *locked =
+                            Some(Error::InvalidState(format!("snowflake init failed: {e:?}")));
                     }
                     eprintln!("[SDK.actor] snowflake init failed: {e:?}");
                     return;
@@ -2299,9 +2326,29 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::IsConnected { resp } => {
-                        let _ = resp.send(Ok(state.is_connected().await));
+                        let is_connected = state.is_connected().await;
+                        if let Some((from, to)) = state.apply_transport_health(is_connected) {
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::ConnectionStateChanged { from, to },
+                            );
+                        }
+                        let _ = resp.send(Ok(is_connected));
                     }
                     Command::GetConnectionState { resp } => {
+                        let is_connected = state.is_connected().await;
+                        if let Some((from, to)) = state.apply_transport_health(is_connected) {
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::ConnectionStateChanged { from, to },
+                            );
+                        }
                         let _ = resp.send(Ok(state.session_state.as_connection_state()));
                     }
                     Command::Ping { resp } => {
@@ -3111,7 +3158,12 @@ impl PrivchatSdk {
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
-                            Ok(uid) => state.storage.delete_blacklist_entry(uid, blocked_user_id).await,
+                            Ok(uid) => {
+                                state
+                                    .storage
+                                    .delete_blacklist_entry(uid, blocked_user_id)
+                                    .await
+                            }
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -3122,7 +3174,12 @@ impl PrivchatSdk {
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
-                            Ok(uid) => state.storage.list_blacklist_entries(uid, limit, offset).await,
+                            Ok(uid) => {
+                                state
+                                    .storage
+                                    .list_blacklist_entries(uid, limit, offset)
+                                    .await
+                            }
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -3165,7 +3222,12 @@ impl PrivchatSdk {
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
-                            Ok(uid) => state.storage.delete_group_member(uid, group_id, user_id).await,
+                            Ok(uid) => {
+                                state
+                                    .storage
+                                    .delete_group_member(uid, group_id, user_id)
+                                    .await
+                            }
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -4734,7 +4796,7 @@ impl PrivchatSdk {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, ConnectionState, Error, PrivchatConfig, SessionState, SdkEvent};
+    use super::{Action, ConnectionState, Error, PrivchatConfig, SdkEvent, SessionState};
 
     #[test]
     fn state_machine_enforces_legacy_flow() {
@@ -4798,7 +4860,10 @@ mod tests {
         }
 
         assert!(got_started, "missing ShutdownStarted event");
-        assert!(got_state_change, "missing ConnectionStateChanged(... -> Shutdown)");
+        assert!(
+            got_state_change,
+            "missing ConnectionStateChanged(... -> Shutdown)"
+        );
         assert!(got_completed, "missing ShutdownCompleted event");
     }
 
@@ -4816,11 +4881,15 @@ mod tests {
             );
         }
         assert!(
-            events.iter().any(|e| matches!(e.event, SdkEvent::ShutdownStarted)),
+            events
+                .iter()
+                .any(|e| matches!(e.event, SdkEvent::ShutdownStarted)),
             "replay missing ShutdownStarted"
         );
         assert!(
-            events.iter().any(|e| matches!(e.event, SdkEvent::ShutdownCompleted)),
+            events
+                .iter()
+                .any(|e| matches!(e.event, SdkEvent::ShutdownCompleted)),
             "replay missing ShutdownCompleted"
         );
     }
@@ -4831,7 +4900,10 @@ mod tests {
         sdk.shutdown().await;
         sdk.shutdown().await;
 
-        let err = sdk.connect().await.expect_err("connect should fail after shutdown");
+        let err = sdk
+            .connect()
+            .await
+            .expect_err("connect should fail after shutdown");
         assert!(matches!(err, Error::Shutdown));
     }
 }

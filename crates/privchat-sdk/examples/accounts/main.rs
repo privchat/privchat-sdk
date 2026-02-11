@@ -13,7 +13,7 @@ type BoxResult<T> = Result<T, BoxError>;
 async fn main() -> BoxResult<()> {
     println!("\nPrivChat SDK Multi-Account Example (accounts)");
     println!("================================================");
-    println!("Phases: auth/bootstrap, friend, direct chat, group, reaction/read, blacklist, qrcode, presence/typing\n");
+    println!("Phases: full 27-phase business interoperability + offline PTS strict suite\n");
 
     let started = std::time::Instant::now();
     let mut manager = MultiAccountManager::new().await?;
@@ -24,7 +24,10 @@ async fn main() -> BoxResult<()> {
     println!("Accounts:");
     println!("  alice   => {} (uid={})", alice.username, alice.user_id);
     println!("  bob     => {} (uid={})", bob.username, bob.user_id);
-    println!("  charlie => {} (uid={})", charlie.username, charlie.user_id);
+    println!(
+        "  charlie => {} (uid={})",
+        charlie.username, charlie.user_id
+    );
     println!("Data dir: {}\n", manager.base_dir.display());
 
     let mut coordinator = TestCoordinator::new();

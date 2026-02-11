@@ -5,8 +5,8 @@ use tokio::sync::oneshot;
 
 use crate::local_store::{LocalStore, StoragePaths};
 use crate::{
-    Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredChannel,
-    StoredChannelExtra, StoredChannelMember, StoredBlacklistEntry, StoredFriend, StoredGroup,
+    Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
+    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
     StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
     StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
@@ -984,7 +984,11 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_blacklist_entry(&self, uid: String, input: UpsertBlacklistInput) -> Result<()> {
+    pub async fn upsert_blacklist_entry(
+        &self,
+        uid: String,
+        input: UpsertBlacklistInput,
+    ) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertBlacklistEntry {
@@ -1162,7 +1166,12 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn delete_group_member(&self, uid: String, group_id: u64, user_id: u64) -> Result<()> {
+    pub async fn delete_group_member(
+        &self,
+        uid: String,
+        group_id: u64,
+        user_id: u64,
+    ) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::DeleteGroupMember {
