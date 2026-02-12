@@ -17,11 +17,12 @@ use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterR
 use privchat_protocol::rpc::routes;
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
-    ClientInfo, DeviceInfo, DeviceType, ErrorCode, MessageType, RpcRequest, RpcResponse,
+    ClientInfo, DeviceInfo, DeviceType, ErrorCode, MessageType, PingRequest, PongResponse,
+    RpcRequest, RpcResponse,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::{interval, timeout, MissedTickBehavior};
 
 mod local_store;
 mod runtime;
@@ -170,6 +171,21 @@ pub enum ConnectionState {
     LoggedIn,
     Authenticated,
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NetworkHint {
+    Unknown,
+    Offline,
+    Wifi,
+    Cellular,
+    Ethernet,
+}
+
+impl NetworkHint {
+    fn is_online(self) -> bool {
+        !matches!(self, NetworkHint::Offline)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -661,6 +677,7 @@ impl Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+const NETWORK_DISCONNECTED_MESSAGE: &str = "网络已断开，请检查网络连接后再试。";
 
 enum Command {
     Connect {
@@ -676,6 +693,10 @@ enum Command {
         resp: oneshot::Sender<Result<ConnectionState>>,
     },
     Ping {
+        resp: oneshot::Sender<Result<()>>,
+    },
+    SetNetworkHint {
+        hint: NetworkHint,
         resp: oneshot::Sender<Result<()>>,
     },
     Register {
@@ -727,6 +748,16 @@ enum Command {
         is_typing: bool,
         action_type: TypingActionType,
         resp: oneshot::Sender<Result<()>>,
+    },
+    SendTextNow {
+        channel_id: u64,
+        channel_type: i32,
+        from_uid: u64,
+        message_type: i32,
+        content: String,
+        local_message_id: u64,
+        extra: String,
+        resp: oneshot::Sender<Result<privchat_protocol::protocol::SendMessageResponse>>,
     },
     RpcCall {
         route: String,
@@ -1085,6 +1116,8 @@ struct State {
     snowflake: Arc<snowflake_me::Snowflake>,
     storage: StorageHandle,
     current_uid: Option<String>,
+    should_auto_reconnect: bool,
+    network_hint: NetworkHint,
 }
 
 impl State {
@@ -1103,6 +1136,37 @@ impl State {
                 Some((from, self.session_state.as_connection_state()))
             }
             _ => None,
+        }
+    }
+
+    fn network_disconnected_error(&self) -> Error {
+        Error::Transport(NETWORK_DISCONNECTED_MESSAGE.to_string())
+    }
+
+    async fn request_bytes(
+        &mut self,
+        payload: Bytes,
+        biz_type: u8,
+        timeout: Duration,
+        context: &str,
+    ) -> Result<Bytes> {
+        let transport = match self.transport.as_mut() {
+            Some(t) => t,
+            None => {
+                let _ = self.apply_transport_health(false);
+                return Err(self.network_disconnected_error());
+            }
+        };
+        let opt = TransportOptions::new()
+            .with_biz_type(biz_type)
+            .with_timeout(timeout);
+        match transport.request_with_options(payload, opt).await {
+            Ok(raw) => Ok(raw),
+            Err(e) => {
+                eprintln!("[SDK.actor] {context} transport error: {e}");
+                let _ = self.apply_transport_health(false);
+                Err(self.network_disconnected_error())
+            }
         }
     }
 
@@ -1675,6 +1739,60 @@ impl State {
         Err(last_err.unwrap_or_else(|| Error::Transport("no endpoint".into())))
     }
 
+    async fn try_auto_reconnect(&mut self) -> Result<SessionState> {
+        eprintln!("[SDK.actor] monitor: reconnect start");
+        match timeout(self.connect_timeout_total(), self.connect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("[SDK.actor] monitor: reconnect failed: {e}");
+                return Err(e);
+            }
+            Err(_) => {
+                let e = Error::Transport("reconnect timeout".to_string());
+                eprintln!("[SDK.actor] monitor: reconnect failed: {e}");
+                return Err(e);
+            }
+        }
+
+        let uid = match self.current_uid.clone() {
+            Some(v) => v,
+            None => return Ok(SessionState::Connected),
+        };
+        let snapshot = match self.storage.load_session(uid).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(SessionState::Connected),
+            Err(e) => {
+                eprintln!("[SDK.actor] monitor: load session failed: {e}");
+                return Ok(SessionState::Connected);
+            }
+        };
+
+        eprintln!(
+            "[SDK.actor] monitor: restoring session user_id={}",
+            snapshot.user_id
+        );
+        match timeout(
+            Duration::from_secs(20),
+            self.authenticate(snapshot.user_id, snapshot.token, snapshot.device_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                self.bootstrap_completed = snapshot.bootstrap_completed;
+                eprintln!("[SDK.actor] monitor: session restored");
+                Ok(SessionState::Authenticated)
+            }
+            Ok(Err(e)) => {
+                eprintln!("[SDK.actor] monitor: restore auth failed: {e}");
+                Ok(SessionState::Connected)
+            }
+            Err(_) => {
+                eprintln!("[SDK.actor] monitor: restore auth timeout");
+                Ok(SessionState::Connected)
+            }
+        }
+    }
+
     async fn disconnect(&mut self) -> Result<()> {
         if let Some(transport) = self.transport.as_ref() {
             transport
@@ -1690,6 +1808,44 @@ impl State {
         match self.transport.as_ref() {
             Some(transport) => transport.is_connected().await,
             None => false,
+        }
+    }
+
+    async fn probe_connection(&mut self) -> bool {
+        let transport = match self.transport.as_mut() {
+            Some(transport) => transport,
+            None => return false,
+        };
+        if !transport.is_connected().await {
+            return false;
+        }
+        let payload = match encode_message(&PingRequest {
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[SDK.actor] monitor: encode ping failed: {e}");
+                return false;
+            }
+        };
+        let options = TransportOptions::new()
+            .with_biz_type(MessageType::PingRequest as u8)
+            .with_timeout(Duration::from_secs(2));
+        match transport
+            .request_with_options(Bytes::from(payload), options)
+            .await
+        {
+            Ok(raw) => match decode_message::<PongResponse>(&raw) {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("[SDK.actor] monitor: decode pong failed: {e}");
+                    true
+                }
+            },
+            Err(e) => {
+                eprintln!("[SDK.actor] monitor: ping request failed: {e}");
+                false
+            }
         }
     }
 
@@ -1755,7 +1911,6 @@ impl State {
     ) -> Result<LoginResult> {
         eprintln!("[SDK.actor] login: enter");
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let req = RpcRequest {
             route: "account/auth/login".to_string(),
             body: serde_json::to_value(AuthLoginRequest {
@@ -1769,13 +1924,14 @@ impl State {
 
         let payload = encode_message(&req)
             .map_err(|e| Error::Serialization(format!("encode rpc request: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::RpcRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("rpc login: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc login",
+            )
+            .await?;
 
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode rpc response: {e}")))?;
@@ -1809,7 +1965,6 @@ impl State {
         device_id: String,
     ) -> Result<LoginResult> {
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let req = RpcRequest {
             route: routes::account_user::REGISTER.to_string(),
             body: serde_json::to_value(UserRegisterRequest {
@@ -1825,13 +1980,14 @@ impl State {
         };
         let payload = encode_message(&req)
             .map_err(|e| Error::Serialization(format!("encode register request: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::RpcRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("rpc register: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc register",
+            )
+            .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode register response: {e}")))?;
         if rpc_resp.code != 0 {
@@ -1858,7 +2014,6 @@ impl State {
     async fn authenticate(&mut self, user_id: u64, token: String, device_id: String) -> Result<()> {
         eprintln!("[SDK.actor] authenticate: enter user_id={user_id}");
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let token_for_persist = token.clone();
         let device_id_for_persist = device_id.clone();
         let req = AuthorizationRequest {
@@ -1896,13 +2051,14 @@ impl State {
         };
         let payload = encode_message(&req)
             .map_err(|e| Error::Serialization(format!("encode auth request: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::AuthorizationRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("auth request: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::AuthorizationRequest as u8,
+                timeout,
+                "auth request",
+            )
+            .await?;
         let auth_resp: AuthorizationResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode auth response: {e}")))?;
         if !auth_resp.success {
@@ -1932,7 +2088,6 @@ impl State {
 
     async fn sync_entities(&mut self, entity_type: String, scope: Option<String>) -> Result<usize> {
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let entity_type_for_apply = entity_type.clone();
         let scope_for_apply = scope.clone();
         let req = privchat_protocol::rpc::sync::SyncEntitiesRequest {
@@ -1948,13 +2103,14 @@ impl State {
         };
         let payload = encode_message(&request)
             .map_err(|e| Error::Serialization(format!("encode sync_entities rpc: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::RpcRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("rpc sync_entities: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc sync_entities",
+            )
+            .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode sync_entities rpc: {e}")))?;
         if rpc_resp.code != 0 {
@@ -2012,7 +2168,6 @@ impl State {
             return Ok(Vec::new());
         }
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let req = SubscribePresenceRequest { user_ids };
         let request = RpcRequest {
             route: routes::presence::SUBSCRIBE.to_string(),
@@ -2022,13 +2177,14 @@ impl State {
         };
         let payload = encode_message(&request)
             .map_err(|e| Error::Serialization(format!("encode subscribe_presence rpc: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::RpcRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("rpc subscribe_presence: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc subscribe_presence",
+            )
+            .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode subscribe_presence rpc: {e}")))?;
         if rpc_resp.code != 0 {
@@ -2054,7 +2210,6 @@ impl State {
             return Ok(());
         }
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let req = UnsubscribePresenceRequest { user_ids };
         let request = RpcRequest {
             route: routes::presence::UNSUBSCRIBE.to_string(),
@@ -2064,13 +2219,14 @@ impl State {
         };
         let payload = encode_message(&request)
             .map_err(|e| Error::Serialization(format!("encode unsubscribe_presence rpc: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::RpcRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("rpc unsubscribe_presence: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc unsubscribe_presence",
+            )
+            .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode unsubscribe_presence rpc: {e}")))?;
         if rpc_resp.code != 0 {
@@ -2084,7 +2240,6 @@ impl State {
             return Ok(Vec::new());
         }
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let req = GetOnlineStatusRequest { user_ids };
         let request = RpcRequest {
             route: routes::presence::STATUS_GET.to_string(),
@@ -2093,13 +2248,14 @@ impl State {
         };
         let payload = encode_message(&request)
             .map_err(|e| Error::Serialization(format!("encode fetch_presence rpc: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::RpcRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("rpc fetch_presence: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc fetch_presence",
+            )
+            .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode fetch_presence rpc: {e}")))?;
         if rpc_resp.code != 0 {
@@ -2129,7 +2285,6 @@ impl State {
         let channel_type = u8::try_from(channel_type)
             .map_err(|_| Error::InvalidState(format!("invalid channel_type: {channel_type}")))?;
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let req = TypingIndicatorRequest {
             channel_id,
             channel_type,
@@ -2143,13 +2298,14 @@ impl State {
         };
         let payload = encode_message(&request)
             .map_err(|e| Error::Serialization(format!("encode send_typing rpc: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::RpcRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("rpc send_typing: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc send_typing",
+            )
+            .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode send_typing rpc: {e}")))?;
         if rpc_resp.code != 0 {
@@ -2158,23 +2314,87 @@ impl State {
         Ok(())
     }
 
+    async fn send_text_now(
+        &mut self,
+        channel_id: u64,
+        _channel_type: i32,
+        from_uid: u64,
+        message_type: i32,
+        content: String,
+        local_message_id: u64,
+        extra: String,
+    ) -> Result<privchat_protocol::protocol::SendMessageResponse> {
+        let message_type = u32::try_from(message_type)
+            .map_err(|_| Error::InvalidState(format!("invalid message_type: {message_type}")))?;
+        if local_message_id == 0 {
+            return Err(Error::InvalidState(
+                "local_message_id must be non-zero".to_string(),
+            ));
+        }
+
+        let timeout = self.timeout();
+        let metadata_value =
+            serde_json::from_str::<serde_json::Value>(&extra).unwrap_or(serde_json::Value::Null);
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "content": content,
+            "metadata": metadata_value,
+        }))
+        .map_err(|e| Error::Serialization(format!("encode send payload: {e}")))?;
+
+        let req = privchat_protocol::protocol::SendMessageRequest {
+            setting: privchat_protocol::protocol::MessageSetting {
+                need_receipt: true,
+                signal: 0,
+            },
+            client_seq: 1,
+            local_message_id,
+            stream_no: format!("stream_{local_message_id}"),
+            channel_id,
+            message_type,
+            expire: 3600,
+            from_uid,
+            topic: "chat".to_string(),
+            payload,
+        };
+
+        let request_data = encode_message(&req)
+            .map_err(|e| Error::Serialization(format!("encode send request: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(request_data),
+                MessageType::SendMessageRequest as u8,
+                timeout,
+                "send message",
+            )
+            .await?;
+        let response: privchat_protocol::protocol::SendMessageResponse = decode_message(&raw)
+            .map_err(|e| Error::Serialization(format!("decode send response: {e}")))?;
+        if response.reason_code != 0 {
+            return Err(Error::Transport(format!(
+                "send message failed: reason_code={}",
+                response.reason_code
+            )));
+        }
+        Ok(response)
+    }
+
     async fn rpc_call_json(
         &mut self,
         route: String,
         body: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let timeout = self.timeout();
-        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
         let request = RpcRequest { route, body };
         let payload = encode_message(&request)
             .map_err(|e| Error::Serialization(format!("encode rpc request: {e}")))?;
-        let opt = TransportOptions::new()
-            .with_biz_type(MessageType::RpcRequest as u8)
-            .with_timeout(timeout);
-        let raw = transport
-            .request_with_options(Bytes::from(payload), opt)
-            .await
-            .map_err(|e| Error::Transport(format!("rpc call failed: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc call",
+            )
+            .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode rpc response: {e}")))?;
         if rpc_resp.code != 0 {
@@ -2271,11 +2491,70 @@ impl PrivchatSdk {
                 snowflake,
                 storage: storage.clone(),
                 current_uid,
+                should_auto_reconnect: false,
+                network_hint: NetworkHint::Unknown,
             };
-            while let Some(cmd) = rx.recv().await {
-                match cmd {
+            let mut health_tick = interval(Duration::from_secs(2));
+            health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = health_tick.tick() => {
+                        if state.session_state == SessionState::Shutdown || !state.should_auto_reconnect {
+                            continue;
+                        }
+                        if !state.network_hint.is_online() {
+                            continue;
+                        }
+
+                        if matches!(
+                            state.session_state,
+                            SessionState::Connected | SessionState::LoggedIn | SessionState::Authenticated
+                        ) {
+                            let is_connected = state.probe_connection().await;
+                            if !is_connected {
+                                if let Some((from, to)) = state.apply_transport_health(false) {
+                                    emit_sequenced_event(
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        SdkEvent::ConnectionStateChanged { from, to },
+                                    );
+                                }
+                            }
+                        }
+
+                        if state.session_state == SessionState::New && state.should_auto_reconnect {
+                            let from = state.session_state.as_connection_state();
+                            match state.try_auto_reconnect().await {
+                                Ok(next) => {
+                                    state.session_state = next;
+                                    emit_sequenced_event(
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        SdkEvent::ConnectionStateChanged {
+                                            from,
+                                            to: state.session_state.as_connection_state(),
+                                        },
+                                    );
+                                }
+                                Err(_) => {
+                                    // keep New and retry on next tick
+                                }
+                            }
+                        }
+                    }
+                    cmd = rx.recv() => {
+                        let Some(cmd) = cmd else { break; };
+                        match cmd {
                     Command::Connect { resp } => {
                         eprintln!("[SDK.actor] loop: cmd connect");
+                        if !state.network_hint.is_online() {
+                            let _ = resp.send(Err(state.network_disconnected_error()));
+                            continue;
+                        }
                         let from_state = state.session_state.as_connection_state();
                         let result = match state.session_state.can(Action::Connect) {
                             Ok(next_state) => {
@@ -2293,6 +2572,7 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
+                            state.should_auto_reconnect = true;
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -2308,6 +2588,7 @@ impl PrivchatSdk {
                     }
                     Command::Disconnect { resp } => {
                         eprintln!("[SDK.actor] loop: cmd disconnect");
+                        state.should_auto_reconnect = false;
                         let from_state = state.session_state.as_connection_state();
                         let result = state.disconnect().await;
                         if result.is_ok() && state.session_state != SessionState::Shutdown {
@@ -2352,12 +2633,47 @@ impl PrivchatSdk {
                         let _ = resp.send(Ok(state.session_state.as_connection_state()));
                     }
                     Command::Ping { resp } => {
-                        let result = if state.is_connected().await {
+                        let result = if state.probe_connection().await {
                             Ok(())
                         } else {
-                            Err(Error::NotConnected)
+                            let _ = state.apply_transport_health(false);
+                            Err(state.network_disconnected_error())
                         };
                         let _ = resp.send(result);
+                    }
+                    Command::SetNetworkHint { hint, resp } => {
+                        let old_hint = state.network_hint;
+                        state.network_hint = hint;
+                        if matches!(hint, NetworkHint::Offline) {
+                            if let Some((from, to)) = state.apply_transport_health(false) {
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::ConnectionStateChanged { from, to },
+                                );
+                            }
+                        } else if matches!(old_hint, NetworkHint::Offline) && state.should_auto_reconnect {
+                            // Trigger reconnect sooner on network recovery.
+                            if state.session_state == SessionState::New {
+                                let from = state.session_state.as_connection_state();
+                                if let Ok(next) = state.try_auto_reconnect().await {
+                                    state.session_state = next;
+                                    emit_sequenced_event(
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        SdkEvent::ConnectionStateChanged {
+                                            from,
+                                            to: state.session_state.as_connection_state(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        let _ = resp.send(Ok(()));
                     }
                     Command::Login {
                         username,
@@ -2608,6 +2924,38 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::SendTextNow {
+                        channel_id,
+                        channel_type,
+                        from_uid,
+                        message_type,
+                        content,
+                        local_message_id,
+                        extra,
+                        resp,
+                    } => {
+                        let result = match state.session_state.can(Action::Authenticate) {
+                            Ok(_) => match timeout(
+                                Duration::from_secs(10),
+                                state.send_text_now(
+                                    channel_id,
+                                    channel_type,
+                                    from_uid,
+                                    message_type,
+                                    content,
+                                    local_message_id,
+                                    extra,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => Err(Error::Transport("send_text_now timeout".to_string())),
+                            },
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::RpcCall {
                         route,
                         body_json,
@@ -2687,6 +3035,7 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::ClearLocalState { resp } => {
+                        state.should_auto_reconnect = false;
                         let from_state = state.session_state.as_connection_state();
                         state.bootstrap_completed = false;
                         state.session_state = SessionState::Connected;
@@ -3504,6 +3853,7 @@ impl PrivchatSdk {
                     }
                     Command::Shutdown { resp } => {
                         eprintln!("[SDK.actor] loop: cmd shutdown");
+                        state.should_auto_reconnect = false;
                         emit_sequenced_event(
                             &actor_event_tx,
                             &actor_event_history,
@@ -3536,6 +3886,8 @@ impl PrivchatSdk {
                         );
                         let _ = resp.send(());
                         break;
+                    }
+                        }
                     }
                 }
             }
@@ -3668,6 +4020,19 @@ impl PrivchatSdk {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::Ping { resp: resp_tx })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn set_network_hint(&self, hint: NetworkHint) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetNetworkHint {
+                hint,
+                resp: resp_tx,
+            })
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
@@ -3837,6 +4202,34 @@ impl PrivchatSdk {
                 channel_type,
                 is_typing,
                 action_type,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn send_text_now(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        from_uid: u64,
+        message_type: i32,
+        content: String,
+        local_message_id: u64,
+        extra: String,
+    ) -> Result<privchat_protocol::protocol::SendMessageResponse> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SendTextNow {
+                channel_id,
+                channel_type,
+                from_uid,
+                message_type,
+                content,
+                local_message_id,
+                extra,
                 resp: resp_tx,
             })
             .await

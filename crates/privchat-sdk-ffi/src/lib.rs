@@ -2,71 +2,65 @@
 
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::{
-    AccountSearchQueryRequest, AccountSearchResponse, BlacklistAddRequest, BlacklistAddResponse,
-    BlacklistCheckRequest, BlacklistCheckResponse, BlacklistListRequest, BlacklistListResponse,
-    BlacklistRemoveRequest, BlacklistRemoveResponse, FriendAcceptRequest, FriendAcceptResponse,
-    FriendApplyRequest, FriendApplyResponse, FriendCheckRequest, FriendCheckResponse,
-    FriendPendingRequest, FriendPendingResponse, FriendRejectRequest, FriendRejectResponse,
-    FriendRemoveRequest, FriendRemoveResponse, GetOrCreateDirectChannelRequest,
-    GetOrCreateDirectChannelResponse, GroupCreateRequest, GroupCreateResponse, GroupInfoRequest, GroupInfoResponse,
-    GroupMemberListRequest, GroupMemberListResponse, MessageStatusReadRequest, MessageStatusReadResponse,
-    MessageRevokeRequest, MessageRevokeResponse, MessageReactionAddRequest, MessageReactionAddResponse,
-    MessageReactionRemoveRequest, MessageReactionRemoveResponse, MessageReactionListRequest,
-    MessageReactionListResponse, MessageReactionStatsRequest, MessageReactionStatsResponse,
-    ChannelPinRequest, ChannelPinResponse, ChannelHideRequest, ChannelHideResponse, ChannelMuteRequest,
-    ChannelMuteResponse, DevicePushUpdateRequest, DevicePushUpdateResponse, DevicePushStatusRequest,
-    DevicePushStatusResponse, MessageHistoryGetRequest, MessageHistoryResponse, MessageReadListRequest,
-    MessageReadListResponse, MessageReadStatsRequest, MessageReadStatsResponse, MessageStatusCountRequest,
-    MessageStatusCountResponse,
-    AccountPrivacyGetRequest, AccountPrivacyGetResponse, AccountPrivacyUpdateRequest, AccountPrivacyUpdateResponse,
-    QRCodeGenerateRequest, QRCodeGenerateResponse, QRCodeResolveRequest, QRCodeResolveResponse, QRCodeListRequest,
-    QRCodeListResponse, UserQRCodeGetRequest, UserQRCodeGetResponse, UserQRCodeGenerateRequest,
-    UserQRCodeGenerateResponse, UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
-    QRCodeRefreshRequest, QRCodeRefreshResponse, QRCodeRevokeRequest, QRCodeRevokeResponse,
-    AccountSearchByQRCodeRequest, AccountUserDetailRequest, AccountUserDetailResponse,
-    AccountUserShareCardRequest, AccountUserShareCardResponse, AccountUserUpdateRequest,
-    AccountUserUpdateResponse, GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberRemoveRequest,
-    GroupMemberRemoveResponse, GroupMemberLeaveRequest, GroupMemberLeaveResponse, GroupMemberMuteRequest,
-    GroupMemberMuteResponse, GroupMemberUnmuteRequest, GroupMemberUnmuteResponse, GroupTransferOwnerRequest,
-    GroupTransferOwnerResponse, GroupRoleSetRequest, GroupRoleSetResponse, GroupSettingsGetRequest,
-    GroupSettingsGetResponse, GroupSettingsUpdateRequest, GroupSettingsUpdateResponse, GroupMuteAllRequest,
-    GroupApprovalListRequest, GroupApprovalListResponse, GroupApprovalHandleRequest, GroupApprovalHandleResponse,
-    GroupQRCodeGenerateRequest, GroupQRCodeGenerateResponse, GroupQRCodeJoinRequest, GroupQRCodeJoinResponse,
-    ClientSubmitRequest, ClientSubmitResponse, SyncEntitiesRequest, SyncEntitiesResponse,
-    GetDifferenceRequest, GetDifferenceResponse, GetChannelPtsRequest, GetChannelPtsResponse,
-    BatchGetChannelPtsRequest, BatchGetChannelPtsResponse, FileRequestUploadTokenRequest,
-    FileRequestUploadTokenResponse, FileUploadCallbackRequest, FileUploadCallbackResponse,
-    ChannelBroadcastSubscribeRequest, ChannelBroadcastSubscribeResponse,
-    AccountProfileGetRequest, AccountProfileGetResponse, AccountProfileUpdateRequest,
-    AccountProfileUpdateResponse,
-    ChannelBroadcastCreateRequest, ChannelBroadcastCreateResponse, ChannelBroadcastListRequest,
-    ChannelBroadcastListResponse, ChannelContentPublishRequest, ChannelContentPublishResponse,
-    ChannelContentListRequest, ChannelContentListResponse, StickerPackageListRequest,
-    StickerPackageListResponse, StickerPackageDetailRequest, StickerPackageDetailResponse,
+    AccountPrivacyGetRequest, AccountPrivacyGetResponse, AccountPrivacyUpdateRequest,
+    AccountPrivacyUpdateResponse, AccountProfileGetRequest, AccountProfileGetResponse,
+    AccountProfileUpdateRequest, AccountProfileUpdateResponse, AccountSearchByQRCodeRequest,
+    AccountSearchQueryRequest, AccountSearchResponse, AccountUserDetailRequest,
+    AccountUserDetailResponse, AccountUserShareCardRequest, AccountUserShareCardResponse,
+    AccountUserUpdateRequest, AccountUserUpdateResponse, BatchGetChannelPtsRequest,
+    BatchGetChannelPtsResponse, BlacklistAddRequest, BlacklistAddResponse, BlacklistCheckRequest,
+    BlacklistCheckResponse, BlacklistListRequest, BlacklistListResponse, BlacklistRemoveRequest,
+    BlacklistRemoveResponse, ChannelBroadcastCreateRequest, ChannelBroadcastCreateResponse,
+    ChannelBroadcastListRequest, ChannelBroadcastListResponse, ChannelBroadcastSubscribeRequest,
+    ChannelBroadcastSubscribeResponse, ChannelContentListRequest, ChannelContentListResponse,
+    ChannelContentPublishRequest, ChannelContentPublishResponse, ChannelHideRequest,
+    ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse, ChannelPinRequest,
+    ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse, DevicePushStatusRequest,
+    DevicePushStatusResponse, DevicePushUpdateRequest, DevicePushUpdateResponse,
+    FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
+    FileUploadCallbackResponse, FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest,
+    FriendApplyResponse, FriendCheckRequest, FriendCheckResponse, FriendPendingRequest,
+    FriendPendingResponse, FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest,
+    FriendRemoveResponse, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
+    GetDifferenceResponse, GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
+    GroupApprovalHandleRequest, GroupApprovalHandleResponse, GroupApprovalListRequest,
+    GroupApprovalListResponse, GroupCreateRequest, GroupCreateResponse, GroupInfoRequest,
+    GroupInfoResponse, GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberLeaveRequest,
+    GroupMemberLeaveResponse, GroupMemberListRequest, GroupMemberListResponse,
+    GroupMemberMuteRequest, GroupMemberMuteResponse, GroupMemberRemoveRequest,
+    GroupMemberRemoveResponse, GroupMemberUnmuteRequest, GroupMemberUnmuteResponse,
+    GroupMuteAllRequest, GroupQRCodeGenerateRequest, GroupQRCodeGenerateResponse,
+    GroupQRCodeJoinRequest, GroupQRCodeJoinResponse, GroupRoleSetRequest, GroupRoleSetResponse,
+    GroupSettingsGetRequest, GroupSettingsGetResponse, GroupSettingsUpdateRequest,
+    GroupSettingsUpdateResponse, GroupTransferOwnerRequest, GroupTransferOwnerResponse,
+    MessageHistoryGetRequest, MessageHistoryResponse, MessageReactionAddRequest,
+    MessageReactionAddResponse, MessageReactionListRequest, MessageReactionListResponse,
+    MessageReactionRemoveRequest, MessageReactionRemoveResponse, MessageReactionStatsRequest,
+    MessageReactionStatsResponse, MessageReadListRequest, MessageReadListResponse,
+    MessageReadStatsRequest, MessageReadStatsResponse, MessageRevokeRequest, MessageRevokeResponse,
+    MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadRequest,
+    MessageStatusReadResponse, QRCodeGenerateRequest, QRCodeGenerateResponse, QRCodeListRequest,
+    QRCodeListResponse, QRCodeRefreshRequest, QRCodeRefreshResponse, QRCodeResolveRequest,
+    QRCodeResolveResponse, QRCodeRevokeRequest, QRCodeRevokeResponse, StickerPackageDetailRequest,
+    StickerPackageDetailResponse, StickerPackageListRequest, StickerPackageListResponse,
+    SyncEntitiesRequest, SyncEntitiesResponse, UserQRCodeGenerateRequest,
+    UserQRCodeGenerateResponse, UserQRCodeGetRequest, UserQRCodeGetResponse,
+    UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
 };
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use std::future::Future;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex as StdMutex;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast::error::RecvError, Mutex as AsyncMutex};
 use privchat_sdk::{
     ConnectionState as SdkConnectionState, Error as SdkError, FileQueueRef as SdkFileQueueRef,
-    LoginResult as SdkLoginResult, MentionInput as SdkMentionInput, NewMessage as SdkNewMessage,
-    PresenceStatus as SdkPresenceStatus, PrivchatConfig as SdkConfig, PrivchatSdk as InnerSdk,
-    QueueMessage as SdkQueueMessage, ServerEndpoint as SdkServerEndpoint,
-    SequencedSdkEvent as SdkSequencedSdkEvent,
-    SessionSnapshot as SdkSessionSnapshot, StoredChannel as SdkStoredChannel,
-    StoredChannelExtra as SdkStoredChannelExtra, StoredChannelMember as SdkStoredChannelMember,
-    StoredBlacklistEntry as SdkStoredBlacklistEntry, StoredFriend as SdkStoredFriend, StoredGroup as SdkStoredGroup,
-    StoredGroupMember as SdkStoredGroupMember, StoredMessage as SdkStoredMessage,
-    StoredMessageExtra as SdkStoredMessageExtra, StoredMessageReaction as SdkStoredMessageReaction,
-    StoredReminder as SdkStoredReminder, StoredUser as SdkStoredUser,
-    TransportProtocol as SdkProtocol, TypingActionType as SdkTypingActionType,
-    UnreadMentionCount as SdkUnreadMentionCount,
+    LoginResult as SdkLoginResult, MentionInput as SdkMentionInput, NetworkHint as SdkNetworkHint,
+    NewMessage as SdkNewMessage, PresenceStatus as SdkPresenceStatus, PrivchatConfig as SdkConfig,
+    PrivchatSdk as InnerSdk, QueueMessage as SdkQueueMessage,
+    SequencedSdkEvent as SdkSequencedSdkEvent, ServerEndpoint as SdkServerEndpoint,
+    SessionSnapshot as SdkSessionSnapshot, StoredBlacklistEntry as SdkStoredBlacklistEntry,
+    StoredChannel as SdkStoredChannel, StoredChannelExtra as SdkStoredChannelExtra,
+    StoredChannelMember as SdkStoredChannelMember, StoredFriend as SdkStoredFriend,
+    StoredGroup as SdkStoredGroup, StoredGroupMember as SdkStoredGroupMember,
+    StoredMessage as SdkStoredMessage, StoredMessageExtra as SdkStoredMessageExtra,
+    StoredMessageReaction as SdkStoredMessageReaction, StoredReminder as SdkStoredReminder,
+    StoredUser as SdkStoredUser, TransportProtocol as SdkProtocol,
+    TypingActionType as SdkTypingActionType, UnreadMentionCount as SdkUnreadMentionCount,
     UpsertBlacklistInput as SdkUpsertBlacklistInput,
     UpsertChannelExtraInput as SdkUpsertChannelExtraInput,
     UpsertChannelInput as SdkUpsertChannelInput,
@@ -77,6 +71,15 @@ use privchat_sdk::{
     UpsertReminderInput as SdkUpsertReminderInput, UpsertUserInput as SdkUpsertUserInput,
     UserStoragePaths as SdkUserStoragePaths,
 };
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{broadcast::error::RecvError, Mutex as AsyncMutex};
 
 const USER_SETTINGS_KEY: &str = "__user_settings_json__";
 
@@ -974,6 +977,15 @@ pub enum ConnectionState {
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
+pub enum NetworkHint {
+    Unknown,
+    Offline,
+    Wifi,
+    Cellular,
+    Ethernet,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum SdkEvent {
     ConnectionStateChanged {
         from: ConnectionState,
@@ -1478,6 +1490,16 @@ fn map_connection_state(v: SdkConnectionState) -> ConnectionState {
     }
 }
 
+fn map_network_hint(v: NetworkHint) -> SdkNetworkHint {
+    match v {
+        NetworkHint::Unknown => SdkNetworkHint::Unknown,
+        NetworkHint::Offline => SdkNetworkHint::Offline,
+        NetworkHint::Wifi => SdkNetworkHint::Wifi,
+        NetworkHint::Cellular => SdkNetworkHint::Cellular,
+        NetworkHint::Ethernet => SdkNetworkHint::Ethernet,
+    }
+}
+
 #[cfg(test)]
 fn parse_read_list_entries(raw: &str) -> Vec<serde_json::Value> {
     if let Ok(resp) = serde_json::from_str::<MessageReadListResponse>(raw) {
@@ -1959,16 +1981,16 @@ fn map_storage_paths(v: SdkUserStoragePaths) -> UserStoragePaths {
     }
 }
 
-fn map_reactions_map(
-    reactions: HashMap<String, Vec<u64>>,
-) -> Vec<MessageReactionEmojiUsersView> {
+fn map_reactions_map(reactions: HashMap<String, Vec<u64>>) -> Vec<MessageReactionEmojiUsersView> {
     reactions
         .into_iter()
         .map(|(emoji, user_ids)| MessageReactionEmojiUsersView { emoji, user_ids })
         .collect()
 }
 
-fn map_sticker_package_info(v: privchat_protocol::rpc::StickerPackageInfo) -> StickerPackageInfoView {
+fn map_sticker_package_info(
+    v: privchat_protocol::rpc::StickerPackageInfo,
+) -> StickerPackageInfoView {
     StickerPackageInfoView {
         package_id: v.package_id,
         name: v.name,
@@ -2097,7 +2119,9 @@ impl PrivchatClient {
     ) -> Result<u64, PrivchatFfiError> {
         let channels = self.list_channels(1, 200).await?;
         for ch in channels {
-            let messages = self.list_messages(ch.channel_id, ch.channel_type, 1, 200).await?;
+            let messages = self
+                .list_messages(ch.channel_id, ch.channel_type, 1, 200)
+                .await?;
             if messages
                 .iter()
                 .any(|m| m.server_message_id == Some(server_message_id))
@@ -2145,6 +2169,13 @@ impl PrivchatClient {
         Ok(map_connection_state(state))
     }
 
+    pub async fn set_network_hint(&self, hint: NetworkHint) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .set_network_hint(map_network_hint(hint))
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn get_connection_state(&self) -> Result<ConnectionState, PrivchatFfiError> {
         self.connection_state().await
     }
@@ -2178,13 +2209,10 @@ impl PrivchatClient {
     }
 
     pub fn add_server(&self, endpoint: ServerEndpoint) -> Result<(), PrivchatFfiError> {
-        let mut cfg = self
-            .config
-            .lock()
-            .map_err(|_| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                detail: "config lock poisoned".to_string(),
-            })?;
+        let mut cfg = self.config.lock().map_err(|_| PrivchatFfiError::SdkError {
+            code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
+            detail: "config lock poisoned".to_string(),
+        })?;
         cfg.endpoints.push(endpoint);
         Ok(())
     }
@@ -2401,18 +2429,14 @@ impl PrivchatClient {
         let on_connection_state_changed_registered = self
             .on_connection_state_changed_registered
             .load(Ordering::Relaxed);
-        let on_message_received_registered = self
-            .on_message_received_registered
-            .load(Ordering::Relaxed);
-        let on_reaction_changed_registered = self
-            .on_reaction_changed_registered
-            .load(Ordering::Relaxed);
-        let on_typing_indicator_registered = self
-            .on_typing_indicator_registered
-            .load(Ordering::Relaxed);
-        let video_process_hook_registered = self
-            .video_process_hook_registered
-            .load(Ordering::Relaxed);
+        let on_message_received_registered =
+            self.on_message_received_registered.load(Ordering::Relaxed);
+        let on_reaction_changed_registered =
+            self.on_reaction_changed_registered.load(Ordering::Relaxed);
+        let on_typing_indicator_registered =
+            self.on_typing_indicator_registered.load(Ordering::Relaxed);
+        let video_process_hook_registered =
+            self.video_process_hook_registered.load(Ordering::Relaxed);
         Ok(ConnectionSummary {
             state: state_text.to_string(),
             user_id,
@@ -2473,7 +2497,8 @@ impl PrivchatClient {
     }
 
     pub fn register_lifecycle_hook(&self) {
-        self.lifecycle_hook_registered.store(true, Ordering::Relaxed);
+        self.lifecycle_hook_registered
+            .store(true, Ordering::Relaxed);
         eprintln!("[FFI] lifecycle hook registered");
     }
 
@@ -2691,7 +2716,10 @@ impl PrivchatClient {
         self.fetch_presence(user_ids).await
     }
 
-    pub async fn get_presence(&self, user_id: u64) -> Result<Option<PresenceStatus>, PrivchatFfiError> {
+    pub async fn get_presence(
+        &self,
+        user_id: u64,
+    ) -> Result<Option<PresenceStatus>, PrivchatFfiError> {
         let mut out = self.fetch_presence(vec![user_id]).await?;
         Ok(out.pop())
     }
@@ -2764,18 +2792,21 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
-    pub async fn search_users(&self, query: String) -> Result<Vec<SearchUserEntry>, PrivchatFfiError> {
+    pub async fn search_users(
+        &self,
+        query: String,
+    ) -> Result<Vec<SearchUserEntry>, PrivchatFfiError> {
         let resp: AccountSearchResponse = rpc_call_typed(
-                &self.inner,
-                routes::account_search::QUERY,
-                &AccountSearchQueryRequest {
-                    query,
-                    page: Some(1),
-                    page_size: Some(50),
-                    from_user_id: 0,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::account_search::QUERY,
+            &AccountSearchQueryRequest {
+                query,
+                page: Some(1),
+                page_size: Some(50),
+                from_user_id: 0,
+            },
+        )
+        .await?;
         Ok(resp
             .users
             .into_iter()
@@ -2800,17 +2831,17 @@ impl PrivchatClient {
         source_id: Option<String>,
     ) -> Result<FriendRequestResult, PrivchatFfiError> {
         let resp: FriendApplyResponse = rpc_call_typed(
-                &self.inner,
-                routes::friend::APPLY,
-                &FriendApplyRequest {
-                    target_user_id,
-                    message,
-                    source,
-                    source_id,
-                    from_user_id: 0,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::friend::APPLY,
+            &FriendApplyRequest {
+                target_user_id,
+                message,
+                source,
+                source_id,
+                from_user_id: 0,
+            },
+        )
+        .await?;
         Ok(FriendRequestResult {
             user_id: resp.user_id,
             username: resp.username,
@@ -2820,13 +2851,15 @@ impl PrivchatClient {
         })
     }
 
-    pub async fn get_friend_pending_requests(&self) -> Result<Vec<FriendPendingEntry>, PrivchatFfiError> {
+    pub async fn get_friend_pending_requests(
+        &self,
+    ) -> Result<Vec<FriendPendingEntry>, PrivchatFfiError> {
         let resp: FriendPendingResponse = rpc_call_typed(
-                &self.inner,
-                routes::friend::PENDING,
-                &FriendPendingRequest { user_id: 0 },
-            )
-            .await?;
+            &self.inner,
+            routes::friend::PENDING,
+            &FriendPendingRequest { user_id: 0 },
+        )
+        .await?;
         Ok(resp
             .requests
             .into_iter()
@@ -2844,15 +2877,15 @@ impl PrivchatClient {
         message: Option<String>,
     ) -> Result<u64, PrivchatFfiError> {
         let resp: FriendAcceptResponse = rpc_call_typed(
-                &self.inner,
-                routes::friend::ACCEPT,
-                &FriendAcceptRequest {
-                    from_user_id,
-                    message,
-                    target_user_id: 0,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::friend::ACCEPT,
+            &FriendAcceptRequest {
+                from_user_id,
+                message,
+                target_user_id: 0,
+            },
+        )
+        .await?;
         Ok(resp)
     }
 
@@ -2863,15 +2896,15 @@ impl PrivchatClient {
     ) -> Result<bool, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?;
         let resp: FriendRejectResponse = rpc_call_typed(
-                &self.inner,
-                routes::friend::REJECT,
-                &FriendRejectRequest {
-                    from_user_id,
-                    target_user_id: user_id,
-                    message,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::friend::REJECT,
+            &FriendRejectRequest {
+                from_user_id,
+                target_user_id: user_id,
+                message,
+            },
+        )
+        .await?;
         Ok(resp)
     }
 
@@ -2880,16 +2913,16 @@ impl PrivchatClient {
         peer_user_id: u64,
     ) -> Result<DirectChannelResult, PrivchatFfiError> {
         let resp: GetOrCreateDirectChannelResponse = rpc_call_typed(
-                &self.inner,
-                routes::channel::DIRECT_GET_OR_CREATE,
-                &GetOrCreateDirectChannelRequest {
-                    target_user_id: peer_user_id,
-                    source: None,
-                    source_id: None,
-                    user_id: 0,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::channel::DIRECT_GET_OR_CREATE,
+            &GetOrCreateDirectChannelRequest {
+                target_user_id: peer_user_id,
+                source: None,
+                source_id: None,
+                user_id: 0,
+            },
+        )
+        .await?;
         Ok(DirectChannelResult {
             channel_id: resp.channel_id,
             created: resp.created,
@@ -2903,16 +2936,16 @@ impl PrivchatClient {
         member_ids: Option<Vec<u64>>,
     ) -> Result<GroupCreateResult, PrivchatFfiError> {
         let resp: GroupCreateResponse = rpc_call_typed(
-                &self.inner,
-                routes::group::CREATE,
-                &GroupCreateRequest {
-                    name,
-                    description,
-                    member_ids,
-                    creator_id: 0,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::group::CREATE,
+            &GroupCreateRequest {
+                name,
+                description,
+                member_ids,
+                creator_id: 0,
+            },
+        )
+        .await?;
         Ok(GroupCreateResult {
             group_id: resp.group_id,
             name: resp.name,
@@ -2925,11 +2958,14 @@ impl PrivchatClient {
 
     pub async fn get_group_info(&self, group_id: u64) -> Result<GroupInfoView, PrivchatFfiError> {
         let resp: GroupInfoResponse = rpc_call_typed(
-                &self.inner,
-                routes::group::INFO,
-                &GroupInfoRequest { group_id, user_id: 0 },
-            )
-            .await?;
+            &self.inner,
+            routes::group::INFO,
+            &GroupInfoRequest {
+                group_id,
+                user_id: 0,
+            },
+        )
+        .await?;
         let now = now_millis();
         let created_at = now;
         let updated_at = now;
@@ -2968,14 +3004,14 @@ impl PrivchatClient {
         _page_size: Option<u32>,
     ) -> Result<GroupMemberRemoteList, PrivchatFfiError> {
         let resp: GroupMemberListResponse = rpc_call_typed(
-                &self.inner,
-                routes::group_member::LIST,
-                &GroupMemberListRequest {
-                    group_id,
-                    user_id: 0,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::group_member::LIST,
+            &GroupMemberListRequest {
+                group_id,
+                user_id: 0,
+            },
+        )
+        .await?;
         let now = now_millis();
         let mut out_members = Vec::with_capacity(resp.members.len());
         for entry in &resp.members {
@@ -3023,14 +3059,11 @@ impl PrivchatClient {
     pub async fn delete_friend(&self, friend_id: u64) -> Result<bool, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?;
         let resp: FriendRemoveResponse = rpc_call_typed(
-                &self.inner,
-                routes::friend::DELETE,
-                &FriendRemoveRequest {
-                    friend_id,
-                    user_id,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::friend::DELETE,
+            &FriendRemoveRequest { friend_id, user_id },
+        )
+        .await?;
         self.inner
             .delete_friend(friend_id)
             .await
@@ -3038,20 +3071,17 @@ impl PrivchatClient {
         Ok(resp)
     }
 
-    pub async fn add_to_blacklist(
-        &self,
-        blocked_user_id: u64,
-    ) -> Result<bool, PrivchatFfiError> {
+    pub async fn add_to_blacklist(&self, blocked_user_id: u64) -> Result<bool, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?;
         let resp: BlacklistAddResponse = rpc_call_typed(
-                &self.inner,
-                routes::blacklist::ADD,
-                &BlacklistAddRequest {
-                    user_id,
-                    blocked_user_id,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::blacklist::ADD,
+            &BlacklistAddRequest {
+                user_id,
+                blocked_user_id,
+            },
+        )
+        .await?;
         let ts = now_millis();
         self.inner
             .upsert_blacklist_entry(SdkUpsertBlacklistInput {
@@ -3070,14 +3100,14 @@ impl PrivchatClient {
     ) -> Result<bool, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?;
         let resp: BlacklistRemoveResponse = rpc_call_typed(
-                &self.inner,
-                routes::blacklist::REMOVE,
-                &BlacklistRemoveRequest {
-                    user_id,
-                    blocked_user_id,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::blacklist::REMOVE,
+            &BlacklistRemoveRequest {
+                user_id,
+                blocked_user_id,
+            },
+        )
+        .await?;
         self.inner
             .delete_blacklist_entry(blocked_user_id)
             .await
@@ -3088,11 +3118,11 @@ impl PrivchatClient {
     pub async fn get_blacklist(&self) -> Result<Vec<StoredBlacklistEntry>, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?;
         let resp: BlacklistListResponse = rpc_call_typed(
-                &self.inner,
-                routes::blacklist::LIST,
-                &BlacklistListRequest { user_id },
-            )
-            .await?;
+            &self.inner,
+            routes::blacklist::LIST,
+            &BlacklistListRequest { user_id },
+        )
+        .await?;
         let remote_ids: HashSet<u64> = resp.users.iter().map(|u| u.user_id).collect();
         let local_entries = self
             .inner
@@ -3101,7 +3131,10 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)?;
         for item in local_entries {
             if !remote_ids.contains(&item.blocked_user_id) {
-                let _ = self.inner.delete_blacklist_entry(item.blocked_user_id).await;
+                let _ = self
+                    .inner
+                    .delete_blacklist_entry(item.blocked_user_id)
+                    .await;
             }
         }
         let ts = now_millis();
@@ -3124,14 +3157,14 @@ impl PrivchatClient {
     ) -> Result<BlacklistCheckResult, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?;
         let resp: BlacklistCheckResponse = rpc_call_typed(
-                &self.inner,
-                routes::blacklist::CHECK,
-                &BlacklistCheckRequest {
-                    user_id,
-                    target_user_id,
-                },
-            )
-            .await?;
+            &self.inner,
+            routes::blacklist::CHECK,
+            &BlacklistCheckRequest {
+                user_id,
+                target_user_id,
+            },
+        )
+        .await?;
         if resp.is_blocked {
             let ts = now_millis();
             let _ = self
@@ -3168,7 +3201,11 @@ impl PrivchatClient {
         .await?;
         let channel_type = self.resolve_channel_type(channel_id).await;
         if let Some(local_message_id) = self
-            .resolve_local_message_id_by_server_message_id(channel_id, channel_type, server_message_id)
+            .resolve_local_message_id_by_server_message_id(
+                channel_id,
+                channel_type,
+                server_message_id,
+            )
             .await?
         {
             let _ = self
@@ -3203,11 +3240,17 @@ impl PrivchatClient {
         .await?;
         let channel_type = self.resolve_channel_type(channel_id).await;
         if let Some(local_message_id) = self
-            .resolve_local_message_id_by_server_message_id(channel_id, channel_type, server_message_id)
+            .resolve_local_message_id_by_server_message_id(
+                channel_id,
+                channel_type,
+                server_message_id,
+            )
             .await?
         {
             let revoker = self.require_current_user_id().await.ok();
-            let _ = self.set_message_revoke(local_message_id, true, revoker).await;
+            let _ = self
+                .set_message_revoke(local_message_id, true, revoker)
+                .await;
         }
         Ok(resp)
     }
@@ -3269,7 +3312,8 @@ impl PrivchatClient {
         channel_id: Option<u64>,
         emoji: String,
     ) -> Result<bool, PrivchatFfiError> {
-        self.add_reaction(server_message_id, channel_id, emoji).await
+        self.add_reaction(server_message_id, channel_id, emoji)
+            .await
     }
 
     pub async fn remove_reaction(
@@ -3423,7 +3467,7 @@ impl PrivchatClient {
                     last_local_message_id: ch.last_local_message_id,
                     last_msg_content: ch.last_msg_content,
                 })
-                    .await;
+                .await;
         }
         Ok(resp)
     }
@@ -3471,7 +3515,7 @@ impl PrivchatClient {
                     last_local_message_id: ch.last_local_message_id,
                     last_msg_content: ch.last_msg_content,
                 })
-                    .await;
+                .await;
         }
         Ok(resp)
     }
@@ -3618,11 +3662,11 @@ impl PrivchatClient {
     pub async fn check_friend(&self, friend_id: u64) -> Result<bool, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?;
         let resp: FriendCheckResponse = rpc_call_typed(
-                &self.inner,
-                routes::friend::CHECK,
-                &FriendCheckRequest { friend_id, user_id },
-            )
-            .await?;
+            &self.inner,
+            routes::friend::CHECK,
+            &FriendCheckRequest { friend_id, user_id },
+        )
+        .await?;
         if resp.is_friend {
             let ts = now_millis();
             let _ = self
@@ -3975,7 +4019,10 @@ impl PrivchatClient {
         })
     }
 
-    pub async fn qrcode_revoke(&self, qr_key: String) -> Result<QrCodeRevokeView, PrivchatFfiError> {
+    pub async fn qrcode_revoke(
+        &self,
+        qr_key: String,
+    ) -> Result<QrCodeRevokeView, PrivchatFfiError> {
         let resp: QRCodeRevokeResponse = rpc_call_typed(
             &self.inner,
             routes::qrcode::REVOKE,
@@ -4009,9 +4056,7 @@ impl PrivchatClient {
         })
     }
 
-    pub async fn user_qrcode_refresh(
-        &self,
-    ) -> Result<QrCodeRefreshView, PrivchatFfiError> {
+    pub async fn user_qrcode_refresh(&self) -> Result<QrCodeRefreshView, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?.to_string();
         let resp: UserQRCodeRefreshResponse = rpc_call_typed(
             &self.inner,
@@ -4116,7 +4161,10 @@ impl PrivchatClient {
         let resp: GroupMemberLeaveResponse = rpc_call_typed(
             &self.inner,
             routes::group_member::LEAVE,
-            &GroupMemberLeaveRequest { group_id, user_id: 0 },
+            &GroupMemberLeaveRequest {
+                group_id,
+                user_id: 0,
+            },
         )
         .await?;
         if let Ok(Some(current_uid)) = self.user_id().await {
@@ -4366,9 +4414,7 @@ impl PrivchatClient {
         state.group_id = group_id;
         state.mute_all = enabled;
         let payload = json_encode(&state, "group_mute_all cache")?.into_bytes();
-        let _ = self
-            .kv_put(key, payload)
-            .await;
+        let _ = self.kv_put(key, payload).await;
         Ok(GroupMuteAllView {
             success: resp.success,
             group_id: resp.group_id,
@@ -4405,10 +4451,7 @@ impl PrivchatClient {
                 .map(|it| GroupApprovalItemView {
                     request_id: it.request_id,
                     user_id: it.user_id,
-                    inviter_id: it
-                        .method
-                        .member_invite
-                        .map(|m| m.inviter_id),
+                    inviter_id: it.method.member_invite.map(|m| m.inviter_id),
                     qr_code_id: it.method.qr_code.map(|q| q.qr_code_id),
                     message: it.message,
                     created_at: it.created_at,
@@ -4629,7 +4672,8 @@ impl PrivchatClient {
             client_timestamp: payload.client_timestamp,
             device_id: payload.device_id,
         };
-        let resp: ClientSubmitResponse = rpc_call_typed(&self.inner, routes::sync::SUBMIT, &req).await?;
+        let resp: ClientSubmitResponse =
+            rpc_call_typed(&self.inner, routes::sync::SUBMIT, &req).await?;
         let (decision, decision_reason) = match resp.decision {
             privchat_protocol::rpc::ServerDecision::Accepted => ("accepted".to_string(), None),
             privchat_protocol::rpc::ServerDecision::Transformed { reason } => {
@@ -4706,7 +4750,9 @@ impl PrivchatClient {
                     content_json: c.content.to_string(),
                     server_timestamp: c.server_timestamp,
                     sender_id: c.sender_id,
-                    sender_info_json: c.sender_info.map(|v| serde_json::to_string(&v).unwrap_or_default()),
+                    sender_info_json: c
+                        .sender_info
+                        .map(|v| serde_json::to_string(&v).unwrap_or_default()),
                 })
                 .collect(),
             current_pts: resp.current_pts,
@@ -4865,8 +4911,44 @@ impl PrivchatClient {
                 extra: String::new(),
             })
             .await?;
-        self.enqueue_outbound_message(message_id, Vec::new()).await?;
+        self.enqueue_outbound_message(message_id, Vec::new())
+            .await?;
         Ok(message_id)
+    }
+
+    async fn send_local_message_now(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
+        let message_id = self.create_local_message(input.clone()).await?;
+        let _ = self.inner.update_message_status(message_id, 1).await;
+        let local_message_id = message_id;
+        let send_result = self
+            .inner
+            .send_text_now(
+                input.channel_id,
+                input.channel_type,
+                input.from_uid,
+                input.message_type,
+                input.content,
+                local_message_id,
+                input.extra,
+            )
+            .await;
+        match send_result {
+            Ok(resp) => {
+                self.inner
+                    .mark_message_sent(message_id, resp.server_message_id)
+                    .await
+                    .map_err(PrivchatFfiError::from)?;
+                self.inner
+                    .update_message_status(message_id, 2)
+                    .await
+                    .map_err(PrivchatFfiError::from)?;
+                Ok(message_id)
+            }
+            Err(e) => {
+                let _ = self.inner.update_message_status(message_id, 3).await;
+                Err(PrivchatFfiError::from(e))
+            }
+        }
     }
 
     pub async fn send_message(
@@ -4876,8 +4958,17 @@ impl PrivchatClient {
         from_uid: u64,
         content: String,
     ) -> Result<u64, PrivchatFfiError> {
-        self.enqueue_text(channel_id, channel_type, from_uid, content)
-            .await
+        self.send_local_message_now(NewMessage {
+            channel_id,
+            channel_type,
+            from_uid,
+            message_type: 1,
+            content,
+            searchable_word: String::new(),
+            setting: 0,
+            extra: String::new(),
+        })
+        .await
     }
 
     pub async fn send_message_blocking(
@@ -4891,10 +4982,11 @@ impl PrivchatClient {
             .await
     }
 
-    pub async fn send_message_with_input(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
-        let message_id = self.create_local_message(input).await?;
-        self.enqueue_outbound_message(message_id, Vec::new()).await?;
-        Ok(message_id)
+    pub async fn send_message_with_input(
+        &self,
+        input: NewMessage,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.send_local_message_now(input).await
     }
 
     pub async fn send_message_with_options(
@@ -5223,7 +5315,8 @@ impl PrivchatClient {
         channel_id: u64,
         channel_type: i32,
     ) -> Result<i32, PrivchatFfiError> {
-        self.get_channel_unread_count(channel_id, channel_type).await
+        self.get_channel_unread_count(channel_id, channel_type)
+            .await
     }
 
     pub async fn get_channel_sync_state(
@@ -5231,7 +5324,9 @@ impl PrivchatClient {
         channel_id: u64,
         channel_type: i32,
     ) -> Result<ChannelSyncState, PrivchatFfiError> {
-        let unread = self.get_channel_unread_count(channel_id, channel_type).await?;
+        let unread = self
+            .get_channel_unread_count(channel_id, channel_type)
+            .await?;
         Ok(ChannelSyncState {
             channel_id,
             channel_type,
@@ -5270,7 +5365,7 @@ impl PrivchatClient {
             key,
             json_encode(&state, "channel_prefs notification_mode")?.into_bytes(),
         )
-            .await
+        .await
     }
 
     pub async fn channel_notification_mode(
@@ -5297,7 +5392,7 @@ impl PrivchatClient {
             key,
             json_encode(&state, "channel_prefs favourite")?.into_bytes(),
         )
-            .await
+        .await
     }
 
     pub async fn set_channel_low_priority(
@@ -5314,7 +5409,7 @@ impl PrivchatClient {
             key,
             json_encode(&state, "channel_prefs low_priority")?.into_bytes(),
         )
-            .await
+        .await
     }
 
     pub async fn channel_tags(
@@ -5396,7 +5491,10 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
-    pub async fn delete_blacklist_entry(&self, blocked_user_id: u64) -> Result<(), PrivchatFfiError> {
+    pub async fn delete_blacklist_entry(
+        &self,
+        blocked_user_id: u64,
+    ) -> Result<(), PrivchatFfiError> {
         self.inner
             .delete_blacklist_entry(blocked_user_id)
             .await
@@ -5751,7 +5849,9 @@ impl PrivchatClient {
                     code: privchat_protocol::ErrorCode::InternalError as u32,
                     detail: format!("invalid user settings json: {e}"),
                 })?;
-            return Ok(UserSettingsView { settings_json: value });
+            return Ok(UserSettingsView {
+                settings_json: value,
+            });
         }
         Ok(UserSettingsView {
             settings_json: "{}".to_string(),
@@ -5760,14 +5860,16 @@ impl PrivchatClient {
 
     pub async fn get_user_setting(&self, key: String) -> Result<Option<String>, PrivchatFfiError> {
         let all = self.get_all_user_settings().await?.settings_json;
-        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&all)
-            .map_err(|e| PrivchatFfiError::SdkError {
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&all).map_err(|e| PrivchatFfiError::SdkError {
                 code: privchat_protocol::ErrorCode::InternalError as u32,
                 detail: format!("invalid settings json: {e}"),
             })?;
-        Ok(map
-            .get(&key)
-            .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string())))
+        Ok(map.get(&key).map(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string())
+        }))
     }
 
     pub async fn set_user_setting(
@@ -5911,7 +6013,9 @@ impl PrivchatClient {
         server_message_id: u64,
         user_id: u64,
     ) -> Result<bool, PrivchatFfiError> {
-        let channel_id = self.resolve_channel_id_by_server_message_id(server_message_id).await?;
+        let channel_id = self
+            .resolve_channel_id_by_server_message_id(server_message_id)
+            .await?;
         let resp: MessageReadListResponse = rpc_call_typed(
             &self.inner,
             routes::message_status::READ_LIST,
@@ -5921,14 +6025,19 @@ impl PrivchatClient {
             },
         )
         .await?;
-        Ok(resp.readers.into_iter().any(|entry| entry.user_id == user_id))
+        Ok(resp
+            .readers
+            .into_iter()
+            .any(|entry| entry.user_id == user_id))
     }
 
     pub async fn seen_by_for_event(
         &self,
         server_message_id: u64,
     ) -> Result<Vec<SeenByEntry>, PrivchatFfiError> {
-        let channel_id = self.resolve_channel_id_by_server_message_id(server_message_id).await?;
+        let channel_id = self
+            .resolve_channel_id_by_server_message_id(server_message_id)
+            .await?;
         let resp: MessageReadListResponse = rpc_call_typed(
             &self.inner,
             routes::message_status::READ_LIST,
@@ -5956,7 +6065,8 @@ impl PrivchatClient {
         page: u64,
         page_size: u64,
     ) -> Result<Vec<StoredMessage>, PrivchatFfiError> {
-        self.list_messages(channel_id, channel_type, page, page_size).await
+        self.list_messages(channel_id, channel_type, page, page_size)
+            .await
     }
 
     pub async fn paginate_forward(
@@ -5966,17 +6076,17 @@ impl PrivchatClient {
         page: u64,
         page_size: u64,
     ) -> Result<Vec<StoredMessage>, PrivchatFfiError> {
-        self.list_messages(channel_id, channel_type, page, page_size).await
+        self.list_messages(channel_id, channel_type, page, page_size)
+            .await
     }
 
     pub async fn retry_message(&self, message_id: u64) -> Result<u64, PrivchatFfiError> {
-        let msg = self
-            .get_message_by_id(message_id)
-            .await?
-            .ok_or_else(|| PrivchatFfiError::SdkError {
+        let msg = self.get_message_by_id(message_id).await?.ok_or_else(|| {
+            PrivchatFfiError::SdkError {
                 code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
                 detail: format!("message not found: {message_id}"),
-            })?;
+            }
+        })?;
         let payload = json_encode(
             &RetryMessagePayloadView {
                 message_id: msg.message_id,
@@ -5993,7 +6103,10 @@ impl PrivchatClient {
         self.enqueue_outbound_message(message_id, payload).await
     }
 
-    pub async fn search_channel(&self, keyword: String) -> Result<Vec<StoredChannel>, PrivchatFfiError> {
+    pub async fn search_channel(
+        &self,
+        keyword: String,
+    ) -> Result<Vec<StoredChannel>, PrivchatFfiError> {
         let needle = keyword.to_lowercase();
         let items = self.list_channels(1, 500).await?;
         Ok(items
@@ -6013,7 +6126,9 @@ impl PrivchatClient {
         keyword: String,
     ) -> Result<Vec<StoredMessage>, PrivchatFfiError> {
         let needle = keyword.to_lowercase();
-        let items = self.list_messages(channel_id, channel_type, 1, 1000).await?;
+        let items = self
+            .list_messages(channel_id, channel_type, 1, 1000)
+            .await?;
         Ok(items
             .into_iter()
             .filter(|m| m.content.to_lowercase().contains(&needle))
@@ -6026,7 +6141,8 @@ impl PrivchatClient {
         route_key: String,
         payload: Vec<u8>,
     ) -> Result<FileQueueRef, PrivchatFfiError> {
-        self.enqueue_outbound_file(message_id, route_key, payload).await
+        self.enqueue_outbound_file(message_id, route_key, payload)
+            .await
     }
 
     pub async fn send_attachment_from_path(
@@ -6039,7 +6155,8 @@ impl PrivchatClient {
             code: privchat_protocol::ErrorCode::InternalError as u32,
             detail: format!("read attachment failed: {e}"),
         })?;
-        self.enqueue_outbound_file(message_id, route_key, payload).await
+        self.enqueue_outbound_file(message_id, route_key, payload)
+            .await
     }
 
     pub async fn download_attachment_to_path(
@@ -6092,30 +6209,31 @@ impl PrivchatClient {
     }
 
     pub fn to_client_endpoint(&self) -> Option<String> {
-        self.config()
-            .endpoints
-            .first()
-            .map(|v| {
-                let scheme = match v.protocol {
-                    TransportProtocol::Quic => "quic",
-                    TransportProtocol::Tcp => "tcp",
-                    TransportProtocol::WebSocket => {
-                        if v.use_tls { "wss" } else { "ws" }
-                    }
-                };
-                let mut endpoint = format!("{scheme}://{}:{}", v.host, v.port);
-                if let Some(path) = v.path.as_ref() {
-                    if !path.is_empty() {
-                        if path.starts_with('/') {
-                            endpoint.push_str(path);
-                        } else {
-                            endpoint.push('/');
-                            endpoint.push_str(path);
-                        }
+        self.config().endpoints.first().map(|v| {
+            let scheme = match v.protocol {
+                TransportProtocol::Quic => "quic",
+                TransportProtocol::Tcp => "tcp",
+                TransportProtocol::WebSocket => {
+                    if v.use_tls {
+                        "wss"
+                    } else {
+                        "ws"
                     }
                 }
-                endpoint
-            })
+            };
+            let mut endpoint = format!("{scheme}://{}:{}", v.host, v.port);
+            if let Some(path) = v.path.as_ref() {
+                if !path.is_empty() {
+                    if path.starts_with('/') {
+                        endpoint.push_str(path);
+                    } else {
+                        endpoint.push('/');
+                        endpoint.push_str(path);
+                    }
+                }
+            }
+            endpoint
+        })
     }
 }
 
@@ -6146,7 +6264,7 @@ mod tests {
 
     use super::{
         parse_read_list_entries, parse_read_list_user_ids, PrivchatClient, PrivchatConfig,
-        ServerEndpoint, SdkEvent, TransportProtocol,
+        SdkEvent, ServerEndpoint, TransportProtocol,
     };
 
     #[test]
@@ -6215,34 +6333,58 @@ mod tests {
             .next_event_envelope(200)
             .await
             .expect("poll should not fail");
-        assert!(evt.is_some(), "envelope polling should return at least one event during shutdown");
+        assert!(
+            evt.is_some(),
+            "envelope polling should return at least one event during shutdown"
+        );
     }
 }
 
 uniffi::setup_scaffolding!();
 
-// Compatibility exports for Kotlin Multiplatform runtime templates.
-// Our current API does not use pointer-returning Rust futures, but the generated
-// runtime still references these symbols during linking.
+// UniFFI 0.31 kotlin-multiplatform bindings may reference pointer future helpers.
+// Our current FFI surface does not produce pointer-based async results, but iOS
+// linking still expects these symbols to exist.
 #[repr(C)]
-struct RustBuffer {
+struct UniffiRustBufferCompat {
     capacity: i64,
     len: i64,
     data: *mut u8,
 }
 
 #[repr(C)]
-struct UniffiRustCallStatus {
+struct UniffiRustCallStatusCompat {
     code: i8,
-    error_buf: RustBuffer,
+    error_buf: UniffiRustBufferCompat,
+}
+
+type UniffiRustFutureContinuationCallbackCompat = extern "C" fn(i64, i8);
+
+#[inline]
+unsafe fn set_call_status_ok(out_status: *mut UniffiRustCallStatusCompat) {
+    if out_status.is_null() {
+        return;
+    }
+    // SAFETY: caller provides a valid pointer when non-null.
+    unsafe {
+        (*out_status).code = 0;
+        (*out_status).error_buf = UniffiRustBufferCompat {
+            capacity: 0,
+            len: 0,
+            data: std::ptr::null_mut(),
+        };
+    }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn ffi_privchat_sdk_ffi_rust_future_poll_pointer(
     _handle: i64,
-    _callback: extern "C" fn(i64, i8),
-    _callback_data: i64,
+    callback: Option<UniffiRustFutureContinuationCallbackCompat>,
+    callback_data: i64,
 ) {
+    if let Some(cb) = callback {
+        cb(callback_data, 1);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -6254,18 +6396,9 @@ extern "C" fn ffi_privchat_sdk_ffi_rust_future_free_pointer(_handle: i64) {}
 #[unsafe(no_mangle)]
 extern "C" fn ffi_privchat_sdk_ffi_rust_future_complete_pointer(
     _handle: i64,
-    out_status: *mut UniffiRustCallStatus,
-) -> *mut core::ffi::c_void {
-    if !out_status.is_null() {
-        // non-zero means call error in UniFFI status convention.
-        unsafe {
-            (*out_status).code = 1;
-            (*out_status).error_buf = RustBuffer {
-                capacity: 0,
-                len: 0,
-                data: core::ptr::null_mut(),
-            };
-        }
-    }
-    core::ptr::null_mut()
+    out_status: *mut UniffiRustCallStatusCompat,
+) -> *mut std::ffi::c_void {
+    // SAFETY: output pointer is owned by caller.
+    unsafe { set_call_status_ok(out_status) };
+    std::ptr::null_mut()
 }

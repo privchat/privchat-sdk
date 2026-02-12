@@ -1,0 +1,3 @@
+[bindings.kotlin]
+package_name = "io.privchat.ffi"
+cdylib_name = "privchat_sdk_ffi"
