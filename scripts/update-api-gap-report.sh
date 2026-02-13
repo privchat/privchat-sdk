@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LEGACY_SDK_RS="${ROOT_DIR}/../privchat-sdk/crates/privchat-sdk/src/sdk.rs"
 NEW_FFI_RS="${ROOT_DIR}/crates/privchat-sdk-ffi/src/lib.rs"
-OUT_MD="${ROOT_DIR}/docs/api-gap-report.md"
+OUT_MD="${ROOT_DIR}/../privchat-docs/api/PRIVCHAT_RUST_API_GAP_REPORT.md"
 
 if [[ ! -f "${LEGACY_SDK_RS}" ]]; then
   echo "missing legacy sdk file: ${LEGACY_SDK_RS}" >&2

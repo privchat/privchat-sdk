@@ -12,18 +12,18 @@ use privchat_protocol::rpc::{
     AccountSearchResponse, BlacklistAddRequest, BlacklistAddResponse, BlacklistCheckRequest,
     BlacklistCheckResponse, BlacklistListRequest, BlacklistRemoveRequest, BlacklistRemoveResponse,
     ChannelHideRequest, ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse,
-    ChannelPinRequest, ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse,
-    FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
-    FileUploadCallbackResponse, FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest,
-    FriendApplyResponse, FriendCheckRequest, FriendCheckResponse, FriendPendingRequest,
-    FriendPendingResponse, FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest,
-    FriendRemoveResponse, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
-    GetDifferenceResponse, GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
-    GroupApprovalListRequest, GroupApprovalListResponse, GroupCreateRequest, GroupCreateResponse,
-    GroupInfoRequest, GroupInfoResponse, GroupMemberAddRequest, GroupMemberAddResponse,
-    GroupMemberLeaveRequest, GroupMemberLeaveResponse, GroupMemberListRequest,
-    GroupMemberListResponse, GroupMemberMuteRequest, GroupMemberRemoveRequest,
-    GroupMemberRemoveResponse, GroupMemberUnmuteRequest, GroupMuteAllRequest, GroupMuteAllResponse,
+    ChannelPinRequest, ChannelPinResponse, ClientSubmitResponse, FileRequestUploadTokenRequest,
+    FileRequestUploadTokenResponse, FileUploadCallbackRequest, FileUploadCallbackResponse,
+    FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse,
+    FriendCheckRequest, FriendCheckResponse, FriendPendingRequest, FriendPendingResponse,
+    FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest, FriendRemoveResponse,
+    GetDifferenceRequest, GetDifferenceResponse, GetOrCreateDirectChannelRequest,
+    GetOrCreateDirectChannelResponse, GroupApprovalListRequest, GroupApprovalListResponse,
+    GroupCreateRequest, GroupCreateResponse, GroupInfoRequest, GroupInfoResponse,
+    GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberLeaveRequest,
+    GroupMemberLeaveResponse, GroupMemberListRequest, GroupMemberListResponse,
+    GroupMemberMuteRequest, GroupMemberRemoveRequest, GroupMemberRemoveResponse,
+    GroupMemberUnmuteRequest, GroupMuteAllRequest, GroupMuteAllResponse,
     GroupQRCodeGenerateRequest, GroupQRCodeGenerateResponse, GroupRoleSetRequest,
     GroupRoleSetResponse, GroupSettingsGetRequest, GroupSettingsGetResponse, GroupSettingsPatch,
     GroupSettingsUpdateRequest, GroupSettingsUpdateResponse, MessageHistoryGetRequest,
@@ -39,7 +39,7 @@ use privchat_protocol::rpc::{
     UserQRCodeGetResponse, UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
 };
 use privchat_sdk::{
-    PrivchatConfig, PrivchatSdk, ServerEndpoint, SessionSnapshot, TransportProtocol,
+    NewMessage, PrivchatConfig, PrivchatSdk, ServerEndpoint, SessionSnapshot, TransportProtocol,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -426,65 +426,28 @@ impl MultiAccountManager {
         channel_type: u8,
         text: &str,
     ) -> BoxResult<ClientSubmitResponse> {
-        for _ in 0..4 {
-            let pts_resp: GetChannelPtsResponse = self
-                .rpc_typed(
-                    key,
-                    routes::sync::GET_CHANNEL_PTS,
-                    &GetChannelPtsRequest {
-                        channel_id,
-                        channel_type,
-                    },
-                )
-                .await?;
-
-            let local_message_id = next_local_message_id();
-            let submit: BoxResult<ClientSubmitResponse> = self
-                .rpc_typed(
-                    key,
-                    routes::sync::SUBMIT,
-                    &ClientSubmitRequest {
-                        local_message_id,
-                        channel_id,
-                        channel_type,
-                        last_pts: pts_resp.current_pts,
-                        command_type: "text".to_string(),
-                        payload: serde_json::json!({ "text": text }),
-                        client_timestamp: now_millis(),
-                        device_id: None,
-                    },
-                )
-                .await;
-            match submit {
-                Ok(v) => {
-                    let should_retry = matches!(
-                        &v.decision,
-                        ServerDecision::Rejected { reason } if reason.contains("Redis ZADD failed")
-                    );
-                    if should_retry {
-                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                        continue;
-                    }
-                    return Ok(v);
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.contains("Redis ZADD failed") {
-                        return Err(e);
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        }
-
+        let sdk = self.sdk(key)?;
+        let from_uid = self.user_id(key)?;
+        let local_message_id = sdk
+            .create_local_message(NewMessage {
+                channel_id,
+                channel_type: channel_type as i32,
+                from_uid,
+                message_type: 0,
+                content: text.to_string(),
+                searchable_word: String::new(),
+                setting: 0,
+                extra: String::new(),
+            })
+            .await?;
+        sdk.enqueue_outbound_message(local_message_id, Vec::new())
+            .await?;
         Ok(ClientSubmitResponse {
-            decision: ServerDecision::Rejected {
-                reason: "submit attempts exhausted".to_string(),
-            },
+            decision: ServerDecision::Accepted,
             pts: None,
             server_msg_id: None,
             server_timestamp: now_millis(),
-            local_message_id: 0,
+            local_message_id,
             has_gap: false,
             current_pts: 0,
         })
@@ -1333,15 +1296,6 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     now.as_millis() as i64
-}
-
-fn next_local_message_id() -> u64 {
-    let base = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let seq = LOCAL_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-    (base << 12) | (seq & 0xFFF)
 }
 
 fn direct_key(a: &str, b: &str) -> String {

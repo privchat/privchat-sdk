@@ -3,14 +3,15 @@ use std::thread;
 
 use tokio::sync::oneshot;
 
-use crate::local_store::{LocalStore, StoragePaths};
+use crate::local_store::{LocalAccountEntry, LocalStore, StoragePaths};
 use crate::{
     Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
     StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
     StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
     StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
-    UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput, UpsertUserInput,
+    UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
+    UpsertRemoteMessageInput, UpsertUserInput,
 };
 
 enum StorageCmd {
@@ -35,61 +36,74 @@ enum StorageCmd {
     LoadCurrentUid {
         resp: oneshot::Sender<Result<Option<String>>>,
     },
+    SaveCurrentUid {
+        uid: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
     ClearCurrentUid {
         resp: oneshot::Sender<Result<()>>,
     },
-    NormalQueuePush {
+    WipeUserFull {
         uid: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    ListLocalAccounts {
+        resp: oneshot::Sender<Result<(Option<String>, Vec<LocalAccountEntry>)>>,
+    },
+    FlushUser {
+        uid: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    NormalQueuePush {
         message_id: u64,
         payload: Vec<u8>,
         resp: oneshot::Sender<Result<u64>>,
     },
     NormalQueuePeek {
-        uid: String,
         limit: usize,
         resp: oneshot::Sender<Result<Vec<(u64, Vec<u8>)>>>,
     },
     NormalQueueAck {
-        uid: String,
         message_ids: Vec<u64>,
         resp: oneshot::Sender<Result<usize>>,
     },
     SelectFileQueue {
-        uid: String,
         route_key: String,
         resp: oneshot::Sender<Result<usize>>,
     },
+    FileQueueCount {
+        resp: oneshot::Sender<Result<usize>>,
+    },
     FileQueuePush {
-        uid: String,
         queue_index: usize,
         message_id: u64,
         payload: Vec<u8>,
         resp: oneshot::Sender<Result<u64>>,
     },
     FileQueuePeek {
-        uid: String,
         queue_index: usize,
         limit: usize,
         resp: oneshot::Sender<Result<Vec<(u64, Vec<u8>)>>>,
     },
     FileQueueAck {
-        uid: String,
         queue_index: usize,
         message_ids: Vec<u64>,
         resp: oneshot::Sender<Result<usize>>,
     },
     CreateLocalMessage {
-        uid: String,
+        local_message_id: u64,
         input: NewMessage,
         resp: oneshot::Sender<Result<u64>>,
     },
     GetMessageById {
-        uid: String,
         message_id: u64,
         resp: oneshot::Sender<Result<Option<StoredMessage>>>,
     },
+    UpsertRemoteMessage {
+        input: UpsertRemoteMessageInput,
+        resp: oneshot::Sender<Result<u64>>,
+    },
     ListMessages {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         limit: usize,
@@ -97,52 +111,47 @@ enum StorageCmd {
         resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
     },
     UpsertChannel {
-        uid: String,
         input: UpsertChannelInput,
         resp: oneshot::Sender<Result<()>>,
     },
     GetChannelById {
-        uid: String,
         channel_id: u64,
         resp: oneshot::Sender<Result<Option<StoredChannel>>>,
     },
     ListChannels {
-        uid: String,
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredChannel>>>,
     },
     UpsertChannelExtra {
-        uid: String,
         input: UpsertChannelExtraInput,
         resp: oneshot::Sender<Result<()>>,
     },
     GetChannelExtra {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         resp: oneshot::Sender<Result<Option<StoredChannelExtra>>>,
     },
     MarkMessageSent {
-        uid: String,
         message_id: u64,
         server_message_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     UpdateLocalMessageId {
-        uid: String,
         message_id: u64,
         local_message_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
+    GetLocalMessageId {
+        message_id: u64,
+        resp: oneshot::Sender<Result<Option<u64>>>,
+    },
     UpdateMessageStatus {
-        uid: String,
         message_id: u64,
         status: i32,
         resp: oneshot::Sender<Result<()>>,
     },
     SetMessageRead {
-        uid: String,
         message_id: u64,
         channel_id: u64,
         channel_type: i32,
@@ -150,135 +159,111 @@ enum StorageCmd {
         resp: oneshot::Sender<Result<()>>,
     },
     SetMessageRevoke {
-        uid: String,
         message_id: u64,
         revoked: bool,
         revoker: Option<u64>,
         resp: oneshot::Sender<Result<()>>,
     },
     EditMessage {
-        uid: String,
         message_id: u64,
         content: String,
         edited_at: i32,
         resp: oneshot::Sender<Result<()>>,
     },
     SetMessagePinned {
-        uid: String,
         message_id: u64,
         is_pinned: bool,
         resp: oneshot::Sender<Result<()>>,
     },
     GetMessageExtra {
-        uid: String,
         message_id: u64,
         resp: oneshot::Sender<Result<Option<StoredMessageExtra>>>,
     },
     MarkChannelRead {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         resp: oneshot::Sender<Result<()>>,
     },
     GetChannelUnreadCount {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         resp: oneshot::Sender<Result<i32>>,
     },
     GetTotalUnreadCount {
-        uid: String,
         exclude_muted: bool,
         resp: oneshot::Sender<Result<i32>>,
     },
     UpsertUser {
-        uid: String,
         input: UpsertUserInput,
         resp: oneshot::Sender<Result<()>>,
     },
     GetUserById {
-        uid: String,
         user_id: u64,
         resp: oneshot::Sender<Result<Option<StoredUser>>>,
     },
     ListUsersByIds {
-        uid: String,
         user_ids: Vec<u64>,
         resp: oneshot::Sender<Result<Vec<StoredUser>>>,
     },
     UpsertFriend {
-        uid: String,
         input: UpsertFriendInput,
         resp: oneshot::Sender<Result<()>>,
     },
     DeleteFriend {
-        uid: String,
         user_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     ListFriends {
-        uid: String,
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredFriend>>>,
     },
     UpsertBlacklistEntry {
-        uid: String,
         input: UpsertBlacklistInput,
         resp: oneshot::Sender<Result<()>>,
     },
     DeleteBlacklistEntry {
-        uid: String,
         blocked_user_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     ListBlacklistEntries {
-        uid: String,
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredBlacklistEntry>>>,
     },
     UpsertGroup {
-        uid: String,
         input: UpsertGroupInput,
         resp: oneshot::Sender<Result<()>>,
     },
     GetGroupById {
-        uid: String,
         group_id: u64,
         resp: oneshot::Sender<Result<Option<StoredGroup>>>,
     },
     ListGroups {
-        uid: String,
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredGroup>>>,
     },
     UpsertGroupMember {
-        uid: String,
         input: UpsertGroupMemberInput,
         resp: oneshot::Sender<Result<()>>,
     },
     DeleteGroupMember {
-        uid: String,
         group_id: u64,
         user_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     ListGroupMembers {
-        uid: String,
         group_id: u64,
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredGroupMember>>>,
     },
     UpsertChannelMember {
-        uid: String,
         input: UpsertChannelMemberInput,
         resp: oneshot::Sender<Result<()>>,
     },
     ListChannelMembers {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         limit: usize,
@@ -286,38 +271,32 @@ enum StorageCmd {
         resp: oneshot::Sender<Result<Vec<StoredChannelMember>>>,
     },
     DeleteChannelMember {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         member_uid: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     UpsertMessageReaction {
-        uid: String,
         input: UpsertMessageReactionInput,
         resp: oneshot::Sender<Result<()>>,
     },
     ListMessageReactions {
-        uid: String,
         message_id: u64,
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredMessageReaction>>>,
     },
     RecordMention {
-        uid: String,
         input: MentionInput,
         resp: oneshot::Sender<Result<u64>>,
     },
     GetUnreadMentionCount {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         user_id: u64,
         resp: oneshot::Sender<Result<i32>>,
     },
     ListUnreadMentionMessageIds {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         user_id: u64,
@@ -325,54 +304,53 @@ enum StorageCmd {
         resp: oneshot::Sender<Result<Vec<u64>>>,
     },
     MarkMentionRead {
-        uid: String,
         message_id: u64,
         user_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     MarkAllMentionsRead {
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         user_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     GetAllUnreadMentionCounts {
-        uid: String,
         user_id: u64,
         resp: oneshot::Sender<Result<Vec<UnreadMentionCount>>>,
     },
     UpsertReminder {
-        uid: String,
         input: UpsertReminderInput,
         resp: oneshot::Sender<Result<()>>,
     },
     ListPendingReminders {
-        uid: String,
         reminder_uid: u64,
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredReminder>>>,
     },
     MarkReminderDone {
-        uid: String,
         reminder_id: u64,
         done: bool,
         resp: oneshot::Sender<Result<()>>,
     },
     KvPut {
-        uid: String,
         key: String,
         value: Vec<u8>,
         resp: oneshot::Sender<Result<()>>,
     },
     KvGet {
-        uid: String,
         key: String,
         resp: oneshot::Sender<Result<Option<Vec<u8>>>>,
     },
+    KvDelete {
+        key: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    KvScanPrefix {
+        prefix: String,
+        resp: oneshot::Sender<Result<Vec<(String, Vec<u8>)>>>,
+    },
     GetStoragePaths {
-        uid: String,
         resp: oneshot::Sender<Result<StoragePaths>>,
     },
     Shutdown,
@@ -452,6 +430,14 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
+    pub async fn save_current_uid(&self, uid: String) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::SaveCurrentUid { uid, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
     pub async fn clear_current_uid(&self) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -460,16 +446,34 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn normal_queue_push(
-        &self,
-        uid: String,
-        message_id: u64,
-        payload: Vec<u8>,
-    ) -> Result<u64> {
+    pub async fn wipe_user_full(&self, uid: String) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::WipeUserFull { uid, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn list_local_accounts(&self) -> Result<(Option<String>, Vec<LocalAccountEntry>)> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::ListLocalAccounts { resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn flush_user(&self, uid: String) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::FlushUser { uid, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn normal_queue_push(&self, message_id: u64, payload: Vec<u8>) -> Result<u64> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::NormalQueuePush {
-                uid,
                 message_id,
                 payload,
                 resp: resp_tx,
@@ -478,15 +482,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn normal_queue_peek(
-        &self,
-        uid: String,
-        limit: usize,
-    ) -> Result<Vec<(u64, Vec<u8>)>> {
+    pub async fn normal_queue_peek(&self, limit: usize) -> Result<Vec<(u64, Vec<u8>)>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::NormalQueuePeek {
-                uid,
                 limit,
                 resp: resp_tx,
             })
@@ -494,11 +493,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn normal_queue_ack(&self, uid: String, message_ids: Vec<u64>) -> Result<usize> {
+    pub async fn normal_queue_ack(&self, message_ids: Vec<u64>) -> Result<usize> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::NormalQueueAck {
-                uid,
                 message_ids,
                 resp: resp_tx,
             })
@@ -506,11 +504,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn select_file_queue(&self, uid: String, route_key: String) -> Result<usize> {
+    pub async fn select_file_queue(&self, route_key: String) -> Result<usize> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::SelectFileQueue {
-                uid,
                 route_key,
                 resp: resp_tx,
             })
@@ -518,9 +515,16 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
+    pub async fn file_queue_count(&self) -> Result<usize> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::FileQueueCount { resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
     pub async fn file_queue_push(
         &self,
-        uid: String,
         queue_index: usize,
         message_id: u64,
         payload: Vec<u8>,
@@ -528,7 +532,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::FileQueuePush {
-                uid,
                 queue_index,
                 message_id,
                 payload,
@@ -540,14 +543,12 @@ impl StorageHandle {
 
     pub async fn file_queue_peek(
         &self,
-        uid: String,
         queue_index: usize,
         limit: usize,
     ) -> Result<Vec<(u64, Vec<u8>)>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::FileQueuePeek {
-                uid,
                 queue_index,
                 limit,
                 resp: resp_tx,
@@ -556,16 +557,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn file_queue_ack(
-        &self,
-        uid: String,
-        queue_index: usize,
-        message_ids: Vec<u64>,
-    ) -> Result<usize> {
+    pub async fn file_queue_ack(&self, queue_index: usize, message_ids: Vec<u64>) -> Result<usize> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::FileQueueAck {
-                uid,
                 queue_index,
                 message_ids,
                 resp: resp_tx,
@@ -574,11 +569,15 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn create_local_message(&self, uid: String, input: NewMessage) -> Result<u64> {
+    pub async fn create_local_message(
+        &self,
+        local_message_id: u64,
+        input: NewMessage,
+    ) -> Result<u64> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::CreateLocalMessage {
-                uid,
+                local_message_id,
                 input,
                 resp: resp_tx,
             })
@@ -586,16 +585,22 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn get_message_by_id(
-        &self,
-        uid: String,
-        message_id: u64,
-    ) -> Result<Option<StoredMessage>> {
+    pub async fn get_message_by_id(&self, message_id: u64) -> Result<Option<StoredMessage>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetMessageById {
-                uid,
                 message_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn upsert_remote_message(&self, input: UpsertRemoteMessageInput) -> Result<u64> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UpsertRemoteMessage {
+                input,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -604,7 +609,6 @@ impl StorageHandle {
 
     pub async fn list_messages(
         &self,
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         limit: usize,
@@ -613,7 +617,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListMessages {
-                uid,
                 channel_id,
                 channel_type,
                 limit,
@@ -624,11 +627,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_channel(&self, uid: String, input: UpsertChannelInput) -> Result<()> {
+    pub async fn upsert_channel(&self, input: UpsertChannelInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertChannel {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -636,15 +638,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn get_channel_by_id(
-        &self,
-        uid: String,
-        channel_id: u64,
-    ) -> Result<Option<StoredChannel>> {
+    pub async fn get_channel_by_id(&self, channel_id: u64) -> Result<Option<StoredChannel>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetChannelById {
-                uid,
                 channel_id,
                 resp: resp_tx,
             })
@@ -652,16 +649,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn list_channels(
-        &self,
-        uid: String,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<StoredChannel>> {
+    pub async fn list_channels(&self, limit: usize, offset: usize) -> Result<Vec<StoredChannel>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListChannels {
-                uid,
                 limit,
                 offset,
                 resp: resp_tx,
@@ -670,15 +661,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_channel_extra(
-        &self,
-        uid: String,
-        input: UpsertChannelExtraInput,
-    ) -> Result<()> {
+    pub async fn upsert_channel_extra(&self, input: UpsertChannelExtraInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertChannelExtra {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -688,14 +674,12 @@ impl StorageHandle {
 
     pub async fn get_channel_extra(
         &self,
-        uid: String,
         channel_id: u64,
         channel_type: i32,
     ) -> Result<Option<StoredChannelExtra>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetChannelExtra {
-                uid,
                 channel_id,
                 channel_type,
                 resp: resp_tx,
@@ -704,16 +688,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn mark_message_sent(
-        &self,
-        uid: String,
-        message_id: u64,
-        server_message_id: u64,
-    ) -> Result<()> {
+    pub async fn mark_message_sent(&self, message_id: u64, server_message_id: u64) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::MarkMessageSent {
-                uid,
                 message_id,
                 server_message_id,
                 resp: resp_tx,
@@ -724,14 +702,12 @@ impl StorageHandle {
 
     pub async fn update_local_message_id(
         &self,
-        uid: String,
         message_id: u64,
         local_message_id: u64,
     ) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpdateLocalMessageId {
-                uid,
                 message_id,
                 local_message_id,
                 resp: resp_tx,
@@ -740,16 +716,21 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn update_message_status(
-        &self,
-        uid: String,
-        message_id: u64,
-        status: i32,
-    ) -> Result<()> {
+    pub async fn get_local_message_id(&self, message_id: u64) -> Result<Option<u64>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::GetLocalMessageId {
+                message_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn update_message_status(&self, message_id: u64, status: i32) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpdateMessageStatus {
-                uid,
                 message_id,
                 status,
                 resp: resp_tx,
@@ -760,7 +741,6 @@ impl StorageHandle {
 
     pub async fn set_message_read(
         &self,
-        uid: String,
         message_id: u64,
         channel_id: u64,
         channel_type: i32,
@@ -769,7 +749,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::SetMessageRead {
-                uid,
                 message_id,
                 channel_id,
                 channel_type,
@@ -782,7 +761,6 @@ impl StorageHandle {
 
     pub async fn set_message_revoke(
         &self,
-        uid: String,
         message_id: u64,
         revoked: bool,
         revoker: Option<u64>,
@@ -790,7 +768,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::SetMessageRevoke {
-                uid,
                 message_id,
                 revoked,
                 revoker,
@@ -800,17 +777,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn edit_message(
-        &self,
-        uid: String,
-        message_id: u64,
-        content: &str,
-        edited_at: i32,
-    ) -> Result<()> {
+    pub async fn edit_message(&self, message_id: u64, content: &str, edited_at: i32) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::EditMessage {
-                uid,
                 message_id,
                 content: content.to_string(),
                 edited_at,
@@ -820,16 +790,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn set_message_pinned(
-        &self,
-        uid: String,
-        message_id: u64,
-        is_pinned: bool,
-    ) -> Result<()> {
+    pub async fn set_message_pinned(&self, message_id: u64, is_pinned: bool) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::SetMessagePinned {
-                uid,
                 message_id,
                 is_pinned,
                 resp: resp_tx,
@@ -838,15 +802,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn get_message_extra(
-        &self,
-        uid: String,
-        message_id: u64,
-    ) -> Result<Option<StoredMessageExtra>> {
+    pub async fn get_message_extra(&self, message_id: u64) -> Result<Option<StoredMessageExtra>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetMessageExtra {
-                uid,
                 message_id,
                 resp: resp_tx,
             })
@@ -854,16 +813,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn mark_channel_read(
-        &self,
-        uid: String,
-        channel_id: u64,
-        channel_type: i32,
-    ) -> Result<()> {
+    pub async fn mark_channel_read(&self, channel_id: u64, channel_type: i32) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::MarkChannelRead {
-                uid,
                 channel_id,
                 channel_type,
                 resp: resp_tx,
@@ -874,14 +827,12 @@ impl StorageHandle {
 
     pub async fn get_channel_unread_count(
         &self,
-        uid: String,
         channel_id: u64,
         channel_type: i32,
     ) -> Result<i32> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetChannelUnreadCount {
-                uid,
                 channel_id,
                 channel_type,
                 resp: resp_tx,
@@ -890,11 +841,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn get_total_unread_count(&self, uid: String, exclude_muted: bool) -> Result<i32> {
+    pub async fn get_total_unread_count(&self, exclude_muted: bool) -> Result<i32> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetTotalUnreadCount {
-                uid,
                 exclude_muted,
                 resp: resp_tx,
             })
@@ -902,11 +852,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_user(&self, uid: String, input: UpsertUserInput) -> Result<()> {
+    pub async fn upsert_user(&self, input: UpsertUserInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertUser {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -914,11 +863,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn get_user_by_id(&self, uid: String, user_id: u64) -> Result<Option<StoredUser>> {
+    pub async fn get_user_by_id(&self, user_id: u64) -> Result<Option<StoredUser>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetUserById {
-                uid,
                 user_id,
                 resp: resp_tx,
             })
@@ -926,15 +874,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn list_users_by_ids(
-        &self,
-        uid: String,
-        user_ids: Vec<u64>,
-    ) -> Result<Vec<StoredUser>> {
+    pub async fn list_users_by_ids(&self, user_ids: Vec<u64>) -> Result<Vec<StoredUser>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListUsersByIds {
-                uid,
                 user_ids,
                 resp: resp_tx,
             })
@@ -942,11 +885,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_friend(&self, uid: String, input: UpsertFriendInput) -> Result<()> {
+    pub async fn upsert_friend(&self, input: UpsertFriendInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertFriend {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -954,11 +896,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn delete_friend(&self, uid: String, user_id: u64) -> Result<()> {
+    pub async fn delete_friend(&self, user_id: u64) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::DeleteFriend {
-                uid,
                 user_id,
                 resp: resp_tx,
             })
@@ -966,16 +907,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn list_friends(
-        &self,
-        uid: String,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<StoredFriend>> {
+    pub async fn list_friends(&self, limit: usize, offset: usize) -> Result<Vec<StoredFriend>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListFriends {
-                uid,
                 limit,
                 offset,
                 resp: resp_tx,
@@ -984,15 +919,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_blacklist_entry(
-        &self,
-        uid: String,
-        input: UpsertBlacklistInput,
-    ) -> Result<()> {
+    pub async fn upsert_blacklist_entry(&self, input: UpsertBlacklistInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertBlacklistEntry {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -1000,11 +930,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn delete_blacklist_entry(&self, uid: String, blocked_user_id: u64) -> Result<()> {
+    pub async fn delete_blacklist_entry(&self, blocked_user_id: u64) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::DeleteBlacklistEntry {
-                uid,
                 blocked_user_id,
                 resp: resp_tx,
             })
@@ -1014,14 +943,12 @@ impl StorageHandle {
 
     pub async fn list_blacklist_entries(
         &self,
-        uid: String,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<StoredBlacklistEntry>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListBlacklistEntries {
-                uid,
                 limit,
                 offset,
                 resp: resp_tx,
@@ -1030,11 +957,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_group(&self, uid: String, input: UpsertGroupInput) -> Result<()> {
+    pub async fn upsert_group(&self, input: UpsertGroupInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertGroup {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -1042,11 +968,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn get_group_by_id(&self, uid: String, group_id: u64) -> Result<Option<StoredGroup>> {
+    pub async fn get_group_by_id(&self, group_id: u64) -> Result<Option<StoredGroup>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetGroupById {
-                uid,
                 group_id,
                 resp: resp_tx,
             })
@@ -1054,16 +979,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn list_groups(
-        &self,
-        uid: String,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<StoredGroup>> {
+    pub async fn list_groups(&self, limit: usize, offset: usize) -> Result<Vec<StoredGroup>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListGroups {
-                uid,
                 limit,
                 offset,
                 resp: resp_tx,
@@ -1072,15 +991,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_group_member(
-        &self,
-        uid: String,
-        input: UpsertGroupMemberInput,
-    ) -> Result<()> {
+    pub async fn upsert_group_member(&self, input: UpsertGroupMemberInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertGroupMember {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -1088,15 +1002,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_channel_member(
-        &self,
-        uid: String,
-        input: UpsertChannelMemberInput,
-    ) -> Result<()> {
+    pub async fn upsert_channel_member(&self, input: UpsertChannelMemberInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertChannelMember {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -1106,7 +1015,6 @@ impl StorageHandle {
 
     pub async fn list_channel_members(
         &self,
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         limit: usize,
@@ -1115,7 +1023,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListChannelMembers {
-                uid,
                 channel_id,
                 channel_type,
                 limit,
@@ -1128,7 +1035,6 @@ impl StorageHandle {
 
     pub async fn delete_channel_member(
         &self,
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         member_uid: u64,
@@ -1136,7 +1042,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::DeleteChannelMember {
-                uid,
                 channel_id,
                 channel_type,
                 member_uid,
@@ -1148,7 +1053,6 @@ impl StorageHandle {
 
     pub async fn list_group_members(
         &self,
-        uid: String,
         group_id: u64,
         limit: usize,
         offset: usize,
@@ -1156,7 +1060,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListGroupMembers {
-                uid,
                 group_id,
                 limit,
                 offset,
@@ -1166,16 +1069,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn delete_group_member(
-        &self,
-        uid: String,
-        group_id: u64,
-        user_id: u64,
-    ) -> Result<()> {
+    pub async fn delete_group_member(&self, group_id: u64, user_id: u64) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::DeleteGroupMember {
-                uid,
                 group_id,
                 user_id,
                 resp: resp_tx,
@@ -1184,15 +1081,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_message_reaction(
-        &self,
-        uid: String,
-        input: UpsertMessageReactionInput,
-    ) -> Result<()> {
+    pub async fn upsert_message_reaction(&self, input: UpsertMessageReactionInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertMessageReaction {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -1202,7 +1094,6 @@ impl StorageHandle {
 
     pub async fn list_message_reactions(
         &self,
-        uid: String,
         message_id: u64,
         limit: usize,
         offset: usize,
@@ -1210,7 +1101,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListMessageReactions {
-                uid,
                 message_id,
                 limit,
                 offset,
@@ -1220,11 +1110,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn record_mention(&self, uid: String, input: MentionInput) -> Result<u64> {
+    pub async fn record_mention(&self, input: MentionInput) -> Result<u64> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::RecordMention {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -1234,7 +1123,6 @@ impl StorageHandle {
 
     pub async fn get_unread_mention_count(
         &self,
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         user_id: u64,
@@ -1242,7 +1130,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetUnreadMentionCount {
-                uid,
                 channel_id,
                 channel_type,
                 user_id,
@@ -1254,7 +1141,6 @@ impl StorageHandle {
 
     pub async fn list_unread_mention_message_ids(
         &self,
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         user_id: u64,
@@ -1263,7 +1149,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListUnreadMentionMessageIds {
-                uid,
                 channel_id,
                 channel_type,
                 user_id,
@@ -1274,16 +1159,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn mark_mention_read(
-        &self,
-        uid: String,
-        message_id: u64,
-        user_id: u64,
-    ) -> Result<()> {
+    pub async fn mark_mention_read(&self, message_id: u64, user_id: u64) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::MarkMentionRead {
-                uid,
                 message_id,
                 user_id,
                 resp: resp_tx,
@@ -1294,7 +1173,6 @@ impl StorageHandle {
 
     pub async fn mark_all_mentions_read(
         &self,
-        uid: String,
         channel_id: u64,
         channel_type: i32,
         user_id: u64,
@@ -1302,7 +1180,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::MarkAllMentionsRead {
-                uid,
                 channel_id,
                 channel_type,
                 user_id,
@@ -1314,13 +1191,11 @@ impl StorageHandle {
 
     pub async fn get_all_unread_mention_counts(
         &self,
-        uid: String,
         user_id: u64,
     ) -> Result<Vec<UnreadMentionCount>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetAllUnreadMentionCounts {
-                uid,
                 user_id,
                 resp: resp_tx,
             })
@@ -1328,11 +1203,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_reminder(&self, uid: String, input: UpsertReminderInput) -> Result<()> {
+    pub async fn upsert_reminder(&self, input: UpsertReminderInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpsertReminder {
-                uid,
                 input,
                 resp: resp_tx,
             })
@@ -1342,7 +1216,6 @@ impl StorageHandle {
 
     pub async fn list_pending_reminders(
         &self,
-        uid: String,
         reminder_uid: u64,
         limit: usize,
         offset: usize,
@@ -1350,7 +1223,6 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ListPendingReminders {
-                uid,
                 reminder_uid,
                 limit,
                 offset,
@@ -1360,16 +1232,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn mark_reminder_done(
-        &self,
-        uid: String,
-        reminder_id: u64,
-        done: bool,
-    ) -> Result<()> {
+    pub async fn mark_reminder_done(&self, reminder_id: u64, done: bool) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::MarkReminderDone {
-                uid,
                 reminder_id,
                 done,
                 resp: resp_tx,
@@ -1378,11 +1244,10 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn kv_put(&self, uid: String, key: String, value: Vec<u8>) -> Result<()> {
+    pub async fn kv_put(&self, key: String, value: Vec<u8>) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::KvPut {
-                uid,
                 key,
                 value,
                 resp: resp_tx,
@@ -1391,22 +1256,37 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn kv_get(&self, uid: String, key: String) -> Result<Option<Vec<u8>>> {
+    pub async fn kv_get(&self, key: String) -> Result<Option<Vec<u8>>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::KvGet {
-                uid,
-                key,
+            .send(StorageCmd::KvGet { key, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn kv_delete(&self, key: String) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::KvDelete { key, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn kv_scan_prefix(&self, prefix: String) -> Result<Vec<(String, Vec<u8>)>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::KvScanPrefix {
+                prefix,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn get_storage_paths(&self, uid: String) -> Result<StoragePaths> {
+    pub async fn get_storage_paths(&self) -> Result<StoragePaths> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::GetStoragePaths { uid, resp: resp_tx })
+            .send(StorageCmd::GetStoragePaths { resp: resp_tx })
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
@@ -1438,425 +1318,693 @@ fn run_loop(store: LocalStore, rx: mpsc::Receiver<StorageCmd>) {
             StorageCmd::LoadCurrentUid { resp } => {
                 let _ = resp.send(store.load_current_uid());
             }
+            StorageCmd::SaveCurrentUid { uid, resp } => {
+                let _ = resp.send(store.save_current_uid(&uid));
+            }
             StorageCmd::ClearCurrentUid { resp } => {
                 let _ = resp.send(store.clear_current_uid());
             }
+            StorageCmd::WipeUserFull { uid, resp } => {
+                let _ = resp.send(store.wipe_user_full(&uid));
+            }
+            StorageCmd::ListLocalAccounts { resp } => {
+                let _ = resp.send(store.list_local_accounts());
+            }
+            StorageCmd::FlushUser { uid, resp } => {
+                let _ = resp.send(store.flush_user(&uid));
+            }
             StorageCmd::NormalQueuePush {
-                uid,
                 message_id,
                 payload,
                 resp,
             } => {
-                let _ = resp.send(store.normal_queue_push(&uid, message_id, &payload));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.normal_queue_push(&uid, message_id, &payload),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::NormalQueuePeek { uid, limit, resp } => {
-                let _ = resp.send(store.normal_queue_peek(&uid, limit));
+            StorageCmd::NormalQueuePeek { limit, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.normal_queue_peek(&uid, limit),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::NormalQueueAck {
-                uid,
-                message_ids,
-                resp,
-            } => {
-                let _ = resp.send(store.normal_queue_ack(&uid, &message_ids));
+            StorageCmd::NormalQueueAck { message_ids, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.normal_queue_ack(&uid, &message_ids),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::SelectFileQueue {
-                uid,
-                route_key,
-                resp,
-            } => {
-                let _ = resp.send(store.select_file_queue(&uid, &route_key));
+            StorageCmd::SelectFileQueue { route_key, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.select_file_queue(&uid, &route_key),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
+            }
+            StorageCmd::FileQueueCount { resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.file_queue_count(&uid),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::FileQueuePush {
-                uid,
                 queue_index,
                 message_id,
                 payload,
                 resp,
             } => {
-                let _ = resp.send(store.file_queue_push(&uid, queue_index, message_id, &payload));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.file_queue_push(&uid, queue_index, message_id, &payload),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::FileQueuePeek {
-                uid,
                 queue_index,
                 limit,
                 resp,
             } => {
-                let _ = resp.send(store.file_queue_peek(&uid, queue_index, limit));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.file_queue_peek(&uid, queue_index, limit),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::FileQueueAck {
-                uid,
                 queue_index,
                 message_ids,
                 resp,
             } => {
-                let _ = resp.send(store.file_queue_ack(&uid, queue_index, &message_ids));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.file_queue_ack(&uid, queue_index, &message_ids),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::CreateLocalMessage { uid, input, resp } => {
-                let _ = resp.send(store.create_local_message(&uid, &input));
-            }
-            StorageCmd::GetMessageById {
-                uid,
-                message_id,
+            StorageCmd::CreateLocalMessage {
+                local_message_id,
+                input,
                 resp,
             } => {
-                let _ = resp.send(store.get_message_by_id(&uid, message_id));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.create_local_message(&uid, &input, local_message_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
+            }
+            StorageCmd::GetMessageById { message_id, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_message_by_id(&uid, message_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
+            }
+            StorageCmd::UpsertRemoteMessage { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_remote_message(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListMessages {
-                uid,
                 channel_id,
                 channel_type,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ =
-                    resp.send(store.list_messages(&uid, channel_id, channel_type, limit, offset));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => {
+                        store.list_messages(&uid, channel_id, channel_type, limit, offset)
+                    }
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertChannel { uid, input, resp } => {
-                let _ = resp.send(store.upsert_channel(&uid, &input));
+            StorageCmd::UpsertChannel { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_channel(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::GetChannelById {
-                uid,
-                channel_id,
-                resp,
-            } => {
-                let _ = resp.send(store.get_channel_by_id(&uid, channel_id));
+            StorageCmd::GetChannelById { channel_id, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_channel_by_id(&uid, channel_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListChannels {
-                uid,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ = resp.send(store.list_channels(&uid, limit, offset));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.list_channels(&uid, limit, offset),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertChannelExtra { uid, input, resp } => {
-                let _ = resp.send(store.upsert_channel_extra(&uid, &input));
+            StorageCmd::UpsertChannelExtra { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_channel_extra(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::GetChannelExtra {
-                uid,
                 channel_id,
                 channel_type,
                 resp,
             } => {
-                let _ = resp.send(store.get_channel_extra(&uid, channel_id, channel_type));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_channel_extra(&uid, channel_id, channel_type),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::MarkMessageSent {
-                uid,
                 message_id,
                 server_message_id,
                 resp,
             } => {
-                let _ = resp.send(store.mark_message_sent(&uid, message_id, server_message_id));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.mark_message_sent(&uid, message_id, server_message_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::UpdateLocalMessageId {
-                uid,
                 message_id,
                 local_message_id,
                 resp,
             } => {
-                let _ =
-                    resp.send(store.update_local_message_id(&uid, message_id, local_message_id));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => {
+                        store.update_local_message_id(&uid, message_id, local_message_id)
+                    }
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
+            }
+            StorageCmd::GetLocalMessageId { message_id, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_local_message_id(&uid, message_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::UpdateMessageStatus {
-                uid,
                 message_id,
                 status,
                 resp,
             } => {
-                let _ = resp.send(store.update_message_status(&uid, message_id, status));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.update_message_status(&uid, message_id, status),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::SetMessageRead {
-                uid,
                 message_id,
                 channel_id,
                 channel_type,
                 is_read,
                 resp,
             } => {
-                let _ = resp.send(store.set_message_read(
-                    &uid,
-                    message_id,
-                    channel_id,
-                    channel_type,
-                    is_read,
-                ));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => {
+                        store.set_message_read(&uid, message_id, channel_id, channel_type, is_read)
+                    }
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::SetMessageRevoke {
-                uid,
                 message_id,
                 revoked,
                 revoker,
                 resp,
             } => {
-                let _ = resp.send(store.set_message_revoke(&uid, message_id, revoked, revoker));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.set_message_revoke(&uid, message_id, revoked, revoker),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::EditMessage {
-                uid,
                 message_id,
                 content,
                 edited_at,
                 resp,
             } => {
-                let _ = resp.send(store.edit_message(&uid, message_id, &content, edited_at));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.edit_message(&uid, message_id, &content, edited_at),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::SetMessagePinned {
-                uid,
                 message_id,
                 is_pinned,
                 resp,
             } => {
-                let _ = resp.send(store.set_message_pinned(&uid, message_id, is_pinned));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.set_message_pinned(&uid, message_id, is_pinned),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::GetMessageExtra {
-                uid,
-                message_id,
-                resp,
-            } => {
-                let _ = resp.send(store.get_message_extra(&uid, message_id));
+            StorageCmd::GetMessageExtra { message_id, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_message_extra(&uid, message_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::MarkChannelRead {
-                uid,
                 channel_id,
                 channel_type,
                 resp,
             } => {
-                let _ = resp.send(store.mark_channel_read(&uid, channel_id, channel_type));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.mark_channel_read(&uid, channel_id, channel_type),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::GetChannelUnreadCount {
-                uid,
                 channel_id,
                 channel_type,
                 resp,
             } => {
-                let _ = resp.send(store.get_channel_unread_count(&uid, channel_id, channel_type));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_channel_unread_count(&uid, channel_id, channel_type),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::GetTotalUnreadCount {
-                uid,
                 exclude_muted,
                 resp,
             } => {
-                let _ = resp.send(store.get_total_unread_count(&uid, exclude_muted));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_total_unread_count(&uid, exclude_muted),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertUser { uid, input, resp } => {
-                let _ = resp.send(store.upsert_user(&uid, &input));
+            StorageCmd::UpsertUser { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_user(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::GetUserById { uid, user_id, resp } => {
-                let _ = resp.send(store.get_user_by_id(&uid, user_id));
+            StorageCmd::GetUserById { user_id, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_user_by_id(&uid, user_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::ListUsersByIds {
-                uid,
-                user_ids,
-                resp,
-            } => {
-                let _ = resp.send(store.list_users_by_ids(&uid, &user_ids));
+            StorageCmd::ListUsersByIds { user_ids, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.list_users_by_ids(&uid, &user_ids),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertFriend { uid, input, resp } => {
-                let _ = resp.send(store.upsert_friend(&uid, &input));
+            StorageCmd::UpsertFriend { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_friend(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::DeleteFriend { uid, user_id, resp } => {
-                let _ = resp.send(store.delete_friend(&uid, user_id));
+            StorageCmd::DeleteFriend { user_id, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.delete_friend(&uid, user_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListFriends {
-                uid,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ = resp.send(store.list_friends(&uid, limit, offset));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.list_friends(&uid, limit, offset),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertBlacklistEntry { uid, input, resp } => {
-                let _ = resp.send(store.upsert_blacklist_entry(&uid, &input));
+            StorageCmd::UpsertBlacklistEntry { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_blacklist_entry(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::DeleteBlacklistEntry {
-                uid,
                 blocked_user_id,
                 resp,
             } => {
-                let _ = resp.send(store.delete_blacklist_entry(&uid, blocked_user_id));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.delete_blacklist_entry(&uid, blocked_user_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListBlacklistEntries {
-                uid,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ = resp.send(store.list_blacklist_entries(&uid, limit, offset));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.list_blacklist_entries(&uid, limit, offset),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertGroup { uid, input, resp } => {
-                let _ = resp.send(store.upsert_group(&uid, &input));
+            StorageCmd::UpsertGroup { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_group(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::GetGroupById {
-                uid,
-                group_id,
-                resp,
-            } => {
-                let _ = resp.send(store.get_group_by_id(&uid, group_id));
+            StorageCmd::GetGroupById { group_id, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_group_by_id(&uid, group_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListGroups {
-                uid,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ = resp.send(store.list_groups(&uid, limit, offset));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.list_groups(&uid, limit, offset),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertGroupMember { uid, input, resp } => {
-                let _ = resp.send(store.upsert_group_member(&uid, &input));
+            StorageCmd::UpsertGroupMember { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_group_member(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::DeleteGroupMember {
-                uid,
                 group_id,
                 user_id,
                 resp,
             } => {
-                let _ = resp.send(store.delete_group_member(&uid, group_id, user_id));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.delete_group_member(&uid, group_id, user_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListGroupMembers {
-                uid,
                 group_id,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ = resp.send(store.list_group_members(&uid, group_id, limit, offset));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.list_group_members(&uid, group_id, limit, offset),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertChannelMember { uid, input, resp } => {
-                let _ = resp.send(store.upsert_channel_member(&uid, &input));
+            StorageCmd::UpsertChannelMember { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_channel_member(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListChannelMembers {
-                uid,
                 channel_id,
                 channel_type,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ = resp.send(store.list_channel_members(
-                    &uid,
-                    channel_id,
-                    channel_type,
-                    limit,
-                    offset,
-                ));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => {
+                        store.list_channel_members(&uid, channel_id, channel_type, limit, offset)
+                    }
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::DeleteChannelMember {
-                uid,
                 channel_id,
                 channel_type,
                 member_uid,
                 resp,
             } => {
-                let _ = resp.send(store.delete_channel_member(
-                    &uid,
-                    channel_id,
-                    channel_type,
-                    member_uid,
-                ));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => {
+                        store.delete_channel_member(&uid, channel_id, channel_type, member_uid)
+                    }
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertMessageReaction { uid, input, resp } => {
-                let _ = resp.send(store.upsert_message_reaction(&uid, &input));
+            StorageCmd::UpsertMessageReaction { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_message_reaction(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListMessageReactions {
-                uid,
                 message_id,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ = resp.send(store.list_message_reactions(&uid, message_id, limit, offset));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.list_message_reactions(&uid, message_id, limit, offset),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::RecordMention { uid, input, resp } => {
-                let _ = resp.send(store.record_mention(&uid, &input));
+            StorageCmd::RecordMention { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.record_mention(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::GetUnreadMentionCount {
-                uid,
                 channel_id,
                 channel_type,
                 user_id,
                 resp,
             } => {
-                let _ = resp.send(store.get_unread_mention_count(
-                    &uid,
-                    channel_id,
-                    channel_type,
-                    user_id,
-                ));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => {
+                        store.get_unread_mention_count(&uid, channel_id, channel_type, user_id)
+                    }
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListUnreadMentionMessageIds {
-                uid,
                 channel_id,
                 channel_type,
                 user_id,
                 limit,
                 resp,
             } => {
-                let _ = resp.send(store.list_unread_mention_message_ids(
-                    &uid,
-                    channel_id,
-                    channel_type,
-                    user_id,
-                    limit,
-                ));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.list_unread_mention_message_ids(
+                        &uid,
+                        channel_id,
+                        channel_type,
+                        user_id,
+                        limit,
+                    ),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::MarkMentionRead {
-                uid,
                 message_id,
                 user_id,
                 resp,
             } => {
-                let _ = resp.send(store.mark_mention_read(&uid, message_id, user_id));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.mark_mention_read(&uid, message_id, user_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::MarkAllMentionsRead {
-                uid,
                 channel_id,
                 channel_type,
                 user_id,
                 resp,
             } => {
-                let _ = resp.send(store.mark_all_mentions_read(
-                    &uid,
-                    channel_id,
-                    channel_type,
-                    user_id,
-                ));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => {
+                        store.mark_all_mentions_read(&uid, channel_id, channel_type, user_id)
+                    }
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::GetAllUnreadMentionCounts { uid, user_id, resp } => {
-                let _ = resp.send(store.get_all_unread_mention_counts(&uid, user_id));
+            StorageCmd::GetAllUnreadMentionCounts { user_id, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.get_all_unread_mention_counts(&uid, user_id),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::UpsertReminder { uid, input, resp } => {
-                let _ = resp.send(store.upsert_reminder(&uid, &input));
+            StorageCmd::UpsertReminder { input, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.upsert_reminder(&uid, &input),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::ListPendingReminders {
-                uid,
                 reminder_uid,
                 limit,
                 offset,
                 resp,
             } => {
-                let _ = resp.send(store.list_pending_reminders(&uid, reminder_uid, limit, offset));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => {
+                        store.list_pending_reminders(&uid, reminder_uid, limit, offset)
+                    }
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::MarkReminderDone {
-                uid,
                 reminder_id,
                 done,
                 resp,
             } => {
-                let _ = resp.send(store.mark_reminder_done(&uid, reminder_id, done));
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.mark_reminder_done(&uid, reminder_id, done),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::KvPut {
-                uid,
-                key,
-                value,
-                resp,
-            } => {
-                let _ = resp.send(store.kv_put(&uid, &key, &value));
+            StorageCmd::KvPut { key, value, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.kv_put(&uid, &key, &value),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::KvGet { uid, key, resp } => {
-                let _ = resp.send(store.kv_get(&uid, &key));
+            StorageCmd::KvGet { key, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.kv_get(&uid, &key),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
-            StorageCmd::GetStoragePaths { uid, resp } => {
-                let _ = resp.send(store.ensure_user_storage(&uid));
+            StorageCmd::KvDelete { key, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.kv_delete(&uid, &key),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
+            }
+            StorageCmd::KvScanPrefix { prefix, resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.kv_scan_prefix(&uid, &prefix),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
+            }
+            StorageCmd::GetStoragePaths { resp } => {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) => store.ensure_user_storage(&uid),
+                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(result);
             }
             StorageCmd::Shutdown => break,
         }

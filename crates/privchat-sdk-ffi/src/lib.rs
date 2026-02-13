@@ -49,19 +49,20 @@ use privchat_protocol::rpc::{
 };
 use privchat_sdk::{
     ConnectionState as SdkConnectionState, Error as SdkError, FileQueueRef as SdkFileQueueRef,
-    LoginResult as SdkLoginResult, MentionInput as SdkMentionInput, NetworkHint as SdkNetworkHint,
-    NewMessage as SdkNewMessage, PresenceStatus as SdkPresenceStatus, PrivchatConfig as SdkConfig,
-    PrivchatSdk as InnerSdk, QueueMessage as SdkQueueMessage,
-    SequencedSdkEvent as SdkSequencedSdkEvent, ServerEndpoint as SdkServerEndpoint,
-    SessionSnapshot as SdkSessionSnapshot, StoredBlacklistEntry as SdkStoredBlacklistEntry,
-    StoredChannel as SdkStoredChannel, StoredChannelExtra as SdkStoredChannelExtra,
-    StoredChannelMember as SdkStoredChannelMember, StoredFriend as SdkStoredFriend,
-    StoredGroup as SdkStoredGroup, StoredGroupMember as SdkStoredGroupMember,
-    StoredMessage as SdkStoredMessage, StoredMessageExtra as SdkStoredMessageExtra,
-    StoredMessageReaction as SdkStoredMessageReaction, StoredReminder as SdkStoredReminder,
-    StoredUser as SdkStoredUser, TransportProtocol as SdkProtocol,
-    TypingActionType as SdkTypingActionType, UnreadMentionCount as SdkUnreadMentionCount,
-    UpsertBlacklistInput as SdkUpsertBlacklistInput,
+    LocalAccountSummary as SdkLocalAccountSummary, LoginResult as SdkLoginResult,
+    MediaProcessOp as SdkMediaProcessOp, MentionInput as SdkMentionInput,
+    NetworkHint as SdkNetworkHint, NewMessage as SdkNewMessage,
+    PresenceStatus as SdkPresenceStatus, PrivchatConfig as SdkConfig, PrivchatSdk as InnerSdk,
+    QueueMessage as SdkQueueMessage, SequencedSdkEvent as SdkSequencedSdkEvent,
+    ServerEndpoint as SdkServerEndpoint, SessionSnapshot as SdkSessionSnapshot,
+    StoredBlacklistEntry as SdkStoredBlacklistEntry, StoredChannel as SdkStoredChannel,
+    StoredChannelExtra as SdkStoredChannelExtra, StoredChannelMember as SdkStoredChannelMember,
+    StoredFriend as SdkStoredFriend, StoredGroup as SdkStoredGroup,
+    StoredGroupMember as SdkStoredGroupMember, StoredMessage as SdkStoredMessage,
+    StoredMessageExtra as SdkStoredMessageExtra, StoredMessageReaction as SdkStoredMessageReaction,
+    StoredReminder as SdkStoredReminder, StoredUser as SdkStoredUser,
+    TransportProtocol as SdkProtocol, TypingActionType as SdkTypingActionType,
+    UnreadMentionCount as SdkUnreadMentionCount, UpsertBlacklistInput as SdkUpsertBlacklistInput,
     UpsertChannelExtraInput as SdkUpsertChannelExtraInput,
     UpsertChannelInput as SdkUpsertChannelInput,
     UpsertChannelMemberInput as SdkUpsertChannelMemberInput,
@@ -69,7 +70,7 @@ use privchat_sdk::{
     UpsertGroupMemberInput as SdkUpsertGroupMemberInput,
     UpsertMessageReactionInput as SdkUpsertMessageReactionInput,
     UpsertReminderInput as SdkUpsertReminderInput, UpsertUserInput as SdkUpsertUserInput,
-    UserStoragePaths as SdkUserStoragePaths,
+    UserStoragePaths as SdkUserStoragePaths, VideoProcessHook as SdkVideoProcessHook,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast::error::RecvError, Mutex as AsyncMutex};
 
 const USER_SETTINGS_KEY: &str = "__user_settings_json__";
+const USER_SETTINGS_ITEM_PREFIX: &str = "entity_sync:user_settings:";
 
 #[derive(Debug, Clone, Serialize)]
 struct AuthLogoutRequest {}
@@ -213,6 +215,23 @@ pub struct BlacklistCheckResult {
 pub struct SeenByEntry {
     pub user_id: u64,
     pub read_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaProcessOp {
+    Thumbnail,
+    Compress,
+}
+
+#[uniffi::export(callback_interface)]
+pub trait VideoProcessHook: Send + Sync {
+    fn process(
+        &self,
+        op: MediaProcessOp,
+        source_path: String,
+        meta_path: String,
+        output_path: String,
+    ) -> Result<bool, PrivchatFfiError>;
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -350,6 +369,12 @@ pub struct GroupApprovalItemView {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UserSettingsView {
     pub settings_json: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct KeyValueEntry {
+    pub key: String,
+    pub value: Vec<u8>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -921,7 +946,7 @@ pub enum PrivchatFfiError {
 impl From<SdkError> for PrivchatFfiError {
     fn from(value: SdkError) -> Self {
         Self::SdkError {
-            code: value.protocol_code(),
+            code: value.sdk_code(),
             detail: value.to_string(),
         }
     }
@@ -993,6 +1018,58 @@ pub enum SdkEvent {
     },
     BootstrapCompleted {
         user_id: u64,
+    },
+    SyncEntitiesApplied {
+        entity_type: String,
+        scope: Option<String>,
+        queued: u64,
+        applied: u64,
+        dropped_duplicates: u64,
+    },
+    SyncEntityChanged {
+        entity_type: String,
+        entity_id: String,
+        deleted: bool,
+    },
+    SyncChannelApplied {
+        channel_id: u64,
+        channel_type: i32,
+        applied: u64,
+    },
+    SyncAllChannelsApplied {
+        applied: u64,
+    },
+    NetworkHintChanged {
+        from: NetworkHint,
+        to: NetworkHint,
+    },
+    OutboundQueueUpdated {
+        kind: String,
+        action: String,
+        message_id: Option<u64>,
+        queue_index: Option<u64>,
+    },
+    TimelineUpdated {
+        channel_id: u64,
+        channel_type: i32,
+        message_id: u64,
+        reason: String,
+    },
+    ReadReceiptUpdated {
+        channel_id: u64,
+        channel_type: i32,
+        message_id: u64,
+        is_read: bool,
+    },
+    MessageSendStatusChanged {
+        message_id: u64,
+        status: i32,
+        server_message_id: Option<u64>,
+    },
+    TypingSent {
+        channel_id: u64,
+        channel_type: i32,
+        is_typing: bool,
     },
     ShutdownStarted,
     ShutdownCompleted,
@@ -1435,6 +1512,14 @@ pub struct UserStoragePaths {
     pub media_root: String,
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LocalAccountSummary {
+    pub uid: String,
+    pub created_at: i64,
+    pub last_login_at: i64,
+    pub is_active: bool,
+}
+
 fn map_protocol(p: TransportProtocol) -> SdkProtocol {
     match p {
         TransportProtocol::Quic => SdkProtocol::Quic,
@@ -1500,11 +1585,30 @@ fn map_network_hint(v: NetworkHint) -> SdkNetworkHint {
     }
 }
 
+fn map_sdk_network_hint(v: SdkNetworkHint) -> NetworkHint {
+    match v {
+        SdkNetworkHint::Unknown => NetworkHint::Unknown,
+        SdkNetworkHint::Offline => NetworkHint::Offline,
+        SdkNetworkHint::Wifi => NetworkHint::Wifi,
+        SdkNetworkHint::Cellular => NetworkHint::Cellular,
+        SdkNetworkHint::Ethernet => NetworkHint::Ethernet,
+    }
+}
+
 #[cfg(test)]
 fn parse_read_list_entries(raw: &str) -> Vec<serde_json::Value> {
+    fn to_values(
+        entries: Vec<privchat_protocol::rpc::MessageReadUserEntry>,
+    ) -> Vec<serde_json::Value> {
+        entries
+            .into_iter()
+            .filter_map(|entry| serde_json::to_value(entry).ok())
+            .collect()
+    }
+
     if let Ok(resp) = serde_json::from_str::<MessageReadListResponse>(raw) {
         if !resp.readers.is_empty() {
-            return resp.readers;
+            return to_values(resp.readers);
         }
     }
 
@@ -1516,7 +1620,7 @@ fn parse_read_list_entries(raw: &str) -> Vec<serde_json::Value> {
 
     if let Ok(env) = serde_json::from_str::<DataEnvelope>(raw) {
         if let Some(data) = env.data {
-            return data.readers;
+            return to_values(data.readers);
         }
         if let Some(items) = env.items {
             return items;
@@ -1570,6 +1674,97 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
         privchat_sdk::SdkEvent::BootstrapCompleted { user_id } => {
             SdkEvent::BootstrapCompleted { user_id }
         }
+        privchat_sdk::SdkEvent::SyncEntitiesApplied {
+            entity_type,
+            scope,
+            queued,
+            applied,
+            dropped_duplicates,
+        } => SdkEvent::SyncEntitiesApplied {
+            entity_type,
+            scope,
+            queued: queued as u64,
+            applied: applied as u64,
+            dropped_duplicates: dropped_duplicates as u64,
+        },
+        privchat_sdk::SdkEvent::SyncEntityChanged {
+            entity_type,
+            entity_id,
+            deleted,
+        } => SdkEvent::SyncEntityChanged {
+            entity_type,
+            entity_id,
+            deleted,
+        },
+        privchat_sdk::SdkEvent::SyncChannelApplied {
+            channel_id,
+            channel_type,
+            applied,
+        } => SdkEvent::SyncChannelApplied {
+            channel_id,
+            channel_type,
+            applied: applied as u64,
+        },
+        privchat_sdk::SdkEvent::SyncAllChannelsApplied { applied } => {
+            SdkEvent::SyncAllChannelsApplied {
+                applied: applied as u64,
+            }
+        }
+        privchat_sdk::SdkEvent::NetworkHintChanged { from, to } => SdkEvent::NetworkHintChanged {
+            from: map_sdk_network_hint(from),
+            to: map_sdk_network_hint(to),
+        },
+        privchat_sdk::SdkEvent::OutboundQueueUpdated {
+            kind,
+            action,
+            message_id,
+            queue_index,
+        } => SdkEvent::OutboundQueueUpdated {
+            kind,
+            action,
+            message_id,
+            queue_index: queue_index.map(|v| v as u64),
+        },
+        privchat_sdk::SdkEvent::TimelineUpdated {
+            channel_id,
+            channel_type,
+            message_id,
+            reason,
+        } => SdkEvent::TimelineUpdated {
+            channel_id,
+            channel_type,
+            message_id,
+            reason,
+        },
+        privchat_sdk::SdkEvent::ReadReceiptUpdated {
+            channel_id,
+            channel_type,
+            message_id,
+            is_read,
+        } => SdkEvent::ReadReceiptUpdated {
+            channel_id,
+            channel_type,
+            message_id,
+            is_read,
+        },
+        privchat_sdk::SdkEvent::MessageSendStatusChanged {
+            message_id,
+            status,
+            server_message_id,
+        } => SdkEvent::MessageSendStatusChanged {
+            message_id,
+            status,
+            server_message_id,
+        },
+        privchat_sdk::SdkEvent::TypingSent {
+            channel_id,
+            channel_type,
+            is_typing,
+        } => SdkEvent::TypingSent {
+            channel_id,
+            channel_type,
+            is_typing,
+        },
         privchat_sdk::SdkEvent::ShutdownStarted => SdkEvent::ShutdownStarted,
         privchat_sdk::SdkEvent::ShutdownCompleted => SdkEvent::ShutdownCompleted,
     }
@@ -1581,6 +1776,150 @@ fn map_sequenced_sdk_event(v: SdkSequencedSdkEvent) -> SequencedSdkEvent {
         timestamp_ms: v.timestamp_ms,
         event: map_sdk_event(v.event),
     }
+}
+
+fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
+    use serde_json::json;
+    match event {
+        SdkEvent::ConnectionStateChanged { from, to } => json!({
+            "type": "connection_state_changed",
+            "from_state": format!("{from:?}"),
+            "to_state": format!("{to:?}")
+        }),
+        SdkEvent::BootstrapCompleted { user_id } => json!({
+            "type": "bootstrap_completed",
+            "user_id": user_id
+        }),
+        SdkEvent::SyncEntitiesApplied {
+            entity_type,
+            scope,
+            queued,
+            applied,
+            dropped_duplicates,
+        } => json!({
+            "type": "sync_entities_applied",
+            "entity_type": entity_type,
+            "scope": scope,
+            "queued": queued,
+            "applied": applied,
+            "dropped_duplicates": dropped_duplicates
+        }),
+        SdkEvent::SyncEntityChanged {
+            entity_type,
+            entity_id,
+            deleted,
+        } => json!({
+            "type": "sync_entity_changed",
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "deleted": deleted
+        }),
+        SdkEvent::SyncChannelApplied {
+            channel_id,
+            channel_type,
+            applied,
+        } => json!({
+            "type": "sync_channel_applied",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "applied": applied
+        }),
+        SdkEvent::SyncAllChannelsApplied { applied } => json!({
+            "type": "sync_all_channels_applied",
+            "applied": applied
+        }),
+        SdkEvent::NetworkHintChanged { from, to } => json!({
+            "type": "network_hint_changed",
+            "from_network_hint": format!("{from:?}"),
+            "to_network_hint": format!("{to:?}")
+        }),
+        SdkEvent::OutboundQueueUpdated {
+            kind,
+            action,
+            message_id,
+            queue_index,
+        } => json!({
+            "type": "outbound_queue_updated",
+            "kind": kind,
+            "action": action,
+            "message_id": message_id,
+            "queue_index": queue_index
+        }),
+        SdkEvent::TimelineUpdated {
+            channel_id,
+            channel_type,
+            message_id,
+            reason,
+        } => json!({
+            "type": "timeline_updated",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "message_id": message_id,
+            "reason": reason
+        }),
+        SdkEvent::ReadReceiptUpdated {
+            channel_id,
+            channel_type,
+            message_id,
+            is_read,
+        } => json!({
+            "type": "read_receipt_updated",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "message_id": message_id,
+            "is_read": is_read
+        }),
+        SdkEvent::MessageSendStatusChanged {
+            message_id,
+            status,
+            server_message_id,
+        } => json!({
+            "type": "message_send_status_changed",
+            "message_id": message_id,
+            "status": status,
+            "server_message_id": server_message_id
+        }),
+        SdkEvent::TypingSent {
+            channel_id,
+            channel_type,
+            is_typing,
+        } => json!({
+            "type": "typing_sent",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "is_typing": is_typing
+        }),
+        SdkEvent::ShutdownStarted => json!({ "type": "shutdown_started" }),
+        SdkEvent::ShutdownCompleted => json!({ "type": "shutdown_completed" }),
+    }
+}
+
+fn sequenced_event_to_json_value(event: &SequencedSdkEvent) -> serde_json::Value {
+    serde_json::json!({
+        "sequence_id": event.sequence_id,
+        "timestamp_ms": event.timestamp_ms,
+        "event": sdk_event_to_json_value(&event.event)
+    })
+}
+
+fn is_timeline_event(evt: &SdkEvent) -> bool {
+    matches!(
+        evt,
+        SdkEvent::TimelineUpdated { .. }
+            | SdkEvent::ReadReceiptUpdated { .. }
+            | SdkEvent::MessageSendStatusChanged { .. }
+            | SdkEvent::SyncEntityChanged { .. }
+            | SdkEvent::SyncChannelApplied { .. }
+            | SdkEvent::SyncAllChannelsApplied { .. }
+            | SdkEvent::TypingSent { .. }
+    )
+}
+
+fn is_network_event(evt: &SdkEvent) -> bool {
+    matches!(
+        evt,
+        SdkEvent::ConnectionStateChanged { .. } | SdkEvent::NetworkHintChanged { .. }
+    )
 }
 
 fn map_queue_message(r: SdkQueueMessage) -> QueueMessage {
@@ -1981,6 +2320,15 @@ fn map_storage_paths(v: SdkUserStoragePaths) -> UserStoragePaths {
     }
 }
 
+fn map_local_account_summary(v: SdkLocalAccountSummary) -> LocalAccountSummary {
+    LocalAccountSummary {
+        uid: v.uid,
+        created_at: v.created_at,
+        last_login_at: v.last_login_at,
+        is_active: v.is_active,
+    }
+}
+
 fn map_reactions_map(reactions: HashMap<String, Vec<u64>>) -> Vec<MessageReactionEmojiUsersView> {
     reactions
         .into_iter()
@@ -2251,6 +2599,88 @@ impl PrivchatClient {
         }
     }
 
+    pub async fn next_timeline_event_envelope(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<Option<SequencedSdkEvent>, PrivchatFfiError> {
+        self.event_poll_count.fetch_add(1, Ordering::Relaxed);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
+        let mut cursor = self.inner.last_event_sequence_id();
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let remain = deadline.saturating_duration_since(now);
+            let mut rx = self.event_rx.lock().await;
+            match tokio::time::timeout(remain, rx.recv()).await {
+                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {
+                    let replay = self
+                        .inner
+                        .timeline_events_since(cursor, self.inner.event_history_limit());
+                    if let Some(evt) = replay.last().cloned() {
+                        return Ok(Some(map_sequenced_sdk_event(evt)));
+                    }
+                    cursor = self.inner.last_event_sequence_id();
+                }
+                Ok(Err(RecvError::Closed)) => return Ok(None),
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+
+    pub async fn next_timeline_event(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<Option<SdkEvent>, PrivchatFfiError> {
+        Ok(self
+            .next_timeline_event_envelope(timeout_ms)
+            .await?
+            .map(|v| v.event))
+    }
+
+    pub async fn next_network_event_envelope(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<Option<SequencedSdkEvent>, PrivchatFfiError> {
+        self.event_poll_count.fetch_add(1, Ordering::Relaxed);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
+        let mut cursor = self.inner.last_event_sequence_id();
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let remain = deadline.saturating_duration_since(now);
+            let mut rx = self.event_rx.lock().await;
+            match tokio::time::timeout(remain, rx.recv()).await {
+                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {
+                    let replay = self
+                        .inner
+                        .network_events_since(cursor, self.inner.event_history_limit());
+                    if let Some(evt) = replay.last().cloned() {
+                        return Ok(Some(map_sequenced_sdk_event(evt)));
+                    }
+                    cursor = self.inner.last_event_sequence_id();
+                }
+                Ok(Err(RecvError::Closed)) => return Ok(None),
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+
+    pub async fn next_network_event(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<Option<SdkEvent>, PrivchatFfiError> {
+        Ok(self
+            .next_network_event_envelope(timeout_ms)
+            .await?
+            .map(|v| v.event))
+    }
+
     pub fn event_stream_cursor(&self) -> u64 {
         self.inner.last_event_sequence_id()
     }
@@ -2278,6 +2708,74 @@ impl PrivchatClient {
             .events_since(sequence_id, cap)
             .into_iter()
             .map(map_sequenced_sdk_event)
+            .collect()
+    }
+
+    pub fn recent_timeline_events(&self, limit: u64) -> Vec<SequencedSdkEvent> {
+        let cap = if limit == 0 {
+            0usize
+        } else {
+            limit.min(self.inner.event_history_limit() as u64) as usize
+        };
+        self.inner
+            .recent_timeline_events(cap)
+            .into_iter()
+            .map(map_sequenced_sdk_event)
+            .collect()
+    }
+
+    pub fn timeline_events_since(&self, sequence_id: u64, limit: u64) -> Vec<SequencedSdkEvent> {
+        let cap = if limit == 0 {
+            0usize
+        } else {
+            limit.min(self.inner.event_history_limit() as u64) as usize
+        };
+        self.inner
+            .timeline_events_since(sequence_id, cap)
+            .into_iter()
+            .map(map_sequenced_sdk_event)
+            .collect()
+    }
+
+    pub fn recent_network_events(&self, limit: u64) -> Vec<SequencedSdkEvent> {
+        let cap = if limit == 0 {
+            0usize
+        } else {
+            limit.min(self.inner.event_history_limit() as u64) as usize
+        };
+        self.inner
+            .recent_network_events(cap)
+            .into_iter()
+            .map(map_sequenced_sdk_event)
+            .collect()
+    }
+
+    pub fn network_events_since(&self, sequence_id: u64, limit: u64) -> Vec<SequencedSdkEvent> {
+        let cap = if limit == 0 {
+            0usize
+        } else {
+            limit.min(self.inner.event_history_limit() as u64) as usize
+        };
+        self.inner
+            .network_events_since(sequence_id, cap)
+            .into_iter()
+            .map(map_sequenced_sdk_event)
+            .collect()
+    }
+
+    pub fn recent_timeline_plain_events(&self, limit: u64) -> Vec<SdkEvent> {
+        self.recent_timeline_events(limit)
+            .into_iter()
+            .map(|e| e.event)
+            .filter(is_timeline_event)
+            .collect()
+    }
+
+    pub fn recent_network_plain_events(&self, limit: u64) -> Vec<SdkEvent> {
+        self.recent_network_events(limit)
+            .into_iter()
+            .map(|e| e.event)
+            .filter(is_network_event)
             .collect()
     }
 
@@ -2786,6 +3284,41 @@ impl PrivchatClient {
         route: String,
         body_json: String,
     ) -> Result<String, PrivchatFfiError> {
+        #[derive(Deserialize)]
+        struct EventPollReq {
+            timeout_ms: Option<u64>,
+            limit: Option<u64>,
+        }
+
+        if route == "__sdk.next_event_json" {
+            let req = serde_json::from_str::<EventPollReq>(&body_json).unwrap_or(EventPollReq {
+                timeout_ms: Some(1000),
+                limit: None,
+            });
+            let timeout_ms = req.timeout_ms.unwrap_or(1000);
+            let event = self.next_event_envelope(timeout_ms).await?;
+            return Ok(match event {
+                Some(v) => sequenced_event_to_json_value(&v).to_string(),
+                None => "null".to_string(),
+            });
+        }
+
+        if route == "__sdk.recent_events_json" {
+            let req = serde_json::from_str::<EventPollReq>(&body_json).unwrap_or(EventPollReq {
+                timeout_ms: None,
+                limit: Some(100),
+            });
+            let limit = req.limit.unwrap_or(100).min(2048);
+            let events: Vec<serde_json::Value> = self
+                .inner
+                .recent_events(limit as usize)
+                .into_iter()
+                .map(map_sequenced_sdk_event)
+                .map(|evt| sequenced_event_to_json_value(&evt))
+                .collect();
+            return Ok(serde_json::Value::Array(events).to_string());
+        }
+
         self.inner
             .rpc_call(route, body_json)
             .await
@@ -2886,6 +3419,10 @@ impl PrivchatClient {
             },
         )
         .await?;
+        self.inner
+            .sync_channel(resp, 1)
+            .await
+            .map_err(PrivchatFfiError::from)?;
         Ok(resp)
     }
 
@@ -2923,6 +3460,10 @@ impl PrivchatClient {
             },
         )
         .await?;
+        self.inner
+            .sync_channel(resp.channel_id, 1)
+            .await
+            .map_err(PrivchatFfiError::from)?;
         Ok(DirectChannelResult {
             channel_id: resp.channel_id,
             created: resp.created,
@@ -4904,7 +5445,7 @@ impl PrivchatClient {
                 channel_id,
                 channel_type,
                 from_uid,
-                message_type: 1,
+                message_type: 0,
                 content,
                 searchable_word: String::new(),
                 setting: 0,
@@ -4916,39 +5457,11 @@ impl PrivchatClient {
         Ok(message_id)
     }
 
-    async fn send_local_message_now(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
-        let message_id = self.create_local_message(input.clone()).await?;
-        let _ = self.inner.update_message_status(message_id, 1).await;
-        let local_message_id = message_id;
-        let send_result = self
-            .inner
-            .send_text_now(
-                input.channel_id,
-                input.channel_type,
-                input.from_uid,
-                input.message_type,
-                input.content,
-                local_message_id,
-                input.extra,
-            )
-            .await;
-        match send_result {
-            Ok(resp) => {
-                self.inner
-                    .mark_message_sent(message_id, resp.server_message_id)
-                    .await
-                    .map_err(PrivchatFfiError::from)?;
-                self.inner
-                    .update_message_status(message_id, 2)
-                    .await
-                    .map_err(PrivchatFfiError::from)?;
-                Ok(message_id)
-            }
-            Err(e) => {
-                let _ = self.inner.update_message_status(message_id, 3).await;
-                Err(PrivchatFfiError::from(e))
-            }
-        }
+    async fn enqueue_local_message(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
+        let message_id = self.create_local_message(input).await?;
+        self.enqueue_outbound_message(message_id, Vec::new())
+            .await?;
+        Ok(message_id)
     }
 
     pub async fn send_message(
@@ -4958,11 +5471,11 @@ impl PrivchatClient {
         from_uid: u64,
         content: String,
     ) -> Result<u64, PrivchatFfiError> {
-        self.send_local_message_now(NewMessage {
+        self.enqueue_local_message(NewMessage {
             channel_id,
             channel_type,
             from_uid,
-            message_type: 1,
+            message_type: 0,
             content,
             searchable_word: String::new(),
             setting: 0,
@@ -4986,7 +5499,16 @@ impl PrivchatClient {
         &self,
         input: NewMessage,
     ) -> Result<u64, PrivchatFfiError> {
-        self.send_local_message_now(input).await
+        self.enqueue_local_message(input).await
+    }
+
+    // Backward-compat symbol for older generated bindings.
+    // Semantics stay queue-first: create local message and enqueue it.
+    pub async fn send_local_message_now(
+        &self,
+        input: NewMessage,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.send_message_with_input(input).await
     }
 
     pub async fn send_message_with_options(
@@ -5771,6 +6293,21 @@ impl PrivchatClient {
         self.inner.kv_get(key).await.map_err(PrivchatFfiError::from)
     }
 
+    pub async fn kv_scan_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<Vec<KeyValueEntry>, PrivchatFfiError> {
+        let out = self
+            .inner
+            .kv_scan_prefix(prefix)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(out
+            .into_iter()
+            .map(|(key, value)| KeyValueEntry { key, value })
+            .collect())
+    }
+
     pub async fn user_storage_paths(&self) -> Result<UserStoragePaths, PrivchatFfiError> {
         let out = self
             .inner
@@ -5778,6 +6315,29 @@ impl PrivchatClient {
             .await
             .map_err(PrivchatFfiError::from)?;
         Ok(map_storage_paths(out))
+    }
+
+    pub async fn list_local_accounts(&self) -> Result<Vec<LocalAccountSummary>, PrivchatFfiError> {
+        let out = self
+            .inner
+            .list_local_accounts()
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(out.into_iter().map(map_local_account_summary).collect())
+    }
+
+    pub async fn set_current_uid(&self, uid: String) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .set_current_uid(uid)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn wipe_current_user_full(&self) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .wipe_current_user_full()
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn add_channel_members(
@@ -5838,23 +6398,77 @@ impl PrivchatClient {
     }
 
     pub async fn get_all_user_settings(&self) -> Result<UserSettingsView, PrivchatFfiError> {
-        let raw = self.kv_get(USER_SETTINGS_KEY.to_string()).await?;
-        if let Some(buf) = raw {
-            let value = String::from_utf8(buf).map_err(|e| PrivchatFfiError::SdkError {
+        let mut map = serde_json::Map::<String, serde_json::Value>::new();
+        let entries = self
+            .kv_scan_prefix(USER_SETTINGS_ITEM_PREFIX.to_string())
+            .await?;
+        for entry in entries {
+            if !entry.key.starts_with(USER_SETTINGS_ITEM_PREFIX) {
+                continue;
+            }
+            let setting_key = entry
+                .key
+                .trim_start_matches(USER_SETTINGS_ITEM_PREFIX)
+                .to_string();
+            if setting_key.is_empty() {
+                continue;
+            }
+            let raw = String::from_utf8(entry.value).map_err(|e| PrivchatFfiError::SdkError {
                 code: privchat_protocol::ErrorCode::InternalError as u32,
-                detail: format!("invalid user settings payload: {e}"),
+                detail: format!("invalid user setting payload for key={setting_key}: {e}"),
             })?;
-            let _: serde_json::Value =
-                serde_json::from_str(&value).map_err(|e| PrivchatFfiError::SdkError {
+            let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw));
+            map.insert(setting_key, parsed);
+        }
+        if map.is_empty() {
+            let raw = self.kv_get(USER_SETTINGS_KEY.to_string()).await?;
+            if let Some(buf) = raw {
+                let value = String::from_utf8(buf).map_err(|e| PrivchatFfiError::SdkError {
                     code: privchat_protocol::ErrorCode::InternalError as u32,
-                    detail: format!("invalid user settings json: {e}"),
+                    detail: format!("invalid user settings payload: {e}"),
                 })?;
-            return Ok(UserSettingsView {
-                settings_json: value,
-            });
+                let parsed = serde_json::from_str::<serde_json::Value>(&value).map_err(|e| {
+                    PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::InternalError as u32,
+                        detail: format!("invalid user settings json: {e}"),
+                    }
+                })?;
+                match parsed {
+                    serde_json::Value::Object(obj) => {
+                        if let Some(items) = obj.get("items").and_then(|v| v.as_array()) {
+                            for item in items {
+                                let key = item
+                                    .get("entity_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                if key.is_empty() {
+                                    continue;
+                                }
+                                if item
+                                    .get("deleted")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                                let payload = item
+                                    .get("payload")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                map.insert(key, payload);
+                            }
+                        } else {
+                            map = obj;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(UserSettingsView {
-            settings_json: "{}".to_string(),
+            settings_json: serde_json::Value::Object(map).to_string(),
         })
     }
 
@@ -5883,7 +6497,12 @@ impl PrivchatClient {
                 code: privchat_protocol::ErrorCode::InternalError as u32,
                 detail: format!("invalid settings json: {e}"),
             })?;
-        map.insert(key, serde_json::Value::String(value));
+        map.insert(key.clone(), serde_json::Value::String(value.clone()));
+        self.kv_put(
+            format!("{USER_SETTINGS_ITEM_PREFIX}{key}"),
+            serde_json::Value::String(value).to_string().into_bytes(),
+        )
+        .await?;
         let payload = serde_json::Value::Object(map).to_string().into_bytes();
         self.kv_put(USER_SETTINGS_KEY.to_string(), payload).await
     }
@@ -6202,10 +6821,43 @@ impl PrivchatClient {
         self.download_attachment_to_path(source_path, target).await
     }
 
-    pub fn set_video_process_hook(&self) {
+    pub async fn set_video_process_hook(
+        &self,
+        hook: Option<Box<dyn VideoProcessHook>>,
+    ) -> Result<(), PrivchatFfiError> {
+        let hook_registered = hook.is_some();
+        let sdk_hook: Option<SdkVideoProcessHook> = hook.map(|h| {
+            let h: Arc<dyn VideoProcessHook> = Arc::from(h);
+            Arc::new(
+                move |op: SdkMediaProcessOp,
+                      source_path: &std::path::Path,
+                      meta_path: &std::path::Path,
+                      output_path: &std::path::Path| {
+                    let op_ffi = match op {
+                        SdkMediaProcessOp::Thumbnail => MediaProcessOp::Thumbnail,
+                        SdkMediaProcessOp::Compress => MediaProcessOp::Compress,
+                    };
+                    h.process(
+                        op_ffi,
+                        source_path.to_string_lossy().to_string(),
+                        meta_path.to_string_lossy().to_string(),
+                        output_path.to_string_lossy().to_string(),
+                    )
+                    .map_err(|e| format!("{e}"))
+                },
+            ) as SdkVideoProcessHook
+        });
+        self.inner
+            .set_video_process_hook(sdk_hook)
+            .await
+            .map_err(PrivchatFfiError::from)?;
         self.video_process_hook_registered
-            .store(true, Ordering::Relaxed);
-        eprintln!("[FFI] set_video_process_hook called (no-op in rust core)");
+            .store(hook_registered, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub async fn remove_video_process_hook(&self) -> Result<(), PrivchatFfiError> {
+        self.set_video_process_hook(None).await
     }
 
     pub fn to_client_endpoint(&self) -> Option<String> {

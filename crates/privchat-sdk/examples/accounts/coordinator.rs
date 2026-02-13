@@ -71,6 +71,10 @@ impl TestCoordinator {
             .await;
         self.run_phase(TestPhases::phase27_pts_offline_strict(manager).await)
             .await;
+        self.run_phase(TestPhases::phase28_friend_display_name_rules(manager).await)
+            .await;
+        self.run_phase(TestPhases::phase29_channel_title_rules(manager).await)
+            .await;
         Ok(())
     }
 

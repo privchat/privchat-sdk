@@ -1,6 +1,11 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use hkdf::Hkdf;
+use rand::RngCore;
 use refinery::embed_migrations;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -12,12 +17,148 @@ use crate::{
     StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
     StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
-    UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput, UpsertUserInput,
+    UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
+    UpsertRemoteMessageInput, UpsertUserInput,
 };
 
 mod embedded {
     use super::embed_migrations;
     embed_migrations!("migrations");
+}
+
+const STORAGE_SCHEMA_VERSION: i32 = 1;
+const WRAP_VERSION: i32 = 1;
+const WRAP_ALG: &str = "HKDF-SHA256+AES-256-GCM";
+const TOKEN_ALG: &str = "AES-256-GCM";
+
+const GLOBAL_TREE_INSTALL: &str = "install";
+const GLOBAL_TREE_ACCOUNTS: &str = "accounts";
+
+const ACCOUNT_TREE_META: &str = "meta";
+const ACCOUNT_TREE_PROFILE: &str = "profile";
+const ACCOUNT_TREE_WRAP: &str = "wrap";
+const ACCOUNT_TREE_AUTH: &str = "auth";
+const ACCOUNT_TREE_KV: &str = "kv";
+
+const K_SCHEMA_VERSION: &[u8] = b"schema_version";
+const K_DEVICE_ID: &[u8] = b"device_id";
+const K_INSTALL_SECRET: &[u8] = b"install_secret";
+const K_CREATED_AT: &[u8] = b"created_at";
+const K_ACTIVE_UID: &[u8] = b"active_uid";
+const K_UID: &[u8] = b"uid";
+const K_LAST_LOGIN_AT: &[u8] = b"last_login_at";
+const K_BOOTSTRAP_COMPLETED: &[u8] = b"bootstrap_completed";
+const K_WRAP_VERSION: &[u8] = b"wrap_version";
+const K_WRAP_ALG: &[u8] = b"wrap_alg";
+const K_USER_WRAP_ENABLED: &[u8] = b"user_wrap_enabled";
+const K_USER_WRAP_VERSION: &[u8] = b"user_wrap_version";
+const K_PROFILE_UPDATED_AT: &[u8] = b"profile_updated_at";
+const K_MASTER_KEY_WRAPPED: &[u8] = b"master_key_wrapped";
+const K_MASTER_KEY_NONCE: &[u8] = b"master_key_nonce";
+const K_ACCESS_TOKEN_ALG: &[u8] = b"access_token_alg";
+const K_ACCESS_TOKEN_ENC: &[u8] = b"access_token_enc";
+const K_ACCESS_TOKEN_NONCE: &[u8] = b"access_token_nonce";
+const K_REFRESH_TOKEN_ALG: &[u8] = b"refresh_token_alg";
+const K_REFRESH_TOKEN_ENC: &[u8] = b"refresh_token_enc";
+const K_REFRESH_TOKEN_NONCE: &[u8] = b"refresh_token_nonce";
+const K_TOKEN_EXPIRE_AT: &[u8] = b"token_expire_at";
+const K_DEVICE_ID_CURRENT: &[u8] = b"device_id";
+
+#[derive(Debug, Clone)]
+struct InstallState {
+    device_id: String,
+    install_secret: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+struct EncryptedBlob {
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAccountEntry {
+    pub uid: String,
+    pub created_at: i64,
+    pub last_login_at: i64,
+}
+
+#[cfg(unix)]
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path)
+        .map_err(|e| Error::Storage(format!("create dir {}: {e}", path.display())))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| Error::Storage(format!("set dir mode 700 {}: {e}", path.display())))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| Error::Storage(format!("create dir {}: {e}", path.display())))?;
+    Ok(())
+}
+
+fn get_string(tree: &sled::Tree, key: &[u8]) -> Result<Option<String>> {
+    let value = tree
+        .get(key)
+        .map_err(|e| Error::Storage(format!("read key {}: {e}", String::from_utf8_lossy(key))))?;
+    match value {
+        Some(bytes) => {
+            let s = String::from_utf8(bytes.to_vec()).map_err(|e| {
+                Error::Storage(format!(
+                    "key {} is not valid utf8: {e}",
+                    String::from_utf8_lossy(key)
+                ))
+            })?;
+            Ok(Some(s))
+        }
+        None => Ok(None),
+    }
+}
+
+fn random_hex(num_bytes: usize) -> String {
+    let mut buf = vec![0u8; num_bytes];
+    rand::thread_rng().fill_bytes(&mut buf);
+    hex::encode(buf)
+}
+
+fn i32_to_be_bytes(v: i32) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
+}
+
+fn i64_to_be_bytes(v: i64) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
+}
+
+fn i32_from_be_slice(raw: &[u8]) -> Result<i32> {
+    let arr: [u8; 4] = raw
+        .try_into()
+        .map_err(|_| Error::Storage("invalid i32 bytes length".to_string()))?;
+    Ok(i32::from_be_bytes(arr))
+}
+
+fn derive_wrap_key(install: &InstallState, uid: &str) -> Result<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(
+        Some(install.device_id.as_bytes()),
+        install.install_secret.as_slice(),
+    );
+    let mut out = [0u8; 32];
+    let info = format!("privchat.wrap.master_key|v=1|uid={uid}");
+    hk.expand(info.as_bytes(), &mut out)
+        .map_err(|e| Error::Storage(format!("derive wrap key: {e}")))?;
+    Ok(out)
+}
+
+fn wrap_aad(uid: &str) -> String {
+    format!(
+        "privchat|purpose=wrap_master_key|uid={uid}|wrap_version={WRAP_VERSION}|schema={STORAGE_SCHEMA_VERSION}"
+    )
+}
+
+fn token_aad(uid: &str, purpose: &str) -> String {
+    format!("privchat|purpose={purpose}|uid={uid}|schema={STORAGE_SCHEMA_VERSION}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,8 +175,8 @@ pub struct StoragePaths {
 impl StoragePaths {
     pub fn for_user(base: &Path, uid: &str) -> Self {
         let user_root = base.join("users").join(uid);
-        let db_path = user_root.join("messages.db");
-        let kv_path = user_root.join("kv");
+        let db_path = user_root.join("privchat.db");
+        let kv_path = user_root.join("account.kv");
         let queue_root = user_root.join("queues");
         let normal_queue_path = queue_root.join("normal");
         let file_queue_paths = vec![
@@ -59,6 +200,8 @@ impl StoragePaths {
 #[derive(Clone)]
 pub struct LocalStore {
     base_dir: Arc<PathBuf>,
+    account_dbs: Arc<Mutex<HashMap<String, sled::Db>>>,
+    global_db: Arc<Mutex<Option<sled::Db>>>,
 }
 
 impl LocalStore {
@@ -71,6 +214,8 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("create data dir: {e}")))?;
         Ok(Self {
             base_dir: Arc::new(base),
+            account_dbs: Arc::new(Mutex::new(HashMap::new())),
+            global_db: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -88,6 +233,91 @@ impl LocalStore {
         self.base_dir.as_path()
     }
 
+    fn global_root(&self) -> PathBuf {
+        self.base_dir().join("global")
+    }
+
+    fn global_kv_path(&self) -> PathBuf {
+        self.global_root().join("global.kv")
+    }
+
+    fn open_global_db(&self) -> Result<sled::Db> {
+        let mut guard = self
+            .global_db
+            .lock()
+            .map_err(|_| Error::Storage("lock global_db failed".to_string()))?;
+        if let Some(db) = guard.as_ref() {
+            return Ok(db.clone());
+        }
+        ensure_private_dir(&self.global_root())?;
+        let path = self.global_kv_path();
+        ensure_private_dir(&path)?;
+        let db = Self::open_db(&path)?;
+        *guard = Some(db.clone());
+        Ok(db)
+    }
+
+    fn open_account_db(&self, uid: &str) -> Result<sled::Db> {
+        let mut guard = self
+            .account_dbs
+            .lock()
+            .map_err(|_| Error::Storage("lock account_dbs failed".to_string()))?;
+        if let Some(db) = guard.get(uid) {
+            return Ok(db.clone());
+        }
+        let paths = self.ensure_user_storage(uid)?;
+        let db = Self::open_db(&paths.kv_path)?;
+        guard.insert(uid.to_string(), db.clone());
+        Ok(db)
+    }
+
+    fn account_tree(&self, uid: &str, tree_name: &str) -> Result<sled::Tree> {
+        let db = self.open_account_db(uid)?;
+        db.open_tree(tree_name)
+            .map_err(|e| Error::Storage(format!("open account tree {tree_name}: {e}")))
+    }
+
+    fn get_install_state(&self) -> Result<InstallState> {
+        let db = self.open_global_db()?;
+        let install = db
+            .open_tree(GLOBAL_TREE_INSTALL)
+            .map_err(|e| Error::Storage(format!("open install tree: {e}")))?;
+        let device_id = get_string(&install, K_DEVICE_ID)?;
+        let install_secret = install
+            .get(K_INSTALL_SECRET)
+            .map_err(|e| Error::Storage(format!("read install secret: {e}")))?;
+        if let (Some(device_id), Some(secret)) = (device_id, install_secret) {
+            let install_secret: [u8; 32] = secret.as_ref().try_into().map_err(|_| {
+                Error::Storage("invalid install secret length, expect 32 bytes".to_string())
+            })?;
+            return Ok(InstallState {
+                device_id,
+                install_secret,
+            });
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let device_id = random_hex(16);
+        let mut install_secret = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut install_secret);
+        install
+            .insert(K_SCHEMA_VERSION, i32_to_be_bytes(STORAGE_SCHEMA_VERSION))
+            .map_err(|e| Error::Storage(format!("save install schema: {e}")))?;
+        install
+            .insert(K_DEVICE_ID, device_id.as_bytes())
+            .map_err(|e| Error::Storage(format!("save install device_id: {e}")))?;
+        install
+            .insert(K_INSTALL_SECRET, install_secret.as_slice())
+            .map_err(|e| Error::Storage(format!("save install secret: {e}")))?;
+        install
+            .insert(K_CREATED_AT, i64_to_be_bytes(now))
+            .map_err(|e| Error::Storage(format!("save install created_at: {e}")))?;
+        Ok(InstallState {
+            device_id,
+            install_secret,
+        })
+    }
+
     pub fn storage_paths(&self, uid: &str) -> StoragePaths {
         StoragePaths::for_user(self.base_dir(), uid)
     }
@@ -96,6 +326,26 @@ impl LocalStore {
         let paths = self.storage_paths(uid);
         std::fs::create_dir_all(&paths.user_root)
             .map_err(|e| Error::Storage(format!("create user root: {e}")))?;
+        let legacy_db_path = paths.user_root.join("messages.db");
+        if legacy_db_path.exists() && !paths.db_path.exists() {
+            std::fs::rename(&legacy_db_path, &paths.db_path)
+                .map_err(|e| Error::Storage(format!("migrate db path: {e}")))?;
+            let legacy_wal = paths.user_root.join("messages.db-wal");
+            let legacy_shm = paths.user_root.join("messages.db-shm");
+            let new_wal = paths.user_root.join("privchat.db-wal");
+            let new_shm = paths.user_root.join("privchat.db-shm");
+            if legacy_wal.exists() {
+                let _ = std::fs::rename(&legacy_wal, &new_wal);
+            }
+            if legacy_shm.exists() {
+                let _ = std::fs::rename(&legacy_shm, &new_shm);
+            }
+        }
+        let legacy_kv_path = paths.user_root.join("kv");
+        if legacy_kv_path.exists() && !paths.kv_path.exists() {
+            std::fs::rename(&legacy_kv_path, &paths.kv_path)
+                .map_err(|e| Error::Storage(format!("migrate kv path: {e}")))?;
+        }
         std::fs::create_dir_all(&paths.kv_path)
             .map_err(|e| Error::Storage(format!("create kv path: {e}")))?;
         std::fs::create_dir_all(&paths.queue_root)
@@ -153,37 +403,371 @@ impl LocalStore {
     }
 
     pub fn save_login(&self, uid: &str, login: &LoginResult) -> Result<()> {
-        let conn = self.conn_for_user(uid)?;
         let now = chrono::Utc::now().timestamp_millis();
-        conn.execute(
-            "INSERT INTO auth_session(id, user_id, token, device_id, bootstrap_completed, updated_at)
-             VALUES (1, ?1, ?2, ?3, COALESCE((SELECT bootstrap_completed FROM auth_session WHERE id=1),0), ?4)
-             ON CONFLICT(id) DO UPDATE SET
-               user_id=excluded.user_id,
-               token=excluded.token,
-               device_id=excluded.device_id,
-               updated_at=excluded.updated_at",
-            params![login.user_id, login.token, login.device_id, now],
+        let bootstrap_completed = self.load_bootstrap_completed(uid)?;
+        let install = self.get_install_state()?;
+        let master_key = self.get_or_create_master_key(uid, &install)?;
+        let access_blob =
+            self.encrypt_user_blob(uid, "access_token", &master_key, login.token.as_bytes())?;
+        let refresh_blob = match login.refresh_token.as_deref() {
+            Some(token) => {
+                Some(self.encrypt_user_blob(uid, "refresh_token", &master_key, token.as_bytes())?)
+            }
+            None => None,
+        };
+        let account_db = self.open_account_db(uid)?;
+        let meta = account_db
+            .open_tree(ACCOUNT_TREE_META)
+            .map_err(|e| Error::Storage(format!("open meta tree: {e}")))?;
+        let profile = account_db
+            .open_tree(ACCOUNT_TREE_PROFILE)
+            .map_err(|e| Error::Storage(format!("open profile tree: {e}")))?;
+        let auth = account_db
+            .open_tree(ACCOUNT_TREE_AUTH)
+            .map_err(|e| Error::Storage(format!("open auth tree: {e}")))?;
+
+        meta.insert(K_SCHEMA_VERSION, i32_to_be_bytes(STORAGE_SCHEMA_VERSION))
+            .map_err(|e| Error::Storage(format!("save schema version: {e}")))?;
+        meta.insert(K_WRAP_VERSION, i32_to_be_bytes(WRAP_VERSION))
+            .map_err(|e| Error::Storage(format!("save wrap version: {e}")))?;
+        meta.insert(K_WRAP_ALG, WRAP_ALG.as_bytes())
+            .map_err(|e| Error::Storage(format!("save wrap alg: {e}")))?;
+        meta.insert(K_LAST_LOGIN_AT, i64_to_be_bytes(now))
+            .map_err(|e| Error::Storage(format!("save last_login_at: {e}")))?;
+        meta.insert(
+            K_BOOTSTRAP_COMPLETED,
+            i32_to_be_bytes(if bootstrap_completed { 1 } else { 0 }),
         )
-        .map_err(|e| Error::Storage(format!("save login: {e}")))?;
+        .map_err(|e| Error::Storage(format!("save bootstrap completed: {e}")))?;
+        meta.insert(K_USER_WRAP_ENABLED, i32_to_be_bytes(0))
+            .map_err(|e| Error::Storage(format!("save user_wrap_enabled: {e}")))?;
+        meta.insert(K_USER_WRAP_VERSION, i32_to_be_bytes(0))
+            .map_err(|e| Error::Storage(format!("save user_wrap_version: {e}")))?;
+
+        profile
+            .insert(K_UID, uid.as_bytes())
+            .map_err(|e| Error::Storage(format!("save profile uid: {e}")))?;
+        profile
+            .insert(K_PROFILE_UPDATED_AT, i64_to_be_bytes(now))
+            .map_err(|e| Error::Storage(format!("save profile_updated_at: {e}")))?;
+
+        auth.insert(K_ACCESS_TOKEN_ALG, TOKEN_ALG.as_bytes())
+            .map_err(|e| Error::Storage(format!("save access token alg: {e}")))?;
+        auth.insert(K_ACCESS_TOKEN_ENC, access_blob.ciphertext)
+            .map_err(|e| Error::Storage(format!("save access token enc: {e}")))?;
+        auth.insert(K_ACCESS_TOKEN_NONCE, access_blob.nonce)
+            .map_err(|e| Error::Storage(format!("save access token nonce: {e}")))?;
+        auth.insert(K_DEVICE_ID_CURRENT, login.device_id.as_bytes())
+            .map_err(|e| Error::Storage(format!("save device_id: {e}")))?;
+        if let Some(refresh_blob) = refresh_blob {
+            auth.insert(K_REFRESH_TOKEN_ALG, TOKEN_ALG.as_bytes())
+                .map_err(|e| Error::Storage(format!("save refresh token alg: {e}")))?;
+            auth.insert(K_REFRESH_TOKEN_ENC, refresh_blob.ciphertext)
+                .map_err(|e| Error::Storage(format!("save refresh token enc: {e}")))?;
+            auth.insert(K_REFRESH_TOKEN_NONCE, refresh_blob.nonce)
+                .map_err(|e| Error::Storage(format!("save refresh token nonce: {e}")))?;
+        } else {
+            let _ = auth.remove(K_REFRESH_TOKEN_ALG);
+            let _ = auth.remove(K_REFRESH_TOKEN_ENC);
+            let _ = auth.remove(K_REFRESH_TOKEN_NONCE);
+        }
+        auth.insert(K_TOKEN_EXPIRE_AT, login.expires_at.as_bytes())
+            .map_err(|e| Error::Storage(format!("save token expire_at: {e}")))?;
+        drop(auth);
+        drop(profile);
+        drop(meta);
+        drop(account_db);
+
+        let global_db = self.open_global_db()?;
+        let accounts = global_db
+            .open_tree(GLOBAL_TREE_ACCOUNTS)
+            .map_err(|e| Error::Storage(format!("open accounts tree: {e}")))?;
+        accounts
+            .insert(K_SCHEMA_VERSION, i32_to_be_bytes(STORAGE_SCHEMA_VERSION))
+            .map_err(|e| Error::Storage(format!("save accounts schema: {e}")))?;
+        accounts
+            .insert(K_ACTIVE_UID, uid.as_bytes())
+            .map_err(|e| Error::Storage(format!("save active uid: {e}")))?;
+        let created_key = Self::k_acct_created_at(uid);
+        if accounts
+            .get(created_key.as_bytes())
+            .map_err(|e| Error::Storage(format!("load account created_at: {e}")))?
+            .is_none()
+        {
+            accounts
+                .insert(created_key.as_bytes(), i64_to_be_bytes(now))
+                .map_err(|e| Error::Storage(format!("save account created_at: {e}")))?;
+        }
+        let last_login_key = Self::k_acct_last_login(uid);
+        accounts
+            .insert(last_login_key.as_bytes(), i64_to_be_bytes(now))
+            .map_err(|e| Error::Storage(format!("save account last_login_at: {e}")))?;
+
+        self.clear_legacy_session(uid)?;
         self.save_current_uid(uid)?;
         Ok(())
     }
 
     pub fn set_bootstrap_completed(&self, uid: &str, completed: bool) -> Result<()> {
-        let conn = self.conn_for_user(uid)?;
-        conn.execute(
-            "UPDATE auth_session SET bootstrap_completed=?1, updated_at=?2 WHERE id=1",
-            params![
-                if completed { 1 } else { 0 },
-                chrono::Utc::now().timestamp_millis()
-            ],
+        let meta = self.account_tree(uid, ACCOUNT_TREE_META)?;
+        meta.insert(
+            K_BOOTSTRAP_COMPLETED,
+            i32_to_be_bytes(if completed { 1 } else { 0 }),
         )
         .map_err(|e| Error::Storage(format!("set bootstrap completed: {e}")))?;
         Ok(())
     }
 
     pub fn load_session(&self, uid: &str) -> Result<Option<SessionSnapshot>> {
+        if let Some(snapshot) = self.load_session_from_account(uid)? {
+            return Ok(Some(snapshot));
+        }
+        let Some(legacy) = self.load_legacy_session(uid)? else {
+            return Ok(None);
+        };
+        let login = LoginResult {
+            user_id: legacy.user_id,
+            token: legacy.token.clone(),
+            device_id: legacy.device_id.clone(),
+            refresh_token: None,
+            expires_at: String::new(),
+        };
+        self.save_login(uid, &login)?;
+        self.set_bootstrap_completed(uid, legacy.bootstrap_completed)?;
+        Ok(Some(legacy))
+    }
+
+    pub fn clear_session(&self, uid: &str) -> Result<()> {
+        let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
+        auth.remove(K_ACCESS_TOKEN_ENC)
+            .map_err(|e| Error::Storage(format!("clear access token: {e}")))?;
+        auth.remove(K_ACCESS_TOKEN_NONCE)
+            .map_err(|e| Error::Storage(format!("clear access token nonce: {e}")))?;
+        auth.remove(K_REFRESH_TOKEN_ENC)
+            .map_err(|e| Error::Storage(format!("clear refresh token: {e}")))?;
+        auth.remove(K_REFRESH_TOKEN_NONCE)
+            .map_err(|e| Error::Storage(format!("clear refresh token nonce: {e}")))?;
+        auth.remove(K_REFRESH_TOKEN_ALG)
+            .map_err(|e| Error::Storage(format!("clear refresh token alg: {e}")))?;
+        auth.remove(K_DEVICE_ID_CURRENT)
+            .map_err(|e| Error::Storage(format!("clear device_id: {e}")))?;
+        auth.remove(K_TOKEN_EXPIRE_AT)
+            .map_err(|e| Error::Storage(format!("clear token expire_at: {e}")))?;
+        self.clear_legacy_session(uid)?;
+        Ok(())
+    }
+
+    fn k_acct_last_login(uid: &str) -> String {
+        format!("acct/{uid}/last_login_at")
+    }
+
+    fn k_acct_created_at(uid: &str) -> String {
+        format!("acct/{uid}/created_at")
+    }
+
+    fn load_bootstrap_completed(&self, uid: &str) -> Result<bool> {
+        let meta = self.account_tree(uid, ACCOUNT_TREE_META)?;
+        if let Some(v) = meta
+            .get(K_BOOTSTRAP_COMPLETED)
+            .map_err(|e| Error::Storage(format!("load bootstrap completed: {e}")))?
+        {
+            return Ok(i32_from_be_slice(v.as_ref())? != 0);
+        }
+        Ok(self
+            .load_legacy_session(uid)?
+            .map(|s| s.bootstrap_completed)
+            .unwrap_or(false))
+    }
+
+    fn get_or_create_master_key(&self, uid: &str, install: &InstallState) -> Result<[u8; 32]> {
+        let wrap = self.account_tree(uid, ACCOUNT_TREE_WRAP)?;
+        let wrapped = wrap
+            .get(K_MASTER_KEY_WRAPPED)
+            .map_err(|e| Error::Storage(format!("load wrapped master key: {e}")))?;
+        let nonce = wrap
+            .get(K_MASTER_KEY_NONCE)
+            .map_err(|e| Error::Storage(format!("load wrapped master key nonce: {e}")))?;
+        if let (Some(wrapped), Some(nonce)) = (wrapped, nonce) {
+            return self.unwrap_master_key(uid, install, wrapped.as_ref(), nonce.as_ref());
+        }
+        let mut master_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut master_key);
+        let wrap_key = derive_wrap_key(install, uid)?;
+        let cipher = Aes256Gcm::new_from_slice(&wrap_key)
+            .map_err(|e| Error::Storage(format!("init wrap cipher: {e}")))?;
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let aad = wrap_aad(uid);
+        let wrapped = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &master_key,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|e| Error::Storage(format!("wrap master key: {e}")))?;
+        wrap.insert(K_MASTER_KEY_WRAPPED, wrapped)
+            .map_err(|e| Error::Storage(format!("save wrapped master key: {e}")))?;
+        wrap.insert(K_MASTER_KEY_NONCE, nonce.as_slice())
+            .map_err(|e| Error::Storage(format!("save wrapped master key nonce: {e}")))?;
+        Ok(master_key)
+    }
+
+    fn unwrap_master_key(
+        &self,
+        uid: &str,
+        install: &InstallState,
+        wrapped: &[u8],
+        nonce: &[u8],
+    ) -> Result<[u8; 32]> {
+        if nonce.len() != 12 {
+            return Err(Error::Storage(
+                "invalid wrapped master key nonce length, expect 12 bytes".to_string(),
+            ));
+        }
+        let wrap_key = derive_wrap_key(install, uid)?;
+        let cipher = Aes256Gcm::new_from_slice(&wrap_key)
+            .map_err(|e| Error::Storage(format!("init unwrap cipher: {e}")))?;
+        let aad = wrap_aad(uid);
+        let plain = cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: wrapped,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|e| Error::Storage(format!("unwrap master key: {e}")))?;
+        plain.as_slice().try_into().map_err(|_| {
+            Error::Storage("invalid master key length after unwrap, expect 32 bytes".to_string())
+        })
+    }
+
+    fn load_master_key(&self, uid: &str) -> Result<[u8; 32]> {
+        let install = self.get_install_state()?;
+        let wrap = self.account_tree(uid, ACCOUNT_TREE_WRAP)?;
+        let wrapped = wrap
+            .get(K_MASTER_KEY_WRAPPED)
+            .map_err(|e| Error::Storage(format!("load wrapped master key: {e}")))?
+            .ok_or_else(|| Error::Storage("master key not initialized".to_string()))?;
+        let nonce = wrap
+            .get(K_MASTER_KEY_NONCE)
+            .map_err(|e| Error::Storage(format!("load wrapped master key nonce: {e}")))?
+            .ok_or_else(|| Error::Storage("master key nonce not initialized".to_string()))?;
+        self.unwrap_master_key(uid, &install, wrapped.as_ref(), nonce.as_ref())
+    }
+
+    fn encrypt_user_blob(
+        &self,
+        uid: &str,
+        purpose: &str,
+        master_key: &[u8; 32],
+        plain: &[u8],
+    ) -> Result<EncryptedBlob> {
+        let cipher = Aes256Gcm::new_from_slice(master_key)
+            .map_err(|e| Error::Storage(format!("init token cipher: {e}")))?;
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let aad = token_aad(uid, purpose);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plain,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|e| Error::Storage(format!("encrypt {purpose}: {e}")))?;
+        Ok(EncryptedBlob {
+            ciphertext,
+            nonce: nonce.to_vec(),
+        })
+    }
+
+    fn decrypt_user_blob(
+        &self,
+        uid: &str,
+        purpose: &str,
+        master_key: &[u8; 32],
+        ciphertext: &[u8],
+        nonce: &[u8],
+    ) -> Result<Vec<u8>> {
+        if nonce.len() != 12 {
+            return Err(Error::Storage(format!(
+                "invalid nonce length for {purpose}, expect 12 bytes"
+            )));
+        }
+        let cipher = Aes256Gcm::new_from_slice(master_key)
+            .map_err(|e| Error::Storage(format!("init token decipher: {e}")))?;
+        let aad = token_aad(uid, purpose);
+        cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|e| Error::Storage(format!("decrypt {purpose}: {e}")))
+    }
+
+    fn load_session_from_account(&self, uid: &str) -> Result<Option<SessionSnapshot>> {
+        let account_db = self.open_account_db(uid)?;
+        let auth = account_db
+            .open_tree(ACCOUNT_TREE_AUTH)
+            .map_err(|e| Error::Storage(format!("open auth tree: {e}")))?;
+        let profile = account_db
+            .open_tree(ACCOUNT_TREE_PROFILE)
+            .map_err(|e| Error::Storage(format!("open profile tree: {e}")))?;
+        let meta = account_db
+            .open_tree(ACCOUNT_TREE_META)
+            .map_err(|e| Error::Storage(format!("open meta tree: {e}")))?;
+        let token_enc = auth
+            .get(K_ACCESS_TOKEN_ENC)
+            .map_err(|e| Error::Storage(format!("load access token: {e}")))?;
+        let token_nonce = auth
+            .get(K_ACCESS_TOKEN_NONCE)
+            .map_err(|e| Error::Storage(format!("load access token nonce: {e}")))?;
+        let device_id = get_string(&auth, K_DEVICE_ID_CURRENT)?;
+        let profile_uid = get_string(&profile, K_UID)?;
+        if token_enc.is_none()
+            || token_nonce.is_none()
+            || device_id.is_none()
+            || profile_uid.is_none()
+        {
+            return Ok(None);
+        }
+        let master_key = self.load_master_key(uid)?;
+        let token_plain = self.decrypt_user_blob(
+            uid,
+            "access_token",
+            &master_key,
+            token_enc.as_ref().expect("checked").as_ref(),
+            token_nonce.as_ref().expect("checked").as_ref(),
+        )?;
+        let token = String::from_utf8(token_plain)
+            .map_err(|e| Error::Storage(format!("decode access token utf8: {e}")))?;
+        let user_id = profile_uid
+            .expect("checked")
+            .parse::<u64>()
+            .map_err(|e| Error::Storage(format!("parse profile uid: {e}")))?;
+        let bootstrap_completed = meta
+            .get(K_BOOTSTRAP_COMPLETED)
+            .map_err(|e| Error::Storage(format!("load bootstrap completed: {e}")))?
+            .map(|v| i32_from_be_slice(v.as_ref()))
+            .transpose()?
+            .unwrap_or(0)
+            != 0;
+        Ok(Some(SessionSnapshot {
+            user_id,
+            token,
+            device_id: device_id.expect("checked"),
+            bootstrap_completed,
+        }))
+    }
+
+    fn load_legacy_session(&self, uid: &str) -> Result<Option<SessionSnapshot>> {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(
             "SELECT user_id, token, device_id, bootstrap_completed FROM auth_session WHERE id=1",
@@ -198,17 +782,86 @@ impl LocalStore {
             },
         )
         .optional()
-        .map_err(|e| Error::Storage(format!("load session: {e}")))
+        .map_err(|e| Error::Storage(format!("load legacy session: {e}")))
     }
 
-    pub fn clear_session(&self, uid: &str) -> Result<()> {
+    fn clear_legacy_session(&self, uid: &str) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute("DELETE FROM auth_session", [])
-            .map_err(|e| Error::Storage(format!("clear session: {e}")))?;
+            .map_err(|e| Error::Storage(format!("clear legacy session: {e}")))?;
         Ok(())
     }
 
-    pub fn create_local_message(&self, uid: &str, input: &NewMessage) -> Result<u64> {
+    pub fn list_local_accounts(&self) -> Result<(Option<String>, Vec<LocalAccountEntry>)> {
+        let global_db = self.open_global_db()?;
+        let accounts = global_db
+            .open_tree(GLOBAL_TREE_ACCOUNTS)
+            .map_err(|e| Error::Storage(format!("open accounts tree: {e}")))?;
+        let active_uid = get_string(&accounts, K_ACTIVE_UID)?;
+        let mut out = Vec::new();
+        for item in accounts.iter() {
+            let (k, v) = item.map_err(|e| Error::Storage(format!("iterate accounts: {e}")))?;
+            let key = String::from_utf8(k.to_vec())
+                .map_err(|e| Error::Storage(format!("decode account key utf8: {e}")))?;
+            let Some(uid) = key
+                .strip_prefix("acct/")
+                .and_then(|s| s.strip_suffix("/last_login_at"))
+            else {
+                continue;
+            };
+            let last_login_at = {
+                let arr: [u8; 8] = v
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| Error::Storage("invalid last_login_at bytes".to_string()))?;
+                i64::from_be_bytes(arr)
+            };
+            let created_key = Self::k_acct_created_at(uid);
+            let created_at = match accounts
+                .get(created_key.as_bytes())
+                .map_err(|e| Error::Storage(format!("read account created_at: {e}")))?
+            {
+                Some(raw) => {
+                    let arr: [u8; 8] = raw
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| Error::Storage("invalid created_at bytes".to_string()))?;
+                    i64::from_be_bytes(arr)
+                }
+                None => last_login_at,
+            };
+            out.push(LocalAccountEntry {
+                uid: uid.to_string(),
+                created_at,
+                last_login_at,
+            });
+        }
+        out.sort_by(|a, b| {
+            b.last_login_at
+                .cmp(&a.last_login_at)
+                .then_with(|| a.uid.cmp(&b.uid))
+        });
+        Ok((active_uid, out))
+    }
+
+    pub fn flush_user(&self, uid: &str) -> Result<()> {
+        let account_db = self.open_account_db(uid)?;
+        account_db
+            .flush()
+            .map_err(|e| Error::Storage(format!("flush account db: {e}")))?;
+        let global_db = self.open_global_db()?;
+        global_db
+            .flush()
+            .map_err(|e| Error::Storage(format!("flush global db: {e}")))?;
+        Ok(())
+    }
+
+    pub fn create_local_message(
+        &self,
+        uid: &str,
+        input: &NewMessage,
+        local_message_id: u64,
+    ) -> Result<u64> {
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         conn.execute(
@@ -227,12 +880,97 @@ impl LocalStore {
                 now_ms,
                 now_ms,
                 input.searchable_word,
-                0_i64,
+                local_message_id as i64,
                 input.setting,
                 input.extra
             ],
         )
         .map_err(|e| Error::Storage(format!("insert message: {e}")))?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    pub fn upsert_remote_message(
+        &self,
+        uid: &str,
+        input: &UpsertRemoteMessageInput,
+    ) -> Result<u64> {
+        if input.server_message_id == 0 {
+            return Err(Error::InvalidState(
+                "server_message_id is required".to_string(),
+            ));
+        }
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let existed: Option<(i64, i64, i64)> = conn
+            .query_row(
+                "SELECT id, COALESCE(order_seq, 0), COALESCE(pts, 0)
+                 FROM message WHERE message_id = ?1 LIMIT 1",
+                params![input.server_message_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("query remote message: {e}")))?;
+
+        if let Some((row_id, current_order_seq, current_pts)) = existed {
+            // Guard against out-of-order replay regressing a newer row.
+            if input.order_seq < current_order_seq
+                || (input.order_seq == current_order_seq && input.pts < current_pts)
+            {
+                return Ok(row_id as u64);
+            }
+            conn.execute(
+                "UPDATE message
+                 SET channel_id = ?1, channel_type = ?2, timestamp = ?3, from_uid = ?4,
+                     type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
+                     local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14
+                 WHERE id = ?15",
+                params![
+                    input.channel_id as i64,
+                    input.channel_type,
+                    input.timestamp,
+                    input.from_uid as i64,
+                    input.message_type,
+                    input.content,
+                    input.status,
+                    now_ms,
+                    input.searchable_word,
+                    input.local_message_id as i64,
+                    input.setting,
+                    input.extra,
+                    input.pts,
+                    input.order_seq,
+                    row_id,
+                ],
+            )
+            .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
+            return Ok(row_id as u64);
+        }
+
+        conn.execute(
+            "INSERT INTO message (
+                message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
+                content, status, created_at, updated_at, searchable_word, local_message_id,
+                setting, order_seq, extra
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                input.server_message_id as i64,
+                input.pts,
+                input.channel_id as i64,
+                input.channel_type,
+                input.timestamp,
+                input.from_uid as i64,
+                input.message_type,
+                input.content,
+                input.status,
+                now_ms,
+                input.searchable_word,
+                input.local_message_id as i64,
+                input.setting,
+                input.order_seq,
+                input.extra,
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
         Ok(conn.last_insert_rowid() as u64)
     }
 
@@ -358,15 +1096,105 @@ impl LocalStore {
 
     pub fn get_channel_by_id(&self, uid: &str, channel_id: u64) -> Result<Option<StoredChannel>> {
         let conn = self.conn_for_user(uid)?;
+        let uid_i64 = uid.parse::<i64>().unwrap_or_default();
         conn.query_row(
             "SELECT
-                channel_id, channel_type, channel_name, channel_remark, avatar,
-                unread_count, top, mute, last_msg_timestamp, last_local_message_id,
-                last_msg_content, updated_at
-             FROM channel
-             WHERE channel_id = ?1
+                c.channel_id,
+                c.channel_type,
+                CASE
+                    WHEN c.channel_type = 1 THEN COALESCE(
+                        (
+                            SELECT COALESCE(
+                                NULLIF(u.alias, ''),
+                                NULLIF(u.nickname, ''),
+                                NULLIF(u.username, ''),
+                                CAST(u.user_id AS TEXT)
+                            )
+                            FROM \"user\" u
+                            WHERE u.user_id = COALESCE(
+                                (
+                                    SELECT cm.member_uid
+                                    FROM channel_member cm
+                                    WHERE cm.channel_id = c.channel_id
+                                      AND cm.channel_type = c.channel_type
+                                      AND cm.member_uid != ?2
+                                    ORDER BY cm.role ASC, cm.member_uid ASC
+                                    LIMIT 1
+                                ),
+                                (
+                                    SELECT u2.user_id
+                                    FROM \"user\" u2
+                                    WHERE u2.channel_id = CAST(c.channel_id AS TEXT)
+                                    ORDER BY u2.updated_at DESC
+                                    LIMIT 1
+                                )
+                            )
+                            LIMIT 1
+                        ),
+                        NULLIF(c.channel_name, ''),
+                        CAST(c.channel_id AS TEXT)
+                    )
+                    WHEN c.channel_type = 2 THEN COALESCE(
+                        NULLIF(c.channel_name, ''),
+                        (
+                            SELECT NULLIF(g.name, '')
+                            FROM \"group\" g
+                            WHERE g.group_id = c.channel_id
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT NULLIF(group_concat(name_part, '、'), '')
+                            FROM (
+                                SELECT COALESCE(
+                                    NULLIF(gm.alias, ''),
+                                    NULLIF(u.alias, ''),
+                                    NULLIF(u.nickname, ''),
+                                    NULLIF(u.username, ''),
+                                    CAST(gm.user_id AS TEXT)
+                                ) AS name_part
+                                FROM group_member gm
+                                LEFT JOIN \"user\" u ON u.user_id = gm.user_id
+                                WHERE gm.group_id = c.channel_id
+                                  AND gm.status = 0
+                                ORDER BY gm.role ASC, gm.joined_at ASC, gm.user_id ASC
+                                LIMIT 3
+                            )
+                        ),
+                        CAST(c.channel_id AS TEXT)
+                    )
+                    ELSE c.channel_name
+                END AS resolved_channel_name,
+                c.channel_remark,
+                c.avatar,
+                unread_count, top, mute,
+                COALESCE(
+                    (
+                        SELECT m.created_at
+                        FROM message m
+                        WHERE m.channel_id = c.channel_id
+                          AND m.channel_type = c.channel_type
+                        ORDER BY m.created_at DESC, m.id DESC
+                        LIMIT 1
+                    ),
+                    c.last_msg_timestamp
+                ) AS resolved_last_msg_timestamp,
+                last_local_message_id,
+                COALESCE(
+                    (
+                        SELECT m.content
+                        FROM message m
+                        WHERE m.channel_id = c.channel_id
+                          AND m.channel_type = c.channel_type
+                        ORDER BY m.created_at DESC, m.id DESC
+                        LIMIT 1
+                    ),
+                    c.last_msg_content
+                ) AS resolved_last_msg_content,
+                c.updated_at
+             FROM channel c
+             WHERE c.channel_id = ?1
              LIMIT 1",
-            params![channel_id as i64],
+            params![channel_id as i64, uid_i64],
             |row| {
                 Ok(StoredChannel {
                     channel_id: row.get::<_, i64>(0)? as u64,
@@ -395,19 +1223,109 @@ impl LocalStore {
         offset: usize,
     ) -> Result<Vec<StoredChannel>> {
         let conn = self.conn_for_user(uid)?;
+        let uid_i64 = uid.parse::<i64>().unwrap_or_default();
         let mut stmt = conn
             .prepare(
                 "SELECT
-                    channel_id, channel_type, channel_name, channel_remark, avatar,
-                    unread_count, top, mute, last_msg_timestamp, last_local_message_id,
-                    last_msg_content, updated_at
-                 FROM channel
-                 ORDER BY top DESC, last_msg_timestamp DESC, channel_id DESC
+                    c.channel_id,
+                    c.channel_type,
+                    CASE
+                        WHEN c.channel_type = 1 THEN COALESCE(
+                            (
+                                SELECT COALESCE(
+                                    NULLIF(u.alias, ''),
+                                    NULLIF(u.nickname, ''),
+                                    NULLIF(u.username, ''),
+                                    CAST(u.user_id AS TEXT)
+                                )
+                                FROM \"user\" u
+                                WHERE u.user_id = COALESCE(
+                                    (
+                                        SELECT cm.member_uid
+                                        FROM channel_member cm
+                                        WHERE cm.channel_id = c.channel_id
+                                          AND cm.channel_type = c.channel_type
+                                          AND cm.member_uid != ?3
+                                        ORDER BY cm.role ASC, cm.member_uid ASC
+                                        LIMIT 1
+                                    ),
+                                    (
+                                        SELECT u2.user_id
+                                        FROM \"user\" u2
+                                        WHERE u2.channel_id = CAST(c.channel_id AS TEXT)
+                                        ORDER BY u2.updated_at DESC
+                                        LIMIT 1
+                                    )
+                                )
+                                LIMIT 1
+                            ),
+                            NULLIF(c.channel_name, ''),
+                            CAST(c.channel_id AS TEXT)
+                        )
+                        WHEN c.channel_type = 2 THEN COALESCE(
+                            NULLIF(c.channel_name, ''),
+                            (
+                                SELECT NULLIF(g.name, '')
+                                FROM \"group\" g
+                                WHERE g.group_id = c.channel_id
+                                LIMIT 1
+                            ),
+                            (
+                                SELECT NULLIF(group_concat(name_part, '、'), '')
+                                FROM (
+                                    SELECT COALESCE(
+                                        NULLIF(gm.alias, ''),
+                                        NULLIF(u.alias, ''),
+                                        NULLIF(u.nickname, ''),
+                                        NULLIF(u.username, ''),
+                                        CAST(gm.user_id AS TEXT)
+                                    ) AS name_part
+                                    FROM group_member gm
+                                    LEFT JOIN \"user\" u ON u.user_id = gm.user_id
+                                    WHERE gm.group_id = c.channel_id
+                                      AND gm.status = 0
+                                    ORDER BY gm.role ASC, gm.joined_at ASC, gm.user_id ASC
+                                    LIMIT 3
+                                )
+                            ),
+                            CAST(c.channel_id AS TEXT)
+                        )
+                        ELSE c.channel_name
+                    END AS resolved_channel_name,
+                    c.channel_remark,
+                    c.avatar,
+                    unread_count, top, mute,
+                    COALESCE(
+                        (
+                            SELECT m.created_at
+                            FROM message m
+                            WHERE m.channel_id = c.channel_id
+                              AND m.channel_type = c.channel_type
+                            ORDER BY m.created_at DESC, m.id DESC
+                            LIMIT 1
+                        ),
+                        c.last_msg_timestamp
+                    ) AS resolved_last_msg_timestamp,
+                    last_local_message_id,
+                    COALESCE(
+                        (
+                            SELECT m.content
+                            FROM message m
+                            WHERE m.channel_id = c.channel_id
+                              AND m.channel_type = c.channel_type
+                            ORDER BY m.created_at DESC, m.id DESC
+                            LIMIT 1
+                        ),
+                        c.last_msg_content
+                    ) AS resolved_last_msg_content,
+                    c.updated_at
+                 FROM channel c
+                 ORDER BY c.top DESC, c.last_msg_timestamp DESC, c.channel_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
             .map_err(|e| Error::Storage(format!("prepare list channels: {e}")))?;
         let rows = stmt
-            .query_map(params![limit as i64, offset as i64], |row| {
+            .query_map(params![limit as i64, offset as i64, uid_i64], |row| {
                 Ok(StoredChannel {
                     channel_id: row.get::<_, i64>(0)? as u64,
                     channel_type: row.get::<_, i32>(1)?,
@@ -1362,6 +2280,18 @@ impl LocalStore {
         Ok(())
     }
 
+    pub fn get_local_message_id(&self, uid: &str, message_id: u64) -> Result<Option<u64>> {
+        let conn = self.conn_for_user(uid)?;
+        conn.query_row(
+            "SELECT local_message_id FROM message WHERE id = ?1 LIMIT 1",
+            params![message_id as i64],
+            |row| Ok(row.get::<_, Option<i64>>(0)?.map(|v| v as u64)),
+        )
+        .optional()
+        .map_err(|e| Error::Storage(format!("get local_message_id: {e}")))
+        .map(|v| v.flatten())
+    }
+
     pub fn update_message_status(&self, uid: &str, message_id: u64, status: i32) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1684,6 +2614,47 @@ impl LocalStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub fn wipe_user_full(&self, uid: &str) -> Result<()> {
+        if let Ok(mut guard) = self.account_dbs.lock() {
+            let _ = guard.remove(uid);
+        }
+        let paths = self.storage_paths(uid);
+        if paths.user_root.exists() {
+            std::fs::remove_dir_all(&paths.user_root)
+                .map_err(|e| Error::Storage(format!("remove user dir: {e}")))?;
+        }
+        let global_db = self.open_global_db()?;
+        let accounts = global_db
+            .open_tree(GLOBAL_TREE_ACCOUNTS)
+            .map_err(|e| Error::Storage(format!("open accounts tree: {e}")))?;
+        accounts
+            .remove(Self::k_acct_last_login(uid).as_bytes())
+            .map_err(|e| Error::Storage(format!("remove account last_login_at: {e}")))?;
+        accounts
+            .remove(Self::k_acct_created_at(uid).as_bytes())
+            .map_err(|e| Error::Storage(format!("remove account created_at: {e}")))?;
+        if let Some(active_uid) = get_string(&accounts, K_ACTIVE_UID)? {
+            if active_uid == uid {
+                accounts
+                    .remove(K_ACTIVE_UID)
+                    .map_err(|e| Error::Storage(format!("remove active uid: {e}")))?;
+            }
+        }
+        global_db
+            .flush()
+            .map_err(|e| Error::Storage(format!("flush global db: {e}")))?;
+        if self
+            .load_current_uid()?
+            .as_ref()
+            .map(|v| v == uid)
+            .unwrap_or(false)
+        {
+            self.clear_current_uid()?;
+        }
+        Ok(())
+    }
+
     fn derive_encryption_key(uid: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"privchat_sdk_encryption_key_v1");
@@ -1693,24 +2664,37 @@ impl LocalStore {
     }
 
     pub fn kv_put(&self, uid: &str, key: &str, value: &[u8]) -> Result<()> {
-        let paths = self.ensure_user_storage(uid)?;
-        let db =
-            sled::open(paths.kv_path).map_err(|e| Error::Storage(format!("open sled kv: {e}")))?;
-        db.insert(key.as_bytes(), value)
+        let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
+        tree.insert(key.as_bytes(), value)
             .map_err(|e| Error::Storage(format!("sled kv put: {e}")))?;
-        db.flush()
-            .map_err(|e| Error::Storage(format!("sled kv flush: {e}")))?;
         Ok(())
     }
 
     pub fn kv_get(&self, uid: &str, key: &str) -> Result<Option<Vec<u8>>> {
-        let paths = self.ensure_user_storage(uid)?;
-        let db =
-            sled::open(paths.kv_path).map_err(|e| Error::Storage(format!("open sled kv: {e}")))?;
-        let v = db
+        let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
+        let v = tree
             .get(key.as_bytes())
             .map_err(|e| Error::Storage(format!("sled kv get: {e}")))?;
         Ok(v.map(|x| x.to_vec()))
+    }
+
+    pub fn kv_delete(&self, uid: &str, key: &str) -> Result<()> {
+        let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
+        tree.remove(key.as_bytes())
+            .map_err(|e| Error::Storage(format!("sled kv delete: {e}")))?;
+        Ok(())
+    }
+
+    pub fn kv_scan_prefix(&self, uid: &str, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
+        let mut out = Vec::new();
+        for row in tree.scan_prefix(prefix.as_bytes()) {
+            let (k, v) = row.map_err(|e| Error::Storage(format!("sled kv scan_prefix: {e}")))?;
+            let key = String::from_utf8(k.to_vec())
+                .map_err(|e| Error::Storage(format!("sled kv key utf8: {e}")))?;
+            out.push((key, v.to_vec()));
+        }
+        Ok(out)
     }
 
     fn open_db(path: &Path) -> Result<sled::Db> {
@@ -1859,16 +2843,115 @@ impl LocalStore {
 #[cfg(test)]
 mod tests {
     use super::LocalStore;
-    use crate::{NewMessage, UpsertChannelExtraInput, UpsertChannelInput};
+    use crate::{
+        LoginResult, NewMessage, UpsertChannelExtraInput, UpsertChannelInput,
+        UpsertRemoteMessageInput,
+    };
+    use rand::RngCore;
     use rusqlite::params;
     use std::path::PathBuf;
 
     fn test_store() -> LocalStore {
+        let mut rand_bytes = [0u8; 6];
+        rand::thread_rng().fill_bytes(&mut rand_bytes);
         let dir = PathBuf::from(format!(
-            "/tmp/privchat-rust-test-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            "/tmp/privchat-rust-test-{}-{}",
+            chrono::Utc::now().timestamp_micros(),
+            hex::encode(rand_bytes)
         ));
         LocalStore::open_at(dir).expect("open test store")
+    }
+
+    #[test]
+    fn account_kv_path_uses_dot_kv_suffix() {
+        let store = test_store();
+        let paths = store.storage_paths("20001");
+        assert_eq!(
+            paths.kv_path.file_name().and_then(|v| v.to_str()),
+            Some("account.kv")
+        );
+    }
+
+    #[test]
+    fn db_path_migrates_messages_db_to_privchat_db() {
+        let store = test_store();
+        let uid = "20000";
+        let paths = store.storage_paths(uid);
+        std::fs::create_dir_all(&paths.user_root).expect("create user root");
+        let legacy = paths.user_root.join("messages.db");
+        let conn = rusqlite::Connection::open(&legacy).expect("open legacy db");
+        let key = LocalStore::derive_encryption_key(uid);
+        conn.pragma_update(None, "key", &key)
+            .expect("set legacy db key");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", [])
+            .expect("init legacy db");
+        drop(conn);
+
+        let out = store.ensure_user_storage(uid).expect("ensure user storage");
+        assert_eq!(
+            out.db_path.file_name().and_then(|v| v.to_str()),
+            Some("privchat.db")
+        );
+        assert!(out.db_path.exists());
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn session_roundtrip_uses_encrypted_account_store() {
+        let store = test_store();
+        let uid = "20002";
+        let login = LoginResult {
+            user_id: uid.parse().expect("uid"),
+            token: "token-secret-value".to_string(),
+            device_id: "device-a".to_string(),
+            refresh_token: Some("refresh-secret-value".to_string()),
+            expires_at: "0".to_string(),
+        };
+        store.save_login(uid, &login).expect("save login");
+        let snap = store
+            .load_session(uid)
+            .expect("load session")
+            .expect("session exists");
+        assert_eq!(snap.user_id, login.user_id);
+        assert_eq!(snap.token, login.token);
+        assert_eq!(snap.device_id, login.device_id);
+
+        let account_db = store.open_account_db(uid).expect("open account db");
+        let auth = account_db.open_tree("auth").expect("open auth tree");
+        let token_enc = auth.get("access_token_enc").expect("get access enc");
+        assert!(token_enc.is_some());
+        let plain = token_enc.expect("access enc exists");
+        assert_ne!(plain.as_ref(), login.token.as_bytes());
+    }
+
+    #[test]
+    fn load_session_migrates_legacy_sqlite_row() {
+        let store = test_store();
+        let uid = "20003";
+        let conn = store.conn_for_user(uid).expect("open user db");
+        conn.execute(
+            "INSERT OR REPLACE INTO auth_session(id, user_id, token, device_id, bootstrap_completed, updated_at)
+             VALUES(1, ?1, ?2, ?3, 1, ?4)",
+            params![
+                uid.parse::<u64>().expect("uid parse"),
+                "legacy-token",
+                "legacy-device",
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )
+        .expect("insert legacy session");
+
+        let snap = store
+            .load_session(uid)
+            .expect("load session")
+            .expect("session exists");
+        assert_eq!(snap.token, "legacy-token");
+        assert!(snap.bootstrap_completed);
+
+        let remain: i64 = conn
+            .query_row("SELECT COUNT(1) FROM auth_session", [], |r| r.get(0))
+            .expect("count auth_session");
+        assert_eq!(remain, 0);
     }
 
     #[test]
@@ -1931,7 +3014,7 @@ mod tests {
         };
 
         let message_id = store
-            .create_local_message(uid, &input)
+            .create_local_message(uid, &input, 0)
             .expect("create local message");
         let msg = store
             .get_message_by_id(uid, message_id)
@@ -1954,6 +3037,131 @@ mod tests {
     }
 
     #[test]
+    fn upsert_remote_message_is_idempotent_by_server_message_id() {
+        let store = test_store();
+        let uid = "10004";
+
+        let first = store
+            .upsert_remote_message(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 700001,
+                    local_message_id: 0,
+                    channel_id: 200,
+                    channel_type: 1,
+                    timestamp: 1_700_000_000_000,
+                    from_uid: 12345,
+                    message_type: 0,
+                    content: "first".to_string(),
+                    status: 2,
+                    pts: 100,
+                    setting: 0,
+                    order_seq: 100,
+                    searchable_word: "first".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("upsert first");
+        let loaded_first = store
+            .get_message_by_id(uid, first)
+            .expect("load first")
+            .expect("first exists");
+        assert_eq!(loaded_first.server_message_id, Some(700001));
+        assert_eq!(loaded_first.content, "first");
+
+        let second = store
+            .upsert_remote_message(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 700001,
+                    local_message_id: 111,
+                    channel_id: 200,
+                    channel_type: 1,
+                    timestamp: 1_700_000_000_100,
+                    from_uid: 12345,
+                    message_type: 0,
+                    content: "updated".to_string(),
+                    status: 3,
+                    pts: 101,
+                    setting: 1,
+                    order_seq: 101,
+                    searchable_word: "updated".to_string(),
+                    extra: "{\"k\":1}".to_string(),
+                },
+            )
+            .expect("upsert second");
+        assert_eq!(
+            first, second,
+            "same server_message_id should update same row"
+        );
+
+        let loaded_second = store
+            .get_message_by_id(uid, second)
+            .expect("load second")
+            .expect("second exists");
+        assert_eq!(loaded_second.content, "updated");
+        assert_eq!(loaded_second.status, 3);
+    }
+
+    #[test]
+    fn upsert_remote_message_ignores_out_of_order_replay() {
+        let store = test_store();
+        let uid = "10006";
+
+        let row_id = store
+            .upsert_remote_message(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 800001,
+                    local_message_id: 0,
+                    channel_id: 300,
+                    channel_type: 1,
+                    timestamp: 1_700_000_000_500,
+                    from_uid: 22334,
+                    message_type: 0,
+                    content: "newer".to_string(),
+                    status: 2,
+                    pts: 300,
+                    setting: 0,
+                    order_seq: 300,
+                    searchable_word: "newer".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert newer");
+
+        let same_row = store
+            .upsert_remote_message(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 800001,
+                    local_message_id: 0,
+                    channel_id: 300,
+                    channel_type: 1,
+                    timestamp: 1_700_000_000_100,
+                    from_uid: 22334,
+                    message_type: 0,
+                    content: "older".to_string(),
+                    status: 1,
+                    pts: 200,
+                    setting: 0,
+                    order_seq: 200,
+                    searchable_word: "older".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("replay older");
+        assert_eq!(row_id, same_row);
+
+        let loaded = store
+            .get_message_by_id(uid, row_id)
+            .expect("load row")
+            .expect("row exists");
+        assert_eq!(loaded.content, "newer");
+        assert_eq!(loaded.status, 2);
+    }
+
+    #[test]
     fn list_messages_by_channel() {
         let store = test_store();
         let uid = "10005";
@@ -1968,16 +3176,16 @@ mod tests {
             extra: "{}".to_string(),
         };
         let m1 = store
-            .create_local_message(uid, &input)
+            .create_local_message(uid, &input, 0)
             .expect("create message 1");
         input.content = "hello-2".to_string();
         let m2 = store
-            .create_local_message(uid, &input)
+            .create_local_message(uid, &input, 0)
             .expect("create message 2");
         input.channel_id = 101;
         input.content = "other-channel".to_string();
         let _m3 = store
-            .create_local_message(uid, &input)
+            .create_local_message(uid, &input, 0)
             .expect("create message 3");
 
         let page = store
@@ -2005,7 +3213,7 @@ mod tests {
             extra: "{}".to_string(),
         };
         let message_id = store
-            .create_local_message(uid, &input)
+            .create_local_message(uid, &input, 0)
             .expect("create message");
 
         store
@@ -2419,7 +3627,7 @@ mod tests {
             extra: "{}".to_string(),
         };
         let message_id = store
-            .create_local_message(uid, &input)
+            .create_local_message(uid, &input, 0)
             .expect("create local message");
 
         store
@@ -2456,7 +3664,7 @@ mod tests {
             extra: "{}".to_string(),
         };
         let message_id = store
-            .create_local_message(uid, &input)
+            .create_local_message(uid, &input, 0)
             .expect("create message");
 
         store
