@@ -7806,7 +7806,8 @@ impl PrivchatSdk {
 #[cfg(test)]
 mod tests {
     use super::{
-        error_codes, Action, ConnectionState, Error, PrivchatConfig, SdkEvent, SessionState, State,
+        error_codes, Action, ConnectionState, Error, NetworkHint, PrivchatConfig, PrivchatSdk,
+        SdkEvent, SessionState, State, NETWORK_DISCONNECTED_MESSAGE,
     };
     use privchat_protocol::PushMessageRequest;
 
@@ -7993,7 +7994,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_is_idempotent_and_rejects_new_work() {
-        let sdk = super::PrivchatSdk::new(PrivchatConfig::default());
+        let sdk = PrivchatSdk::new(PrivchatConfig::default());
         sdk.shutdown().await;
         sdk.shutdown().await;
 
@@ -8002,5 +8003,56 @@ mod tests {
             .await
             .expect_err("connect should fail after shutdown");
         assert!(matches!(err, Error::Shutdown));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_hint_offline_emits_event_and_blocks_connect() {
+        let sdk = PrivchatSdk::new(PrivchatConfig::default());
+        let baseline = sdk.last_event_sequence_id();
+
+        sdk.set_network_hint(NetworkHint::Offline)
+            .await
+            .expect("set_network_hint should succeed");
+
+        let network_events = sdk.network_events_since(baseline, 16);
+        assert!(
+            network_events.iter().any(|evt| matches!(
+                evt.event,
+                SdkEvent::NetworkHintChanged { .. }
+            )),
+            "expected NetworkHintChanged in replay events"
+        );
+
+        let err = sdk.connect().await.expect_err("connect must fail while offline");
+        assert!(
+            err.to_string().contains(NETWORK_DISCONNECTED_MESSAGE),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_hint_recovery_is_replayable_without_polling() {
+        let sdk = PrivchatSdk::new(PrivchatConfig::default());
+
+        sdk.set_network_hint(NetworkHint::Offline)
+            .await
+            .expect("set offline");
+        let after_offline = sdk.last_event_sequence_id();
+
+        sdk.set_network_hint(NetworkHint::Unknown)
+            .await
+            .expect("set unknown");
+
+        let events = sdk.network_events_since(after_offline, 16);
+        assert!(
+            events.iter().any(|evt| matches!(
+                evt.event,
+                SdkEvent::NetworkHintChanged {
+                    from: NetworkHint::Offline,
+                    to: NetworkHint::Unknown
+                }
+            )),
+            "expected offline->unknown network hint event"
+        );
     }
 }
