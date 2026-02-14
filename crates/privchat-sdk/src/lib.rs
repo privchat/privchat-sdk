@@ -20,19 +20,25 @@ use privchat_protocol::rpc::file::upload::{
     FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
 };
 use privchat_protocol::rpc::routes;
-use privchat_protocol::rpc::sync::SyncEntityItem;
-use privchat_protocol::rpc::sync::{ClientSubmitRequest, ClientSubmitResponse, ServerDecision};
+use privchat_protocol::rpc::sync::{
+    ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelSyncPayload,
+    ChannelUnreadSyncPayload, FriendSyncPayload, GroupMemberSyncPayload, GroupSyncPayload,
+    MessageStatusSyncPayload, MessageSyncPayload, SyncEntityItem, UserSettingsSyncPayload,
+};
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
-    ClientInfo, ContentMessageType, DeviceInfo, DeviceType, ErrorCode, MessageType, PingRequest,
-    PongResponse, PushBatchRequest, PushMessageRequest, RpcRequest, RpcResponse,
+    ClientInfo, ContentMessageType, DeviceInfo, DeviceType, DisconnectRequest, DisconnectResponse,
+    ErrorCode, MessageType, PingRequest, PongResponse, PublishRequest, PublishResponse,
+    PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse, RpcRequest,
+    RpcResponse, SendMessageRequest, SendMessageResponse, SubscribeRequest, SubscribeResponse,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
-mod local_store;
 pub mod error_codes;
+mod local_store;
 mod receive_pipeline;
 mod runtime;
 mod storage_actor;
@@ -370,6 +376,11 @@ async fn stop_inbound_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+fn inbound_logs_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PRIVCHAT_INBOUND_LOG").ok().as_deref() == Some("1"))
+}
+
 async fn start_inbound_task(
     state: &State,
     actor_tx: mpsc::Sender<Command>,
@@ -381,9 +392,16 @@ async fn start_inbound_task(
     };
     let mut event_rx = transport.subscribe_events();
     *task = Some(tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            match event {
-                ClientEvent::MessageReceived(context) => {
+        loop {
+            match event_rx.recv().await {
+                Ok(ClientEvent::MessageReceived(context)) => {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] message received biz_type={} len={}",
+                            context.biz_type,
+                            context.data.len()
+                        );
+                    }
                     if actor_tx
                         .send(Command::InboundFrame {
                             biz_type: context.biz_type,
@@ -395,11 +413,22 @@ async fn start_inbound_task(
                         break;
                     }
                 }
-                ClientEvent::Disconnected { .. } => {
+                Ok(ClientEvent::Disconnected { .. }) => {
+                    eprintln!("[SDK.inbound] transport disconnected");
                     let _ = actor_tx.send(Command::InboundDisconnected).await;
                     break;
                 }
-                _ => {}
+                Ok(_) => {}
+                Err(RecvError::Lagged(skipped)) => {
+                    eprintln!(
+                        "[SDK.inbound] event stream lagged, skipped={} (continue)",
+                        skipped
+                    );
+                }
+                Err(RecvError::Closed) => {
+                    eprintln!("[SDK.inbound] event stream closed");
+                    break;
+                }
             }
         }
     }));
@@ -504,6 +533,46 @@ pub struct StoredMessage {
     pub created_at: i64,
     pub updated_at: i64,
     pub extra: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineSnapshot {
+    pub messages: Vec<StoredMessage>,
+    pub newest_message_id: Option<u64>,
+    pub oldest_message_id: Option<u64>,
+    pub has_more_before: bool,
+    pub from_cache: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageCachePolicyConfig {
+    pub per_channel_budget_bytes: u32,
+    pub global_budget_bytes: u32,
+    pub min_messages: u16,
+    pub max_messages: u16,
+}
+
+impl Default for MessageCachePolicyConfig {
+    fn default() -> Self {
+        Self {
+            per_channel_budget_bytes: 64 * 1024,
+            global_budget_bytes: 8 * 1024 * 1024,
+            min_messages: 10,
+            max_messages: 200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MessageCachePolicy {
+    Disabled,
+    Enabled(MessageCachePolicyConfig),
+}
+
+impl Default for MessageCachePolicy {
+    fn default() -> Self {
+        Self::Enabled(MessageCachePolicyConfig::default())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -616,6 +685,10 @@ pub struct UpsertFriendInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredFriend {
     pub user_id: u64,
+    pub username: Option<String>,
+    pub nickname: Option<String>,
+    pub alias: Option<String>,
+    pub avatar: String,
     pub tags: Option<String>,
     pub is_pinned: bool,
     pub created_at: i64,
@@ -1030,6 +1103,17 @@ enum Command {
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
     },
+    QueryTimelineSnapshot {
+        channel_id: u64,
+        channel_type: i32,
+        limit: usize,
+        offset: usize,
+        resp: oneshot::Sender<Result<TimelineSnapshot>>,
+    },
+    SetMessageCachePolicy {
+        policy: MessageCachePolicy,
+        resp: oneshot::Sender<Result<()>>,
+    },
     UpsertChannel {
         input: UpsertChannelInput,
         resp: oneshot::Sender<Result<()>>,
@@ -1292,6 +1376,19 @@ enum Action {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ChannelCacheKey {
+    channel_id: u64,
+    channel_type: i32,
+}
+
+#[derive(Debug, Clone)]
+struct ChannelMessageCache {
+    messages: VecDeque<StoredMessage>,
+    estimated_bytes: usize,
+    has_more_before: bool,
+}
+
 impl SessionState {
     fn can(self, action: Action) -> std::result::Result<SessionState, Error> {
         match (self, action) {
@@ -1347,6 +1444,14 @@ struct State {
     video_process_hook: Option<VideoProcessHook>,
     last_tmp_cleanup_day: Option<String>,
     pending_events: Vec<SdkEvent>,
+    message_cache_policy: MessageCachePolicy,
+    channel_message_cache: HashMap<ChannelCacheKey, ChannelMessageCache>,
+    channel_cache_generation: HashMap<ChannelCacheKey, u64>,
+    channel_cache_lru: VecDeque<ChannelCacheKey>,
+    channel_cache_total_bytes: usize,
+    cache_debug_log: bool,
+    cache_hit_count: u64,
+    cache_miss_count: u64,
 }
 
 impl State {
@@ -1417,6 +1522,266 @@ impl State {
         std::mem::take(&mut self.pending_events)
     }
 
+    fn cache_key(channel_id: u64, channel_type: i32) -> ChannelCacheKey {
+        ChannelCacheKey {
+            channel_id,
+            channel_type,
+        }
+    }
+
+    fn cache_config(&self) -> Option<&MessageCachePolicyConfig> {
+        match &self.message_cache_policy {
+            MessageCachePolicy::Disabled => None,
+            MessageCachePolicy::Enabled(cfg) => Some(cfg),
+        }
+    }
+
+    fn estimate_message_bytes(message: &StoredMessage) -> usize {
+        // Keep this lightweight and stable: string payloads + fixed object overhead.
+        96 + message.content.len() + message.extra.len()
+    }
+
+    fn touch_cache_lru(&mut self, key: ChannelCacheKey) {
+        if let Some(pos) = self.channel_cache_lru.iter().position(|k| *k == key) {
+            self.channel_cache_lru.remove(pos);
+        }
+        self.channel_cache_lru.push_back(key);
+    }
+
+    fn evict_channel_cache(&mut self, key: ChannelCacheKey) {
+        if let Some(removed) = self.channel_message_cache.remove(&key) {
+            self.channel_cache_total_bytes = self
+                .channel_cache_total_bytes
+                .saturating_sub(removed.estimated_bytes);
+        }
+        if let Some(pos) = self.channel_cache_lru.iter().position(|k| *k == key) {
+            self.channel_cache_lru.remove(pos);
+        }
+    }
+
+    fn enforce_global_cache_budget(&mut self) {
+        let Some(global_budget) = self
+            .cache_config()
+            .map(|cfg| usize::try_from(cfg.global_budget_bytes).unwrap_or(usize::MAX))
+        else {
+            return;
+        };
+        while self.channel_cache_total_bytes > global_budget {
+            let Some(oldest) = self.channel_cache_lru.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.channel_message_cache.remove(&oldest) {
+                self.channel_cache_total_bytes = self
+                    .channel_cache_total_bytes
+                    .saturating_sub(removed.estimated_bytes);
+            }
+        }
+    }
+
+    fn invalidate_channel_cache_with_reason(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        reason: &str,
+    ) {
+        let key = Self::cache_key(channel_id, channel_type);
+        let next_gen = self
+            .channel_cache_generation
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.channel_cache_generation.insert(key, next_gen);
+        self.evict_channel_cache(key);
+        if self.cache_debug_log {
+            eprintln!(
+                "[SDK.cache] invalidate channel={}:{} reason={} gen={}",
+                channel_type, channel_id, reason, next_gen
+            );
+        }
+    }
+
+    fn invalidate_channel_cache(&mut self, channel_id: u64, channel_type: i32) {
+        self.invalidate_channel_cache_with_reason(channel_id, channel_type, "manual");
+    }
+
+    fn invalidate_cache_for_events(&mut self, events: &[SdkEvent]) {
+        for event in events {
+            match event {
+                SdkEvent::TimelineUpdated {
+                    channel_id,
+                    channel_type,
+                    ..
+                }
+                | SdkEvent::ReadReceiptUpdated {
+                    channel_id,
+                    channel_type,
+                    ..
+                } => self.invalidate_channel_cache_with_reason(
+                    *channel_id,
+                    *channel_type,
+                    "event_apply",
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    fn store_channel_cache(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        mut messages: Vec<StoredMessage>,
+        has_more_before: bool,
+    ) {
+        let Some(config) = self.cache_config().cloned() else {
+            return;
+        };
+        if messages.is_empty() {
+            self.invalidate_channel_cache(channel_id, channel_type);
+            return;
+        }
+        let max_messages = usize::from(config.max_messages.max(1));
+        if messages.len() > max_messages {
+            messages.truncate(max_messages);
+        }
+        let min_messages = usize::from(config.min_messages.min(config.max_messages).max(1));
+        let per_budget = usize::try_from(config.per_channel_budget_bytes).unwrap_or(usize::MAX);
+        let mut deque: VecDeque<StoredMessage> = VecDeque::with_capacity(messages.len());
+        let mut bytes = 0usize;
+        for message in messages {
+            bytes = bytes.saturating_add(Self::estimate_message_bytes(&message));
+            deque.push_back(message);
+            while deque.len() > min_messages && (deque.len() > max_messages || bytes > per_budget) {
+                if let Some(old) = deque.pop_back() {
+                    bytes = bytes.saturating_sub(Self::estimate_message_bytes(&old));
+                }
+            }
+        }
+        let key = Self::cache_key(channel_id, channel_type);
+        self.evict_channel_cache(key);
+        self.channel_cache_total_bytes = self.channel_cache_total_bytes.saturating_add(bytes);
+        self.channel_message_cache.insert(
+            key,
+            ChannelMessageCache {
+                messages: deque,
+                estimated_bytes: bytes,
+                has_more_before,
+            },
+        );
+        self.touch_cache_lru(key);
+        self.enforce_global_cache_budget();
+    }
+
+    fn snapshot_from_cache(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        limit: usize,
+        offset: usize,
+    ) -> Option<TimelineSnapshot> {
+        if offset != 0 {
+            return None;
+        }
+        let _ = self.cache_config()?;
+        let key = Self::cache_key(channel_id, channel_type);
+        let entry = self.channel_message_cache.get(&key)?;
+        let cap = limit.max(1);
+        let mut messages: Vec<StoredMessage> = entry.messages.iter().take(cap).cloned().collect();
+        if messages.is_empty() {
+            return None;
+        }
+        let newest_message_id = messages.first().map(|m| m.message_id);
+        let oldest_message_id = messages.last().map(|m| m.message_id);
+        let has_more_before = entry.has_more_before || entry.messages.len() > messages.len();
+        self.touch_cache_lru(key);
+        self.cache_hit_count = self.cache_hit_count.saturating_add(1);
+        if self.cache_debug_log {
+            eprintln!(
+                "[SDK.cache] hit channel={}:{} limit={} offset={} hit={} miss={}",
+                channel_type, channel_id, cap, offset, self.cache_hit_count, self.cache_miss_count
+            );
+        }
+        Some(TimelineSnapshot {
+            messages: std::mem::take(&mut messages),
+            newest_message_id,
+            oldest_message_id,
+            has_more_before,
+            from_cache: true,
+        })
+    }
+
+    async fn query_timeline_snapshot(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        limit: usize,
+        offset: usize,
+    ) -> Result<TimelineSnapshot> {
+        if let Some(snapshot) = self.snapshot_from_cache(channel_id, channel_type, limit, offset) {
+            return Ok(snapshot);
+        }
+        self.cache_miss_count = self.cache_miss_count.saturating_add(1);
+        if self.cache_debug_log {
+            eprintln!(
+                "[SDK.cache] miss channel={}:{} limit={} offset={} hit={} miss={}",
+                channel_type,
+                channel_id,
+                limit,
+                offset,
+                self.cache_hit_count,
+                self.cache_miss_count
+            );
+        }
+        let key = Self::cache_key(channel_id, channel_type);
+        let generation_before = self
+            .channel_cache_generation
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        let fetch_limit = limit.max(1).saturating_add(1);
+        let mut rows = self
+            .storage
+            .list_messages(channel_id, channel_type, fetch_limit, offset)
+            .await?;
+        let mut has_more_before = false;
+        let cap = limit.max(1);
+        if rows.len() > cap {
+            has_more_before = true;
+            rows.truncate(cap);
+        }
+        let generation_after = self
+            .channel_cache_generation
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if offset == 0 && generation_before == generation_after {
+            self.store_channel_cache(channel_id, channel_type, rows.clone(), has_more_before);
+        } else if self.cache_debug_log && offset == 0 && generation_before != generation_after {
+            eprintln!(
+                "[SDK.cache] skip-store stale generation channel={}:{} before={} after={}",
+                channel_type, channel_id, generation_before, generation_after
+            );
+        }
+        Ok(TimelineSnapshot {
+            newest_message_id: rows.first().map(|m| m.message_id),
+            oldest_message_id: rows.last().map(|m| m.message_id),
+            messages: rows,
+            has_more_before,
+            from_cache: false,
+        })
+    }
+
+    fn set_message_cache_policy(&mut self, policy: MessageCachePolicy) {
+        self.message_cache_policy = policy;
+        self.channel_message_cache.clear();
+        self.channel_cache_generation.clear();
+        self.channel_cache_lru.clear();
+        self.channel_cache_total_bytes = 0;
+        self.cache_hit_count = 0;
+        self.cache_miss_count = 0;
+    }
+
     async fn request_bytes(
         &mut self,
         payload: Bytes,
@@ -1424,6 +1789,32 @@ impl State {
         timeout: Duration,
         context: &str,
     ) -> Result<Bytes> {
+        if biz_type == MessageType::RpcRequest as u8 {
+            match decode_message::<RpcRequest>(&payload) {
+                Ok(req) => {
+                    let body_preview = {
+                        let s = req.body.to_string();
+                        if s.len() > 8192 {
+                            format!("{}...", &s[..8192])
+                        } else {
+                            s
+                        }
+                    };
+                    eprintln!(
+                        "[SDK.rpc] request context={} route={} body={}",
+                        context, req.route, body_preview
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[SDK.rpc] request context={} decode_error={} payload_len={}",
+                        context,
+                        e,
+                        payload.len()
+                    );
+                }
+            }
+        }
         let transport = match self.transport.as_mut() {
             Some(t) => t,
             None => {
@@ -1436,7 +1827,39 @@ impl State {
             .with_biz_type(biz_type)
             .with_timeout(timeout);
         match transport.request_with_options(payload, opt).await {
-            Ok(raw) => Ok(raw),
+            Ok(raw) => {
+                if biz_type == MessageType::RpcRequest as u8 {
+                    match decode_message::<RpcResponse>(&raw) {
+                        Ok(resp) => {
+                            let data_preview = resp
+                                .data
+                                .as_ref()
+                                .map(|v| {
+                                    let s = v.to_string();
+                                    if s.len() > 8192 {
+                                        format!("{}...", &s[..8192])
+                                    } else {
+                                        s
+                                    }
+                                })
+                                .unwrap_or_else(|| "null".to_string());
+                            eprintln!(
+                                "[SDK.rpc] response context={} code={} message={} data={}",
+                                context, resp.code, resp.message, data_preview
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[SDK.rpc] response context={} decode_error={} payload_len={}",
+                                context,
+                                e,
+                                raw.len()
+                            );
+                        }
+                    }
+                }
+                Ok(raw)
+            }
             Err(e) => {
                 eprintln!("[SDK.actor] {context} transport error: {e}");
                 let transition = self.apply_transport_health(false);
@@ -1577,31 +2000,6 @@ impl State {
         Some((channel_type, channel_id))
     }
 
-    fn parse_message_type(value: &serde_json::Value) -> i32 {
-        if let Some(kind) = Self::json_get_i32(value, &["message_type", "type"]) {
-            return kind;
-        }
-        if let Some(kind) = Self::json_get_string(value, &["message_type", "type"]) {
-            let normalized = kind.to_ascii_lowercase();
-            let mapped = match normalized.as_str() {
-                "text" => ContentMessageType::Text.as_u32(),
-                "image" => ContentMessageType::Image.as_u32(),
-                "file" => ContentMessageType::File.as_u32(),
-                "voice" => ContentMessageType::Voice.as_u32(),
-                "video" => ContentMessageType::Video.as_u32(),
-                "system" => ContentMessageType::System.as_u32(),
-                "audio" => ContentMessageType::Audio.as_u32(),
-                "location" => ContentMessageType::Location.as_u32(),
-                "contact_card" => ContentMessageType::ContactCard.as_u32(),
-                "sticker" => ContentMessageType::Sticker.as_u32(),
-                "forward" => ContentMessageType::Forward.as_u32(),
-                _ => ContentMessageType::Text.as_u32(),
-            };
-            return i32::try_from(mapped).unwrap_or(0);
-        }
-        i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0)
-    }
-
     fn resolve_group_id_from_scope(scope: Option<&str>) -> Option<u64> {
         let scope = scope?;
         if let Ok(v) = scope.parse::<u64>() {
@@ -1636,31 +2034,195 @@ impl State {
     }
 
     fn push_message_to_sync_item(push: PushMessageRequest) -> SyncEntityItem {
-        let payload = serde_json::json!({
-            "server_message_id": push.server_message_id,
-            "local_message_id": push.local_message_id,
-            "channel_id": push.channel_id,
-            "channel_type": push.channel_type,
-            "timestamp": push.timestamp as i64,
-            "from_uid": push.from_uid,
-            "message_type": push.message_type as i64,
-            "content": Self::push_payload_content(&push.payload),
-            "status": 2,
-            "pts": push.message_seq as i64,
-            "setting": if push.setting.need_receipt { 1 } else { 0 },
-            "order_seq": push.message_seq as i64,
-            "topic": push.topic,
-            "stream_no": push.stream_no,
-            "stream_seq": push.stream_seq as i64,
-            "stream_flag": push.stream_flag as i64,
-            "msg_key": push.msg_key,
-            "expire": push.expire as i64,
-        });
+        let payload = serde_json::to_value(MessageSyncPayload {
+            server_message_id: Some(push.server_message_id),
+            message_id: Some(push.server_message_id),
+            id: Some(push.server_message_id),
+            local_message_id: Some(push.local_message_id),
+            channel_id: Some(push.channel_id),
+            channel_type: Some(i32::from(push.channel_type)),
+            type_field: Some(i32::from(push.channel_type)),
+            conversation_type: Some(i32::from(push.channel_type)),
+            timestamp: Some(push.timestamp as i64),
+            created_at: Some(push.timestamp as i64),
+            send_time: Some(push.timestamp as i64),
+            from_uid: Some(push.from_uid),
+            sender_id: Some(push.from_uid),
+            from: Some(push.from_uid),
+            uid: Some(push.from_uid),
+            message_type: i32::try_from(push.message_type).ok(),
+            content: Some(Self::push_payload_content(&push.payload)),
+            text: None,
+            body: None,
+            status: Some(2),
+            pts: Some(push.message_seq as i64),
+            setting: Some(if push.setting.need_receipt { 1 } else { 0 }),
+            order_seq: Some(push.message_seq as i64),
+            searchable_word: None,
+            extra: None,
+            topic: Some(push.topic),
+            stream_no: Some(push.stream_no),
+            stream_seq: Some(push.stream_seq as i64),
+            stream_flag: Some(push.stream_flag as i64),
+            msg_key: Some(push.msg_key),
+            expire: Some(push.expire as i64),
+        })
+        .unwrap_or_else(|_| serde_json::json!({}));
         SyncEntityItem {
             entity_id: push.server_message_id.to_string(),
             version: u64::from(push.message_seq),
             deleted: false,
             payload: Some(payload),
+        }
+    }
+
+    fn send_message_to_sync_item(
+        req: SendMessageRequest,
+        channel_type: u8,
+    ) -> Option<SyncEntityItem> {
+        if req.local_message_id == 0 {
+            return None;
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let payload = serde_json::to_value(MessageSyncPayload {
+            // Compatibility path: some server deployments forward SendMessageRequest
+            // directly to recipients without PushMessageRequest wrapping.
+            server_message_id: Some(req.local_message_id),
+            message_id: Some(req.local_message_id),
+            id: Some(req.local_message_id),
+            local_message_id: Some(req.local_message_id),
+            channel_id: Some(req.channel_id),
+            channel_type: Some(i32::from(channel_type)),
+            type_field: Some(i32::from(channel_type)),
+            conversation_type: Some(i32::from(channel_type)),
+            timestamp: Some(now_ms),
+            created_at: Some(now_ms),
+            send_time: Some(now_ms),
+            from_uid: Some(req.from_uid),
+            sender_id: Some(req.from_uid),
+            from: Some(req.from_uid),
+            uid: Some(req.from_uid),
+            message_type: i32::try_from(req.message_type).ok(),
+            content: Some(Self::push_payload_content(&req.payload)),
+            text: None,
+            body: None,
+            status: Some(2),
+            pts: Some(0),
+            setting: Some(if req.setting.need_receipt { 1 } else { 0 }),
+            order_seq: Some(0),
+            searchable_word: None,
+            extra: None,
+            topic: Some(req.topic),
+            stream_no: Some(req.stream_no),
+            stream_seq: Some(0),
+            stream_flag: Some(0),
+            msg_key: Some(String::new()),
+            expire: Some(req.expire as i64),
+        })
+        .unwrap_or_else(|_| serde_json::json!({}));
+        Some(SyncEntityItem {
+            entity_id: req.local_message_id.to_string(),
+            version: 0,
+            deleted: false,
+            payload: Some(payload),
+        })
+    }
+
+    fn log_inbound_decoded(message_type: MessageType, data: &[u8]) {
+        if !inbound_logs_enabled() {
+            return;
+        }
+        match message_type {
+            MessageType::AuthorizationRequest => {
+                if let Ok(v) = decode_message::<AuthorizationRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded AuthorizationRequest: {:?}", v);
+                }
+            }
+            MessageType::AuthorizationResponse => {
+                if let Ok(v) = decode_message::<AuthorizationResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded AuthorizationResponse: {:?}", v);
+                }
+            }
+            MessageType::DisconnectRequest => {
+                if let Ok(v) = decode_message::<DisconnectRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded DisconnectRequest: {:?}", v);
+                }
+            }
+            MessageType::DisconnectResponse => {
+                if let Ok(v) = decode_message::<DisconnectResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded DisconnectResponse: {:?}", v);
+                }
+            }
+            MessageType::SendMessageRequest => {
+                if let Ok(v) = decode_message::<SendMessageRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded SendMessageRequest: {:?}", v);
+                }
+            }
+            MessageType::SendMessageResponse => {
+                if let Ok(v) = decode_message::<SendMessageResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded SendMessageResponse: {:?}", v);
+                }
+            }
+            MessageType::PushMessageRequest => {
+                if let Ok(v) = decode_message::<PushMessageRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded PushMessageRequest: {:?}", v);
+                }
+            }
+            MessageType::PushMessageResponse => {
+                if let Ok(v) = decode_message::<PushMessageResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded PushMessageResponse: {:?}", v);
+                }
+            }
+            MessageType::PushBatchRequest => {
+                if let Ok(v) = decode_message::<PushBatchRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded PushBatchRequest: {:?}", v);
+                }
+            }
+            MessageType::PushBatchResponse => {
+                if let Ok(v) = decode_message::<PushBatchResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded PushBatchResponse: {:?}", v);
+                }
+            }
+            MessageType::PingRequest => {
+                if let Ok(v) = decode_message::<PingRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded PingRequest: {:?}", v);
+                }
+            }
+            MessageType::PongResponse => {
+                if let Ok(v) = decode_message::<PongResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded PongResponse: {:?}", v);
+                }
+            }
+            MessageType::SubscribeRequest => {
+                if let Ok(v) = decode_message::<SubscribeRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded SubscribeRequest: {:?}", v);
+                }
+            }
+            MessageType::SubscribeResponse => {
+                if let Ok(v) = decode_message::<SubscribeResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded SubscribeResponse: {:?}", v);
+                }
+            }
+            MessageType::PublishRequest => {
+                if let Ok(v) = decode_message::<PublishRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded PublishRequest: {:?}", v);
+                }
+            }
+            MessageType::PublishResponse => {
+                if let Ok(v) = decode_message::<PublishResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded PublishResponse: {:?}", v);
+                }
+            }
+            MessageType::RpcRequest => {
+                if let Ok(v) = decode_message::<RpcRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded RpcRequest: {:?}", v);
+                }
+            }
+            MessageType::RpcResponse => {
+                if let Ok(v) = decode_message::<RpcResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded RpcResponse: {:?}", v);
+                }
+            }
         }
     }
 
@@ -1687,12 +2249,18 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let user_id = Self::json_get_u64(&payload, &["user_id", "uid"])
+                    let friend_sync = serde_json::from_value::<FriendSyncPayload>(payload.clone())
+                        .unwrap_or_default();
+                    let user_id = friend_sync
+                        .user_id
+                        .or(friend_sync.uid)
                         .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
                         .unwrap_or(0);
                     if user_id == 0 {
                         continue;
                     }
+                    let friend_meta = friend_sync.friend.unwrap_or_default();
+                    let embedded_user = friend_sync.user.unwrap_or_default();
                     if item.deleted {
                         self.storage.delete_friend(user_id).await?;
                         emitted.push(SdkEvent::SyncEntityChanged {
@@ -1705,15 +2273,60 @@ impl State {
                     self.storage
                         .upsert_friend(UpsertFriendInput {
                             user_id,
-                            tags: Self::json_get_string(&payload, &["tags"]),
-                            is_pinned: Self::json_get_bool(&payload, &["is_pinned", "pinned"])
+                            tags: friend_sync.tags.clone(),
+                            is_pinned: friend_sync
+                                .is_pinned
+                                .or(friend_sync.pinned)
                                 .unwrap_or(false),
-                            created_at: Self::json_get_i64(&payload, &["created_at"])
+                            created_at: friend_sync
+                                .created_at
+                                .or(friend_meta.created_at)
                                 .unwrap_or(now_ms),
-                            updated_at: Self::json_get_i64(&payload, &["updated_at", "version"])
+                            updated_at: friend_sync
+                                .updated_at
+                                .or(friend_meta.updated_at)
+                                .or(friend_meta.version)
+                                .or(friend_sync.version)
                                 .unwrap_or(item.version as i64),
                         })
                         .await?;
+                    // Current server returns user profile inside friend payload. We must persist it
+                    // even when `entity_type=user` is unsupported, otherwise DM title falls back to raw ID.
+                    let has_embedded_user = embedded_user.username.is_some()
+                        || embedded_user.nickname.is_some()
+                        || embedded_user.name.is_some()
+                        || embedded_user.alias.is_some()
+                        || embedded_user.avatar.is_some();
+                    if has_embedded_user {
+                        self.storage
+                            .upsert_user(UpsertUserInput {
+                                user_id,
+                                username: embedded_user.username.clone(),
+                                nickname: embedded_user
+                                    .nickname
+                                    .clone()
+                                    .or(embedded_user.name.clone()),
+                                alias: embedded_user.alias.clone(),
+                                avatar: embedded_user.avatar.clone().unwrap_or_default(),
+                                user_type: embedded_user
+                                    .user_type
+                                    .or(embedded_user.type_field)
+                                    .unwrap_or(0),
+                                is_deleted: false,
+                                channel_id: String::new(),
+                                updated_at: embedded_user
+                                    .updated_at
+                                    .or(embedded_user.version)
+                                    .unwrap_or(item.version as i64),
+                            })
+                            .await?;
+                    }
+                    eprintln!(
+                        "[SDK.actor] friend sync hydrated user: user_id={} username={:?} nickname={:?}",
+                        user_id,
+                        embedded_user.username,
+                        embedded_user.nickname.or(embedded_user.name)
+                    );
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "friend".to_string(),
                         entity_id: item.entity_id.clone(),
@@ -1807,7 +2420,11 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let group_id = Self::json_get_u64(&payload, &["group_id"])
+                    let group_sync = serde_json::from_value::<GroupSyncPayload>(payload.clone())
+                        .unwrap_or_default();
+                    let group_id = group_sync
+                        .group_id
+                        .or_else(|| Self::json_get_u64(&payload, &["group_id"]))
                         .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
                         .unwrap_or(0);
                     if group_id == 0 {
@@ -1816,16 +2433,32 @@ impl State {
                     self.storage
                         .upsert_group(UpsertGroupInput {
                             group_id,
-                            name: Self::json_get_string(&payload, &["name", "group_name"]),
-                            avatar: Self::json_get_string(&payload, &["avatar"])
+                            name: group_sync.name.clone().or_else(|| {
+                                Self::json_get_string(&payload, &["name", "group_name"])
+                            }),
+                            avatar: group_sync
+                                .avatar
+                                .clone()
+                                .or(group_sync.avatar_url.clone())
+                                .or_else(|| {
+                                    Self::json_get_string(&payload, &["avatar", "avatar_url"])
+                                })
                                 .unwrap_or_default(),
-                            owner_id: Self::json_get_u64(&payload, &["owner_id", "owner"]),
+                            owner_id: group_sync
+                                .owner_id
+                                .or_else(|| Self::json_get_u64(&payload, &["owner_id", "owner"])),
                             is_dismissed: item.deleted
                                 || Self::json_get_bool(&payload, &["is_dismissed"])
                                     .unwrap_or(false),
-                            created_at: Self::json_get_i64(&payload, &["created_at"])
+                            created_at: group_sync
+                                .created_at
+                                .or_else(|| Self::json_get_i64(&payload, &["created_at"]))
                                 .unwrap_or(now_ms),
-                            updated_at: Self::json_get_i64(&payload, &["updated_at", "version"])
+                            updated_at: group_sync
+                                .updated_at
+                                .or_else(|| {
+                                    Self::json_get_i64(&payload, &["updated_at", "version"])
+                                })
                                 .unwrap_or(item.version as i64),
                         })
                         .await?;
@@ -1842,11 +2475,16 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let group_id = Self::json_get_u64(&payload, &["group_id"])
+                    let group_member = serde_json::from_value::<GroupMemberSyncPayload>(payload)
+                        .unwrap_or_default();
+                    let group_id = group_member
+                        .group_id
                         .or_else(|| Self::resolve_group_id_from_scope(scope))
                         .or_else(|| Self::parse_two_ids(&item.entity_id).map(|v| v.0))
                         .unwrap_or(0);
-                    let user_id = Self::json_get_u64(&payload, &["user_id", "uid"])
+                    let user_id = group_member
+                        .user_id
+                        .or(group_member.uid)
                         .or_else(|| Self::parse_two_ids(&item.entity_id).map(|v| v.1))
                         .unwrap_or(0);
                     if group_id == 0 || user_id == 0 {
@@ -1865,13 +2503,14 @@ impl State {
                         .upsert_group_member(UpsertGroupMemberInput {
                             group_id,
                             user_id,
-                            role: Self::json_get_i32(&payload, &["role"]).unwrap_or(2),
-                            status: Self::json_get_i32(&payload, &["status"]).unwrap_or(0),
-                            alias: Self::json_get_string(&payload, &["alias"]),
-                            is_muted: Self::json_get_bool(&payload, &["is_muted"]).unwrap_or(false),
-                            joined_at: Self::json_get_i64(&payload, &["joined_at"])
-                                .unwrap_or(now_ms),
-                            updated_at: Self::json_get_i64(&payload, &["updated_at", "version"])
+                            role: group_member.role.unwrap_or(2),
+                            status: group_member.status.unwrap_or(0),
+                            alias: group_member.alias,
+                            is_muted: group_member.is_muted.unwrap_or(false),
+                            joined_at: group_member.joined_at.unwrap_or(now_ms),
+                            updated_at: group_member
+                                .updated_at
+                                .or(group_member.version)
                                 .unwrap_or(item.version as i64),
                         })
                         .await?;
@@ -1888,15 +2527,24 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let channel_id = Self::json_get_u64(&payload, &["channel_id"])
+                    let channel_sync =
+                        serde_json::from_value::<ChannelSyncPayload>(payload.clone())
+                            .unwrap_or_default();
+                    let channel_id = channel_sync
+                        .channel_id
+                        .or_else(|| Self::json_get_u64(&payload, &["channel_id"]))
                         .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
                         .unwrap_or(0);
                     if channel_id == 0 {
                         continue;
                     }
-                    let Some(channel_type) =
+                    let typed_channel_type = channel_sync
+                        .channel_type
+                        .or(channel_sync.type_field)
+                        .and_then(|v| i32::try_from(v).ok());
+                    let Some(channel_type) = typed_channel_type.or_else(|| {
                         Self::parse_protocol_channel_type(&payload, &["channel_type", "type"])
-                    else {
+                    }) else {
                         eprintln!(
                             "[SDK.actor] skip channel entity with invalid channel_type, entity_id={}, payload={}",
                             item.entity_id, payload
@@ -1904,10 +2552,13 @@ impl State {
                         continue;
                     };
                     let existing = self.storage.get_channel_by_id(channel_id).await?;
-                    let incoming_last_ts =
-                        Self::json_get_i64(&payload, &["last_msg_timestamp", "updated_at"]);
-                    let incoming_last_content =
-                        Self::json_get_string(&payload, &["last_msg_content"]);
+                    let incoming_last_ts = channel_sync.last_msg_timestamp.or_else(|| {
+                        Self::json_get_i64(&payload, &["last_msg_timestamp", "updated_at"])
+                    });
+                    let incoming_last_content = channel_sync
+                        .last_msg_content
+                        .clone()
+                        .or_else(|| Self::json_get_string(&payload, &["last_msg_content"]));
                     let (last_msg_timestamp, last_msg_content, last_local_message_id) =
                         if let Some(existing) = existing.as_ref() {
                             (
@@ -1923,23 +2574,42 @@ impl State {
                                 0,
                             )
                         };
+                    // `channel_unread` sync may be unavailable on some server deployments.
+                    // Keep local unread as source-of-truth floor to avoid clearing badges on app restart.
+                    let existing_unread = existing.as_ref().map(|c| c.unread_count).unwrap_or(0);
+                    let unread_count = channel_sync
+                        .unread_count
+                        .or_else(|| Self::json_get_i32(&payload, &["unread_count"]))
+                        .map(|incoming| incoming.max(existing_unread))
+                        .unwrap_or(existing_unread);
                     self.storage
                         .upsert_channel(UpsertChannelInput {
                             channel_id,
                             channel_type,
-                            channel_name: Self::json_get_string(
-                                &payload,
-                                &["channel_name", "name"],
-                            )
-                            .unwrap_or_default(),
+                            channel_name: channel_sync
+                                .channel_name
+                                .clone()
+                                .or(channel_sync.name.clone())
+                                .or_else(|| {
+                                    Self::json_get_string(&payload, &["channel_name", "name"])
+                                })
+                                .unwrap_or_default(),
                             channel_remark: Self::json_get_string(&payload, &["channel_remark"])
                                 .unwrap_or_default(),
-                            avatar: Self::json_get_string(&payload, &["avatar"])
+                            avatar: channel_sync
+                                .avatar
+                                .clone()
+                                .or_else(|| Self::json_get_string(&payload, &["avatar"]))
                                 .unwrap_or_default(),
-                            unread_count: Self::json_get_i32(&payload, &["unread_count"])
+                            unread_count,
+                            top: channel_sync
+                                .top
+                                .or_else(|| Self::json_get_i32(&payload, &["top"]))
                                 .unwrap_or(0),
-                            top: Self::json_get_i32(&payload, &["top"]).unwrap_or(0),
-                            mute: Self::json_get_i32(&payload, &["mute"]).unwrap_or(0),
+                            mute: channel_sync
+                                .mute
+                                .or_else(|| Self::json_get_i32(&payload, &["mute"]))
+                                .unwrap_or(0),
                             last_msg_timestamp,
                             last_local_message_id,
                             last_msg_content,
@@ -1958,23 +2628,28 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let channel_id = Self::json_get_u64(&payload, &["channel_id"])
+                    let channel_member =
+                        serde_json::from_value::<ChannelMemberSyncPayload>(payload)
+                            .unwrap_or_default();
+                    let channel_id = channel_member
+                        .channel_id
                         .or_else(|| Self::parse_two_ids(&item.entity_id).map(|v| v.0))
                         .unwrap_or(0);
-                    let member_uid =
-                        Self::json_get_u64(&payload, &["member_uid", "user_id", "uid"])
-                            .or_else(|| Self::parse_two_ids(&item.entity_id).map(|v| v.1))
-                            .unwrap_or(0);
+                    let member_uid = channel_member
+                        .member_uid
+                        .or(channel_member.user_id)
+                        .or(channel_member.uid)
+                        .or_else(|| Self::parse_two_ids(&item.entity_id).map(|v| v.1))
+                        .unwrap_or(0);
                     if channel_id == 0 || member_uid == 0 {
                         continue;
                     }
-                    let Some(channel_type) =
-                        Self::parse_protocol_channel_type(&payload, &["channel_type"])
+                    let Some(channel_type) = channel_member
+                        .channel_type
+                        .or(channel_member.type_field)
+                        .map(|v| if v == 0 { 1 } else { v })
                     else {
-                        eprintln!(
-                            "[SDK.actor] skip channel_member entity with invalid channel_type, entity_id={}, payload={}",
-                            item.entity_id, payload
-                        );
+                        eprintln!("[SDK.actor] skip channel_member entity with invalid channel_type, entity_id={}", item.entity_id);
                         continue;
                     };
                     if item.deleted {
@@ -1988,51 +2663,90 @@ impl State {
                         });
                         continue;
                     }
+                    let member_name = channel_member
+                        .member_name
+                        .clone()
+                        .or(channel_member.name.clone())
+                        .unwrap_or_default();
+                    let member_remark = channel_member
+                        .member_remark
+                        .clone()
+                        .or(channel_member.remark.clone())
+                        .unwrap_or_default();
+                    let member_avatar = channel_member
+                        .member_avatar
+                        .clone()
+                        .or(channel_member.avatar.clone())
+                        .unwrap_or_default();
                     self.storage
                         .upsert_channel_member(UpsertChannelMemberInput {
                             channel_id,
                             channel_type,
                             member_uid,
-                            member_name: Self::json_get_string(&payload, &["member_name", "name"])
+                            member_name,
+                            member_remark,
+                            member_avatar,
+                            member_invite_uid: channel_member
+                                .member_invite_uid
+                                .or(channel_member.inviter_uid)
+                                .unwrap_or(0),
+                            role: channel_member.role.unwrap_or(0),
+                            status: channel_member.status.unwrap_or(0),
+                            is_deleted: channel_member.is_deleted.unwrap_or(false),
+                            robot: channel_member.robot.unwrap_or(0),
+                            version: channel_member.version.unwrap_or(item.version as i64),
+                            created_at: channel_member.created_at.unwrap_or(now_ms),
+                            updated_at: channel_member.updated_at.unwrap_or(now_ms),
+                            extra: channel_member.extra.unwrap_or_default(),
+                            forbidden_expiration_time: channel_member
+                                .forbidden_expiration_time
+                                .unwrap_or(0),
+                            member_avatar_cache_key: channel_member
+                                .member_avatar_cache_key
                                 .unwrap_or_default(),
-                            member_remark: Self::json_get_string(
-                                &payload,
-                                &["member_remark", "remark"],
-                            )
-                            .unwrap_or_default(),
-                            member_avatar: Self::json_get_string(
-                                &payload,
-                                &["member_avatar", "avatar"],
-                            )
-                            .unwrap_or_default(),
-                            member_invite_uid: Self::json_get_u64(
-                                &payload,
-                                &["member_invite_uid", "inviter_uid"],
-                            )
-                            .unwrap_or(0),
-                            role: Self::json_get_i32(&payload, &["role"]).unwrap_or(0),
-                            status: Self::json_get_i32(&payload, &["status"]).unwrap_or(0),
-                            is_deleted: false,
-                            robot: Self::json_get_i32(&payload, &["robot"]).unwrap_or(0),
-                            version: Self::json_get_i64(&payload, &["version"])
-                                .unwrap_or(item.version as i64),
-                            created_at: Self::json_get_i64(&payload, &["created_at"])
-                                .unwrap_or(now_ms),
-                            updated_at: Self::json_get_i64(&payload, &["updated_at"])
-                                .unwrap_or(now_ms),
-                            extra: Self::json_get_string(&payload, &["extra"]).unwrap_or_default(),
-                            forbidden_expiration_time: Self::json_get_i64(
-                                &payload,
-                                &["forbidden_expiration_time"],
-                            )
-                            .unwrap_or(0),
-                            member_avatar_cache_key: Self::json_get_string(
-                                &payload,
-                                &["member_avatar_cache_key"],
-                            )
-                            .unwrap_or_default(),
                         })
                         .await?;
+                    // Hydrate user profile from channel_member payload when available,
+                    // so DM/group title resolution can avoid falling back to raw numeric IDs.
+                    let inferred_username = channel_member
+                        .member_name
+                        .as_ref()
+                        .or(channel_member.name.as_ref())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let inferred_alias = channel_member
+                        .member_remark
+                        .as_ref()
+                        .or(channel_member.remark.as_ref())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let inferred_avatar = channel_member
+                        .member_avatar
+                        .clone()
+                        .or(channel_member.avatar.clone())
+                        .unwrap_or_default();
+                    if inferred_username.is_some()
+                        || inferred_alias.is_some()
+                        || !inferred_avatar.is_empty()
+                    {
+                        let _ = self
+                            .storage
+                            .upsert_user(UpsertUserInput {
+                                user_id: member_uid,
+                                username: inferred_username.clone(),
+                                nickname: inferred_username,
+                                alias: inferred_alias,
+                                avatar: inferred_avatar,
+                                user_type: 0,
+                                is_deleted: false,
+                                channel_id: String::new(),
+                                updated_at: channel_member
+                                    .updated_at
+                                    .or(channel_member.version)
+                                    .unwrap_or(item.version as i64),
+                            })
+                            .await;
+                    }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "channel_member".to_string(),
                         entity_id: item.entity_id.clone(),
@@ -2046,17 +2760,21 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
+                    let channel_extra = serde_json::from_value::<ChannelExtraSyncPayload>(payload)
+                        .unwrap_or_default();
                     let scoped_channel = Self::parse_channel_scope(scope);
-                    let channel_id = Self::json_get_u64(&payload, &["channel_id"])
+                    let channel_id = channel_extra
+                        .channel_id
                         .or(scoped_channel.map(|v| v.1))
                         .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
                         .unwrap_or(0);
-                    let channel_type = Self::parse_protocol_channel_type(
-                        &payload,
-                        &["channel_type", "type", "conversation_type"],
-                    )
-                    .or(scoped_channel.map(|v| v.0))
-                    .unwrap_or(1);
+                    let channel_type = channel_extra
+                        .channel_type
+                        .or(channel_extra.type_field)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .or(scoped_channel.map(|v| v.0))
+                        .map(|v| if v == 0 { 1 } else { v })
+                        .unwrap_or(1);
                     if channel_id == 0 {
                         continue;
                     }
@@ -2064,13 +2782,11 @@ impl State {
                         .upsert_channel_extra(UpsertChannelExtraInput {
                             channel_id,
                             channel_type,
-                            browse_to: Self::json_get_u64(&payload, &["browse_to"]).unwrap_or(0),
-                            keep_pts: Self::json_get_u64(&payload, &["keep_pts"]).unwrap_or(0),
-                            keep_offset_y: Self::json_get_i32(&payload, &["keep_offset_y"])
-                                .unwrap_or(0),
-                            draft: Self::json_get_string(&payload, &["draft"]).unwrap_or_default(),
-                            draft_updated_at: Self::json_get_u64(&payload, &["draft_updated_at"])
-                                .unwrap_or(0),
+                            browse_to: channel_extra.browse_to.unwrap_or(0),
+                            keep_pts: channel_extra.keep_pts.unwrap_or(0),
+                            keep_offset_y: channel_extra.keep_offset_y.unwrap_or(0),
+                            draft: channel_extra.draft.unwrap_or_default(),
+                            draft_updated_at: channel_extra.draft_updated_at.unwrap_or(0),
                         })
                         .await?;
                     emitted.push(SdkEvent::SyncEntityChanged {
@@ -2086,22 +2802,26 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
+                    let channel_unread =
+                        serde_json::from_value::<ChannelUnreadSyncPayload>(payload)
+                            .unwrap_or_default();
                     let scoped_channel = Self::parse_channel_scope(scope);
-                    let channel_id = Self::json_get_u64(&payload, &["channel_id"])
+                    let channel_id = channel_unread
+                        .channel_id
                         .or(scoped_channel.map(|v| v.1))
                         .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
                         .unwrap_or(0);
-                    let channel_type = Self::parse_protocol_channel_type(
-                        &payload,
-                        &["channel_type", "type", "conversation_type"],
-                    )
-                    .or(scoped_channel.map(|v| v.0))
-                    .unwrap_or(1);
+                    let channel_type = channel_unread
+                        .channel_type
+                        .or(channel_unread.type_field)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .or(scoped_channel.map(|v| v.0))
+                        .map(|v| if v == 0 { 1 } else { v })
+                        .unwrap_or(1);
                     if channel_id == 0 {
                         continue;
                     }
-                    let unread_count =
-                        Self::json_get_i32(&payload, &["unread_count", "count"]).unwrap_or(0);
+                    let unread_count = channel_unread.unread_count.unwrap_or(0);
                     let mut channel = self.storage.get_channel_by_id(channel_id).await?;
                     if let Some(existing) = channel.as_mut() {
                         existing.unread_count = unread_count;
@@ -2151,68 +2871,74 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let server_message_id =
-                        Self::json_get_u64(&payload, &["server_message_id", "message_id", "id"])
-                            .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
-                            .unwrap_or(0);
+                    let message_sync =
+                        serde_json::from_value::<MessageSyncPayload>(payload).unwrap_or_default();
+                    let server_message_id = message_sync
+                        .server_message_id
+                        .or(message_sync.message_id)
+                        .or(message_sync.id)
+                        .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
+                        .unwrap_or(0);
                     if server_message_id == 0 {
                         continue;
                     }
                     let scoped_channel = Self::parse_channel_scope(scope);
                     let channel_type_scope = scoped_channel.map(|v| v.0);
                     let channel_id_scope = scoped_channel.map(|v| v.1);
-                    let channel_id = Self::json_get_u64(&payload, &["channel_id"])
-                        .or(channel_id_scope)
+                    let channel_id = message_sync.channel_id.or(channel_id_scope).unwrap_or(0);
+                    let channel_type = message_sync
+                        .channel_type
+                        .or(message_sync.type_field)
+                        .or(message_sync.conversation_type)
+                        .or(channel_type_scope)
+                        .map(|v| if v == 0 { 1 } else { v })
+                        .unwrap_or(1);
+                    let local_message_id = message_sync.local_message_id.unwrap_or(0);
+                    let timestamp = message_sync
+                        .timestamp
+                        .or(message_sync.created_at)
+                        .or(message_sync.send_time)
+                        .unwrap_or(now_ms);
+                    let from_uid = message_sync
+                        .from_uid
+                        .or(message_sync.sender_id)
+                        .or(message_sync.from)
+                        .or(message_sync.uid)
                         .unwrap_or(0);
-                    let channel_type = Self::parse_protocol_channel_type(
-                        &payload,
-                        &["channel_type", "type", "conversation_type"],
-                    )
-                    .or(channel_type_scope)
-                    .unwrap_or(1);
+                    let message_type = message_sync.message_type.unwrap_or_else(|| {
+                        i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0)
+                    });
+                    let content = message_sync
+                        .content
+                        .clone()
+                        .or(message_sync.text.clone())
+                        .or(message_sync.body.clone())
+                        .unwrap_or_default();
+                    let status = message_sync.status.unwrap_or(2);
+                    let pts = message_sync.pts.unwrap_or(item.version as i64);
+                    let setting = message_sync.setting.unwrap_or(0);
+                    let order_seq = message_sync.order_seq.unwrap_or(item.version as i64);
+                    let searchable_word = message_sync.searchable_word.unwrap_or_default();
+                    let extra = message_sync.extra.unwrap_or_default();
                     if item.deleted {
                         if channel_id > 0 {
                             let local_id = self
                                 .storage
                                 .upsert_remote_message(UpsertRemoteMessageInput {
                                     server_message_id,
-                                    local_message_id: Self::json_get_u64(
-                                        &payload,
-                                        &["local_message_id"],
-                                    )
-                                    .unwrap_or(0),
+                                    local_message_id,
                                     channel_id,
                                     channel_type,
-                                    timestamp: Self::json_get_i64(
-                                        &payload,
-                                        &["timestamp", "created_at", "send_time"],
-                                    )
-                                    .unwrap_or(now_ms),
-                                    from_uid: Self::json_get_u64(
-                                        &payload,
-                                        &["from_uid", "sender_id", "from", "uid"],
-                                    )
-                                    .unwrap_or(0),
-                                    message_type: Self::parse_message_type(&payload),
-                                    content: Self::json_get_string(
-                                        &payload,
-                                        &["content", "text", "body"],
-                                    )
-                                    .unwrap_or_default(),
-                                    status: Self::json_get_i32(&payload, &["status"]).unwrap_or(2),
-                                    pts: Self::json_get_i64(&payload, &["pts"])
-                                        .unwrap_or(item.version as i64),
-                                    setting: Self::json_get_i32(&payload, &["setting"])
-                                        .unwrap_or(0),
-                                    order_seq: Self::json_get_i64(&payload, &["order_seq"])
-                                        .unwrap_or(item.version as i64),
-                                    searchable_word: Self::json_get_string(
-                                        &payload,
-                                        &["searchable_word"],
-                                    )
-                                    .unwrap_or_default(),
-                                    extra: Self::json_get_string(&payload, &["extra"])
-                                        .unwrap_or_default(),
+                                    timestamp,
+                                    from_uid,
+                                    message_type,
+                                    content: content.clone(),
+                                    status,
+                                    pts,
+                                    setting,
+                                    order_seq,
+                                    searchable_word: searchable_word.clone(),
+                                    extra: extra.clone(),
                                 })
                                 .await?;
                             let _ = self.storage.set_message_revoke(local_id, true, None).await;
@@ -2235,26 +2961,6 @@ impl State {
                     if channel_id == 0 {
                         continue;
                     }
-                    let from_uid =
-                        Self::json_get_u64(&payload, &["from_uid", "sender_id", "from", "uid"])
-                            .unwrap_or(0);
-                    let local_message_id =
-                        Self::json_get_u64(&payload, &["local_message_id"]).unwrap_or(0);
-                    let status = Self::json_get_i32(&payload, &["status"]).unwrap_or(2);
-                    let searchable_word =
-                        Self::json_get_string(&payload, &["searchable_word"]).unwrap_or_default();
-                    let extra = Self::json_get_string(&payload, &["extra"]).unwrap_or_default();
-                    let setting = Self::json_get_i32(&payload, &["setting"]).unwrap_or(0);
-                    let order_seq =
-                        Self::json_get_i64(&payload, &["order_seq"]).unwrap_or(item.version as i64);
-                    let timestamp =
-                        Self::json_get_i64(&payload, &["timestamp", "created_at", "send_time"])
-                            .unwrap_or(now_ms);
-                    let pts = Self::json_get_i64(&payload, &["pts"]).unwrap_or(item.version as i64);
-                    let message_type = Self::parse_message_type(&payload);
-                    let content = Self::json_get_string(&payload, &["content", "text", "body"])
-                        .unwrap_or_default();
-
                     let message_id = self
                         .storage
                         .upsert_remote_message(UpsertRemoteMessageInput {
@@ -2274,6 +2980,7 @@ impl State {
                             extra,
                         })
                         .await?;
+                    let from_self = current_user_id.map(|v| v == from_uid).unwrap_or(false);
                     let _ = self
                         .update_channel_last_message(
                             channel_id,
@@ -2281,6 +2988,7 @@ impl State {
                             &content,
                             timestamp,
                             message_id,
+                            !from_self,
                         )
                         .await;
                     emitted.push(SdkEvent::SyncEntityChanged {
@@ -2294,7 +3002,6 @@ impl State {
                         message_id,
                         reason: "sync_entity".to_string(),
                     });
-                    let from_self = current_user_id.map(|v| v == from_uid).unwrap_or(false);
                     if local_message_id > 0 || from_self {
                         emitted.push(SdkEvent::MessageSendStatusChanged {
                             message_id,
@@ -2570,14 +3277,18 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let message_id =
-                        Self::json_get_u64(&payload, &["message_id", "server_message_id", "id"])
-                            .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
-                            .unwrap_or(0);
+                    let status_sync = serde_json::from_value::<MessageStatusSyncPayload>(payload)
+                        .unwrap_or_default();
+                    let message_id = status_sync
+                        .message_id
+                        .or(status_sync.server_message_id)
+                        .or(status_sync.id)
+                        .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
+                        .unwrap_or(0);
                     if message_id == 0 {
                         continue;
                     }
-                    if let Some(status) = Self::json_get_i32(&payload, &["status"]) {
+                    if let Some(status) = status_sync.status {
                         let _ = self.storage.update_message_status(message_id, status).await;
                         emitted.push(SdkEvent::MessageSendStatusChanged {
                             message_id,
@@ -2586,18 +3297,22 @@ impl State {
                         });
                     }
                     let scoped_channel = Self::parse_channel_scope(scope);
-                    let channel_type = Self::parse_protocol_channel_type(
-                        &payload,
-                        &["channel_type", "type", "conversation_type"],
-                    )
-                    .or(scoped_channel.map(|v| v.0))
-                    .unwrap_or(1);
-                    let channel_id = Self::json_get_u64(&payload, &["channel_id"])
+                    let channel_type = status_sync
+                        .channel_type
+                        .or(status_sync.type_field)
+                        .or(status_sync.conversation_type)
+                        .or(scoped_channel.map(|v| v.0))
+                        .map(|v| if v == 0 { 1 } else { v })
+                        .unwrap_or(1);
+                    let channel_id = status_sync
+                        .channel_id
                         .or(scoped_channel.map(|v| v.1))
                         .unwrap_or(0);
                     if channel_id > 0 {
-                        if let Some(is_read) =
-                            Self::json_get_bool(&payload, &["readed", "is_read", "read"])
+                        if let Some(is_read) = status_sync
+                            .readed
+                            .or(status_sync.is_read)
+                            .or(status_sync.read)
                         {
                             let _ = self
                                 .storage
@@ -2620,18 +3335,27 @@ impl State {
             }
             "user_settings" => {
                 for item in items {
-                    let setting_key = item.entity_id.clone();
+                    let payload = item
+                        .payload
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let settings_sync =
+                        serde_json::from_value::<UserSettingsSyncPayload>(payload.clone())
+                            .unwrap_or_default();
+                    let setting_key = settings_sync
+                        .setting_key
+                        .clone()
+                        .unwrap_or_else(|| item.entity_id.clone());
                     let key = format!("{USER_SETTINGS_ITEM_PREFIX}{setting_key}");
                     if item.deleted {
                         self.storage.kv_delete(key).await?;
                     } else {
-                        let payload = item
-                            .payload
-                            .clone()
-                            .unwrap_or_else(|| serde_json::json!({}))
+                        let value = settings_sync
+                            .value
+                            .unwrap_or(payload)
                             .to_string()
                             .into_bytes();
-                        self.storage.kv_put(key, payload).await?;
+                        self.storage.kv_put(key, value).await?;
                     }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "user_settings".to_string(),
@@ -2771,33 +3495,31 @@ impl State {
                 }
             };
             let local_message_id = self.ensure_local_message_id(message_id).await?;
-            match self.submit_message_via_sync(&msg, local_message_id).await {
-                Ok(submit) => {
-                    if let ServerDecision::Rejected { reason } = submit.decision {
-                        let _ = self.storage.update_message_status(message_id, 3).await;
-                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
-                            kind: "normal".to_string(),
-                            action: "failed".to_string(),
-                            message_id: Some(message_id),
-                            queue_index: None,
-                        });
-                        return Err(Error::Auth(format!("submit rejected: {reason}")));
-                    }
-                    if let Some(server_message_id) = submit.server_msg_id {
-                        let _ = self
-                            .storage
-                            .mark_message_sent(message_id, server_message_id)
-                            .await;
-                    }
-                    let _ = self.storage.update_message_status(message_id, 2).await;
+            let send_req = self.build_send_message_request_with_content(
+                &msg,
+                local_message_id,
+                msg.content.clone(),
+            )?;
+            match self.direct_send_message(send_req).await {
+                Ok(resp) => {
+                    let _ = self
+                        .storage
+                        .mark_message_sent(message_id, resp.server_message_id)
+                        .await;
                     let _ = self.storage.normal_queue_ack(vec![message_id]).await;
+                    let last_ts = if msg.created_at > 0 {
+                        msg.created_at
+                    } else {
+                        chrono::Utc::now().timestamp_millis()
+                    };
                     let _ = self
                         .update_channel_last_message(
                             msg.channel_id,
                             msg.channel_type,
                             &msg.content,
-                            submit.server_timestamp,
+                            last_ts,
                             message_id,
+                            false,
                         )
                         .await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
@@ -2810,12 +3532,12 @@ impl State {
                         .push(SdkEvent::MessageSendStatusChanged {
                             message_id,
                             status: 2,
-                            server_message_id: submit.server_msg_id,
+                            server_message_id: Some(resp.server_message_id),
                         });
                     processed += 1;
                 }
                 Err(e) => {
-                    let _ = self.storage.update_message_status(message_id, 1).await;
+                    let _ = self.storage.update_message_status(message_id, 3).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "normal".to_string(),
                         action: "failed".to_string(),
@@ -2825,7 +3547,7 @@ impl State {
                     self.pending_events
                         .push(SdkEvent::MessageSendStatusChanged {
                             message_id,
-                            status: 1,
+                            status: 3,
                             server_message_id: None,
                         });
                     return Err(e);
@@ -2864,12 +3586,11 @@ impl State {
                 .process_outbound_file(&msg, local_message_id, payload)
                 .await
             {
-                Ok(sent) => {
+                Ok(resp) => {
                     let _ = self
                         .storage
-                        .mark_message_sent(message_id, sent.server_message_id)
+                        .mark_message_sent(message_id, resp.server_message_id)
                         .await;
-                    let _ = self.storage.update_message_status(message_id, 2).await;
                     let _ = self
                         .storage
                         .file_queue_ack(queue_index, vec![message_id])
@@ -2884,12 +3605,12 @@ impl State {
                         .push(SdkEvent::MessageSendStatusChanged {
                             message_id,
                             status: 2,
-                            server_message_id: Some(sent.server_message_id),
+                            server_message_id: Some(resp.server_message_id),
                         });
                     processed += 1;
                 }
                 Err(e) => {
-                    let _ = self.storage.update_message_status(message_id, 1).await;
+                    let _ = self.storage.update_message_status(message_id, 3).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: "failed".to_string(),
@@ -2899,7 +3620,7 @@ impl State {
                     self.pending_events
                         .push(SdkEvent::MessageSendStatusChanged {
                             message_id,
-                            status: 1,
+                            status: 3,
                             server_message_id: None,
                         });
                     return Err(e);
@@ -3388,7 +4109,31 @@ impl State {
             let rpc_resp: RpcResponse = decode_message(&raw)
                 .map_err(|e| Error::Serialization(format!("decode sync_entities rpc: {e}")))?;
             if rpc_resp.code != 0 {
-                return Err(Error::Auth(rpc_resp.message));
+                let data_preview = rpc_resp
+                    .data
+                    .as_ref()
+                    .map(|v| {
+                        let s = v.to_string();
+                        if s.len() > 512 {
+                            format!("{}...", &s[..512])
+                        } else {
+                            s
+                        }
+                    })
+                    .unwrap_or_else(|| "<none>".to_string());
+                eprintln!(
+                    "[SDK.actor] sync_entities rpc rejected: entity_type={} scope={:?} since_version={} code={} message={} data={}",
+                    entity_type_for_apply,
+                    scope_for_apply,
+                    since_version,
+                    rpc_resp.code,
+                    rpc_resp.message,
+                    data_preview
+                );
+                return Err(Error::Auth(format!(
+                    "sync_entities rejected: entity_type={} scope={:?} since_version={} code={} message={}",
+                    entity_type_for_apply, scope_for_apply, since_version, rpc_resp.code, rpc_resp.message
+                )));
             }
             let body = rpc_resp
                 .data
@@ -3454,6 +4199,7 @@ impl State {
         }
         self.last_sync_queued = total_queued;
         self.last_sync_dropped_duplicates = total_dropped;
+        self.invalidate_cache_for_events(&entity_events);
         self.last_sync_entity_events = entity_events;
         Ok(applied)
     }
@@ -3489,6 +4235,7 @@ impl State {
                 }
             }
         }
+        self.invalidate_cache_for_events(&entity_events);
         self.last_sync_entity_events = entity_events;
         Ok(applied)
     }
@@ -3497,9 +4244,56 @@ impl State {
         if self.session_state != SessionState::Authenticated {
             return Ok(0);
         }
+        if inbound_logs_enabled() {
+            eprintln!(
+                "[SDK.inbound] frame biz_type={} len={}",
+                biz_type,
+                data.len()
+            );
+        }
         let message_type = MessageType::from(biz_type);
+        if inbound_logs_enabled() {
+            eprintln!("[SDK.inbound] frame message_type={:?}", message_type);
+        }
+        Self::log_inbound_decoded(message_type, &data);
         let mut items = Vec::new();
         match message_type {
+            MessageType::SendMessageRequest => {
+                let req: SendMessageRequest = decode_message(&data).map_err(|e| {
+                    Error::Serialization(format!("decode send message request: {e}"))
+                })?;
+                let current_user_id = self
+                    .current_uid
+                    .as_ref()
+                    .and_then(|v| v.parse::<u64>().ok());
+                // Avoid self-echo duplicates:
+                // Some transports/server paths can bounce our own SendMessageRequest back.
+                // Our outbound path already wrote the local row and later push/ack will reconcile it.
+                if current_user_id == Some(req.from_uid) {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] ignore self SendMessageRequest echo: from_uid={} local_message_id={}",
+                            req.from_uid, req.local_message_id
+                        );
+                    }
+                    return Ok(0);
+                }
+                let channel_type = self
+                    .storage
+                    .get_channel_by_id(req.channel_id)
+                    .await?
+                    .map(|ch| ch.channel_type as u8)
+                    .unwrap_or(1);
+                if let Some(item) = Self::send_message_to_sync_item(req, channel_type) {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] mapped SendMessageRequest -> sync item channel_type={}",
+                            channel_type
+                        );
+                    }
+                    items.push(item);
+                }
+            }
             MessageType::PushMessageRequest => {
                 let req: PushMessageRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
@@ -3514,7 +4308,46 @@ impl State {
                         .map(Self::push_message_to_sync_item),
                 );
             }
+            MessageType::PublishRequest => {
+                let req: PublishRequest = decode_message(&data)
+                    .map_err(|e| Error::Serialization(format!("decode publish request: {e}")))?;
+                if let Ok(push) = decode_message::<PushMessageRequest>(&req.payload) {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] publish payload decoded as PushMessageRequest channel_id={}",
+                            push.channel_id
+                        );
+                    }
+                    items.push(Self::push_message_to_sync_item(push));
+                } else if let Ok(batch) = decode_message::<PushBatchRequest>(&req.payload) {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] publish payload decoded as PushBatchRequest count={}",
+                            batch.messages.len()
+                        );
+                    }
+                    items.extend(
+                        batch
+                            .messages
+                            .into_iter()
+                            .map(Self::push_message_to_sync_item),
+                    );
+                } else {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] publish payload not recognized as push payload channel_id={} topic={:?}",
+                            req.channel_id, req.topic
+                        );
+                    }
+                }
+            }
             _ => {
+                if inbound_logs_enabled() {
+                    eprintln!(
+                        "[SDK.inbound] ignore inbound message_type={:?} biz_type={}",
+                        message_type, biz_type
+                    );
+                }
                 return Ok(0);
             }
         }
@@ -3531,6 +4364,14 @@ impl State {
         }
 
         // Keep order aligned with legacy SDK bootstrap strategy.
+        // Core entities are required by local-first read models.
+        let core_entities = ["friend", "group", "channel", "user_settings"];
+        // Optional entities depend on current server capability rollout.
+        let optional_entities = ["user", "user_block", "channel_extra", "channel_unread"];
+        eprintln!(
+            "[SDK.actor] bootstrap sync plan core={:?} optional={:?}",
+            core_entities, optional_entities
+        );
         let order = [
             "friend",
             "user",
@@ -3551,8 +4392,10 @@ impl State {
                 }
                 Err(e) if Self::is_unsupported_entity_error(&e) => {
                     eprintln!(
-                        "[SDK.actor] bootstrap sync skip unsupported entity_type={}: {}",
-                        entity_type, e
+                        "[SDK.actor] bootstrap sync skip unsupported entity_type={} reason={} (core_required={})",
+                        entity_type,
+                        e,
+                        core_entities.contains(&entity_type)
                     );
                 }
                 Err(e) => return Err(e),
@@ -3561,7 +4404,10 @@ impl State {
 
         // Scoped member sync (best effort but still inside bootstrap critical path):
         // - group_member scoped by group_id
-        // - channel_member scoped by "{channel_type}:{channel_id}"
+        // NOTE:
+        //   ENTITY_SYNC_V1 core controlled enum is `group_member`.
+        //   `channel_member` is not guaranteed by current server deployment and is not
+        //   part of old stable bootstrap path, so we do not treat it as bootstrap core.
         let mut group_offset = 0usize;
         let group_page_size = 500usize;
         loop {
@@ -3586,8 +4432,8 @@ impl State {
                     }
                     Err(e) if Self::is_unsupported_entity_error(&e) => {
                         eprintln!(
-                            "[SDK.actor] bootstrap sync skip unsupported entity_type=group_member: {}",
-                            e
+                            "[SDK.actor] bootstrap sync skip unsupported entity_type=group_member scope=group:{} reason={}",
+                            group.group_id, e
                         );
                     }
                     Err(e) => return Err(e),
@@ -3597,42 +4443,6 @@ impl State {
                 break;
             }
             group_offset += group_page_size;
-        }
-        let mut channel_offset = 0usize;
-        let channel_page_size = 500usize;
-        loop {
-            let channels = self
-                .storage
-                .list_channels(channel_page_size, channel_offset)
-                .await?;
-            if channels.is_empty() {
-                break;
-            }
-            for channel in channels.iter() {
-                let scope = format!("{}:{}", channel.channel_type, channel.channel_id);
-                match self
-                    .sync_entities("channel_member".to_string(), Some(scope))
-                    .await
-                {
-                    Ok(count) => {
-                        eprintln!(
-                            "[SDK.actor] bootstrap sync entity=channel_member scope=channel:{}:{} count={}",
-                            channel.channel_type, channel.channel_id, count
-                        );
-                    }
-                    Err(e) if Self::is_unsupported_entity_error(&e) => {
-                        eprintln!(
-                            "[SDK.actor] bootstrap sync skip unsupported entity_type=channel_member: {}",
-                            e
-                        );
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            if channels.len() < channel_page_size {
-                break;
-            }
-            channel_offset += channel_page_size;
         }
         self.bootstrap_completed = true;
         if let Some(uid) = &self.current_uid {
@@ -3682,53 +4492,108 @@ impl State {
 
     async fn sync_channel(&mut self, channel_id: u64, channel_type: i32) -> Result<usize> {
         // Keep channel-targeted sync aligned with local-first bootstrap:
-        // channel base + extra + unread + members in one call chain.
+        // channel base + extra + unread + (group member for group channels).
         let scope = Some(format!("{channel_type}:{channel_id}"));
         let mut total = 0usize;
         total += self
             .sync_entities("channel".to_string(), scope.clone())
             .await?;
-        total += self
+        match self
             .sync_entities("channel_extra".to_string(), scope.clone())
-            .await?;
-        total += self
+            .await
+        {
+            Ok(v) => total += v,
+            Err(e) if Self::is_unsupported_entity_error(&e) => {
+                eprintln!(
+                    "[SDK.actor] sync_channel skip unsupported entity_type=channel_extra scope={:?} reason={}",
+                    scope, e
+                );
+            }
+            Err(e) => return Err(e),
+        }
+        match self
             .sync_entities("channel_unread".to_string(), scope.clone())
-            .await?;
-        total += self
-            .sync_entities("channel_member".to_string(), scope)
-            .await?;
+            .await
+        {
+            Ok(v) => total += v,
+            Err(e) if Self::is_unsupported_entity_error(&e) => {
+                eprintln!(
+                    "[SDK.actor] sync_channel skip unsupported entity_type=channel_unread scope={:?} reason={}",
+                    scope, e
+                );
+            }
+            Err(e) => return Err(e),
+        }
+        if channel_type == 2 {
+            match self
+                .sync_entities("group_member".to_string(), Some(channel_id.to_string()))
+                .await
+            {
+                Ok(v) => total += v,
+                Err(e) if Self::is_unsupported_entity_error(&e) => {
+                    eprintln!(
+                        "[SDK.actor] sync_channel skip unsupported entity_type=group_member scope=Some(\"{}\") reason={}",
+                        channel_id, e
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
         Ok(total)
     }
 
     async fn sync_all_channels(&mut self) -> Result<usize> {
         let mut total = 0usize;
         total += self.sync_entities("channel".to_string(), None).await?;
-        total += self
-            .sync_entities("channel_extra".to_string(), None)
-            .await?;
-        total += self
-            .sync_entities("channel_unread".to_string(), None)
-            .await?;
-        let mut channel_offset = 0usize;
-        let channel_page_size = 500usize;
+        match self.sync_entities("channel_extra".to_string(), None).await {
+            Ok(v) => total += v,
+            Err(e) if Self::is_unsupported_entity_error(&e) => {
+                eprintln!(
+                    "[SDK.actor] sync_all_channels skip unsupported entity_type=channel_extra reason={}",
+                    e
+                );
+            }
+            Err(e) => return Err(e),
+        }
+        match self.sync_entities("channel_unread".to_string(), None).await {
+            Ok(v) => total += v,
+            Err(e) if Self::is_unsupported_entity_error(&e) => {
+                eprintln!(
+                    "[SDK.actor] sync_all_channels skip unsupported entity_type=channel_unread reason={}",
+                    e
+                );
+            }
+            Err(e) => return Err(e),
+        }
+        let mut group_offset = 0usize;
+        let group_page_size = 500usize;
         loop {
-            let channels = self
+            let groups = self
                 .storage
-                .list_channels(channel_page_size, channel_offset)
+                .list_groups(group_page_size, group_offset)
                 .await?;
-            if channels.is_empty() {
+            if groups.is_empty() {
                 break;
             }
-            for channel in channels.iter() {
-                let scope = format!("{}:{}", channel.channel_type, channel.channel_id);
-                total += self
-                    .sync_entities("channel_member".to_string(), Some(scope))
-                    .await?;
+            for group in groups.iter() {
+                match self
+                    .sync_entities("group_member".to_string(), Some(group.group_id.to_string()))
+                    .await
+                {
+                    Ok(v) => total += v,
+                    Err(e) if Self::is_unsupported_entity_error(&e) => {
+                        eprintln!(
+                            "[SDK.actor] sync_all_channels skip unsupported entity_type=group_member scope=Some(\"{}\") reason={}",
+                            group.group_id, e
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            if channels.len() < channel_page_size {
+            if groups.len() < group_page_size {
                 break;
             }
-            channel_offset += channel_page_size;
+            group_offset += group_page_size;
         }
         Ok(total)
     }
@@ -3921,32 +4786,49 @@ impl State {
     async fn direct_send_message(
         &mut self,
         req: privchat_protocol::protocol::SendMessageRequest,
-    ) -> Result<privchat_protocol::protocol::SendMessageResponse> {
+    ) -> Result<SendMessageResponse> {
         if req.local_message_id == 0 {
             return Err(Error::InvalidState(
                 "local_message_id must be non-zero".to_string(),
             ));
         }
-        let timeout = self.timeout();
         let request_data = encode_message(&req)
             .map_err(|e| Error::Serialization(format!("encode send request: {e}")))?;
-        let raw = self
-            .request_bytes(
-                Bytes::from(request_data),
-                MessageType::SendMessageRequest as u8,
-                timeout,
-                "direct send message",
-            )
-            .await?;
-        let response: privchat_protocol::protocol::SendMessageResponse = decode_message(&raw)
+        let timeout = self.timeout();
+        let transport = match self.transport.as_mut() {
+            Some(t) => t,
+            None => {
+                let transition = self.apply_transport_health(false);
+                self.push_connection_transition_event(transition);
+                return Err(self.network_disconnected_error());
+            }
+        };
+        let opt = TransportOptions::new()
+            .with_biz_type(MessageType::SendMessageRequest as u8)
+            .with_timeout(timeout);
+        let raw = transport
+            .request_with_options(Bytes::from(request_data), opt)
+            .await
+            .map_err(|e| {
+                eprintln!("[SDK.actor] direct send message transport error: {e}");
+                let transition = self.apply_transport_health(false);
+                self.push_connection_transition_event(transition);
+                self.network_disconnected_error()
+            })?;
+        let resp: SendMessageResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode send response: {e}")))?;
-        if response.reason_code != 0 {
+        if resp.reason_code != 0 {
             return Err(Error::Transport(format!(
                 "send message failed: reason_code={}",
-                response.reason_code
+                resp.reason_code
             )));
         }
-        Ok(response)
+        if resp.server_message_id == 0 {
+            return Err(Error::Serialization(
+                "send message response missing server_message_id".to_string(),
+            ));
+        }
+        Ok(resp)
     }
 
     fn guess_file_type(message_type: i32, filename: &str, mime: &str) -> &'static str {
@@ -4180,7 +5062,7 @@ impl State {
         message: &StoredMessage,
         local_message_id: u64,
         payload: Vec<u8>,
-    ) -> Result<privchat_protocol::protocol::SendMessageResponse> {
+    ) -> Result<SendMessageResponse> {
         if payload.is_empty() {
             return Err(Error::InvalidState(
                 "attachment payload is empty".to_string(),
@@ -4482,6 +5364,7 @@ impl State {
         content: &str,
         timestamp_ms: i64,
         message_id: u64,
+        bump_unread: bool,
     ) -> Result<()> {
         let existing = self.storage.get_channel_by_id(channel_id).await?;
         let (channel_name, channel_remark, avatar, top, mute, unread_count) =
@@ -4492,7 +5375,11 @@ impl State {
                     c.avatar,
                     c.top,
                     c.mute,
-                    c.unread_count,
+                    if bump_unread {
+                        c.unread_count.saturating_add(1)
+                    } else {
+                        c.unread_count
+                    },
                 )
             } else {
                 (
@@ -4501,7 +5388,7 @@ impl State {
                     String::new(),
                     0,
                     0,
-                    0,
+                    if bump_unread { 1 } else { 0 },
                 )
             };
         self.storage
@@ -4520,51 +5407,6 @@ impl State {
             })
             .await?;
         Ok(())
-    }
-
-    async fn submit_message_via_sync(
-        &mut self,
-        message: &StoredMessage,
-        local_message_id: u64,
-    ) -> Result<ClientSubmitResponse> {
-        let channel_type = u8::try_from(message.channel_type).map_err(|_| {
-            Error::InvalidState(format!("invalid channel_type: {}", message.channel_type))
-        })?;
-        let command_type = ContentMessageType::from_u32(message.message_type as u32)
-            .map(|v| v.as_str().to_string())
-            .unwrap_or_else(|| "text".to_string());
-        let mut payload = serde_json::json!({
-            "content": message.content,
-            "text": message.content,
-        });
-        if let Ok(extra_json) = serde_json::from_str::<serde_json::Value>(&message.extra) {
-            if let (serde_json::Value::Object(base), serde_json::Value::Object(extra)) =
-                (&mut payload, extra_json)
-            {
-                for (k, v) in extra {
-                    base.insert(k, v);
-                }
-            }
-        }
-        let submit_req = ClientSubmitRequest {
-            local_message_id,
-            channel_id: message.channel_id,
-            channel_type,
-            last_pts: 0,
-            command_type,
-            payload,
-            client_timestamp: chrono::Utc::now().timestamp_millis(),
-            device_id: None,
-        };
-        let body = self
-            .rpc_call_json(
-                routes::sync::SUBMIT.to_string(),
-                serde_json::to_value(submit_req)
-                    .map_err(|e| Error::Serialization(format!("encode submit body: {e}")))?,
-            )
-            .await?;
-        serde_json::from_value::<ClientSubmitResponse>(body)
-            .map_err(|e| Error::Serialization(format!("decode submit response: {e}")))
     }
 }
 
@@ -4685,6 +5527,14 @@ impl PrivchatSdk {
                 video_process_hook: None,
                 last_tmp_cleanup_day: None,
                 pending_events: Vec::new(),
+                message_cache_policy: MessageCachePolicy::default(),
+                channel_message_cache: HashMap::new(),
+                channel_cache_generation: HashMap::new(),
+                channel_cache_lru: VecDeque::new(),
+                channel_cache_total_bytes: 0,
+                cache_debug_log: std::env::var("PRIVCHAT_CACHE_LOG").ok().as_deref() == Some("1"),
+                cache_hit_count: 0,
+                cache_miss_count: 0,
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut health_tick = interval(Duration::from_secs(2));
@@ -5540,6 +6390,11 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if let Ok(message_id) = result {
+                            state.invalidate_channel_cache_with_reason(
+                                channel_id,
+                                channel_type,
+                                "create_local_message",
+                            );
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -5583,15 +6438,34 @@ impl PrivchatSdk {
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
+                            Ok(_) => state
+                                .query_timeline_snapshot(channel_id, channel_type, limit, offset)
+                                .await
+                                .map(|snapshot| snapshot.messages),
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
+                    Command::QueryTimelineSnapshot {
+                        channel_id,
+                        channel_type,
+                        limit,
+                        offset,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
                             Ok(_) => {
                                 state
-                                    .storage
-                                    .list_messages(channel_id, channel_type, limit, offset)
+                                    .query_timeline_snapshot(channel_id, channel_type, limit, offset)
                                     .await
                             }
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
+                    }
+                    Command::SetMessageCachePolicy { policy, resp } => {
+                        state.set_message_cache_policy(policy);
+                        let _ = resp.send(Ok(()));
                     }
                     Command::UpsertChannel { input, resp } => {
                         let result = match state.current_uid_required() {
@@ -5646,6 +6520,10 @@ impl PrivchatSdk {
                         server_message_id,
                         resp,
                     } => {
+                        let message_ctx = match state.current_uid_required() {
+                            Ok(_) => state.storage.get_message_by_id(message_id).await.ok().flatten(),
+                            Err(_) => None,
+                        };
                         let result = match state.current_uid_required() {
                             Ok(_) => state
                                 .storage
@@ -5654,6 +6532,13 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
+                            if let Some(msg) = &message_ctx {
+                                state.invalidate_channel_cache_with_reason(
+                                    msg.channel_id,
+                                    msg.channel_type,
+                                    "mark_message_sent",
+                                );
+                            }
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -5673,11 +6558,22 @@ impl PrivchatSdk {
                         status,
                         resp,
                     } => {
+                        let message_ctx = match state.current_uid_required() {
+                            Ok(_) => state.storage.get_message_by_id(message_id).await.ok().flatten(),
+                            Err(_) => None,
+                        };
                         let result = match state.current_uid_required() {
                             Ok(_) => state.storage.update_message_status(message_id, status).await,
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
+                            if let Some(msg) = &message_ctx {
+                                state.invalidate_channel_cache_with_reason(
+                                    msg.channel_id,
+                                    msg.channel_type,
+                                    "update_message_status",
+                                );
+                            }
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -5709,6 +6605,11 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
+                            state.invalidate_channel_cache_with_reason(
+                                channel_id,
+                                channel_type,
+                                "set_message_read",
+                            );
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -5744,6 +6645,13 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
+                            if let Some(msg) = &message_ctx {
+                                state.invalidate_channel_cache_with_reason(
+                                    msg.channel_id,
+                                    msg.channel_type,
+                                    "set_message_revoke",
+                                );
+                            }
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -5779,6 +6687,13 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
+                            if let Some(msg) = &message_ctx {
+                                state.invalidate_channel_cache_with_reason(
+                                    msg.channel_id,
+                                    msg.channel_type,
+                                    "edit_message",
+                                );
+                            }
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -5813,6 +6728,13 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
+                            if let Some(msg) = &message_ctx {
+                                state.invalidate_channel_cache_with_reason(
+                                    msg.channel_id,
+                                    msg.channel_type,
+                                    "set_message_pinned",
+                                );
+                            }
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -5853,6 +6775,13 @@ impl PrivchatSdk {
                             }
                             Err(e) => Err(e),
                         };
+                        if result.is_ok() {
+                            state.invalidate_channel_cache_with_reason(
+                                channel_id,
+                                channel_type,
+                                "mark_channel_read",
+                            );
+                        }
                         let _ = resp.send(result);
                     }
                     Command::GetChannelUnreadCount {
@@ -7042,6 +7971,41 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    pub async fn query_timeline_snapshot(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        limit: usize,
+        offset: usize,
+    ) -> Result<TimelineSnapshot> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::QueryTimelineSnapshot {
+                channel_id,
+                channel_type,
+                limit,
+                offset,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn set_message_cache_policy(&self, policy: MessageCachePolicy) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetMessageCachePolicy {
+                policy,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
     pub async fn upsert_channel(&self, input: UpsertChannelInput) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -7915,12 +8879,18 @@ mod tests {
             Error::Transport("x".to_string()).sdk_code(),
             error_codes::TRANSPORT_FAILURE
         );
-        assert_eq!(Error::NotConnected.sdk_code(), error_codes::NETWORK_DISCONNECTED);
+        assert_eq!(
+            Error::NotConnected.sdk_code(),
+            error_codes::NETWORK_DISCONNECTED
+        );
         assert_eq!(
             Error::Storage("x".to_string()).sdk_code(),
             error_codes::STORAGE_FAILURE
         );
-        assert_eq!(Error::Auth("x".to_string()).sdk_code(), error_codes::AUTH_FAILURE);
+        assert_eq!(
+            Error::Auth("x".to_string()).sdk_code(),
+            error_codes::AUTH_FAILURE
+        );
         assert_eq!(Error::Shutdown.sdk_code(), error_codes::SHUTDOWN);
         assert_eq!(
             Error::InvalidState("x".to_string()).sdk_code(),
@@ -8016,14 +8986,16 @@ mod tests {
 
         let network_events = sdk.network_events_since(baseline, 16);
         assert!(
-            network_events.iter().any(|evt| matches!(
-                evt.event,
-                SdkEvent::NetworkHintChanged { .. }
-            )),
+            network_events
+                .iter()
+                .any(|evt| matches!(evt.event, SdkEvent::NetworkHintChanged { .. })),
             "expected NetworkHintChanged in replay events"
         );
 
-        let err = sdk.connect().await.expect_err("connect must fail while offline");
+        let err = sdk
+            .connect()
+            .await
+            .expect_err("connect must fail while offline");
         assert!(
             err.to_string().contains(NETWORK_DISCONNECTED_MESSAGE),
             "unexpected error: {err}"

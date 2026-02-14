@@ -80,10 +80,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast::error::RecvError, Mutex as AsyncMutex};
+use tokio::sync::{broadcast::error::TryRecvError, Mutex as AsyncMutex};
 
 const USER_SETTINGS_KEY: &str = "__user_settings_json__";
 const USER_SETTINGS_ITEM_PREFIX: &str = "entity_sync:user_settings:";
+
+async fn poll_wait(remain: std::time::Duration) {
+    let wait = std::cmp::min(std::time::Duration::from_millis(10), remain);
+    if wait.is_zero() {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::time::sleep(wait).await;
+    } else {
+        std::thread::sleep(wait);
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct AuthLogoutRequest {}
@@ -2569,11 +2581,20 @@ impl PrivchatClient {
         self.event_poll_count.fetch_add(1, Ordering::Relaxed);
         let mut rx = self.event_rx.lock().await;
         let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Ok(evt)) => Ok(Some(map_sdk_event(evt))),
-            Ok(Err(RecvError::Lagged(_))) => Ok(None),
-            Ok(Err(RecvError::Closed)) => Ok(None),
-            Err(_) => Ok(None),
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(evt) => return Ok(Some(map_sdk_event(evt))),
+                Err(TryRecvError::Lagged(_)) => return Ok(None),
+                Err(TryRecvError::Closed) => return Ok(None),
+                Err(TryRecvError::Empty) => {
+                    let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remain.is_zero() {
+                        return Ok(None);
+                    }
+                    poll_wait(remain).await;
+                }
+            }
         }
     }
 
@@ -2583,19 +2604,17 @@ impl PrivchatClient {
     ) -> Result<Option<SequencedSdkEvent>, PrivchatFfiError> {
         self.event_poll_count.fetch_add(1, Ordering::Relaxed);
         let before_seq = self.inner.last_event_sequence_id();
-        let mut rx = self.event_rx.lock().await;
         let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Ok(_)) => {
-                let replay = self.inner.events_since(before_seq, 1);
-                Ok(replay.into_iter().next().map(map_sequenced_sdk_event))
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(evt) = self.inner.events_since(before_seq, 1).into_iter().next() {
+                return Ok(Some(map_sequenced_sdk_event(evt)));
             }
-            Ok(Err(RecvError::Lagged(_))) => {
-                let replay = self.inner.events_since(before_seq, 1);
-                Ok(replay.into_iter().next().map(map_sequenced_sdk_event))
+            let remain = deadline.saturating_duration_since(std::time::Instant::now());
+            if remain.is_zero() {
+                return Ok(None);
             }
-            Ok(Err(RecvError::Closed)) => Ok(None),
-            Err(_) => Ok(None),
+            poll_wait(remain).await;
         }
     }
 
@@ -2612,10 +2631,9 @@ impl PrivchatClient {
             if now >= deadline {
                 return Ok(None);
             }
-            let remain = deadline.saturating_duration_since(now);
             let mut rx = self.event_rx.lock().await;
-            match tokio::time::timeout(remain, rx.recv()).await {
-                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {
+            match rx.try_recv() {
+                Ok(_) | Err(TryRecvError::Lagged(_)) => {
                     let replay = self
                         .inner
                         .timeline_events_since(cursor, self.inner.event_history_limit());
@@ -2624,8 +2642,14 @@ impl PrivchatClient {
                     }
                     cursor = self.inner.last_event_sequence_id();
                 }
-                Ok(Err(RecvError::Closed)) => return Ok(None),
-                Err(_) => return Ok(None),
+                Err(TryRecvError::Closed) => return Ok(None),
+                Err(TryRecvError::Empty) => {
+                    let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remain.is_zero() {
+                        return Ok(None);
+                    }
+                    poll_wait(remain).await;
+                }
             }
         }
     }
@@ -2653,10 +2677,9 @@ impl PrivchatClient {
             if now >= deadline {
                 return Ok(None);
             }
-            let remain = deadline.saturating_duration_since(now);
             let mut rx = self.event_rx.lock().await;
-            match tokio::time::timeout(remain, rx.recv()).await {
-                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {
+            match rx.try_recv() {
+                Ok(_) | Err(TryRecvError::Lagged(_)) => {
                     let replay = self
                         .inner
                         .network_events_since(cursor, self.inner.event_history_limit());
@@ -2665,8 +2688,14 @@ impl PrivchatClient {
                     }
                     cursor = self.inner.last_event_sequence_id();
                 }
-                Ok(Err(RecvError::Closed)) => return Ok(None),
-                Err(_) => return Ok(None),
+                Err(TryRecvError::Closed) => return Ok(None),
+                Err(TryRecvError::Empty) => {
+                    let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remain.is_zero() {
+                        return Ok(None);
+                    }
+                    poll_wait(remain).await;
+                }
             }
         }
     }
@@ -5504,10 +5533,7 @@ impl PrivchatClient {
 
     // Backward-compat symbol for older generated bindings.
     // Semantics stay queue-first: create local message and enqueue it.
-    pub async fn send_local_message_now(
-        &self,
-        input: NewMessage,
-    ) -> Result<u64, PrivchatFfiError> {
+    pub async fn send_local_message_now(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
         self.send_message_with_input(input).await
     }
 

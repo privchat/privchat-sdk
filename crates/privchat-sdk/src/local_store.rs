@@ -904,8 +904,8 @@ impl LocalStore {
         let existed: Option<(i64, i64, i64)> = conn
             .query_row(
                 "SELECT id, COALESCE(order_seq, 0), COALESCE(pts, 0)
-                 FROM message WHERE message_id = ?1 LIMIT 1",
-                params![input.server_message_id as i64],
+                 FROM message WHERE channel_id = ?1 AND message_id = ?2 LIMIT 1",
+                params![input.channel_id as i64, input.server_message_id as i64],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -1102,38 +1102,40 @@ impl LocalStore {
                 c.channel_id,
                 c.channel_type,
                 CASE
-                    WHEN c.channel_type = 1 THEN COALESCE(
-                        (
-                            SELECT COALESCE(
-                                NULLIF(u.alias, ''),
-                                NULLIF(u.nickname, ''),
-                                NULLIF(u.username, ''),
-                                CAST(u.user_id AS TEXT)
-                            )
-                            FROM \"user\" u
-                            WHERE u.user_id = COALESCE(
-                                (
-                                    SELECT cm.member_uid
-                                    FROM channel_member cm
-                                    WHERE cm.channel_id = c.channel_id
-                                      AND cm.channel_type = c.channel_type
-                                      AND cm.member_uid != ?2
-                                    ORDER BY cm.role ASC, cm.member_uid ASC
-                                    LIMIT 1
-                                ),
-                                (
-                                    SELECT u2.user_id
-                                    FROM \"user\" u2
-                                    WHERE u2.channel_id = CAST(c.channel_id AS TEXT)
-                                    ORDER BY u2.updated_at DESC
-                                    LIMIT 1
+                        WHEN c.channel_type = 1 THEN COALESCE(
+                            (
+                                SELECT COALESCE(
+                                    NULLIF(u.alias, ''),
+                                    NULLIF(u.nickname, ''),
+                                    NULLIF(u.username, ''),
+                                    CAST(peer.peer_user_id AS TEXT)
                                 )
-                            )
-                            LIMIT 1
-                        ),
-                        NULLIF(c.channel_name, ''),
-                        CAST(c.channel_id AS TEXT)
-                    )
+                                FROM (
+                                    SELECT COALESCE(
+                                        (
+                                            SELECT cm.member_uid
+                                            FROM channel_member cm
+                                            WHERE cm.channel_id = c.channel_id
+                                              AND cm.channel_type = c.channel_type
+                                              AND cm.member_uid != ?2
+                                            ORDER BY cm.role ASC, cm.member_uid ASC
+                                            LIMIT 1
+                                        ),
+                                        CASE
+                                            WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
+                                            THEN CAST(c.channel_name AS INTEGER)
+                                            ELSE NULL
+                                        END
+                                    ) AS peer_user_id
+                                ) peer
+                                LEFT JOIN friend f ON f.user_id = peer.peer_user_id
+                                LEFT JOIN \"user\" u ON u.user_id = COALESCE(f.user_id, peer.peer_user_id)
+                                WHERE peer.peer_user_id IS NOT NULL
+                                LIMIT 1
+                            ),
+                            NULLIF(c.channel_name, ''),
+                            CAST(c.channel_id AS TEXT)
+                        )
                     WHEN c.channel_type = 2 THEN COALESCE(
                         NULLIF(c.channel_name, ''),
                         (
@@ -1236,27 +1238,29 @@ impl LocalStore {
                                     NULLIF(u.alias, ''),
                                     NULLIF(u.nickname, ''),
                                     NULLIF(u.username, ''),
-                                    CAST(u.user_id AS TEXT)
+                                    CAST(peer.peer_user_id AS TEXT)
                                 )
-                                FROM \"user\" u
-                                WHERE u.user_id = COALESCE(
-                                    (
-                                        SELECT cm.member_uid
-                                        FROM channel_member cm
-                                        WHERE cm.channel_id = c.channel_id
-                                          AND cm.channel_type = c.channel_type
-                                          AND cm.member_uid != ?3
-                                        ORDER BY cm.role ASC, cm.member_uid ASC
-                                        LIMIT 1
-                                    ),
-                                    (
-                                        SELECT u2.user_id
-                                        FROM \"user\" u2
-                                        WHERE u2.channel_id = CAST(c.channel_id AS TEXT)
-                                        ORDER BY u2.updated_at DESC
-                                        LIMIT 1
-                                    )
-                                )
+                                FROM (
+                                    SELECT COALESCE(
+                                        (
+                                            SELECT cm.member_uid
+                                            FROM channel_member cm
+                                            WHERE cm.channel_id = c.channel_id
+                                              AND cm.channel_type = c.channel_type
+                                              AND cm.member_uid != ?3
+                                            ORDER BY cm.role ASC, cm.member_uid ASC
+                                            LIMIT 1
+                                        ),
+                                        CASE
+                                            WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
+                                            THEN CAST(c.channel_name AS INTEGER)
+                                            ELSE NULL
+                                        END
+                                    ) AS peer_user_id
+                                ) peer
+                                LEFT JOIN friend f ON f.user_id = peer.peer_user_id
+                                LEFT JOIN \"user\" u ON u.user_id = COALESCE(f.user_id, peer.peer_user_id)
+                                WHERE peer.peer_user_id IS NOT NULL
                                 LIMIT 1
                             ),
                             NULLIF(c.channel_name, ''),
@@ -1320,7 +1324,7 @@ impl LocalStore {
                     ) AS resolved_last_msg_content,
                     c.updated_at
                  FROM channel c
-                 ORDER BY c.top DESC, c.last_msg_timestamp DESC, c.channel_id DESC
+                 ORDER BY c.top DESC, resolved_last_msg_timestamp DESC, c.channel_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
             .map_err(|e| Error::Storage(format!("prepare list channels: {e}")))?;
@@ -1557,9 +1561,19 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         let mut stmt = conn
             .prepare(
-                "SELECT user_id, tags, is_pinned, created_at, updated_at
-                 FROM friend
-                 ORDER BY is_pinned DESC, updated_at DESC, user_id DESC
+                "SELECT
+                    f.user_id,
+                    u.username,
+                    u.nickname,
+                    u.alias,
+                    COALESCE(u.avatar, ''),
+                    f.tags,
+                    f.is_pinned,
+                    f.created_at,
+                    f.updated_at
+                 FROM friend f
+                 LEFT JOIN \"user\" u ON u.user_id = f.user_id
+                 ORDER BY f.is_pinned DESC, f.updated_at DESC, f.user_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
             .map_err(|e| Error::Storage(format!("prepare list friends: {e}")))?;
@@ -1567,10 +1581,14 @@ impl LocalStore {
             .query_map(params![limit as i64, offset as i64], |row| {
                 Ok(StoredFriend {
                     user_id: row.get::<_, i64>(0)? as u64,
-                    tags: row.get::<_, Option<String>>(1)?,
-                    is_pinned: row.get::<_, i32>(2)? != 0,
-                    created_at: row.get::<_, i64>(3)?,
-                    updated_at: row.get::<_, i64>(4)?,
+                    username: row.get::<_, Option<String>>(1)?,
+                    nickname: row.get::<_, Option<String>>(2)?,
+                    alias: row.get::<_, Option<String>>(3)?,
+                    avatar: row.get::<_, String>(4)?,
+                    tags: row.get::<_, Option<String>>(5)?,
+                    is_pinned: row.get::<_, i32>(6)? != 0,
+                    created_at: row.get::<_, i64>(7)?,
+                    updated_at: row.get::<_, i64>(8)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list friends: {e}")))?;
@@ -2236,12 +2254,35 @@ impl LocalStore {
         message_id: u64,
         server_message_id: u64,
     ) -> Result<()> {
-        let conn = self.conn_for_user(uid)?;
+        let mut conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let updated = conn
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("mark message sent begin tx: {e}")))?;
+        let channel_id: Option<i64> = tx
+            .query_row(
+                "SELECT channel_id FROM message WHERE id = ?1 LIMIT 1",
+                params![message_id as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("mark message sent find channel: {e}")))?;
+        let Some(channel_id) = channel_id else {
+            return Err(Error::Storage(format!(
+                "mark message sent failed: message.id={} not found",
+                message_id
+            )));
+        };
+        tx.execute(
+            "DELETE FROM message
+             WHERE channel_id = ?1 AND message_id = ?2 AND id != ?3",
+            params![channel_id, server_message_id as i64, message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("mark message sent dedupe: {e}")))?;
+        let updated = tx
             .execute(
                 "UPDATE message
-                 SET message_id = ?1, updated_at = ?2
+                 SET message_id = ?1, status = 2, updated_at = ?2
                  WHERE id = ?3",
                 params![server_message_id as i64, now_ms, message_id as i64],
             )
@@ -2252,6 +2293,8 @@ impl LocalStore {
                 message_id
             )));
         }
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("mark message sent commit: {e}")))?;
         Ok(())
     }
 
@@ -3034,6 +3077,61 @@ mod tests {
             .expect("sent exists");
         assert_eq!(sent.message_id, message_id);
         assert_eq!(sent.server_message_id, Some(900001));
+        assert_eq!(sent.status, 2);
+    }
+
+    #[test]
+    fn mark_message_sent_merges_duplicate_server_row_into_local_row() {
+        let store = test_store();
+        let uid = "10003-merge";
+        let input = NewMessage {
+            channel_id: 100,
+            channel_type: 1,
+            from_uid: 200,
+            message_type: 1,
+            content: "hello".to_string(),
+            searchable_word: "hello".to_string(),
+            setting: 0,
+            extra: "{}".to_string(),
+        };
+
+        let local_id = store
+            .create_local_message(uid, &input, 123456)
+            .expect("create local message");
+
+        let remote_id = store
+            .upsert_remote_message(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 900001,
+                    local_message_id: 0,
+                    channel_id: 100,
+                    channel_type: 1,
+                    timestamp: 1_700_000_000_000,
+                    from_uid: 200,
+                    message_type: 1,
+                    content: "hello".to_string(),
+                    status: 2,
+                    searchable_word: "hello".to_string(),
+                    setting: 0,
+                    pts: 1,
+                    order_seq: 1,
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("upsert remote row");
+        assert_ne!(local_id, remote_id);
+
+        store
+            .mark_message_sent(uid, local_id, 900001)
+            .expect("mark sent");
+
+        let all = store
+            .list_messages(uid, 100, 1, 10, 0)
+            .expect("list messages after merge");
+        assert_eq!(all.len(), 1, "duplicate server row should be merged");
+        assert_eq!(all[0].message_id, local_id);
+        assert_eq!(all[0].server_message_id, Some(900001));
     }
 
     #[test]
