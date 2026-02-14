@@ -4498,6 +4498,16 @@ impl State {
         total += self
             .sync_entities("channel".to_string(), scope.clone())
             .await?;
+        match self.sync_entities("user".to_string(), scope.clone()).await {
+            Ok(v) => total += v,
+            Err(e) if Self::is_unsupported_entity_error(&e) => {
+                eprintln!(
+                    "[SDK.actor] sync_channel skip unsupported entity_type=user scope={:?} reason={}",
+                    scope, e
+                );
+            }
+            Err(e) => return Err(e),
+        }
         match self
             .sync_entities("channel_extra".to_string(), scope.clone())
             .await
