@@ -901,6 +901,10 @@ impl LocalStore {
         }
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let current_uid = uid.parse::<u64>().ok();
+        let from_self = current_uid
+            .map(|current| current == input.from_uid)
+            .unwrap_or(false);
         let existed: Option<(i64, i64, i64)> = conn
             .query_row(
                 "SELECT id, COALESCE(order_seq, 0), COALESCE(pts, 0)
@@ -910,20 +914,27 @@ impl LocalStore {
             )
             .optional()
             .map_err(|e| Error::Storage(format!("query remote message: {e}")))?;
+        let existed_by_local: Option<(i64, i64, i64)> = if from_self && input.local_message_id > 0 {
+            conn.query_row(
+                "SELECT id, COALESCE(order_seq, 0), COALESCE(pts, 0)
+                 FROM message WHERE from_uid = ?1 AND local_message_id = ?2 LIMIT 1",
+                params![input.from_uid as i64, input.local_message_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("query local message by local_message_id: {e}")))?
+        } else {
+            None
+        };
 
-        if let Some((row_id, current_order_seq, current_pts)) = existed {
-            // Guard against out-of-order replay regressing a newer row.
-            if input.order_seq < current_order_seq
-                || (input.order_seq == current_order_seq && input.pts < current_pts)
-            {
-                return Ok(row_id as u64);
-            }
+        let update_row = |conn: &Connection, row_id: i64| -> Result<()> {
             conn.execute(
                 "UPDATE message
                  SET channel_id = ?1, channel_type = ?2, timestamp = ?3, from_uid = ?4,
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
-                     local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14
-                 WHERE id = ?15",
+                     local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
+                     message_id = ?15
+                 WHERE id = ?16",
                 params![
                     input.channel_id as i64,
                     input.channel_type,
@@ -939,10 +950,41 @@ impl LocalStore {
                     input.extra,
                     input.pts,
                     input.order_seq,
+                    input.server_message_id as i64,
                     row_id,
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
+            Ok(())
+        };
+
+        if let Some((row_id, current_order_seq, current_pts)) = existed {
+            // Guard against out-of-order replay regressing a newer row.
+            if input.order_seq < current_order_seq
+                || (input.order_seq == current_order_seq && input.pts < current_pts)
+            {
+                return Ok(row_id as u64);
+            }
+            if let Some((local_row_id, _, _)) = existed_by_local {
+                if local_row_id != row_id {
+                    // Keep the local row as canonical when local_message_id matches self-send.
+                    conn.execute("DELETE FROM message WHERE id = ?1", params![row_id])
+                        .map_err(|e| Error::Storage(format!("delete duplicate remote message: {e}")))?;
+                    update_row(&conn, local_row_id)?;
+                    return Ok(local_row_id as u64);
+                }
+            }
+            update_row(&conn, row_id)?;
+            return Ok(row_id as u64);
+        }
+
+        if let Some((row_id, current_order_seq, current_pts)) = existed_by_local {
+            if input.order_seq < current_order_seq
+                || (input.order_seq == current_order_seq && input.pts < current_pts)
+            {
+                return Ok(row_id as u64);
+            }
+            update_row(&conn, row_id)?;
             return Ok(row_id as u64);
         }
 
@@ -3199,6 +3241,99 @@ mod tests {
             .expect("second exists");
         assert_eq!(loaded_second.content, "updated");
         assert_eq!(loaded_second.status, 3);
+    }
+
+    #[test]
+    fn upsert_remote_message_prefers_self_local_message_id_for_merge() {
+        let store = test_store();
+        let uid = "100001087";
+        let local_message_id = 545600001u64;
+        let channel_id = 1112u64;
+
+        let local_row_id = store
+            .create_local_message(
+                uid,
+                &NewMessage {
+                    channel_id,
+                    channel_type: 1,
+                    from_uid: 100001087,
+                    message_type: 0,
+                    content: "pending".to_string(),
+                    searchable_word: "pending".to_string(),
+                    setting: 0,
+                    extra: "{}".to_string(),
+                },
+                local_message_id,
+            )
+            .expect("create local self message");
+
+        let merged_row_id = store
+            .upsert_remote_message(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 9001001,
+                    local_message_id,
+                    channel_id,
+                    channel_type: 1,
+                    timestamp: 1_700_000_000_100,
+                    from_uid: 100001087,
+                    message_type: 0,
+                    content: "pending".to_string(),
+                    status: 2,
+                    pts: 100,
+                    setting: 0,
+                    order_seq: 100,
+                    searchable_word: "pending".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("merge self echo");
+
+        assert_eq!(merged_row_id, local_row_id, "must update existing local row");
+
+        let second_device_row_id = store
+            .upsert_remote_message(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 9001002,
+                    local_message_id: 545600099,
+                    channel_id,
+                    channel_type: 1,
+                    timestamp: 1_700_000_000_200,
+                    from_uid: 100001087,
+                    message_type: 0,
+                    content: "from other device".to_string(),
+                    status: 2,
+                    pts: 101,
+                    setting: 0,
+                    order_seq: 101,
+                    searchable_word: "other".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert self message from another device");
+
+        assert_ne!(
+            second_device_row_id, local_row_id,
+            "different local_message_id should insert another row"
+        );
+
+        let all = store
+            .list_messages(uid, channel_id, 1, 50, 0)
+            .expect("list messages");
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.iter()
+                .filter(|m| m.server_message_id == Some(9001001))
+                .count(),
+            1
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|m| m.server_message_id == Some(9001002))
+                .count(),
+            1
+        );
     }
 
     #[test]
