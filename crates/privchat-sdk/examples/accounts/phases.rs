@@ -1787,11 +1787,25 @@ impl TestPhases {
                 .push("login_with_new_sdk returned false".to_string());
         }
 
+        let (notice_ok, notice_details) = manager
+            .verify_login_notice_persisted("alice", &suffix)
+            .await?;
+        metrics.rpc_calls += 1;
+        if notice_ok {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "system login notice not persisted in local message table: {notice_details}"
+            ));
+        }
+
         Ok(PhaseResult {
             phase_name: "login-test".to_string(),
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
-            details: "new sdk instance login/authenticate verified".to_string(),
+            details: format!(
+                "new sdk instance login/authenticate verified; login-notice check: {notice_details}"
+            ),
             metrics,
         })
     }

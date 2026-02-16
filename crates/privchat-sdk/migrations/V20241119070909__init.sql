@@ -7,7 +7,7 @@
 -- 消息表 - 核心消息存储（支持群聊/频道/1对1）
 CREATE TABLE IF NOT EXISTS message (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER,  -- u64，使用 INTEGER 存储（SQLite 支持 i64，u64 值通常不会超过 i64::MAX）
+    message_id INTEGER,  -- 历史字段（迁移后会标准化为 server_message_id）
     pts BIGINT DEFAULT 0,  -- pts（对齐 Telegram，per-channel 顺序）
     channel_id INTEGER NOT NULL DEFAULT 0,  -- u64，使用 INTEGER 存储
     channel_type INT DEFAULT 0,

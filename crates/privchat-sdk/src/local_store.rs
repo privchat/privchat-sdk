@@ -202,6 +202,37 @@ pub struct LocalStore {
     base_dir: Arc<PathBuf>,
     account_dbs: Arc<Mutex<HashMap<String, sled::Db>>>,
     global_db: Arc<Mutex<Option<sled::Db>>>,
+    sqlite_conns: Arc<Mutex<HashMap<String, Connection>>>,
+}
+
+/// A guard that returns the connection to the cache when dropped
+pub struct ConnGuard<'a> {
+    conn: Option<Connection>,
+    uid: String,
+    store: &'a LocalStore,
+}
+
+impl<'a> std::ops::Deref for ConnGuard<'a> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().unwrap()
+    }
+}
+
+impl<'a> std::ops::DerefMut for ConnGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().unwrap()
+    }
+}
+
+impl<'a> Drop for ConnGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            if let Ok(mut cache) = self.store.sqlite_conns.lock() {
+                cache.insert(self.uid.clone(), conn);
+            }
+        }
+    }
 }
 
 impl LocalStore {
@@ -216,6 +247,7 @@ impl LocalStore {
             base_dir: Arc::new(base),
             account_dbs: Arc::new(Mutex::new(HashMap::new())),
             global_db: Arc::new(Mutex::new(None)),
+            sqlite_conns: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -392,14 +424,30 @@ impl LocalStore {
         Ok(())
     }
 
-    fn conn_for_user(&self, uid: &str) -> Result<Connection> {
-        let paths = self.ensure_user_storage(uid)?;
-        let conn =
-            Connection::open(paths.db_path).map_err(|e| Error::Storage(format!("open db: {e}")))?;
-        let key = Self::derive_encryption_key(uid);
-        conn.pragma_update(None, "key", &key)
-            .map_err(|e| Error::Storage(format!("set db key: {e}")))?;
-        Ok(conn)
+    fn conn_for_user(&self, uid: &str) -> Result<ConnGuard<'_>> {
+        // Try to take a cached connection first
+        let cached = self
+            .sqlite_conns
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.remove(uid));
+        let conn = if let Some(c) = cached {
+            c
+        } else {
+            // No cached connection, open a new one
+            let paths = self.ensure_user_storage(uid)?;
+            let c = Connection::open(paths.db_path)
+                .map_err(|e| Error::Storage(format!("open db: {e}")))?;
+            let key = Self::derive_encryption_key(uid);
+            c.pragma_update(None, "key", &key)
+                .map_err(|e| Error::Storage(format!("set db key: {e}")))?;
+            c
+        };
+        Ok(ConnGuard {
+            conn: Some(conn),
+            uid: uid.to_string(),
+            store: self,
+        })
     }
 
     pub fn save_login(&self, uid: &str, login: &LoginResult) -> Result<()> {
@@ -866,7 +914,7 @@ impl LocalStore {
         let now_ms = chrono::Utc::now().timestamp_millis();
         conn.execute(
             "INSERT INTO message (
-                message_id, channel_id, channel_type, from_uid, type, content,
+                server_message_id, channel_id, channel_type, from_uid, type, content,
                 status, created_at, updated_at, searchable_word, local_message_id, setting, extra
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
@@ -908,8 +956,8 @@ impl LocalStore {
         let existed: Option<(i64, i64, i64)> = conn
             .query_row(
                 "SELECT id, COALESCE(order_seq, 0), COALESCE(pts, 0)
-                 FROM message WHERE channel_id = ?1 AND message_id = ?2 LIMIT 1",
-                params![input.channel_id as i64, input.server_message_id as i64],
+                 FROM message WHERE server_message_id = ?1 LIMIT 1",
+                params![input.server_message_id as i64],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -933,7 +981,7 @@ impl LocalStore {
                  SET channel_id = ?1, channel_type = ?2, timestamp = ?3, from_uid = ?4,
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
-                     message_id = ?15
+                     server_message_id = ?15
                  WHERE id = ?16",
                 params![
                     input.channel_id as i64,
@@ -969,7 +1017,9 @@ impl LocalStore {
                 if local_row_id != row_id {
                     // Keep the local row as canonical when local_message_id matches self-send.
                     conn.execute("DELETE FROM message WHERE id = ?1", params![row_id])
-                        .map_err(|e| Error::Storage(format!("delete duplicate remote message: {e}")))?;
+                        .map_err(|e| {
+                            Error::Storage(format!("delete duplicate remote message: {e}"))
+                        })?;
                     update_row(&conn, local_row_id)?;
                     return Ok(local_row_id as u64);
                 }
@@ -990,7 +1040,7 @@ impl LocalStore {
 
         conn.execute(
             "INSERT INTO message (
-                message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
+                server_message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
                 content, status, created_at, updated_at, searchable_word, local_message_id,
                 setting, order_seq, extra
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
@@ -1020,14 +1070,18 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(
             "SELECT
-                id, message_id, channel_id, channel_type, from_uid, type,
-                content, status, created_at, updated_at, extra
+                id, server_message_id, channel_id, channel_type, from_uid, type,
+                content, status, created_at, updated_at, extra, local_message_id
              FROM message WHERE id = ?1 LIMIT 1",
             params![message_id as i64],
             |row| {
                 Ok(StoredMessage {
                     message_id: row.get::<_, i64>(0)? as u64,
                     server_message_id: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                    local_message_id: row
+                        .get::<_, Option<i64>>(11)?
+                        .filter(|&v| v > 0)
+                        .map(|v| v as u64),
                     channel_id: row.get::<_, i64>(2)? as u64,
                     channel_type: row.get::<_, i32>(3)?,
                     from_uid: row.get::<_, i64>(4)? as u64,
@@ -1056,8 +1110,8 @@ impl LocalStore {
         let mut stmt = conn
             .prepare(
                 "SELECT
-                    id, message_id, channel_id, channel_type, from_uid, type,
-                    content, status, created_at, updated_at, extra
+                    id, server_message_id, channel_id, channel_type, from_uid, type,
+                    content, status, created_at, updated_at, extra, local_message_id
                  FROM message
                  WHERE channel_id = ?1 AND channel_type = ?2
                  ORDER BY id DESC
@@ -1071,6 +1125,10 @@ impl LocalStore {
                     Ok(StoredMessage {
                         message_id: row.get::<_, i64>(0)? as u64,
                         server_message_id: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                        local_message_id: row
+                            .get::<_, Option<i64>>(11)?
+                            .filter(|&v| v > 0)
+                            .map(|v| v as u64),
                         channel_id: row.get::<_, i64>(2)? as u64,
                         channel_type: row.get::<_, i32>(3)?,
                         from_uid: row.get::<_, i64>(4)? as u64,
@@ -1150,7 +1208,10 @@ impl LocalStore {
                                     NULLIF(u.alias, ''),
                                     NULLIF(u.nickname, ''),
                                     NULLIF(u.username, ''),
-                                    CAST(peer.peer_user_id AS TEXT)
+                                    CASE
+                                        WHEN peer.peer_user_id = 1 THEN 'System Message'
+                                        ELSE CAST(peer.peer_user_id AS TEXT)
+                                    END
                                 )
                                 FROM (
                                     SELECT COALESCE(
@@ -1175,8 +1236,11 @@ impl LocalStore {
                                 WHERE peer.peer_user_id IS NOT NULL
                                 LIMIT 1
                             ),
-                            NULLIF(c.channel_name, ''),
-                            CAST(c.channel_id AS TEXT)
+                            CASE
+                                WHEN NULLIF(c.channel_name, '') IN ('1', '__system_1__') THEN 'System Message'
+                                ELSE NULLIF(c.channel_name, '')
+                            END,
+                            ''
                         )
                     WHEN c.channel_type = 2 THEN COALESCE(
                         NULLIF(c.channel_name, ''),
@@ -1220,7 +1284,7 @@ impl LocalStore {
                         ORDER BY m.created_at DESC, m.id DESC
                         LIMIT 1
                     ),
-                    c.last_msg_timestamp
+                    0
                 ) AS resolved_last_msg_timestamp,
                 last_local_message_id,
                 COALESCE(
@@ -1232,7 +1296,7 @@ impl LocalStore {
                         ORDER BY m.created_at DESC, m.id DESC
                         LIMIT 1
                     ),
-                    c.last_msg_content
+                    ''
                 ) AS resolved_last_msg_content,
                 c.updated_at
              FROM channel c
@@ -1280,7 +1344,10 @@ impl LocalStore {
                                     NULLIF(u.alias, ''),
                                     NULLIF(u.nickname, ''),
                                     NULLIF(u.username, ''),
-                                    CAST(peer.peer_user_id AS TEXT)
+                                    CASE
+                                        WHEN peer.peer_user_id = 1 THEN 'System Message'
+                                        ELSE CAST(peer.peer_user_id AS TEXT)
+                                    END
                                 )
                                 FROM (
                                     SELECT COALESCE(
@@ -1305,8 +1372,11 @@ impl LocalStore {
                                 WHERE peer.peer_user_id IS NOT NULL
                                 LIMIT 1
                             ),
-                            NULLIF(c.channel_name, ''),
-                            CAST(c.channel_id AS TEXT)
+                            CASE
+                                WHEN NULLIF(c.channel_name, '') IN ('1', '__system_1__') THEN 'System Message'
+                                ELSE NULLIF(c.channel_name, '')
+                            END,
+                            ''
                         )
                         WHEN c.channel_type = 2 THEN COALESCE(
                             NULLIF(c.channel_name, ''),
@@ -1350,7 +1420,7 @@ impl LocalStore {
                             ORDER BY m.created_at DESC, m.id DESC
                             LIMIT 1
                         ),
-                        c.last_msg_timestamp
+                        0
                     ) AS resolved_last_msg_timestamp,
                     last_local_message_id,
                     COALESCE(
@@ -1362,7 +1432,7 @@ impl LocalStore {
                             ORDER BY m.created_at DESC, m.id DESC
                             LIMIT 1
                         ),
-                        c.last_msg_content
+                        ''
                     ) AS resolved_last_msg_content,
                     c.updated_at
                  FROM channel c
@@ -2301,15 +2371,15 @@ impl LocalStore {
         let tx = conn
             .transaction()
             .map_err(|e| Error::Storage(format!("mark message sent begin tx: {e}")))?;
-        let channel_id: Option<i64> = tx
+        let exists: Option<i64> = tx
             .query_row(
-                "SELECT channel_id FROM message WHERE id = ?1 LIMIT 1",
+                "SELECT id FROM message WHERE id = ?1 LIMIT 1",
                 params![message_id as i64],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| Error::Storage(format!("mark message sent find channel: {e}")))?;
-        let Some(channel_id) = channel_id else {
+            .map_err(|e| Error::Storage(format!("mark message sent find message: {e}")))?;
+        let Some(_) = exists else {
             return Err(Error::Storage(format!(
                 "mark message sent failed: message.id={} not found",
                 message_id
@@ -2317,14 +2387,14 @@ impl LocalStore {
         };
         tx.execute(
             "DELETE FROM message
-             WHERE channel_id = ?1 AND message_id = ?2 AND id != ?3",
-            params![channel_id, server_message_id as i64, message_id as i64],
+             WHERE server_message_id = ?1 AND id != ?2",
+            params![server_message_id as i64, message_id as i64],
         )
         .map_err(|e| Error::Storage(format!("mark message sent dedupe: {e}")))?;
         let updated = tx
             .execute(
                 "UPDATE message
-                 SET message_id = ?1, status = 2, updated_at = ?2
+                 SET server_message_id = ?1, status = 2, updated_at = ?2
                  WHERE id = ?3",
                 params![server_message_id as i64, now_ms, message_id as i64],
             )
@@ -3289,7 +3359,10 @@ mod tests {
             )
             .expect("merge self echo");
 
-        assert_eq!(merged_row_id, local_row_id, "must update existing local row");
+        assert_eq!(
+            merged_row_id, local_row_id,
+            "must update existing local row"
+        );
 
         let second_device_row_id = store
             .upsert_remote_message(

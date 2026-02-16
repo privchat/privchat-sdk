@@ -19,6 +19,7 @@ use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterR
 use privchat_protocol::rpc::file::upload::{
     FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
 };
+use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
     ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelSyncPayload,
@@ -524,6 +525,7 @@ pub struct UpsertRemoteMessageInput {
 pub struct StoredMessage {
     pub message_id: u64,
     pub server_message_id: Option<u64>,
+    pub local_message_id: Option<u64>,
     pub channel_id: u64,
     pub channel_type: i32,
     pub from_uid: u64,
@@ -1088,8 +1090,10 @@ enum Command {
         message_ids: Vec<u64>,
         resp: oneshot::Sender<Result<usize>>,
     },
+    KickOutboundDrain,
     CreateLocalMessage {
         input: NewMessage,
+        local_message_id: Option<u64>,
         resp: oneshot::Sender<Result<u64>>,
     },
     GetMessageById {
@@ -1452,6 +1456,7 @@ struct State {
     cache_debug_log: bool,
     cache_hit_count: u64,
     cache_miss_count: u64,
+    pending_prelogin_inbound_frames: Vec<(u8, Vec<u8>)>,
 }
 
 impl State {
@@ -2076,6 +2081,61 @@ impl State {
         }
     }
 
+    fn json_field_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
+        let mut cur = value;
+        for key in path {
+            cur = cur.get(*key)?;
+        }
+        cur.as_u64()
+            .or_else(|| cur.as_i64().and_then(|v| u64::try_from(v).ok()))
+            .or_else(|| cur.as_str().and_then(|s| s.parse::<u64>().ok()))
+    }
+
+    fn json_field_string(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+        let mut cur = value;
+        for key in path {
+            cur = cur.get(*key)?;
+        }
+        cur.as_str().map(|s| s.to_string())
+    }
+
+    fn push_message_to_status_sync_item(push: &PushMessageRequest) -> Option<SyncEntityItem> {
+        let payload_json: serde_json::Value = serde_json::from_slice(&push.payload).ok()?;
+        let notification_type =
+            Self::json_field_string(&payload_json, &["metadata", "notification_type"])?;
+
+        match notification_type.as_str() {
+            // "消息已读"通知：只更新状态，不落 message 表
+            "read_receipt" => {
+                let message_id =
+                    Self::json_field_u64(&payload_json, &["metadata", "message_id"]).unwrap_or(0);
+                if message_id == 0 {
+                    return None;
+                }
+                let payload = serde_json::json!({
+                    "message_id": message_id,
+                    "server_message_id": message_id,
+                    "channel_id": push.channel_id,
+                    "channel_type": i32::from(push.channel_type),
+                    "status": 3,
+                    "is_read": true,
+                    "readed": true,
+                    "read": true,
+                    "updated_at": i64::from(push.timestamp),
+                });
+                Some(SyncEntityItem {
+                    entity_id: message_id.to_string(),
+                    version: u64::from(push.message_seq),
+                    deleted: false,
+                    payload: Some(payload),
+                })
+            }
+            // "已读位置更新"通知：不落 message 表；当前通过 read_pts 事件路径处理
+            "user_read_pts" => None,
+            _ => None,
+        }
+    }
+
     fn send_message_to_sync_item(
         req: SendMessageRequest,
         channel_type: u8,
@@ -2552,27 +2612,18 @@ impl State {
                         continue;
                     };
                     let existing = self.storage.get_channel_by_id(channel_id).await?;
-                    let incoming_last_ts = channel_sync.last_msg_timestamp.or_else(|| {
-                        Self::json_get_i64(&payload, &["last_msg_timestamp", "updated_at"])
-                    });
-                    let incoming_last_content = channel_sync
-                        .last_msg_content
-                        .clone()
-                        .or_else(|| Self::json_get_string(&payload, &["last_msg_content"]));
+                    // Local-first rule:
+                    // channel last message fields are derived from local message table only.
+                    // Server channel sync must not overwrite local preview/timestamp.
                     let (last_msg_timestamp, last_msg_content, last_local_message_id) =
                         if let Some(existing) = existing.as_ref() {
                             (
-                                incoming_last_ts.unwrap_or(existing.last_msg_timestamp),
-                                incoming_last_content
-                                    .unwrap_or_else(|| existing.last_msg_content.clone()),
+                                existing.last_msg_timestamp,
+                                existing.last_msg_content.clone(),
                                 existing.last_local_message_id,
                             )
                         } else {
-                            (
-                                incoming_last_ts.unwrap_or(now_ms),
-                                incoming_last_content.unwrap_or_default(),
-                                0,
-                            )
+                            (0, String::new(), 0)
                         };
                     // `channel_unread` sync may be unavailable on some server deployments.
                     // Keep local unread as source-of-truth floor to avoid clearing badges on app restart.
@@ -2988,6 +3039,7 @@ impl State {
                             &content,
                             timestamp,
                             message_id,
+                            Some(from_uid),
                             !from_self,
                         )
                         .await;
@@ -3502,10 +3554,21 @@ impl State {
             )?;
             match self.direct_send_message(send_req).await {
                 Ok(resp) => {
-                    let _ = self
+                    if let Err(err) = self
                         .storage
                         .mark_message_sent(message_id, resp.server_message_id)
-                        .await;
+                        .await
+                    {
+                        // Server has accepted this message; ack queue item to avoid duplicate sends.
+                        let _ = self.storage.normal_queue_ack(vec![message_id]).await;
+                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                            kind: "normal".to_string(),
+                            action: "commit_failed".to_string(),
+                            message_id: Some(message_id),
+                            queue_index: None,
+                        });
+                        return Err(err);
+                    }
                     let _ = self.storage.normal_queue_ack(vec![message_id]).await;
                     let last_ts = if msg.created_at > 0 {
                         msg.created_at
@@ -3519,6 +3582,7 @@ impl State {
                             &msg.content,
                             last_ts,
                             message_id,
+                            Some(msg.from_uid),
                             false,
                         )
                         .await;
@@ -3587,10 +3651,24 @@ impl State {
                 .await
             {
                 Ok(resp) => {
-                    let _ = self
+                    if let Err(err) = self
                         .storage
                         .mark_message_sent(message_id, resp.server_message_id)
-                        .await;
+                        .await
+                    {
+                        // Server has accepted this message; ack queue item to avoid duplicate sends.
+                        let _ = self
+                            .storage
+                            .file_queue_ack(queue_index, vec![message_id])
+                            .await;
+                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                            kind: "file".to_string(),
+                            action: "commit_failed".to_string(),
+                            message_id: Some(message_id),
+                            queue_index: Some(queue_index),
+                        });
+                        return Err(err);
+                    }
                     let _ = self
                         .storage
                         .file_queue_ack(queue_index, vec![message_id])
@@ -3881,13 +3959,37 @@ impl State {
     ) -> Result<LoginResult> {
         eprintln!("[SDK.actor] login: enter");
         let timeout = self.timeout();
+        let os = std::env::consts::OS.to_string();
+        let device_name = std::env::var("PRIVCHAT_DEVICE_NAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| format!("privchat-{os}"));
+        let device_model = std::env::var("PRIVCHAT_DEVICE_MODEL")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let app_id = std::env::var("PRIVCHAT_APP_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "io.privchat.rust".to_string());
         let req = RpcRequest {
             route: "account/auth/login".to_string(),
             body: serde_json::to_value(AuthLoginRequest {
                 username,
                 password,
                 device_id: device_id.clone(),
-                device_info: None,
+                device_info: Some(DeviceInfo {
+                    device_id: device_id.clone(),
+                    device_type: DeviceType::from_str(&os),
+                    app_id: app_id.clone(),
+                    push_token: None,
+                    push_channel: None,
+                    device_name,
+                    device_model,
+                    os_version: Some(os),
+                    app_version: Some("0.1.0".to_string()),
+                    manufacturer: None,
+                    device_fingerprint: None,
+                }),
             })
             .map_err(|e| Error::Serialization(format!("encode login body: {e}")))?,
         };
@@ -3925,6 +4027,9 @@ impl State {
         self.storage.save_login(uid.clone(), out.clone()).await?;
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
+        if let Err(e) = self.replay_prelogin_inbound_frames().await {
+            eprintln!("[SDK.inbound] replay after login failed: {e}");
+        }
         eprintln!("[SDK.actor] login: success user_id={}", out.user_id);
         Ok(out)
     }
@@ -3936,6 +4041,18 @@ impl State {
         device_id: String,
     ) -> Result<LoginResult> {
         let timeout = self.timeout();
+        let os = std::env::consts::OS.to_string();
+        let device_name = std::env::var("PRIVCHAT_DEVICE_NAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| format!("privchat-{os}"));
+        let device_model = std::env::var("PRIVCHAT_DEVICE_MODEL")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let app_id = std::env::var("PRIVCHAT_APP_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "io.privchat.rust".to_string());
         let req = RpcRequest {
             route: routes::account_user::REGISTER.to_string(),
             body: serde_json::to_value(UserRegisterRequest {
@@ -3945,7 +4062,19 @@ impl State {
                 phone: None,
                 email: None,
                 device_id: device_id.clone(),
-                device_info: None,
+                device_info: Some(DeviceInfo {
+                    device_id: device_id.clone(),
+                    device_type: DeviceType::from_str(&os),
+                    app_id,
+                    push_token: None,
+                    push_channel: None,
+                    device_name,
+                    device_model,
+                    os_version: Some(os),
+                    app_version: Some("0.1.0".to_string()),
+                    manufacturer: None,
+                    device_fingerprint: None,
+                }),
             })
             .map_err(|e| Error::Serialization(format!("encode register body: {e}")))?,
         };
@@ -3980,6 +4109,9 @@ impl State {
         self.storage.save_login(uid.clone(), out.clone()).await?;
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
+        if let Err(e) = self.replay_prelogin_inbound_frames().await {
+            eprintln!("[SDK.inbound] replay after register failed: {e}");
+        }
         Ok(out)
     }
 
@@ -4241,9 +4373,6 @@ impl State {
     }
 
     async fn handle_inbound_frame(&mut self, biz_type: u8, data: Vec<u8>) -> Result<usize> {
-        if self.session_state != SessionState::Authenticated {
-            return Ok(0);
-        }
         if inbound_logs_enabled() {
             eprintln!(
                 "[SDK.inbound] frame biz_type={} len={}",
@@ -4256,7 +4385,41 @@ impl State {
             eprintln!("[SDK.inbound] frame message_type={:?}", message_type);
         }
         Self::log_inbound_decoded(message_type, &data);
-        let mut items = Vec::new();
+        // Do not drop server push frames during login->authenticate gap.
+        // current_uid is set by login, while session_state may still be LoggedIn.
+        // If we gate strictly by Authenticated, login notice pushes are lost and only
+        // channel preview is updated by sync, leaving message table empty.
+        if self.current_uid.is_none() {
+            match message_type {
+                MessageType::SendMessageRequest
+                | MessageType::PushMessageRequest
+                | MessageType::PushBatchRequest
+                | MessageType::PublishRequest => {
+                    if self.pending_prelogin_inbound_frames.len() >= 256 {
+                        let _ = self.pending_prelogin_inbound_frames.remove(0);
+                    }
+                    self.pending_prelogin_inbound_frames.push((biz_type, data));
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] queued pre-login frame message_type={:?} queued={}",
+                            message_type,
+                            self.pending_prelogin_inbound_frames.len()
+                        );
+                    }
+                }
+                _ => {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] skip frame before login message_type={:?} biz_type={}",
+                            message_type, biz_type
+                        );
+                    }
+                }
+            }
+            return Ok(0);
+        }
+        let mut message_items = Vec::new();
+        let mut message_status_items = Vec::new();
         match message_type {
             MessageType::SendMessageRequest => {
                 let req: SendMessageRequest = decode_message(&data).map_err(|e| {
@@ -4291,22 +4454,28 @@ impl State {
                             channel_type
                         );
                     }
-                    items.push(item);
+                    message_items.push(item);
                 }
             }
             MessageType::PushMessageRequest => {
                 let req: PushMessageRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
-                items.push(Self::push_message_to_sync_item(req));
+                if let Some(status_item) = Self::push_message_to_status_sync_item(&req) {
+                    message_status_items.push(status_item);
+                } else {
+                    message_items.push(Self::push_message_to_sync_item(req));
+                }
             }
             MessageType::PushBatchRequest => {
                 let req: PushBatchRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push batch: {e}")))?;
-                items.extend(
-                    req.messages
-                        .into_iter()
-                        .map(Self::push_message_to_sync_item),
-                );
+                for push in req.messages {
+                    if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                        message_status_items.push(status_item);
+                    } else {
+                        message_items.push(Self::push_message_to_sync_item(push));
+                    }
+                }
             }
             MessageType::PublishRequest => {
                 let req: PublishRequest = decode_message(&data)
@@ -4318,7 +4487,11 @@ impl State {
                             push.channel_id
                         );
                     }
-                    items.push(Self::push_message_to_sync_item(push));
+                    if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                        message_status_items.push(status_item);
+                    } else {
+                        message_items.push(Self::push_message_to_sync_item(push));
+                    }
                 } else if let Ok(batch) = decode_message::<PushBatchRequest>(&req.payload) {
                     if inbound_logs_enabled() {
                         eprintln!(
@@ -4326,12 +4499,13 @@ impl State {
                             batch.messages.len()
                         );
                     }
-                    items.extend(
-                        batch
-                            .messages
-                            .into_iter()
-                            .map(Self::push_message_to_sync_item),
-                    );
+                    for push in batch.messages {
+                        if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                            message_status_items.push(status_item);
+                        } else {
+                            message_items.push(Self::push_message_to_sync_item(push));
+                        }
+                    }
                 } else {
                     if inbound_logs_enabled() {
                         eprintln!(
@@ -4352,8 +4526,40 @@ impl State {
             }
         }
 
-        self.enqueue_and_apply_sync_items("message".to_string(), None, items)
-            .await
+        let mut applied = 0usize;
+        if !message_items.is_empty() {
+            applied += self
+                .enqueue_and_apply_sync_items("message".to_string(), None, message_items)
+                .await?;
+        }
+        if !message_status_items.is_empty() {
+            applied += self
+                .enqueue_and_apply_sync_items(
+                    "message_status".to_string(),
+                    None,
+                    message_status_items,
+                )
+                .await?;
+        }
+        Ok(applied)
+    }
+
+    async fn replay_prelogin_inbound_frames(&mut self) -> Result<usize> {
+        if self.current_uid.is_none() || self.pending_prelogin_inbound_frames.is_empty() {
+            return Ok(0);
+        }
+        let pending = std::mem::take(&mut self.pending_prelogin_inbound_frames);
+        let mut applied = 0usize;
+        for (biz_type, data) in pending {
+            applied += self.handle_inbound_frame(biz_type, data).await?;
+        }
+        if inbound_logs_enabled() {
+            eprintln!(
+                "[SDK.inbound] replayed pre-login frames applied={}",
+                applied
+            );
+        }
+        Ok(applied)
     }
 
     async fn run_bootstrap_sync(&mut self) -> Result<()> {
@@ -4487,17 +4693,153 @@ impl State {
             ));
         }
 
+        self.hydrate_system_channel_messages_from_history().await?;
+
+        Ok(())
+    }
+
+    async fn hydrate_system_channel_messages_from_history(&mut self) -> Result<()> {
+        let channels = self.storage.list_channels(200, 0).await?;
+        for channel in channels {
+            if channel.channel_type != 1 && channel.channel_type != 0 {
+                continue;
+            }
+            let normalized_channel_type = if channel.channel_type == 0 {
+                1
+            } else {
+                channel.channel_type
+            };
+            let is_system_channel = channel.channel_name == "1"
+                || channel.channel_remark == "1"
+                || channel.channel_name == "__system_1__";
+            if !is_system_channel {
+                continue;
+            }
+            eprintln!(
+                "[SDK.actor] bootstrap hydrate system channel={} channel_type={} last_msg='{}'",
+                channel.channel_id, normalized_channel_type, channel.last_msg_content
+            );
+            let existing = self
+                .storage
+                .list_messages(channel.channel_id, normalized_channel_type, 1, 0)
+                .await?;
+            if !existing.is_empty() {
+                eprintln!(
+                    "[SDK.actor] bootstrap hydrate skip channel={} existing_local_messages={}",
+                    channel.channel_id,
+                    existing.len()
+                );
+                continue;
+            }
+
+            let req = MessageHistoryGetRequest {
+                user_id: 0,
+                channel_id: channel.channel_id,
+                before_server_message_id: None,
+                limit: Some(20),
+            };
+            let body = serde_json::to_value(req)
+                .map_err(|e| Error::Serialization(format!("encode history req: {e}")))?;
+            let raw = self
+                .rpc_call_json(routes::message_history::GET.to_string(), body)
+                .await?;
+            let resp: MessageHistoryResponse = serde_json::from_value(raw)
+                .map_err(|e| Error::Serialization(format!("decode history resp: {e}")))?;
+            eprintln!(
+                "[SDK.actor] bootstrap hydrate history channel={} messages={}",
+                channel.channel_id,
+                resp.messages.len()
+            );
+            if resp.messages.is_empty() {
+                continue;
+            }
+
+            for item in resp.messages {
+                let timestamp_ms = chrono::DateTime::parse_from_rfc3339(&item.timestamp)
+                    .map(|dt| dt.timestamp_millis())
+                    .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+                let message_type = match item.message_type.as_str() {
+                    "image" => i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(0),
+                    "audio" => i32::try_from(ContentMessageType::Audio.as_u32()).unwrap_or(0),
+                    "video" => i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(0),
+                    "file" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
+                    _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
+                };
+                let message_id = self
+                    .storage
+                    .upsert_remote_message(UpsertRemoteMessageInput {
+                        server_message_id: item.message_id,
+                        local_message_id: 0,
+                        channel_id: item.channel_id,
+                        channel_type: normalized_channel_type,
+                        timestamp: timestamp_ms,
+                        from_uid: item.sender_id,
+                        message_type,
+                        content: item.content.clone(),
+                        status: 2,
+                        pts: 0,
+                        setting: 0,
+                        order_seq: 0,
+                        searchable_word: String::new(),
+                        extra: String::new(),
+                    })
+                    .await?;
+                let from_self = self
+                    .current_uid
+                    .as_ref()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|uid| uid == item.sender_id)
+                    .unwrap_or(false);
+                let _ = self
+                    .update_channel_last_message(
+                        item.channel_id,
+                        normalized_channel_type,
+                        &item.content,
+                        timestamp_ms,
+                        message_id,
+                        Some(item.sender_id),
+                        !from_self,
+                    )
+                    .await;
+            }
+        }
         Ok(())
     }
 
     async fn sync_channel(&mut self, channel_id: u64, channel_type: i32) -> Result<usize> {
         // Keep channel-targeted sync aligned with local-first bootstrap:
-        // channel base + extra + unread + (group member for group channels).
+        // channel base + message timeline + status + extra + unread + (group member for group channels).
         let scope = Some(format!("{channel_type}:{channel_id}"));
         let mut total = 0usize;
         total += self
             .sync_entities("channel".to_string(), scope.clone())
             .await?;
+        match self
+            .sync_entities("message".to_string(), scope.clone())
+            .await
+        {
+            Ok(v) => total += v,
+            Err(e) if Self::is_unsupported_entity_error(&e) => {
+                eprintln!(
+                    "[SDK.actor] sync_channel skip unsupported entity_type=message scope={:?} reason={}",
+                    scope, e
+                );
+            }
+            Err(e) => return Err(e),
+        }
+        match self
+            .sync_entities("message_status".to_string(), scope.clone())
+            .await
+        {
+            Ok(v) => total += v,
+            Err(e) if Self::is_unsupported_entity_error(&e) => {
+                eprintln!(
+                    "[SDK.actor] sync_channel skip unsupported entity_type=message_status scope={:?} reason={}",
+                    scope, e
+                );
+            }
+            Err(e) => return Err(e),
+        }
         match self.sync_entities("user".to_string(), scope.clone()).await {
             Ok(v) => total += v,
             Err(e) if Self::is_unsupported_entity_error(&e) => {
@@ -5374,6 +5716,7 @@ impl State {
         content: &str,
         timestamp_ms: i64,
         message_id: u64,
+        from_uid: Option<u64>,
         bump_unread: bool,
     ) -> Result<()> {
         let existing = self.storage.get_channel_by_id(channel_id).await?;
@@ -5392,8 +5735,22 @@ impl State {
                     },
                 )
             } else {
+                let current_uid = self
+                    .current_uid
+                    .as_ref()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or_default();
+                let inferred_dm_name = if channel_type == 1 {
+                    match from_uid {
+                        Some(1) => "System Message".to_string(),
+                        Some(uid) if uid > 0 && uid != current_uid => uid.to_string(),
+                        _ => String::new(),
+                    }
+                } else {
+                    channel_id.to_string()
+                };
                 (
-                    channel_id.to_string(),
+                    inferred_dm_name,
                     String::new(),
                     String::new(),
                     0,
@@ -5432,6 +5789,7 @@ pub struct PrivchatSdk {
     shutting_down: Arc<AtomicBool>,
     supervised_sync_running: Arc<AtomicBool>,
     startup_error: Arc<StdMutex<Option<Error>>>,
+    snowflake: Arc<snowflake_me::Snowflake>,
 }
 
 impl PrivchatSdk {
@@ -5473,6 +5831,22 @@ impl PrivchatSdk {
         let task_registry = TaskRegistry::new();
         let startup_error = Arc::new(StdMutex::new(None));
         let actor_startup_error = startup_error.clone();
+        let machine_id: u16 = (std::process::id() as u16) & 0x1f;
+        let data_center_id: u16 = (chrono::Utc::now().timestamp_millis() as u16) & 0x1f;
+        let snowflake = snowflake_me::Snowflake::builder()
+            .machine_id(&|| Ok(machine_id))
+            .data_center_id(&|| Ok(data_center_id))
+            .finalize()
+            .map(Arc::new)
+            .unwrap_or_else(|_| {
+                // Fallback: use defaults
+                Arc::new(
+                    snowflake_me::Snowflake::builder()
+                        .finalize()
+                        .expect("default snowflake must work"),
+                )
+            });
+        let actor_snowflake = snowflake.clone();
         let actor_task = runtime_provider.spawn(async move {
             eprintln!("[SDK.actor] loop: started");
             if configured_data_dir.trim().is_empty() {
@@ -5494,23 +5868,7 @@ impl PrivchatSdk {
                     return;
                 }
             };
-            let machine_id: u16 = (std::process::id() as u16) & 0x1f;
-            let data_center_id: u16 = (chrono::Utc::now().timestamp_millis() as u16) & 0x1f;
-            let snowflake = match snowflake_me::Snowflake::builder()
-                .machine_id(&|| Ok(machine_id))
-                .data_center_id(&|| Ok(data_center_id))
-                .finalize()
-            {
-                Ok(v) => Arc::new(v),
-                Err(e) => {
-                    if let Ok(mut locked) = actor_startup_error.lock() {
-                        *locked =
-                            Some(Error::InvalidState(format!("snowflake init failed: {e:?}")));
-                    }
-                    eprintln!("[SDK.actor] snowflake init failed: {e:?}");
-                    return;
-                }
-            };
+            let snowflake = actor_snowflake;
             let current_uid = storage.load_current_uid().await.ok().flatten();
             let saved = if let Some(uid) = &current_uid {
                 storage.load_session(uid.clone()).await.ok().flatten()
@@ -5545,6 +5903,7 @@ impl PrivchatSdk {
                 cache_debug_log: std::env::var("PRIVCHAT_CACHE_LOG").ok().as_deref() == Some("1"),
                 cache_hit_count: 0,
                 cache_miss_count: 0,
+                pending_prelogin_inbound_frames: Vec::new(),
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut health_tick = interval(Duration::from_secs(2));
@@ -6240,7 +6599,6 @@ impl PrivchatSdk {
                                         .storage
                                         .update_message_status(message_id, 1)
                                         .await;
-                                    let _ = state.drain_outbound_queues().await;
                                     Ok(pushed_id)
                                 }
                                 Err(e) => Err(e),
@@ -6260,6 +6618,18 @@ impl PrivchatSdk {
                                     queue_index: None,
                                 },
                             );
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::MessageSendStatusChanged {
+                                    message_id,
+                                    status: 1,
+                                    server_message_id: None,
+                                },
+                            );
+                            let _ = actor_cmd_tx.try_send(Command::KickOutboundDrain);
                         }
                         let _ = resp.send(result);
                     }
@@ -6315,7 +6685,6 @@ impl PrivchatSdk {
                                                     .storage
                                                     .update_message_status(message_id, 1)
                                                     .await;
-                                                let _ = state.drain_outbound_queues().await;
                                                 Ok(FileQueueRef {
                                                     queue_index,
                                                     message_id: file_msg_id,
@@ -6342,6 +6711,18 @@ impl PrivchatSdk {
                                     queue_index: Some(queue_ref.queue_index),
                                 },
                             );
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::MessageSendStatusChanged {
+                                    message_id,
+                                    status: 1,
+                                    server_message_id: None,
+                                },
+                            );
+                            let _ = actor_cmd_tx.try_send(Command::KickOutboundDrain);
                         }
                         let _ = resp.send(result);
                     }
@@ -6384,18 +6765,29 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
-                    Command::CreateLocalMessage { input, resp } => {
+                    Command::KickOutboundDrain => {
+                        if state.should_process_outbound_queue() {
+                            let _ = state.drain_outbound_queues().await;
+                        }
+                    }
+                    Command::CreateLocalMessage { input, local_message_id, resp } => {
                         let channel_id = input.channel_id;
                         let channel_type = input.channel_type;
                         let result = match state.current_uid_required() {
-                            Ok(_) => match state.next_local_message_id() {
-                                Ok(local_message_id) => {
-                                    state
-                                        .storage
-                                        .create_local_message(local_message_id, input)
-                                        .await
+                            Ok(_) => {
+                                let lid = match local_message_id {
+                                    Some(id) => Ok(id),
+                                    None => state.next_local_message_id(),
+                                };
+                                match lid {
+                                    Ok(local_message_id) => {
+                                        state
+                                            .storage
+                                            .create_local_message(local_message_id, input)
+                                            .await
+                                    }
+                                    Err(e) => Err(e),
                                 }
-                                Err(e) => Err(e),
                             },
                             Err(e) => Err(e),
                         };
@@ -7357,6 +7749,7 @@ impl PrivchatSdk {
             shutting_down: Arc::new(AtomicBool::new(false)),
             supervised_sync_running: Arc::new(AtomicBool::new(false)),
             startup_error,
+            snowflake,
         }
     }
 
@@ -7933,12 +8326,27 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    pub fn generate_local_message_id(&self) -> Result<u64> {
+        self.snowflake
+            .next_id()
+            .map_err(|e| Error::Storage(format!("generate local_message_id failed: {e:?}")))
+    }
+
     pub async fn create_local_message(&self, input: NewMessage) -> Result<u64> {
+        self.create_local_message_with_id(input, None).await
+    }
+
+    pub async fn create_local_message_with_id(
+        &self,
+        input: NewMessage,
+        local_message_id: Option<u64>,
+    ) -> Result<u64> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::CreateLocalMessage {
                 input,
+                local_message_id,
                 resp: resp_tx,
             })
             .await

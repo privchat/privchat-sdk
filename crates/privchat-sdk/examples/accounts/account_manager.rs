@@ -1217,6 +1217,103 @@ impl MultiAccountManager {
         Ok(ok)
     }
 
+    pub async fn verify_login_notice_persisted(
+        &self,
+        key: &str,
+        suffix: &str,
+    ) -> BoxResult<(bool, String)> {
+        let cfg = self.account_config(key)?;
+        let data_dir = self.base_dir.join(format!("{key}_login_notice_{suffix}"));
+        std::fs::create_dir_all(&data_dir)?;
+
+        let sdk = PrivchatSdk::new(PrivchatConfig {
+            endpoints: self.endpoints.clone(),
+            connection_timeout_secs: 30,
+            data_dir: data_dir.to_string_lossy().to_string(),
+        });
+
+        let mut details = String::new();
+        let mut ok = false;
+
+        let run = async {
+            sdk.connect().await?;
+            let login = sdk
+                .login(
+                    cfg.username.clone(),
+                    cfg.password.clone(),
+                    pseudo_uuid_v4_like(),
+                )
+                .await?;
+            sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
+                .await?;
+            sdk.run_bootstrap_sync().await?;
+
+            for _ in 0..20 {
+                let channels = sdk.list_channels(200, 0).await?;
+                if let Some(system_channel) = channels.iter().find(|c| {
+                    c.channel_type == 1
+                        && (c.channel_name == "1"
+                            || c.channel_remark == "1"
+                            || c.channel_name == "System Message"
+                            || c.channel_remark == "System Message"
+                            || c.channel_name == "__system_1__"
+                            || c.channel_remark == "__system_1__")
+                }) {
+                    let messages = sdk
+                        .list_messages(
+                            system_channel.channel_id,
+                            system_channel.channel_type,
+                            50,
+                            0,
+                        )
+                        .await?;
+                    let has_login_notice = messages.iter().any(|m| {
+                        m.from_uid == 1 && m.content.contains("设备登录了")
+                    });
+                    details = format!(
+                        "system_channel={} unread={} messages={} has_login_notice={}",
+                        system_channel.channel_id,
+                        system_channel.unread_count,
+                        messages.len(),
+                        has_login_notice
+                    );
+                    if has_login_notice {
+                        ok = true;
+                        return Ok::<(), BoxError>(());
+                    }
+                }
+                if details.is_empty() {
+                    let preview: Vec<String> = channels
+                        .iter()
+                        .take(6)
+                        .map(|c| {
+                            format!(
+                                "{}:{}:{}:{}",
+                                c.channel_id, c.channel_type, c.channel_name, c.channel_remark
+                            )
+                        })
+                        .collect();
+                    details = format!(
+                        "system channel not matched; local channels={}",
+                        preview.join(" | ")
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+
+            if details.is_empty() {
+                details = "system channel not found".to_string();
+            }
+            Ok::<(), BoxError>(())
+        };
+
+        let run_result = run.await;
+        let _ = sdk.disconnect().await;
+        sdk.shutdown().await;
+        run_result?;
+        Ok((ok, details))
+    }
+
     pub async fn cleanup(&self) -> BoxResult<()> {
         for account in self.accounts.values() {
             let _ = account.sdk.disconnect().await;

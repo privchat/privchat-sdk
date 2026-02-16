@@ -1202,6 +1202,7 @@ pub struct NewMessage {
 pub struct StoredMessage {
     pub message_id: u64,
     pub server_message_id: Option<u64>,
+    pub local_message_id: Option<u64>,
     pub channel_id: u64,
     pub channel_type: i32,
     pub from_uid: u64,
@@ -2013,6 +2014,7 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
     StoredMessage {
         message_id: v.message_id,
         server_message_id: v.server_message_id,
+        local_message_id: v.local_message_id,
         channel_id: v.channel_id,
         channel_type: v.channel_type,
         from_uid: v.from_uid,
@@ -5462,6 +5464,12 @@ impl PrivchatClient {
         Ok(())
     }
 
+    pub fn generate_local_message_id(&self) -> Result<u64, PrivchatFfiError> {
+        self.inner
+            .generate_local_message_id()
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn enqueue_text(
         &self,
         channel_id: u64,
@@ -5469,18 +5477,33 @@ impl PrivchatClient {
         from_uid: u64,
         content: String,
     ) -> Result<u64, PrivchatFfiError> {
+        self.enqueue_text_with_local_id(channel_id, channel_type, from_uid, content, None)
+            .await
+    }
+
+    pub async fn enqueue_text_with_local_id(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        from_uid: u64,
+        content: String,
+        local_message_id: Option<u64>,
+    ) -> Result<u64, PrivchatFfiError> {
+        let input = map_new_message(NewMessage {
+            channel_id,
+            channel_type,
+            from_uid,
+            message_type: 0,
+            content,
+            searchable_word: String::new(),
+            setting: 0,
+            extra: String::new(),
+        });
         let message_id = self
-            .create_local_message(NewMessage {
-                channel_id,
-                channel_type,
-                from_uid,
-                message_type: 0,
-                content,
-                searchable_word: String::new(),
-                setting: 0,
-                extra: String::new(),
-            })
-            .await?;
+            .inner
+            .create_local_message_with_id(input, local_message_id)
+            .await
+            .map_err(PrivchatFfiError::from)?;
         self.enqueue_outbound_message(message_id, Vec::new())
             .await?;
         Ok(message_id)
