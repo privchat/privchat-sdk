@@ -103,6 +103,11 @@ enum StorageCmd {
         input: UpsertRemoteMessageInput,
         resp: oneshot::Sender<Result<u64>>,
     },
+    #[allow(dead_code)]
+    BatchUpsertRemoteMessages {
+        inputs: Vec<UpsertRemoteMessageInput>,
+        resp: oneshot::Sender<Vec<Result<u64>>>,
+    },
     ListMessages {
         channel_id: u64,
         channel_type: i32,
@@ -605,6 +610,23 @@ impl StorageHandle {
             })
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// Batch upsert remote messages in a single SQLite transaction.
+    /// Returns a Vec of results, one per input, in the same order.
+    #[allow(dead_code)]
+    pub async fn batch_upsert_remote_messages(
+        &self,
+        inputs: Vec<UpsertRemoteMessageInput>,
+    ) -> Result<Vec<Result<u64>>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::BatchUpsertRemoteMessages {
+                inputs,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)
     }
 
     pub async fn list_messages(
@@ -1296,717 +1318,590 @@ impl StorageHandle {
     }
 }
 
+/// Flush a batch of UpsertRemoteMessage commands in a single transaction.
+fn flush_upsert_batch(
+    store: &LocalStore,
+    batch: Vec<(UpsertRemoteMessageInput, oneshot::Sender<Result<u64>>)>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    match store.load_current_uid() {
+        Ok(Some(uid)) => {
+            let inputs: Vec<_> = batch.iter().map(|(i, _)| i.clone()).collect();
+            let results = store.batch_upsert_remote_messages(&uid, &inputs);
+            for ((_, resp), result) in batch.into_iter().zip(results.into_iter()) {
+                let _ = resp.send(result);
+            }
+        }
+        Ok(None) => {
+            for (_, resp) in batch {
+                let _ = resp.send(Err(Error::InvalidState(
+                    "current uid is not set".to_string(),
+                )));
+            }
+        }
+        Err(e) => {
+            for (_, resp) in batch {
+                let _ = resp.send(Err(Error::Storage(format!("load uid: {e}"))));
+            }
+        }
+    }
+}
+
+fn dispatch_cmd_inner(store: &LocalStore, cmd: StorageCmd, rx: &mpsc::Receiver<StorageCmd>) {
+    match cmd {
+        StorageCmd::UpsertRemoteMessage { input, resp } => {
+            // Even deferred upserts go through batch path
+            let mut batch = Vec::with_capacity(32);
+            batch.push((input, resp));
+            while batch.len() < 32 {
+                match rx.try_recv() {
+                    Ok(StorageCmd::UpsertRemoteMessage { input, resp }) => {
+                        batch.push((input, resp));
+                    }
+                    Ok(other) => {
+                        flush_upsert_batch(store, batch);
+                        dispatch_cmd_inner(store, other, rx);
+                        return;
+                    }
+                    Err(_) => break,
+                }
+            }
+            flush_upsert_batch(store, batch);
+        }
+        // For all other commands, delegate to the existing per-command handler
+        other => handle_single_cmd(store, other),
+    }
+}
+
+fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
+    // Helper macro to reduce boilerplate for commands that need current uid
+    macro_rules! with_uid {
+        ($resp:expr, |$uid:ident| $body:expr) => {
+            let result = match store.load_current_uid() {
+                Ok(Some($uid)) => $body,
+                Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
+                Err(e) => Err(e),
+            };
+            let _ = $resp.send(result);
+        };
+    }
+
+    match cmd {
+        StorageCmd::SaveLogin { uid, login, resp } => {
+            let _ = resp.send(store.save_login(&uid, &login));
+        }
+        StorageCmd::SetBootstrapCompleted {
+            uid,
+            completed,
+            resp,
+        } => {
+            let _ = resp.send(store.set_bootstrap_completed(&uid, completed));
+        }
+        StorageCmd::LoadSession { uid, resp } => {
+            let _ = resp.send(store.load_session(&uid));
+        }
+        StorageCmd::ClearSession { uid, resp } => {
+            let _ = resp.send(store.clear_session(&uid));
+        }
+        StorageCmd::LoadCurrentUid { resp } => {
+            let _ = resp.send(store.load_current_uid());
+        }
+        StorageCmd::SaveCurrentUid { uid, resp } => {
+            let _ = resp.send(store.save_current_uid(&uid));
+        }
+        StorageCmd::ClearCurrentUid { resp } => {
+            let _ = resp.send(store.clear_current_uid());
+        }
+        StorageCmd::WipeUserFull { uid, resp } => {
+            let _ = resp.send(store.wipe_user_full(&uid));
+        }
+        StorageCmd::ListLocalAccounts { resp } => {
+            let _ = resp.send(store.list_local_accounts());
+        }
+        StorageCmd::FlushUser { uid, resp } => {
+            let _ = resp.send(store.flush_user(&uid));
+        }
+        StorageCmd::NormalQueuePush {
+            message_id,
+            payload,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .normal_queue_push(&uid, message_id, &payload));
+        }
+        StorageCmd::NormalQueuePeek { limit, resp } => {
+            with_uid!(resp, |uid| store.normal_queue_peek(&uid, limit));
+        }
+        StorageCmd::NormalQueueAck { message_ids, resp } => {
+            with_uid!(resp, |uid| store.normal_queue_ack(&uid, &message_ids));
+        }
+        StorageCmd::SelectFileQueue { route_key, resp } => {
+            with_uid!(resp, |uid| store.select_file_queue(&uid, &route_key));
+        }
+        StorageCmd::FileQueueCount { resp } => {
+            with_uid!(resp, |uid| store.file_queue_count(&uid));
+        }
+        StorageCmd::FileQueuePush {
+            queue_index,
+            message_id,
+            payload,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.file_queue_push(
+                &uid,
+                queue_index,
+                message_id,
+                &payload
+            ));
+        }
+        StorageCmd::FileQueuePeek {
+            queue_index,
+            limit,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.file_queue_peek(&uid, queue_index, limit));
+        }
+        StorageCmd::FileQueueAck {
+            queue_index,
+            message_ids,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.file_queue_ack(
+                &uid,
+                queue_index,
+                &message_ids
+            ));
+        }
+        StorageCmd::CreateLocalMessage {
+            local_message_id,
+            input,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.create_local_message(
+                &uid,
+                &input,
+                local_message_id
+            ));
+        }
+        StorageCmd::GetMessageById { message_id, resp } => {
+            with_uid!(resp, |uid| store.get_message_by_id(&uid, message_id));
+        }
+        StorageCmd::UpsertRemoteMessage { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_remote_message(&uid, &input));
+        }
+        StorageCmd::BatchUpsertRemoteMessages { inputs, resp } => {
+            let result = match store.load_current_uid() {
+                Ok(Some(uid)) => store.batch_upsert_remote_messages(&uid, &inputs),
+                Ok(None) => inputs
+                    .iter()
+                    .map(|_| Err(Error::InvalidState("current uid is not set".to_string())))
+                    .collect(),
+                Err(e) => inputs
+                    .iter()
+                    .map(|_| Err(Error::Storage(format!("load uid: {e}"))))
+                    .collect(),
+            };
+            let _ = resp.send(result);
+        }
+        StorageCmd::ListMessages {
+            channel_id,
+            channel_type,
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_messages(
+                &uid,
+                channel_id,
+                channel_type,
+                limit,
+                offset
+            ));
+        }
+        StorageCmd::UpsertChannel { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_channel(&uid, &input));
+        }
+        StorageCmd::GetChannelById { channel_id, resp } => {
+            with_uid!(resp, |uid| store.get_channel_by_id(&uid, channel_id));
+        }
+        StorageCmd::ListChannels {
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_channels(&uid, limit, offset));
+        }
+        StorageCmd::UpsertChannelExtra { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_channel_extra(&uid, &input));
+        }
+        StorageCmd::GetChannelExtra {
+            channel_id,
+            channel_type,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.get_channel_extra(
+                &uid,
+                channel_id,
+                channel_type
+            ));
+        }
+        StorageCmd::MarkMessageSent {
+            message_id,
+            server_message_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.mark_message_sent(
+                &uid,
+                message_id,
+                server_message_id
+            ));
+        }
+        StorageCmd::UpdateLocalMessageId {
+            message_id,
+            local_message_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.update_local_message_id(
+                &uid,
+                message_id,
+                local_message_id
+            ));
+        }
+        StorageCmd::GetLocalMessageId { message_id, resp } => {
+            with_uid!(resp, |uid| store.get_local_message_id(&uid, message_id));
+        }
+        StorageCmd::UpdateMessageStatus {
+            message_id,
+            status,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .update_message_status(&uid, message_id, status));
+        }
+        StorageCmd::SetMessageRead {
+            message_id,
+            channel_id,
+            channel_type,
+            is_read,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.set_message_read(
+                &uid,
+                message_id,
+                channel_id,
+                channel_type,
+                is_read
+            ));
+        }
+        StorageCmd::SetMessageRevoke {
+            message_id,
+            revoked,
+            revoker,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .set_message_revoke(&uid, message_id, revoked, revoker));
+        }
+        StorageCmd::EditMessage {
+            message_id,
+            content,
+            edited_at,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .edit_message(&uid, message_id, &content, edited_at));
+        }
+        StorageCmd::SetMessagePinned {
+            message_id,
+            is_pinned,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .set_message_pinned(&uid, message_id, is_pinned));
+        }
+        StorageCmd::GetMessageExtra { message_id, resp } => {
+            with_uid!(resp, |uid| store.get_message_extra(&uid, message_id));
+        }
+        StorageCmd::MarkChannelRead {
+            channel_id,
+            channel_type,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.mark_channel_read(
+                &uid,
+                channel_id,
+                channel_type
+            ));
+        }
+        StorageCmd::GetChannelUnreadCount {
+            channel_id,
+            channel_type,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.get_channel_unread_count(
+                &uid,
+                channel_id,
+                channel_type
+            ));
+        }
+        StorageCmd::GetTotalUnreadCount {
+            exclude_muted,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .get_total_unread_count(&uid, exclude_muted));
+        }
+        StorageCmd::UpsertUser { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_user(&uid, &input));
+        }
+        StorageCmd::GetUserById { user_id, resp } => {
+            with_uid!(resp, |uid| store.get_user_by_id(&uid, user_id));
+        }
+        StorageCmd::ListUsersByIds { user_ids, resp } => {
+            with_uid!(resp, |uid| store.list_users_by_ids(&uid, &user_ids));
+        }
+        StorageCmd::UpsertFriend { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_friend(&uid, &input));
+        }
+        StorageCmd::DeleteFriend { user_id, resp } => {
+            with_uid!(resp, |uid| store.delete_friend(&uid, user_id));
+        }
+        StorageCmd::ListFriends {
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_friends(&uid, limit, offset));
+        }
+        StorageCmd::UpsertBlacklistEntry { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_blacklist_entry(&uid, &input));
+        }
+        StorageCmd::DeleteBlacklistEntry {
+            blocked_user_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .delete_blacklist_entry(&uid, blocked_user_id));
+        }
+        StorageCmd::ListBlacklistEntries {
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .list_blacklist_entries(&uid, limit, offset));
+        }
+        StorageCmd::UpsertGroup { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_group(&uid, &input));
+        }
+        StorageCmd::GetGroupById { group_id, resp } => {
+            with_uid!(resp, |uid| store.get_group_by_id(&uid, group_id));
+        }
+        StorageCmd::ListGroups {
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_groups(&uid, limit, offset));
+        }
+        StorageCmd::UpsertGroupMember { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_group_member(&uid, &input));
+        }
+        StorageCmd::DeleteGroupMember {
+            group_id,
+            user_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .delete_group_member(&uid, group_id, user_id));
+        }
+        StorageCmd::ListGroupMembers {
+            group_id,
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .list_group_members(&uid, group_id, limit, offset));
+        }
+        StorageCmd::UpsertChannelMember { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_channel_member(&uid, &input));
+        }
+        StorageCmd::ListChannelMembers {
+            channel_id,
+            channel_type,
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_channel_members(
+                &uid,
+                channel_id,
+                channel_type,
+                limit,
+                offset
+            ));
+        }
+        StorageCmd::DeleteChannelMember {
+            channel_id,
+            channel_type,
+            member_uid,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.delete_channel_member(
+                &uid,
+                channel_id,
+                channel_type,
+                member_uid
+            ));
+        }
+        StorageCmd::UpsertMessageReaction { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_message_reaction(&uid, &input));
+        }
+        StorageCmd::ListMessageReactions {
+            message_id,
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .list_message_reactions(&uid, message_id, limit, offset));
+        }
+        StorageCmd::RecordMention { input, resp } => {
+            with_uid!(resp, |uid| store.record_mention(&uid, &input));
+        }
+        StorageCmd::GetUnreadMentionCount {
+            channel_id,
+            channel_type,
+            user_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.get_unread_mention_count(
+                &uid,
+                channel_id,
+                channel_type,
+                user_id
+            ));
+        }
+        StorageCmd::ListUnreadMentionMessageIds {
+            channel_id,
+            channel_type,
+            user_id,
+            limit,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_unread_mention_message_ids(
+                &uid,
+                channel_id,
+                channel_type,
+                user_id,
+                limit
+            ));
+        }
+        StorageCmd::MarkMentionRead {
+            message_id,
+            user_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .mark_mention_read(&uid, message_id, user_id));
+        }
+        StorageCmd::MarkAllMentionsRead {
+            channel_id,
+            channel_type,
+            user_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.mark_all_mentions_read(
+                &uid,
+                channel_id,
+                channel_type,
+                user_id
+            ));
+        }
+        StorageCmd::GetAllUnreadMentionCounts { user_id, resp } => {
+            with_uid!(resp, |uid| store
+                .get_all_unread_mention_counts(&uid, user_id));
+        }
+        StorageCmd::UpsertReminder { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_reminder(&uid, &input));
+        }
+        StorageCmd::ListPendingReminders {
+            reminder_uid,
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_pending_reminders(
+                &uid,
+                reminder_uid,
+                limit,
+                offset
+            ));
+        }
+        StorageCmd::MarkReminderDone {
+            reminder_id,
+            done,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.mark_reminder_done(
+                &uid,
+                reminder_id,
+                done
+            ));
+        }
+        StorageCmd::KvPut { key, value, resp } => {
+            with_uid!(resp, |uid| store.kv_put(&uid, &key, &value));
+        }
+        StorageCmd::KvGet { key, resp } => {
+            with_uid!(resp, |uid| store.kv_get(&uid, &key));
+        }
+        StorageCmd::KvDelete { key, resp } => {
+            with_uid!(resp, |uid| store.kv_delete(&uid, &key));
+        }
+        StorageCmd::KvScanPrefix { prefix, resp } => {
+            with_uid!(resp, |uid| store.kv_scan_prefix(&uid, &prefix));
+        }
+        StorageCmd::GetStoragePaths { resp } => {
+            with_uid!(resp, |uid| store.ensure_user_storage(&uid));
+        }
+        StorageCmd::Shutdown => { /* handled in run_loop */ }
+    }
+}
+
 fn run_loop(store: LocalStore, rx: mpsc::Receiver<StorageCmd>) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            StorageCmd::SaveLogin { uid, login, resp } => {
-                let _ = resp.send(store.save_login(&uid, &login));
-            }
-            StorageCmd::SetBootstrapCompleted {
-                uid,
-                completed,
-                resp,
-            } => {
-                let _ = resp.send(store.set_bootstrap_completed(&uid, completed));
-            }
-            StorageCmd::LoadSession { uid, resp } => {
-                let _ = resp.send(store.load_session(&uid));
-            }
-            StorageCmd::ClearSession { uid, resp } => {
-                let _ = resp.send(store.clear_session(&uid));
-            }
-            StorageCmd::LoadCurrentUid { resp } => {
-                let _ = resp.send(store.load_current_uid());
-            }
-            StorageCmd::SaveCurrentUid { uid, resp } => {
-                let _ = resp.send(store.save_current_uid(&uid));
-            }
-            StorageCmd::ClearCurrentUid { resp } => {
-                let _ = resp.send(store.clear_current_uid());
-            }
-            StorageCmd::WipeUserFull { uid, resp } => {
-                let _ = resp.send(store.wipe_user_full(&uid));
-            }
-            StorageCmd::ListLocalAccounts { resp } => {
-                let _ = resp.send(store.list_local_accounts());
-            }
-            StorageCmd::FlushUser { uid, resp } => {
-                let _ = resp.send(store.flush_user(&uid));
-            }
-            StorageCmd::NormalQueuePush {
-                message_id,
-                payload,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.normal_queue_push(&uid, message_id, &payload),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::NormalQueuePeek { limit, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.normal_queue_peek(&uid, limit),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::NormalQueueAck { message_ids, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.normal_queue_ack(&uid, &message_ids),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::SelectFileQueue { route_key, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.select_file_queue(&uid, &route_key),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::FileQueueCount { resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.file_queue_count(&uid),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::FileQueuePush {
-                queue_index,
-                message_id,
-                payload,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.file_queue_push(&uid, queue_index, message_id, &payload),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::FileQueuePeek {
-                queue_index,
-                limit,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.file_queue_peek(&uid, queue_index, limit),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::FileQueueAck {
-                queue_index,
-                message_ids,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.file_queue_ack(&uid, queue_index, &message_ids),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::CreateLocalMessage {
-                local_message_id,
-                input,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.create_local_message(&uid, &input, local_message_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetMessageById { message_id, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_message_by_id(&uid, message_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertRemoteMessage { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_remote_message(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListMessages {
-                channel_id,
-                channel_type,
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => {
-                        store.list_messages(&uid, channel_id, channel_type, limit, offset)
-                    }
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertChannel { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_channel(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetChannelById { channel_id, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_channel_by_id(&uid, channel_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListChannels {
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.list_channels(&uid, limit, offset),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertChannelExtra { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_channel_extra(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetChannelExtra {
-                channel_id,
-                channel_type,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_channel_extra(&uid, channel_id, channel_type),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::MarkMessageSent {
-                message_id,
-                server_message_id,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.mark_message_sent(&uid, message_id, server_message_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpdateLocalMessageId {
-                message_id,
-                local_message_id,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => {
-                        store.update_local_message_id(&uid, message_id, local_message_id)
-                    }
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetLocalMessageId { message_id, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_local_message_id(&uid, message_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpdateMessageStatus {
-                message_id,
-                status,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.update_message_status(&uid, message_id, status),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::SetMessageRead {
-                message_id,
-                channel_id,
-                channel_type,
-                is_read,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => {
-                        store.set_message_read(&uid, message_id, channel_id, channel_type, is_read)
-                    }
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::SetMessageRevoke {
-                message_id,
-                revoked,
-                revoker,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.set_message_revoke(&uid, message_id, revoked, revoker),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::EditMessage {
-                message_id,
-                content,
-                edited_at,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.edit_message(&uid, message_id, &content, edited_at),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::SetMessagePinned {
-                message_id,
-                is_pinned,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.set_message_pinned(&uid, message_id, is_pinned),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetMessageExtra { message_id, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_message_extra(&uid, message_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::MarkChannelRead {
-                channel_id,
-                channel_type,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.mark_channel_read(&uid, channel_id, channel_type),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetChannelUnreadCount {
-                channel_id,
-                channel_type,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_channel_unread_count(&uid, channel_id, channel_type),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetTotalUnreadCount {
-                exclude_muted,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_total_unread_count(&uid, exclude_muted),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertUser { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_user(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetUserById { user_id, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_user_by_id(&uid, user_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListUsersByIds { user_ids, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.list_users_by_ids(&uid, &user_ids),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertFriend { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_friend(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::DeleteFriend { user_id, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.delete_friend(&uid, user_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListFriends {
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.list_friends(&uid, limit, offset),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertBlacklistEntry { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_blacklist_entry(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::DeleteBlacklistEntry {
-                blocked_user_id,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.delete_blacklist_entry(&uid, blocked_user_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListBlacklistEntries {
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.list_blacklist_entries(&uid, limit, offset),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertGroup { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_group(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetGroupById { group_id, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_group_by_id(&uid, group_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListGroups {
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.list_groups(&uid, limit, offset),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertGroupMember { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_group_member(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::DeleteGroupMember {
-                group_id,
-                user_id,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.delete_group_member(&uid, group_id, user_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListGroupMembers {
-                group_id,
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.list_group_members(&uid, group_id, limit, offset),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertChannelMember { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_channel_member(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListChannelMembers {
-                channel_id,
-                channel_type,
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => {
-                        store.list_channel_members(&uid, channel_id, channel_type, limit, offset)
-                    }
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::DeleteChannelMember {
-                channel_id,
-                channel_type,
-                member_uid,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => {
-                        store.delete_channel_member(&uid, channel_id, channel_type, member_uid)
-                    }
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertMessageReaction { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_message_reaction(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListMessageReactions {
-                message_id,
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.list_message_reactions(&uid, message_id, limit, offset),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::RecordMention { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.record_mention(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetUnreadMentionCount {
-                channel_id,
-                channel_type,
-                user_id,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => {
-                        store.get_unread_mention_count(&uid, channel_id, channel_type, user_id)
-                    }
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListUnreadMentionMessageIds {
-                channel_id,
-                channel_type,
-                user_id,
-                limit,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.list_unread_mention_message_ids(
-                        &uid,
-                        channel_id,
-                        channel_type,
-                        user_id,
-                        limit,
-                    ),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::MarkMentionRead {
-                message_id,
-                user_id,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.mark_mention_read(&uid, message_id, user_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::MarkAllMentionsRead {
-                channel_id,
-                channel_type,
-                user_id,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => {
-                        store.mark_all_mentions_read(&uid, channel_id, channel_type, user_id)
-                    }
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetAllUnreadMentionCounts { user_id, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.get_all_unread_mention_counts(&uid, user_id),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::UpsertReminder { input, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.upsert_reminder(&uid, &input),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::ListPendingReminders {
-                reminder_uid,
-                limit,
-                offset,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => {
-                        store.list_pending_reminders(&uid, reminder_uid, limit, offset)
-                    }
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::MarkReminderDone {
-                reminder_id,
-                done,
-                resp,
-            } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.mark_reminder_done(&uid, reminder_id, done),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::KvPut { key, value, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.kv_put(&uid, &key, &value),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::KvGet { key, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.kv_get(&uid, &key),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::KvDelete { key, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.kv_delete(&uid, &key),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::KvScanPrefix { prefix, resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.kv_scan_prefix(&uid, &prefix),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
-            StorageCmd::GetStoragePaths { resp } => {
-                let result = match store.load_current_uid() {
-                    Ok(Some(uid)) => store.ensure_user_storage(&uid),
-                    Ok(None) => Err(Error::InvalidState("current uid is not set".to_string())),
-                    Err(e) => Err(e),
-                };
-                let _ = resp.send(result);
-            }
             StorageCmd::Shutdown => break,
+            StorageCmd::UpsertRemoteMessage { input, resp } => {
+                // Batch drain: collect consecutive UpsertRemoteMessage commands
+                let mut batch: Vec<(UpsertRemoteMessageInput, oneshot::Sender<Result<u64>>)> =
+                    Vec::with_capacity(32);
+                batch.push((input, resp));
+                let mut deferred: Vec<StorageCmd> = Vec::new();
+
+                while batch.len() < 32 {
+                    match rx.try_recv() {
+                        Ok(StorageCmd::UpsertRemoteMessage { input, resp }) => {
+                            batch.push((input, resp));
+                        }
+                        Ok(other) => {
+                            deferred.push(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                flush_upsert_batch(&store, batch);
+
+                for cmd in deferred {
+                    dispatch_cmd_inner(&store, cmd, &rx);
+                }
+            }
+            other => handle_single_cmd(&store, other),
         }
     }
 }
