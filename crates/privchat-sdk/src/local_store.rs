@@ -601,6 +601,21 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("clear device_id: {e}")))?;
         auth.remove(K_TOKEN_EXPIRE_AT)
             .map_err(|e| Error::Storage(format!("clear token expire_at: {e}")))?;
+        // 清除 active_uid，防止重启后 listLocalAccounts 仍返回 isActive=true
+        let global_db = self.open_global_db()?;
+        let accounts = global_db
+            .open_tree(GLOBAL_TREE_ACCOUNTS)
+            .map_err(|e| Error::Storage(format!("open accounts tree: {e}")))?;
+        if let Some(active) = get_string(&accounts, K_ACTIVE_UID)? {
+            if active == uid {
+                accounts
+                    .remove(K_ACTIVE_UID)
+                    .map_err(|e| Error::Storage(format!("clear active uid: {e}")))?;
+                global_db
+                    .flush()
+                    .map_err(|e| Error::Storage(format!("flush global db: {e}")))?;
+            }
+        }
         self.clear_legacy_session(uid)?;
         Ok(())
     }

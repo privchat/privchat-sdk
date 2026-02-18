@@ -2291,6 +2291,7 @@ impl State {
         entity_type: &str,
         scope: Option<&str>,
         items: &[privchat_protocol::rpc::sync::SyncEntityItem],
+        bump_unread_on_incoming: bool,
     ) -> Result<Vec<SdkEvent>> {
         let _ = self.current_uid.clone().ok_or_else(|| {
             Error::InvalidState("current user is not set; login/authenticate required".to_string())
@@ -3031,6 +3032,9 @@ impl State {
                             extra,
                         })
                         .await?;
+                    // During bootstrap/periodic sync, do NOT bump unread —
+                    // the authoritative count comes from `channel_unread` entity sync.
+                    // For realtime push messages, bump_unread_on_incoming is true.
                     let from_self = current_user_id.map(|v| v == from_uid).unwrap_or(false);
                     let _ = self
                         .update_channel_last_message(
@@ -3040,7 +3044,7 @@ impl State {
                             timestamp,
                             message_id,
                             Some(from_uid),
-                            !from_self,
+                            bump_unread_on_incoming && !from_self,
                         )
                         .await;
                     emitted.push(SdkEvent::SyncEntityChanged {
@@ -3970,7 +3974,7 @@ impl State {
         let app_id = std::env::var("PRIVCHAT_APP_ID")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "io.privchat.rust".to_string());
+            .unwrap_or_else(|| "com.netonstream.privchat.rust".to_string());
         let req = RpcRequest {
             route: "account/auth/login".to_string(),
             body: serde_json::to_value(AuthLoginRequest {
@@ -4052,7 +4056,7 @@ impl State {
         let app_id = std::env::var("PRIVCHAT_APP_ID")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "io.privchat.rust".to_string());
+            .unwrap_or_else(|| "com.netonstream.privchat.rust".to_string());
         let req = RpcRequest {
             route: routes::account_user::REGISTER.to_string(),
             body: serde_json::to_value(UserRegisterRequest {
@@ -4129,12 +4133,12 @@ impl State {
                 os: std::env::consts::OS.to_string(),
                 os_version: std::env::consts::OS.to_string(),
                 device_model: None,
-                app_package: Some("io.privchat.rust".to_string()),
+                app_package: Some("com.netonstream.privchat.rust".to_string()),
             },
             device_info: DeviceInfo {
                 device_id,
                 device_type: DeviceType::from_str(std::env::consts::OS),
-                app_id: "io.privchat.rust".to_string(),
+                app_id: "com.netonstream.privchat.rust".to_string(),
                 push_token: None,
                 push_channel: None,
                 device_name: "privchat-rust".to_string(),
@@ -4308,7 +4312,12 @@ impl State {
         for batch in SyncCommitApplier::drain_batches(&mut self.receive_pipeline) {
             let count = batch.items.len();
             match self
-                .apply_sync_entities(&batch.entity_type, batch.scope.as_deref(), &batch.items)
+                .apply_sync_entities(
+                    &batch.entity_type,
+                    batch.scope.as_deref(),
+                    &batch.items,
+                    false,
+                )
                 .await
             {
                 Ok(events) => {
@@ -4354,7 +4363,12 @@ impl State {
         for batch in SyncCommitApplier::drain_batches(&mut self.receive_pipeline) {
             let count = batch.items.len();
             match self
-                .apply_sync_entities(&batch.entity_type, batch.scope.as_deref(), &batch.items)
+                .apply_sync_entities(
+                    &batch.entity_type,
+                    batch.scope.as_deref(),
+                    &batch.items,
+                    true,
+                )
                 .await
             {
                 Ok(events) => {
@@ -4784,12 +4798,8 @@ impl State {
                         extra: String::new(),
                     })
                     .await?;
-                let from_self = self
-                    .current_uid
-                    .as_ref()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|uid| uid == item.sender_id)
-                    .unwrap_or(false);
+                // Bootstrap history hydration should not bump unread —
+                // channel_unread sync provides the authoritative count.
                 let _ = self
                     .update_channel_last_message(
                         item.channel_id,
@@ -4798,7 +4808,7 @@ impl State {
                         timestamp_ms,
                         message_id,
                         Some(item.sender_id),
-                        !from_self,
+                        false,
                     )
                     .await;
             }
