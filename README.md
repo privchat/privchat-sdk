@@ -30,7 +30,7 @@ cargo run --manifest-path uniffi-bindgen/Cargo.toml --release -- \
 
 生成文件：
 
-- `/Users/zoujiaqing/projects/privchat/privchat-rust/crates/privchat-sdk-ffi/bindings/kotlin/io/privchat/sdk/privchat_sdk_ffi.kt`
+- `/Users/zoujiaqing/projects/privchat/privchat-rust/crates/privchat-sdk-ffi/bindings/kotlin/com/netonstream/privchat/sdk/privchat_sdk_ffi.kt`
 
 ## 迁移边界
 
