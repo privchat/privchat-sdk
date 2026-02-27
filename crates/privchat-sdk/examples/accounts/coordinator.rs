@@ -77,6 +77,8 @@ impl TestCoordinator {
             .await;
         self.run_phase(TestPhases::phase30_timeline_cache_local_first(manager).await)
             .await;
+        self.run_phase(TestPhases::phase31_room(manager).await)
+            .await;
         Ok(())
     }
 

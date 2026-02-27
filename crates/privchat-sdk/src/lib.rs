@@ -268,6 +268,14 @@ pub enum SdkEvent {
         channel_type: i32,
         is_typing: bool,
     },
+    SubscriptionMessageReceived {
+        channel_id: u64,
+        topic: Option<String>,
+        payload: Vec<u8>,
+        publisher: Option<String>,
+        server_message_id: Option<u64>,
+        timestamp: u64,
+    },
     ShutdownStarted,
     ShutdownCompleted,
 }
@@ -519,6 +527,12 @@ pub struct UpsertRemoteMessageInput {
     pub order_seq: i64,
     pub searchable_word: String,
     pub extra: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertRemoteMessageResult {
+    pub message_id: u64,
+    pub inserted_new: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1042,6 +1056,16 @@ enum Command {
         channel_type: i32,
         is_typing: bool,
         action_type: TypingActionType,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    Subscribe {
+        channel_id: u64,
+        channel_type: u8,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    Unsubscribe {
+        channel_id: u64,
+        channel_type: u8,
         resp: oneshot::Sender<Result<()>>,
     },
     RpcCall {
@@ -2117,7 +2141,6 @@ impl State {
                     "server_message_id": message_id,
                     "channel_id": push.channel_id,
                     "channel_type": i32::from(push.channel_type),
-                    "status": 3,
                     "is_read": true,
                     "readed": true,
                     "read": true,
@@ -2974,9 +2997,9 @@ impl State {
                     let extra = message_sync.extra.unwrap_or_default();
                     if item.deleted {
                         if channel_id > 0 {
-                            let local_id = self
+                            let upserted = self
                                 .storage
-                                .upsert_remote_message(UpsertRemoteMessageInput {
+                                .upsert_remote_message_with_result(UpsertRemoteMessageInput {
                                     server_message_id,
                                     local_message_id,
                                     channel_id,
@@ -2993,6 +3016,7 @@ impl State {
                                     extra: extra.clone(),
                                 })
                                 .await?;
+                            let local_id = upserted.message_id;
                             let _ = self.storage.set_message_revoke(local_id, true, None).await;
                         }
                         emitted.push(SdkEvent::SyncEntityChanged {
@@ -3013,9 +3037,9 @@ impl State {
                     if channel_id == 0 {
                         continue;
                     }
-                    let message_id = self
+                    let upserted = self
                         .storage
-                        .upsert_remote_message(UpsertRemoteMessageInput {
+                        .upsert_remote_message_with_result(UpsertRemoteMessageInput {
                             server_message_id,
                             local_message_id,
                             channel_id,
@@ -3032,6 +3056,7 @@ impl State {
                             extra,
                         })
                         .await?;
+                    let message_id = upserted.message_id;
                     // During bootstrap/periodic sync, do NOT bump unread —
                     // the authoritative count comes from `channel_unread` entity sync.
                     // For realtime push messages, bump_unread_on_incoming is true.
@@ -3044,7 +3069,7 @@ impl State {
                             timestamp,
                             message_id,
                             Some(from_uid),
-                            bump_unread_on_incoming && !from_self,
+                            bump_unread_on_incoming && !from_self && upserted.inserted_new,
                         )
                         .await;
                     emitted.push(SdkEvent::SyncEntityChanged {
@@ -3335,22 +3360,14 @@ impl State {
                         .unwrap_or_else(|| serde_json::json!({}));
                     let status_sync = serde_json::from_value::<MessageStatusSyncPayload>(payload)
                         .unwrap_or_default();
-                    let message_id = status_sync
+                    let raw_message_id = status_sync
                         .message_id
                         .or(status_sync.server_message_id)
                         .or(status_sync.id)
                         .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
                         .unwrap_or(0);
-                    if message_id == 0 {
+                    if raw_message_id == 0 {
                         continue;
-                    }
-                    if let Some(status) = status_sync.status {
-                        let _ = self.storage.update_message_status(message_id, status).await;
-                        emitted.push(SdkEvent::MessageSendStatusChanged {
-                            message_id,
-                            status,
-                            server_message_id: Some(message_id),
-                        });
                     }
                     let scoped_channel = Self::parse_channel_scope(scope);
                     let channel_type = status_sync
@@ -3364,6 +3381,28 @@ impl State {
                         .channel_id
                         .or(scoped_channel.map(|v| v.1))
                         .unwrap_or(0);
+                    let mut message_id = raw_message_id;
+                    if channel_id > 0 {
+                        if let Ok(Some(local_id)) = self
+                            .storage
+                            .get_message_id_by_server_message_id(
+                                channel_id,
+                                channel_type,
+                                raw_message_id,
+                            )
+                            .await
+                        {
+                            message_id = local_id;
+                        }
+                    }
+                    if let Some(status) = status_sync.status {
+                        let _ = self.storage.update_message_status(message_id, status).await;
+                        emitted.push(SdkEvent::MessageSendStatusChanged {
+                            message_id,
+                            status,
+                            server_message_id: Some(raw_message_id),
+                        });
+                    }
                     if channel_id > 0 {
                         if let Some(is_read) = status_sync
                             .readed
@@ -4495,6 +4534,7 @@ impl State {
                 let req: PublishRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode publish request: {e}")))?;
                 if let Ok(push) = decode_message::<PushMessageRequest>(&req.payload) {
+                    // IM 场景：payload 是 PushMessageRequest（私聊/群聊消息走 sync pipeline）
                     if inbound_logs_enabled() {
                         eprintln!(
                             "[SDK.inbound] publish payload decoded as PushMessageRequest channel_id={}",
@@ -4521,12 +4561,21 @@ impl State {
                         }
                     }
                 } else {
+                    // Room 场景：payload 是原始内容（纯网络，不走本地数据库）
                     if inbound_logs_enabled() {
                         eprintln!(
-                            "[SDK.inbound] publish payload not recognized as push payload channel_id={} topic={:?}",
-                            req.channel_id, req.topic
+                            "[SDK.inbound] room publish channel_id={} topic={:?} payload_len={}",
+                            req.channel_id, req.topic, req.payload.len()
                         );
                     }
+                    self.pending_events.push(SdkEvent::SubscriptionMessageReceived {
+                        channel_id: req.channel_id,
+                        topic: req.topic,
+                        payload: req.payload,
+                        publisher: req.publisher,
+                        server_message_id: req.server_message_id,
+                        timestamp: req.timestamp,
+                    });
                 }
             }
             _ => {
@@ -4781,7 +4830,7 @@ impl State {
                 };
                 let message_id = self
                     .storage
-                    .upsert_remote_message(UpsertRemoteMessageInput {
+                    .upsert_remote_message_with_result(UpsertRemoteMessageInput {
                         server_message_id: item.message_id,
                         local_message_id: 0,
                         channel_id: item.channel_id,
@@ -4797,7 +4846,8 @@ impl State {
                         searchable_word: String::new(),
                         extra: String::new(),
                     })
-                    .await?;
+                    .await?
+                    .message_id;
                 // Bootstrap history hydration should not bump unread —
                 // channel_unread sync provides the authoritative count.
                 let _ = self
@@ -5107,6 +5157,70 @@ impl State {
             .map_err(|e| Error::Serialization(format!("decode send_typing rpc: {e}")))?;
         if rpc_resp.code != 0 {
             return Err(Error::Auth(rpc_resp.message));
+        }
+        Ok(())
+    }
+
+    /// 订阅频道事件（typing / presence 等状态事件通过此通道接收）
+    async fn subscribe_channel(&mut self, channel_id: u64, channel_type: u8) -> Result<()> {
+        let timeout = self.timeout();
+        let req = SubscribeRequest {
+            setting: 0,
+            local_message_id: 0,
+            channel_id,
+            channel_type,
+            action: 1, // SUBSCRIBE
+            param: String::new(),
+        };
+        let payload = encode_message(&req)
+            .map_err(|e| Error::Serialization(format!("encode subscribe_channel: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::SubscribeRequest as u8,
+                timeout,
+                "subscribe_channel",
+            )
+            .await?;
+        let resp: SubscribeResponse = decode_message(&raw)
+            .map_err(|e| Error::Serialization(format!("decode subscribe_channel resp: {e}")))?;
+        if resp.reason_code != 0 {
+            return Err(Error::Auth(format!(
+                "subscribe_channel failed: reason_code={}",
+                resp.reason_code
+            )));
+        }
+        Ok(())
+    }
+
+    /// 取消订阅频道事件
+    async fn unsubscribe_channel(&mut self, channel_id: u64, channel_type: u8) -> Result<()> {
+        let timeout = self.timeout();
+        let req = SubscribeRequest {
+            setting: 0,
+            local_message_id: 0,
+            channel_id,
+            channel_type,
+            action: 2, // UNSUBSCRIBE
+            param: String::new(),
+        };
+        let payload = encode_message(&req)
+            .map_err(|e| Error::Serialization(format!("encode unsubscribe_channel: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::SubscribeRequest as u8,
+                timeout,
+                "unsubscribe_channel",
+            )
+            .await?;
+        let resp: SubscribeResponse = decode_message(&raw)
+            .map_err(|e| Error::Serialization(format!("decode unsubscribe_channel resp: {e}")))?;
+        if resp.reason_code != 0 {
+            return Err(Error::Auth(format!(
+                "unsubscribe_channel failed: reason_code={}",
+                resp.reason_code
+            )));
         }
         Ok(())
     }
@@ -6486,6 +6600,36 @@ impl PrivchatSdk {
                                 },
                             );
                         }
+                        let _ = resp.send(result);
+                    }
+                    Command::Subscribe { channel_id, channel_type, resp } => {
+                        let result = match state.session_state.can(Action::Authenticate) {
+                            Ok(_) => match timeout(
+                                Duration::from_secs(10),
+                                state.subscribe_channel(channel_id, channel_type),
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => Err(Error::Transport("subscribe_channel timeout".to_string())),
+                            },
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
+                    Command::Unsubscribe { channel_id, channel_type, resp } => {
+                        let result = match state.session_state.can(Action::Authenticate) {
+                            Ok(_) => match timeout(
+                                Duration::from_secs(10),
+                                state.unsubscribe_channel(channel_id, channel_type),
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => Err(Error::Transport("unsubscribe_channel timeout".to_string())),
+                            },
+                            Err(e) => Err(e),
+                        };
                         let _ = resp.send(result);
                     }
                     Command::RpcCall {
@@ -8145,6 +8289,38 @@ impl PrivchatSdk {
                 channel_type,
                 is_typing,
                 action_type,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 订阅频道事件（进入聊天页面时调用，接收 typing / presence 等状态事件）
+    /// channel_type: 0=Private, 1=Group, 2=Room
+    pub async fn subscribe_channel(&self, channel_id: u64, channel_type: u8) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Subscribe {
+                channel_id,
+                channel_type,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 取消订阅频道事件（离开聊天页面时调用）
+    /// channel_type: 0=Private, 1=Group, 2=Room
+    pub async fn unsubscribe_channel(&self, channel_id: u64, channel_type: u8) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Unsubscribe {
+                channel_id,
+                channel_type,
                 resp: resp_tx,
             })
             .await

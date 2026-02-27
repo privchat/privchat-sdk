@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use privchat_protocol::rpc::{AccountSearchResponse, ClientSubmitResponse};
+use serde::Deserialize;
 
 use crate::account_manager::{
     MultiAccountManager, DIRECT_SYNC_CHANNEL_TYPE, GROUP_SYNC_CHANNEL_TYPE,
@@ -2053,11 +2054,86 @@ impl TestPhases {
             let _ = group_diff;
         }
 
+        // Extra verification: all 3 accounts go offline/online twice without sending messages.
+        // For business channels, pts should remain stable when there is no new commit.
+        let tracked_channels = build_pts_tracked_channels(manager)?;
+        let mut baseline_pts: std::collections::HashMap<(String, u64, u8), u64> =
+            std::collections::HashMap::new();
+        for (owner, channel_id, channel_type) in &tracked_channels {
+            let p: privchat_protocol::rpc::GetChannelPtsResponse = manager
+                .rpc_typed(
+                    owner,
+                    privchat_protocol::rpc::routes::sync::GET_CHANNEL_PTS,
+                    &privchat_protocol::rpc::GetChannelPtsRequest {
+                        channel_id: *channel_id,
+                        channel_type: *channel_type,
+                    },
+                )
+                .await?;
+            metrics.rpc_calls += 1;
+            metrics.rpc_successes += 1;
+            baseline_pts.insert((owner.clone(), *channel_id, *channel_type), p.current_pts);
+        }
+
+        for cycle in 1..=2 {
+            for key in ["alice", "bob", "charlie"] {
+                let sdk = manager.sdk(key)?;
+                let _ = sdk.disconnect().await;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+
+            for key in ["alice", "bob", "charlie"] {
+                reconnect_account(manager, key).await?;
+                metrics.rpc_calls += 1;
+                metrics.rpc_successes += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+
+            for (owner, channel_id, channel_type) in &tracked_channels {
+                let before = baseline_pts
+                    .get(&(owner.clone(), *channel_id, *channel_type))
+                    .copied()
+                    .unwrap_or(0);
+                let after: privchat_protocol::rpc::GetChannelPtsResponse = manager
+                    .rpc_typed(
+                        owner,
+                        privchat_protocol::rpc::routes::sync::GET_CHANNEL_PTS,
+                        &privchat_protocol::rpc::GetChannelPtsRequest {
+                            channel_id: *channel_id,
+                            channel_type: *channel_type,
+                        },
+                    )
+                    .await?;
+                metrics.rpc_calls += 1;
+                if after.current_pts == before {
+                    metrics.rpc_successes += 1;
+                } else {
+                    metrics.errors.push(format!(
+                        "cycle{cycle} pts drift owner={owner} channel_id={channel_id} type={channel_type}: before={before} after={}",
+                        after.current_pts
+                    ));
+                }
+
+                let diff = manager
+                    .get_difference(owner, *channel_id, *channel_type, before, Some(100))
+                    .await?;
+                metrics.rpc_calls += 1;
+                if diff.commits.is_empty() {
+                    metrics.rpc_successes += 1;
+                } else {
+                    metrics.errors.push(format!(
+                        "cycle{cycle} unexpected commits owner={owner} channel_id={channel_id} type={channel_type}: commits={}",
+                        diff.commits.len()
+                    ));
+                }
+            }
+        }
+
         Ok(PhaseResult {
             phase_name: "pts-offline-strict".to_string(),
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
-            details: "3 rounds offline->send->online strict pts/diff verification".to_string(),
+            details: "3 rounds offline->send->online + 2 rounds all-accounts reconnect pts stability".to_string(),
             metrics,
         })
     }
@@ -2528,6 +2604,221 @@ impl TestPhases {
             metrics,
         })
     }
+
+    /// Phase 31: Room 频道测试
+    ///
+    /// 1. 通过 Admin API 创建 Room 频道
+    /// 2. 三个用户通过 SDK subscribe_channel 订阅该频道
+    /// 3. 通过 Admin API 广播消息到频道
+    /// 4. 验证三个用户都收到了广播消息（SubscriptionMessageReceived）
+    /// 5. 取消订阅
+    pub async fn phase31_room(manager: &mut MultiAccountManager) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let admin_host =
+            std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let admin_port = std::env::var("PRIVCHAT_ADMIN_API_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(9090);
+        let service_key =
+            std::env::var("SERVICE_MASTER_KEY").unwrap_or_else(|_| String::new());
+        let admin_base = format!("http://{}:{}", admin_host, admin_port);
+
+        let client = reqwest::Client::new();
+
+        // --- Step 1: 通过 Admin API 创建 Room 频道 ---
+        let create_resp = client
+            .post(format!("{}/api/admin/room", admin_base))
+            .header("X-Service-Key", &service_key)
+            .json(&serde_json::json!({ "name": "phase31-test-channel" }))
+            .send()
+            .await?;
+        metrics.rpc_calls += 1;
+
+        if !create_resp.status().is_success() {
+            let status = create_resp.status();
+            let body = create_resp.text().await.unwrap_or_default();
+            metrics
+                .errors
+                .push(format!("create room channel failed: {} {}", status, body));
+            return Ok(PhaseResult {
+                phase_name: "room".to_string(),
+                success: false,
+                duration: start.elapsed(),
+                details: "Admin API create room channel failed".to_string(),
+                metrics,
+            });
+        }
+
+        let create_body: CreateRoomChannelResponse = create_resp.json().await?;
+        metrics.rpc_successes += 1;
+        let channel_id = create_body.channel_id;
+
+        // --- Step 2: 三个用户订阅频道 ---
+        let alice_sdk = manager.sdk("alice")?;
+        let bob_sdk = manager.sdk("bob")?;
+        let charlie_sdk = manager.sdk("charlie")?;
+
+        let mut alice_events = alice_sdk.subscribe_events();
+        let mut bob_events = bob_sdk.subscribe_events();
+        let mut charlie_events = charlie_sdk.subscribe_events();
+
+        for (name, sdk) in [("alice", &alice_sdk), ("bob", &bob_sdk), ("charlie", &charlie_sdk)] {
+            match sdk.subscribe_channel(channel_id, 2).await {
+                Ok(_) => {
+                    metrics.rpc_calls += 1;
+                    metrics.rpc_successes += 1;
+                }
+                Err(e) => {
+                    metrics.rpc_calls += 1;
+                    metrics
+                        .errors
+                        .push(format!("{} subscribe_channel failed: {}", name, e));
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // --- Step 3: 通过 Admin API 广播消息 ---
+        let broadcast_content = format!("hello-room-{}", now_millis());
+        let broadcast_resp = client
+            .post(format!("{}/api/admin/room/{}/broadcast", admin_base, channel_id))
+            .header("X-Service-Key", &service_key)
+            .json(&serde_json::json!({
+                "content": broadcast_content,
+                "sender_id": 0
+            }))
+            .send()
+            .await?;
+        metrics.rpc_calls += 1;
+
+        if !broadcast_resp.status().is_success() {
+            let status = broadcast_resp.status();
+            let body = broadcast_resp.text().await.unwrap_or_default();
+            metrics
+                .errors
+                .push(format!("broadcast failed: {} {}", status, body));
+            return Ok(PhaseResult {
+                phase_name: "room".to_string(),
+                success: false,
+                duration: start.elapsed(),
+                details: "Admin API broadcast failed".to_string(),
+                metrics,
+            });
+        }
+
+        let broadcast_body: RoomBroadcastResponse = broadcast_resp.json().await?;
+        metrics.rpc_successes += 1;
+
+        if broadcast_body.online_count < 3 {
+            metrics.errors.push(format!(
+                "expected online_count >= 3, got {}",
+                broadcast_body.online_count
+            ));
+        }
+
+        // --- Step 4: 验证三个用户收到广播消息 ---
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 通过 SDK event 检查是否收到 SubscriptionMessageReceived 事件
+        let mut received = [false; 3];
+        for (i, events) in [&mut alice_events, &mut bob_events, &mut charlie_events]
+            .iter_mut()
+            .enumerate()
+        {
+            loop {
+                match events.try_recv() {
+                    Ok(event) => {
+                        if let privchat_sdk::SdkEvent::SubscriptionMessageReceived { channel_id: cid, payload, .. } = &event {
+                            if *cid == channel_id {
+                                let content = String::from_utf8_lossy(payload);
+                                if content.contains("hello-room-") {
+                                    received[i] = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let names = ["alice", "bob", "charlie"];
+        let mut receive_count = 0;
+        for (i, got) in received.iter().enumerate() {
+            if *got {
+                receive_count += 1;
+            } else {
+                metrics
+                    .errors
+                    .push(format!("{} did not receive room broadcast", names[i]));
+            }
+        }
+
+        // --- Step 5: 取消订阅 ---
+        for (name, sdk) in [("alice", &alice_sdk), ("bob", &bob_sdk), ("charlie", &charlie_sdk)] {
+            if let Err(e) = sdk.unsubscribe_channel(channel_id, 2).await {
+                metrics
+                    .errors
+                    .push(format!("{} unsubscribe_channel failed: {}", name, e));
+            }
+        }
+
+        // --- Step 6: 验证取消订阅后在线人数为 0 ---
+        let verify_resp = client
+            .get(format!("{}/api/admin/room/{}", admin_base, channel_id))
+            .header("X-Service-Key", &service_key)
+            .send()
+            .await?;
+        metrics.rpc_calls += 1;
+
+        if verify_resp.status().is_success() {
+            let channel_info: RoomChannelInfoResponse = verify_resp.json().await?;
+            metrics.rpc_successes += 1;
+            if channel_info.online_count != 0 {
+                metrics.errors.push(format!(
+                    "after unsubscribe, online_count should be 0, got {}",
+                    channel_info.online_count
+                ));
+            }
+        }
+
+        let details = format!(
+            "channel_id={}, broadcast delivered={}/{}, received={}/3",
+            channel_id, broadcast_body.delivered, broadcast_body.online_count, receive_count
+        );
+
+        Ok(PhaseResult {
+            phase_name: "room".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details,
+            metrics,
+        })
+    }
+}
+
+// --- Admin API response types for phase31 ---
+
+#[derive(Deserialize)]
+struct CreateRoomChannelResponse {
+    #[allow(dead_code)]
+    success: bool,
+    channel_id: u64,
+}
+
+#[derive(Deserialize)]
+struct RoomBroadcastResponse {
+    online_count: usize,
+    delivered: usize,
+}
+
+#[derive(Deserialize)]
+struct RoomChannelInfoResponse {
+    online_count: usize,
 }
 
 async fn send_custom(
@@ -2606,6 +2897,31 @@ fn require_group_channel(manager: &MultiAccountManager, key: &str) -> BoxResult<
     manager
         .cached_group_channel(key)
         .ok_or_else(|| boxed_err(format!("missing cached group channel: {key}")))
+}
+
+fn build_pts_tracked_channels(manager: &MultiAccountManager) -> BoxResult<Vec<(String, u64, u8)>> {
+    let main_group = require_group_channel(manager, "main_group")?;
+    let ab = manager
+        .cached_direct_channel("alice", "bob")
+        .ok_or_else(|| boxed_err("missing direct channel alice-bob"))?;
+    let ac = manager
+        .cached_direct_channel("charlie", "alice")
+        .ok_or_else(|| boxed_err("missing direct channel charlie-alice"))?;
+    let bc = manager
+        .cached_direct_channel("bob", "charlie")
+        .ok_or_else(|| boxed_err("missing direct channel bob-charlie"))?;
+
+    Ok(vec![
+        ("alice".to_string(), ab, DIRECT_SYNC_CHANNEL_TYPE),
+        ("alice".to_string(), ac, DIRECT_SYNC_CHANNEL_TYPE),
+        ("alice".to_string(), main_group, GROUP_SYNC_CHANNEL_TYPE),
+        ("bob".to_string(), ab, DIRECT_SYNC_CHANNEL_TYPE),
+        ("bob".to_string(), bc, DIRECT_SYNC_CHANNEL_TYPE),
+        ("bob".to_string(), main_group, GROUP_SYNC_CHANNEL_TYPE),
+        ("charlie".to_string(), ac, DIRECT_SYNC_CHANNEL_TYPE),
+        ("charlie".to_string(), bc, DIRECT_SYNC_CHANNEL_TYPE),
+        ("charlie".to_string(), main_group, GROUP_SYNC_CHANNEL_TYPE),
+    ])
 }
 
 fn submit_ok(resp: &ClientSubmitResponse) -> bool {

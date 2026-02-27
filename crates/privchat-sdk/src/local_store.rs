@@ -18,7 +18,7 @@ use crate::{
     StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
     UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
-    UpsertRemoteMessageInput, UpsertUserInput,
+    UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
 };
 
 mod embedded {
@@ -952,11 +952,11 @@ impl LocalStore {
         Ok(conn.last_insert_rowid() as u64)
     }
 
-    pub fn upsert_remote_message(
+    pub fn upsert_remote_message_with_result(
         &self,
         uid: &str,
         input: &UpsertRemoteMessageInput,
-    ) -> Result<u64> {
+    ) -> Result<UpsertRemoteMessageResult> {
         if input.server_message_id == 0 {
             return Err(Error::InvalidState(
                 "server_message_id is required".to_string(),
@@ -1026,7 +1026,10 @@ impl LocalStore {
             if input.order_seq < current_order_seq
                 || (input.order_seq == current_order_seq && input.pts < current_pts)
             {
-                return Ok(row_id as u64);
+                return Ok(UpsertRemoteMessageResult {
+                    message_id: row_id as u64,
+                    inserted_new: false,
+                });
             }
             if let Some((local_row_id, _, _)) = existed_by_local {
                 if local_row_id != row_id {
@@ -1036,21 +1039,33 @@ impl LocalStore {
                             Error::Storage(format!("delete duplicate remote message: {e}"))
                         })?;
                     update_row(&conn, local_row_id)?;
-                    return Ok(local_row_id as u64);
+                    return Ok(UpsertRemoteMessageResult {
+                        message_id: local_row_id as u64,
+                        inserted_new: false,
+                    });
                 }
             }
             update_row(&conn, row_id)?;
-            return Ok(row_id as u64);
+            return Ok(UpsertRemoteMessageResult {
+                message_id: row_id as u64,
+                inserted_new: false,
+            });
         }
 
         if let Some((row_id, current_order_seq, current_pts)) = existed_by_local {
             if input.order_seq < current_order_seq
                 || (input.order_seq == current_order_seq && input.pts < current_pts)
             {
-                return Ok(row_id as u64);
+                return Ok(UpsertRemoteMessageResult {
+                    message_id: row_id as u64,
+                    inserted_new: false,
+                });
             }
             update_row(&conn, row_id)?;
-            return Ok(row_id as u64);
+            return Ok(UpsertRemoteMessageResult {
+                message_id: row_id as u64,
+                inserted_new: false,
+            });
         }
 
         conn.execute(
@@ -1078,7 +1093,10 @@ impl LocalStore {
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
-        Ok(conn.last_insert_rowid() as u64)
+        Ok(UpsertRemoteMessageResult {
+            message_id: conn.last_insert_rowid() as u64,
+            inserted_new: true,
+        })
     }
 
     /// Batch upsert remote messages within a single SQLite transaction.
@@ -1093,7 +1111,7 @@ impl LocalStore {
         &self,
         uid: &str,
         inputs: &[UpsertRemoteMessageInput],
-    ) -> Vec<Result<u64>> {
+    ) -> Vec<Result<UpsertRemoteMessageResult>> {
         if inputs.is_empty() {
             return vec![];
         }
@@ -1104,7 +1122,7 @@ impl LocalStore {
                 // Transaction failed — fallback to individual upserts
                 inputs
                     .iter()
-                    .map(|input| self.upsert_remote_message(uid, input))
+                    .map(|input| self.upsert_remote_message_with_result(uid, input))
                     .collect()
             }
         }
@@ -1114,7 +1132,7 @@ impl LocalStore {
         &self,
         uid: &str,
         inputs: &[UpsertRemoteMessageInput],
-    ) -> std::result::Result<Vec<Result<u64>>, Error> {
+    ) -> std::result::Result<Vec<Result<UpsertRemoteMessageResult>>, Error> {
         let mut conn = self.conn_for_user(uid)?;
         let tx = conn
             .transaction()
@@ -1138,7 +1156,7 @@ impl LocalStore {
         input: &UpsertRemoteMessageInput,
         now_ms: i64,
         current_uid: Option<u64>,
-    ) -> Result<u64> {
+    ) -> Result<UpsertRemoteMessageResult> {
         if input.server_message_id == 0 {
             return Err(Error::InvalidState(
                 "server_message_id is required".to_string(),
@@ -1206,7 +1224,10 @@ impl LocalStore {
             if input.order_seq < current_order_seq
                 || (input.order_seq == current_order_seq && input.pts < current_pts)
             {
-                return Ok(row_id as u64);
+                return Ok(UpsertRemoteMessageResult {
+                    message_id: row_id as u64,
+                    inserted_new: false,
+                });
             }
             if let Some((local_row_id, _, _)) = existed_by_local {
                 if local_row_id != row_id {
@@ -1215,21 +1236,33 @@ impl LocalStore {
                             Error::Storage(format!("delete duplicate remote message: {e}"))
                         })?;
                     update_row(local_row_id)?;
-                    return Ok(local_row_id as u64);
+                    return Ok(UpsertRemoteMessageResult {
+                        message_id: local_row_id as u64,
+                        inserted_new: false,
+                    });
                 }
             }
             update_row(row_id)?;
-            return Ok(row_id as u64);
+            return Ok(UpsertRemoteMessageResult {
+                message_id: row_id as u64,
+                inserted_new: false,
+            });
         }
 
         if let Some((row_id, current_order_seq, current_pts)) = existed_by_local {
             if input.order_seq < current_order_seq
                 || (input.order_seq == current_order_seq && input.pts < current_pts)
             {
-                return Ok(row_id as u64);
+                return Ok(UpsertRemoteMessageResult {
+                    message_id: row_id as u64,
+                    inserted_new: false,
+                });
             }
             update_row(row_id)?;
-            return Ok(row_id as u64);
+            return Ok(UpsertRemoteMessageResult {
+                message_id: row_id as u64,
+                inserted_new: false,
+            });
         }
 
         tx.execute(
@@ -1257,7 +1290,10 @@ impl LocalStore {
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
-        Ok(tx.last_insert_rowid() as u64)
+        Ok(UpsertRemoteMessageResult {
+            message_id: tx.last_insert_rowid() as u64,
+            inserted_new: true,
+        })
     }
 
     pub fn get_message_by_id(&self, uid: &str, message_id: u64) -> Result<Option<StoredMessage>> {
@@ -1290,6 +1326,25 @@ impl LocalStore {
         )
         .optional()
         .map_err(|e| Error::Storage(format!("get message by id: {e}")))
+    }
+
+    pub fn get_message_id_by_server_message_id(
+        &self,
+        uid: &str,
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+    ) -> Result<Option<u64>> {
+        let conn = self.conn_for_user(uid)?;
+        conn.query_row(
+            "SELECT id FROM message
+             WHERE server_message_id = ?1 AND channel_id = ?2 AND channel_type = ?3
+             LIMIT 1",
+            params![server_message_id as i64, channel_id as i64, channel_type],
+            |row| Ok(row.get::<_, i64>(0)? as u64),
+        )
+        .optional()
+        .map_err(|e| Error::Storage(format!("get message id by server_message_id: {e}")))
     }
 
     pub fn list_messages(
@@ -3406,7 +3461,7 @@ mod tests {
             .expect("create local message");
 
         let remote_id = store
-            .upsert_remote_message(
+            .upsert_remote_message_with_result(
                 uid,
                 &UpsertRemoteMessageInput {
                     server_message_id: 900001,
@@ -3425,7 +3480,8 @@ mod tests {
                     extra: "{}".to_string(),
                 },
             )
-            .expect("upsert remote row");
+            .expect("upsert remote row")
+            .message_id;
         assert_ne!(local_id, remote_id);
 
         store
@@ -3446,7 +3502,7 @@ mod tests {
         let uid = "10004";
 
         let first = store
-            .upsert_remote_message(
+            .upsert_remote_message_with_result(
                 uid,
                 &UpsertRemoteMessageInput {
                     server_message_id: 700001,
@@ -3465,7 +3521,8 @@ mod tests {
                     extra: "{}".to_string(),
                 },
             )
-            .expect("upsert first");
+            .expect("upsert first")
+            .message_id;
         let loaded_first = store
             .get_message_by_id(uid, first)
             .expect("load first")
@@ -3474,7 +3531,7 @@ mod tests {
         assert_eq!(loaded_first.content, "first");
 
         let second = store
-            .upsert_remote_message(
+            .upsert_remote_message_with_result(
                 uid,
                 &UpsertRemoteMessageInput {
                     server_message_id: 700001,
@@ -3493,7 +3550,8 @@ mod tests {
                     extra: "{\"k\":1}".to_string(),
                 },
             )
-            .expect("upsert second");
+            .expect("upsert second")
+            .message_id;
         assert_eq!(
             first, second,
             "same server_message_id should update same row"
@@ -3532,7 +3590,7 @@ mod tests {
             .expect("create local self message");
 
         let merged_row_id = store
-            .upsert_remote_message(
+            .upsert_remote_message_with_result(
                 uid,
                 &UpsertRemoteMessageInput {
                     server_message_id: 9001001,
@@ -3551,7 +3609,8 @@ mod tests {
                     extra: "{}".to_string(),
                 },
             )
-            .expect("merge self echo");
+            .expect("merge self echo")
+            .message_id;
 
         assert_eq!(
             merged_row_id, local_row_id,
@@ -3559,7 +3618,7 @@ mod tests {
         );
 
         let second_device_row_id = store
-            .upsert_remote_message(
+            .upsert_remote_message_with_result(
                 uid,
                 &UpsertRemoteMessageInput {
                     server_message_id: 9001002,
@@ -3578,7 +3637,8 @@ mod tests {
                     extra: "{}".to_string(),
                 },
             )
-            .expect("insert self message from another device");
+            .expect("insert self message from another device")
+            .message_id;
 
         assert_ne!(
             second_device_row_id, local_row_id,
@@ -3609,7 +3669,7 @@ mod tests {
         let uid = "10006";
 
         let row_id = store
-            .upsert_remote_message(
+            .upsert_remote_message_with_result(
                 uid,
                 &UpsertRemoteMessageInput {
                     server_message_id: 800001,
@@ -3628,10 +3688,11 @@ mod tests {
                     extra: "{}".to_string(),
                 },
             )
-            .expect("insert newer");
+            .expect("insert newer")
+            .message_id;
 
         let same_row = store
-            .upsert_remote_message(
+            .upsert_remote_message_with_result(
                 uid,
                 &UpsertRemoteMessageInput {
                     server_message_id: 800001,
@@ -3650,7 +3711,8 @@ mod tests {
                     extra: "{}".to_string(),
                 },
             )
-            .expect("replay older");
+            .expect("replay older")
+            .message_id;
         assert_eq!(row_id, same_row);
 
         let loaded = store

@@ -11,7 +11,7 @@ use crate::{
     StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
     UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
-    UpsertRemoteMessageInput, UpsertUserInput,
+    UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
 };
 
 enum StorageCmd {
@@ -99,14 +99,14 @@ enum StorageCmd {
         message_id: u64,
         resp: oneshot::Sender<Result<Option<StoredMessage>>>,
     },
-    UpsertRemoteMessage {
+    UpsertRemoteMessageWithResult {
         input: UpsertRemoteMessageInput,
-        resp: oneshot::Sender<Result<u64>>,
+        resp: oneshot::Sender<Result<UpsertRemoteMessageResult>>,
     },
     #[allow(dead_code)]
     BatchUpsertRemoteMessages {
         inputs: Vec<UpsertRemoteMessageInput>,
-        resp: oneshot::Sender<Vec<Result<u64>>>,
+        resp: oneshot::Sender<Vec<Result<UpsertRemoteMessageResult>>>,
     },
     ListMessages {
         channel_id: u64,
@@ -149,6 +149,12 @@ enum StorageCmd {
     },
     GetLocalMessageId {
         message_id: u64,
+        resp: oneshot::Sender<Result<Option<u64>>>,
+    },
+    GetMessageIdByServerMessageId {
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
         resp: oneshot::Sender<Result<Option<u64>>>,
     },
     UpdateMessageStatus {
@@ -601,10 +607,13 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn upsert_remote_message(&self, input: UpsertRemoteMessageInput) -> Result<u64> {
+    pub async fn upsert_remote_message_with_result(
+        &self,
+        input: UpsertRemoteMessageInput,
+    ) -> Result<UpsertRemoteMessageResult> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::UpsertRemoteMessage {
+            .send(StorageCmd::UpsertRemoteMessageWithResult {
                 input,
                 resp: resp_tx,
             })
@@ -618,7 +627,7 @@ impl StorageHandle {
     pub async fn batch_upsert_remote_messages(
         &self,
         inputs: Vec<UpsertRemoteMessageInput>,
-    ) -> Result<Vec<Result<u64>>> {
+    ) -> Result<Vec<Result<UpsertRemoteMessageResult>>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::BatchUpsertRemoteMessages {
@@ -743,6 +752,24 @@ impl StorageHandle {
         self.tx
             .send(StorageCmd::GetLocalMessageId {
                 message_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn get_message_id_by_server_message_id(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+    ) -> Result<Option<u64>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::GetMessageIdByServerMessageId {
+                channel_id,
+                channel_type,
+                server_message_id,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1321,7 +1348,10 @@ impl StorageHandle {
 /// Flush a batch of UpsertRemoteMessage commands in a single transaction.
 fn flush_upsert_batch(
     store: &LocalStore,
-    batch: Vec<(UpsertRemoteMessageInput, oneshot::Sender<Result<u64>>)>,
+    batch: Vec<(
+        UpsertRemoteMessageInput,
+        oneshot::Sender<Result<UpsertRemoteMessageResult>>,
+    )>,
 ) {
     if batch.is_empty() {
         return;
@@ -1351,13 +1381,13 @@ fn flush_upsert_batch(
 
 fn dispatch_cmd_inner(store: &LocalStore, cmd: StorageCmd, rx: &mpsc::Receiver<StorageCmd>) {
     match cmd {
-        StorageCmd::UpsertRemoteMessage { input, resp } => {
+        StorageCmd::UpsertRemoteMessageWithResult { input, resp } => {
             // Even deferred upserts go through batch path
             let mut batch = Vec::with_capacity(32);
             batch.push((input, resp));
             while batch.len() < 32 {
                 match rx.try_recv() {
-                    Ok(StorageCmd::UpsertRemoteMessage { input, resp }) => {
+                    Ok(StorageCmd::UpsertRemoteMessageWithResult { input, resp }) => {
                         batch.push((input, resp));
                     }
                     Ok(other) => {
@@ -1488,8 +1518,8 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         StorageCmd::GetMessageById { message_id, resp } => {
             with_uid!(resp, |uid| store.get_message_by_id(&uid, message_id));
         }
-        StorageCmd::UpsertRemoteMessage { input, resp } => {
-            with_uid!(resp, |uid| store.upsert_remote_message(&uid, &input));
+        StorageCmd::UpsertRemoteMessageWithResult { input, resp } => {
+            with_uid!(resp, |uid| store.upsert_remote_message_with_result(&uid, &input));
         }
         StorageCmd::BatchUpsertRemoteMessages { inputs, resp } => {
             let result = match store.load_current_uid() {
@@ -1571,6 +1601,19 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::GetLocalMessageId { message_id, resp } => {
             with_uid!(resp, |uid| store.get_local_message_id(&uid, message_id));
+        }
+        StorageCmd::GetMessageIdByServerMessageId {
+            channel_id,
+            channel_type,
+            server_message_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.get_message_id_by_server_message_id(
+                &uid,
+                channel_id,
+                channel_type,
+                server_message_id
+            ));
         }
         StorageCmd::UpdateMessageStatus {
             message_id,
@@ -1875,16 +1918,18 @@ fn run_loop(store: LocalStore, rx: mpsc::Receiver<StorageCmd>) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             StorageCmd::Shutdown => break,
-            StorageCmd::UpsertRemoteMessage { input, resp } => {
-                // Batch drain: collect consecutive UpsertRemoteMessage commands
-                let mut batch: Vec<(UpsertRemoteMessageInput, oneshot::Sender<Result<u64>>)> =
-                    Vec::with_capacity(32);
+            StorageCmd::UpsertRemoteMessageWithResult { input, resp } => {
+                // Batch drain: collect consecutive upsert commands.
+                let mut batch: Vec<(
+                    UpsertRemoteMessageInput,
+                    oneshot::Sender<Result<UpsertRemoteMessageResult>>,
+                )> = Vec::with_capacity(32);
                 batch.push((input, resp));
                 let mut deferred: Vec<StorageCmd> = Vec::new();
 
                 while batch.len() < 32 {
                     match rx.try_recv() {
-                        Ok(StorageCmd::UpsertRemoteMessage { input, resp }) => {
+                        Ok(StorageCmd::UpsertRemoteMessageWithResult { input, resp }) => {
                             batch.push((input, resp));
                         }
                         Ok(other) => {

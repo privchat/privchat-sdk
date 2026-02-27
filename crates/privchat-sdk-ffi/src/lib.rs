@@ -1083,6 +1083,14 @@ pub enum SdkEvent {
         channel_type: i32,
         is_typing: bool,
     },
+    SubscriptionMessageReceived {
+        channel_id: u64,
+        topic: Option<String>,
+        payload: Vec<u8>,
+        publisher: Option<String>,
+        server_message_id: Option<u64>,
+        timestamp: u64,
+    },
     ShutdownStarted,
     ShutdownCompleted,
 }
@@ -1778,6 +1786,21 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             channel_type,
             is_typing,
         },
+        privchat_sdk::SdkEvent::SubscriptionMessageReceived {
+            channel_id,
+            topic,
+            payload,
+            publisher,
+            server_message_id,
+            timestamp,
+        } => SdkEvent::SubscriptionMessageReceived {
+            channel_id,
+            topic,
+            payload,
+            publisher,
+            server_message_id,
+            timestamp,
+        },
         privchat_sdk::SdkEvent::ShutdownStarted => SdkEvent::ShutdownStarted,
         privchat_sdk::SdkEvent::ShutdownCompleted => SdkEvent::ShutdownCompleted,
     }
@@ -1901,6 +1924,22 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "channel_id": channel_id,
             "channel_type": channel_type,
             "is_typing": is_typing
+        }),
+        SdkEvent::SubscriptionMessageReceived {
+            channel_id,
+            topic,
+            payload,
+            publisher,
+            server_message_id,
+            timestamp,
+        } => json!({
+            "type": "subscription_message_received",
+            "channel_id": channel_id,
+            "topic": topic,
+            "payload_len": payload.len(),
+            "publisher": publisher,
+            "server_message_id": server_message_id,
+            "timestamp": timestamp
         }),
         SdkEvent::ShutdownStarted => json!({ "type": "shutdown_started" }),
         SdkEvent::ShutdownCompleted => json!({ "type": "shutdown_completed" }),
@@ -3226,6 +3265,24 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
+    /// 订阅频道事件（进入聊天页面时调用，接收 typing / presence 等状态事件）
+    /// channel_type: 0=Private, 1=Group, 2=Room
+    pub async fn subscribe_channel(&self, channel_id: u64, channel_type: u8) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .subscribe_channel(channel_id, channel_type)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// 取消订阅频道事件（离开聊天页面时调用）
+    /// channel_type: 0=Private, 1=Group, 2=Room
+    pub async fn unsubscribe_channel(&self, channel_id: u64, channel_type: u8) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .unsubscribe_channel(channel_id, channel_type)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn fetch_presence(
         &self,
         user_ids: Vec<u64>,
@@ -4105,6 +4162,7 @@ impl PrivchatClient {
                 device_id,
                 apns_armed,
                 push_token,
+                vendor: None,
             },
         )
         .await?;
