@@ -1581,29 +1581,249 @@ impl TestPhases {
         let start = std::time::Instant::now();
         let mut metrics = PhaseMetrics::default();
 
+        // --- Step 1: 获取 alice-bob 私聊频道 ---
         let channel_id = manager
             .cached_direct_channel("alice", "bob")
             .or_else(|| manager.cached_group_channel("alice_bob_friend_channel"))
             .ok_or_else(|| boxed_err("missing channel for typing"))?;
 
         let alice_sdk = manager.sdk("alice")?;
+        let bob_sdk = manager.sdk("bob")?;
+
+        // --- Step 2: bob 订阅频道（接收 typing 事件） ---
+        bob_sdk.subscribe_channel(channel_id, 0).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        // 订阅 SDK 事件流（在 subscribe 之后开始监听）
+        let mut bob_events = bob_sdk.subscribe_events();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // --- Step 3: alice 发送 typing → bob 应收到 PublishRequest(topic="typing") ---
         alice_sdk
             .send_typing(channel_id, 0, true, privchat_sdk::TypingActionType::Typing)
             .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut bob_received_typing = false;
+        loop {
+            match bob_events.try_recv() {
+                Ok(event) => {
+                    if let privchat_sdk::SdkEvent::SubscriptionMessageReceived {
+                        channel_id: cid,
+                        topic,
+                        ..
+                    } = &event
+                    {
+                        if *cid == channel_id && topic.as_deref() == Some("typing") {
+                            bob_received_typing = true;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if !bob_received_typing {
+            metrics
+                .errors
+                .push("bob did not receive typing event from alice".to_string());
+        }
+
+        // --- Step 4: 验证限频 — 500ms 内连续发 3 次，bob 最多收到 1 次 ---
+        // 先排空事件队列
+        while bob_events.try_recv().is_ok() {}
+
+        // 等待 600ms 确保上一次限频窗口过期
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // 50ms 间隔连续发 3 次 typing
+        for _ in 0..3 {
+            let _ = alice_sdk
+                .send_typing(channel_id, 0, true, privchat_sdk::TypingActionType::Typing)
+                .await;
+            metrics.rpc_calls += 1;
+            metrics.rpc_successes += 1;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut typing_count = 0u32;
+        loop {
+            match bob_events.try_recv() {
+                Ok(event) => {
+                    if let privchat_sdk::SdkEvent::SubscriptionMessageReceived {
+                        channel_id: cid,
+                        topic,
+                        ..
+                    } = &event
+                    {
+                        if *cid == channel_id && topic.as_deref() == Some("typing") {
+                            typing_count += 1;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // 服务端 500ms 限频：3 次请求在 ~100ms 内发出，只有第 1 次应该被广播
+        if typing_count > 1 {
+            metrics.errors.push(format!(
+                "rate limiting failed: sent 3 rapid typings, bob received {} (expected 1)",
+                typing_count
+            ));
+        }
+
+        // --- Step 5: bob 取消订阅后不再收到 typing ---
+        bob_sdk.unsubscribe_channel(channel_id, 0).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        // 排空事件队列
+        while bob_events.try_recv().is_ok() {}
+
+        // 等待 600ms 确保限频窗口过期后再发
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
         alice_sdk
-            .send_typing(channel_id, 0, false, privchat_sdk::TypingActionType::Typing)
+            .send_typing(channel_id, 0, true, privchat_sdk::TypingActionType::Typing)
             .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut received_after_unsub = false;
+        loop {
+            match bob_events.try_recv() {
+                Ok(event) => {
+                    if let privchat_sdk::SdkEvent::SubscriptionMessageReceived {
+                        channel_id: cid,
+                        topic,
+                        ..
+                    } = &event
+                    {
+                        if *cid == channel_id && topic.as_deref() == Some("typing") {
+                            received_after_unsub = true;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if received_after_unsub {
+            metrics
+                .errors
+                .push("bob received typing after unsubscribe".to_string());
+        }
+
+        // --- Step 6: 群聊 typing 测试 ---
+        let group_channel_id = manager
+            .cached_group_channel("test_group")
+            .ok_or_else(|| boxed_err("missing group channel for typing test"))?;
+
+        let charlie_sdk = manager.sdk("charlie")?;
+
+        // bob 和 charlie 订阅群频道
+        bob_sdk.subscribe_channel(group_channel_id, 1).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        charlie_sdk.subscribe_channel(group_channel_id, 1).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        let mut bob_group_events = bob_sdk.subscribe_events();
+        let mut charlie_group_events = charlie_sdk.subscribe_events();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // alice 在群里发 typing
+        alice_sdk
+            .send_typing(group_channel_id, 1, true, privchat_sdk::TypingActionType::Typing)
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // bob 和 charlie 都应收到
+        let mut bob_group_typing = false;
+        let mut charlie_group_typing = false;
+
+        loop {
+            match bob_group_events.try_recv() {
+                Ok(event) => {
+                    if let privchat_sdk::SdkEvent::SubscriptionMessageReceived {
+                        channel_id: cid,
+                        topic,
+                        ..
+                    } = &event
+                    {
+                        if *cid == group_channel_id && topic.as_deref() == Some("typing") {
+                            bob_group_typing = true;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        loop {
+            match charlie_group_events.try_recv() {
+                Ok(event) => {
+                    if let privchat_sdk::SdkEvent::SubscriptionMessageReceived {
+                        channel_id: cid,
+                        topic,
+                        ..
+                    } = &event
+                    {
+                        if *cid == group_channel_id && topic.as_deref() == Some("typing") {
+                            charlie_group_typing = true;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if !bob_group_typing {
+            metrics
+                .errors
+                .push("bob did not receive group typing from alice".to_string());
+        }
+        if !charlie_group_typing {
+            metrics
+                .errors
+                .push("charlie did not receive group typing from alice".to_string());
+        }
+
+        // 清理：取消群订阅
+        let _ = bob_sdk.unsubscribe_channel(group_channel_id, 1).await;
+        let _ = charlie_sdk.unsubscribe_channel(group_channel_id, 1).await;
+
+        let details = format!(
+            "private ch={} (recv={}, rate_limit_count={}/3), group ch={} (bob={}, charlie={})",
+            channel_id,
+            bob_received_typing,
+            typing_count,
+            group_channel_id,
+            bob_group_typing,
+            charlie_group_typing,
+        );
 
         Ok(PhaseResult {
             phase_name: "typing-indicator".to_string(),
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
-            details: format!("channel_id={channel_id}"),
+            details,
             metrics,
         })
     }
