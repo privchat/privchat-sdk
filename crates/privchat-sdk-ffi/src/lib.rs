@@ -1,3 +1,20 @@
+// Copyright 2025 Shanghai Boyu Information Technology Co., Ltd.
+// https://privchat.dev
+//
+// Author: zoujiaqing <zoujiaqing@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #![allow(clippy::new_without_default)]
 
 use privchat_protocol::rpc::routes;
@@ -3267,9 +3284,10 @@ impl PrivchatClient {
 
     /// 订阅频道事件（进入聊天页面时调用，接收 typing / presence 等状态事件）
     /// channel_type: 0=Private, 1=Group, 2=Room
-    pub async fn subscribe_channel(&self, channel_id: u64, channel_type: u8) -> Result<(), PrivchatFfiError> {
+    /// token: 可选，Room 类型订阅时传入业务 API 签发的 ticket（JWT）
+    pub async fn subscribe_channel(&self, channel_id: u64, channel_type: u8, token: Option<String>) -> Result<(), PrivchatFfiError> {
         self.inner
-            .subscribe_channel(channel_id, channel_type)
+            .subscribe_channel(channel_id, channel_type, token)
             .await
             .map_err(PrivchatFfiError::from)
     }

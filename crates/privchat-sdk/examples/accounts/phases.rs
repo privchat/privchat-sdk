@@ -1,3 +1,20 @@
+// Copyright 2025 Shanghai Boyu Information Technology Co., Ltd.
+// https://privchat.dev
+//
+// Author: zoujiaqing <zoujiaqing@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::time::Duration;
 
 use privchat_protocol::rpc::{AccountSearchResponse, ClientSubmitResponse};
@@ -1591,7 +1608,7 @@ impl TestPhases {
         let bob_sdk = manager.sdk("bob")?;
 
         // --- Step 2: bob 订阅频道（接收 typing 事件） ---
-        bob_sdk.subscribe_channel(channel_id, 0).await?;
+        bob_sdk.subscribe_channel(channel_id, 0, None).await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
@@ -1732,11 +1749,11 @@ impl TestPhases {
         let charlie_sdk = manager.sdk("charlie")?;
 
         // bob 和 charlie 订阅群频道
-        bob_sdk.subscribe_channel(group_channel_id, 1).await?;
+        bob_sdk.subscribe_channel(group_channel_id, 1, None).await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
-        charlie_sdk.subscribe_channel(group_channel_id, 1).await?;
+        charlie_sdk.subscribe_channel(group_channel_id, 1, None).await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
@@ -2886,7 +2903,7 @@ impl TestPhases {
         let mut charlie_events = charlie_sdk.subscribe_events();
 
         for (name, sdk) in [("alice", &alice_sdk), ("bob", &bob_sdk), ("charlie", &charlie_sdk)] {
-            match sdk.subscribe_channel(channel_id, 2).await {
+            match sdk.subscribe_channel(channel_id, 2, None).await {
                 Ok(_) => {
                     metrics.rpc_calls += 1;
                     metrics.rpc_successes += 1;

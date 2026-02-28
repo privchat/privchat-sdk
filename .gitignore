@@ -1,12 +1,10 @@
 # Rust workspace artifacts
-/target/
+**/target/
 **/*.rs.bk
 Cargo.lock
-target/
 
 # Generated bindings / headers
-/crates/privchat-sdk-ffi/bindings/swift/
-/crates/privchat-sdk-ffi/bindings/kotlin/
+/crates/privchat-sdk-ffi/bindings/
 
 # Local environment files
 .env

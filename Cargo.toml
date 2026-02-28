@@ -8,9 +8,10 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-license = "MIT"
+license = "Apache-2.0"
 authors = ["zoujiaqing <zoujiaqing@gmail.com>"]
 homepage = "https://privchat.dev"
+repository = "https://github.com/nicegram/privchat-sdk"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -29,6 +30,6 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 rand = "0.8"
 
-msgtrans = { path = "../msgtrans" }
-privchat-protocol = { path = "../privchat-protocol" }
+msgtrans = { version = "1.0.6", path = "../msgtrans" }
+privchat-protocol = { version = "0.1.0", path = "../privchat-protocol" }
 uniffi = { version = "0.31.0", features = ["cli"] }

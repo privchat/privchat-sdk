@@ -1,3 +1,20 @@
+// Copyright 2025 Shanghai Boyu Information Technology Co., Ltd.
+// https://privchat.dev
+//
+// Author: zoujiaqing <zoujiaqing@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
@@ -1061,6 +1078,7 @@ enum Command {
     Subscribe {
         channel_id: u64,
         channel_type: u8,
+        token: Option<String>,
         resp: oneshot::Sender<Result<()>>,
     },
     Unsubscribe {
@@ -5162,7 +5180,8 @@ impl State {
     }
 
     /// 订阅频道事件（typing / presence 等状态事件通过此通道接收）
-    async fn subscribe_channel(&mut self, channel_id: u64, channel_type: u8) -> Result<()> {
+    /// token: 可选，Room 类型订阅时传入业务 API 签发的 ticket（JWT）
+    async fn subscribe_channel(&mut self, channel_id: u64, channel_type: u8, token: Option<String>) -> Result<()> {
         let timeout = self.timeout();
         let req = SubscribeRequest {
             setting: 0,
@@ -5170,7 +5189,7 @@ impl State {
             channel_id,
             channel_type,
             action: 1, // SUBSCRIBE
-            param: String::new(),
+            param: token.unwrap_or_default(),
         };
         let payload = encode_message(&req)
             .map_err(|e| Error::Serialization(format!("encode subscribe_channel: {e}")))?;
@@ -6602,11 +6621,11 @@ impl PrivchatSdk {
                         }
                         let _ = resp.send(result);
                     }
-                    Command::Subscribe { channel_id, channel_type, resp } => {
+                    Command::Subscribe { channel_id, channel_type, token, resp } => {
                         let result = match state.session_state.can(Action::Authenticate) {
                             Ok(_) => match timeout(
                                 Duration::from_secs(10),
-                                state.subscribe_channel(channel_id, channel_type),
+                                state.subscribe_channel(channel_id, channel_type, token),
                             )
                             .await
                             {
@@ -8298,13 +8317,15 @@ impl PrivchatSdk {
 
     /// 订阅频道事件（进入聊天页面时调用，接收 typing / presence 等状态事件）
     /// channel_type: 0=Private, 1=Group, 2=Room
-    pub async fn subscribe_channel(&self, channel_id: u64, channel_type: u8) -> Result<()> {
+    /// token: 可选，Room 类型订阅时传入业务 API 签发的 ticket（JWT）
+    pub async fn subscribe_channel(&self, channel_id: u64, channel_type: u8, token: Option<String>) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::Subscribe {
                 channel_id,
                 channel_type,
+                token,
                 resp: resp_tx,
             })
             .await
