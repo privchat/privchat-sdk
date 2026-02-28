@@ -216,9 +216,9 @@ SDK 使用 `SdkError` 枚举统一错误类型，FFI 层包装为 `PrivchatFfiEr
 
 | 平台 SDK | 说明 |
 |----------|------|
-| [privchat-sdk-kotlin](../privchat-sdk-kotlin) | Kotlin Multiplatform（Android + iOS + Desktop） |
-| [privchat-sdk-swift](../privchat-sdk-swift) | Swift 原生（iOS / macOS） |
-| [privchat-sdk-android](../privchat-sdk-android) | Android 原生 |
+| [privchat-sdk-kotlin](https://github.com/privchat/privchat-sdk-kotlin) | Kotlin Multiplatform（Android + iOS + Desktop） |
+| [privchat-sdk-swift](https://github.com/privchat/privchat-sdk-swift) | Swift 原生（iOS / macOS） |
+| [privchat-sdk-android](https://github.com/privchat/privchat-sdk-android) | Android 原生 |
 
 ## 相关文档
 

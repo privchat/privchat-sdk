@@ -218,9 +218,9 @@ This project is not intended for direct use by application developers. Instead, 
 
 | Platform SDK | Description |
 |--------------|-------------|
-| [privchat-sdk-kotlin](../privchat-sdk-kotlin) | Kotlin Multiplatform (Android + iOS + Desktop) |
-| [privchat-sdk-swift](../privchat-sdk-swift) | Native Swift (iOS / macOS) |
-| [privchat-sdk-android](../privchat-sdk-android) | Native Android |
+| [privchat-sdk-kotlin](https://github.com/privchat/privchat-sdk-kotlin) | Kotlin Multiplatform (Android + iOS + Desktop) |
+| [privchat-sdk-swift](https://github.com/privchat/privchat-sdk-swift) | Native Swift (iOS / macOS) |
+| [privchat-sdk-android](https://github.com/privchat/privchat-sdk-android) | Native Android |
 
 ## Documentation
 
