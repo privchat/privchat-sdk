@@ -11,7 +11,7 @@ version = "0.1.0"
 license = "Apache-2.0"
 authors = ["zoujiaqing <zoujiaqing@gmail.com>"]
 homepage = "https://privchat.dev"
-repository = "https://github.com/nicegram/privchat-sdk"
+repository = "https://github.com/privchat/privchat-sdk"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -31,5 +31,5 @@ hkdf = "0.12"
 rand = "0.8"
 
 msgtrans = { version = "1.0.6", path = "../msgtrans" }
-privchat-protocol = { version = "0.1.0", path = "../privchat-protocol" }
+privchat-protocol = { version = "0.1", path = "../privchat-protocol" }
 uniffi = { version = "0.31.0", features = ["cli"] }
