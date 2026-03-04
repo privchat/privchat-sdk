@@ -6049,7 +6049,7 @@ impl PrivchatSdk {
                 pending_prelogin_inbound_frames: Vec::new(),
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
-            let mut health_tick = interval(Duration::from_millis(200));
+            let mut health_tick = interval(Duration::from_secs(15));
             health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
