@@ -55,8 +55,8 @@ use privchat_protocol::rpc::{
     MessageReactionRemoveRequest, MessageReactionRemoveResponse, MessageReactionStatsRequest,
     MessageReactionStatsResponse, MessageReadListRequest, MessageReadListResponse,
     MessageReadStatsRequest, MessageReadStatsResponse, MessageRevokeRequest, MessageRevokeResponse,
-    MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadRequest,
-    MessageStatusReadResponse, QRCodeGenerateRequest, QRCodeGenerateResponse, QRCodeListRequest,
+    MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadPtsRequest,
+    MessageStatusReadPtsResponse, QRCodeGenerateRequest, QRCodeGenerateResponse, QRCodeListRequest,
     QRCodeListResponse, QRCodeRefreshRequest, QRCodeRefreshResponse, QRCodeResolveRequest,
     QRCodeResolveResponse, QRCodeRevokeRequest, QRCodeRevokeResponse, StickerPackageDetailRequest,
     StickerPackageDetailResponse, StickerPackageListRequest, StickerPackageListResponse,
@@ -1084,12 +1084,6 @@ pub enum SdkEvent {
         message_id: u64,
         reason: String,
     },
-    ReadReceiptUpdated {
-        channel_id: u64,
-        channel_type: i32,
-        message_id: u64,
-        is_read: bool,
-    },
     MessageSendStatusChanged {
         message_id: u64,
         status: i32,
@@ -1774,17 +1768,6 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             message_id,
             reason,
         },
-        privchat_sdk::SdkEvent::ReadReceiptUpdated {
-            channel_id,
-            channel_type,
-            message_id,
-            is_read,
-        } => SdkEvent::ReadReceiptUpdated {
-            channel_id,
-            channel_type,
-            message_id,
-            is_read,
-        },
         privchat_sdk::SdkEvent::MessageSendStatusChanged {
             message_id,
             status,
@@ -1910,18 +1893,6 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "message_id": message_id,
             "reason": reason
         }),
-        SdkEvent::ReadReceiptUpdated {
-            channel_id,
-            channel_type,
-            message_id,
-            is_read,
-        } => json!({
-            "type": "read_receipt_updated",
-            "channel_id": channel_id,
-            "channel_type": channel_type,
-            "message_id": message_id,
-            "is_read": is_read
-        }),
         SdkEvent::MessageSendStatusChanged {
             message_id,
             status,
@@ -1975,7 +1946,6 @@ fn is_timeline_event(evt: &SdkEvent) -> bool {
     matches!(
         evt,
         SdkEvent::TimelineUpdated { .. }
-            | SdkEvent::ReadReceiptUpdated { .. }
             | SdkEvent::MessageSendStatusChanged { .. }
             | SdkEvent::SyncEntityChanged { .. }
             | SdkEvent::SyncChannelApplied { .. }
@@ -3830,44 +3800,35 @@ impl PrivchatClient {
         })
     }
 
-    pub async fn mark_as_read(
+    pub async fn mark_read_to_pts(
         &self,
         channel_id: u64,
-        server_message_id: u64,
-    ) -> Result<bool, PrivchatFfiError> {
-        let user_id = self.require_current_user_id().await?;
-        let resp: MessageStatusReadResponse = rpc_call_typed(
+        read_pts: u64,
+    ) -> Result<u64, PrivchatFfiError> {
+        let resp: MessageStatusReadPtsResponse = rpc_call_typed(
             &self.inner,
-            routes::message_status::READ,
-            &MessageStatusReadRequest {
+            routes::message_status::READ_PTS,
+            &MessageStatusReadPtsRequest {
                 channel_id,
-                message_id: server_message_id,
-                user_id,
+                read_pts,
+                last_read_message_id: None,
             },
         )
         .await?;
         let channel_type = self.resolve_channel_type(channel_id).await;
-        if let Some(local_message_id) = self
-            .resolve_local_message_id_by_server_message_id(
-                channel_id,
-                channel_type,
-                server_message_id,
-            )
-            .await?
-        {
-            let _ = self
-                .set_message_read(local_message_id, channel_id, channel_type, true)
-                .await;
-        }
-        Ok(resp)
+        let _ = self
+            .inner
+            .project_channel_read_cursor(channel_id, channel_type, resp.last_read_pts)
+            .await;
+        Ok(resp.last_read_pts)
     }
 
-    pub async fn mark_as_read_blocking(
+    pub async fn mark_read_to_pts_blocking(
         &self,
         channel_id: u64,
-        server_message_id: u64,
-    ) -> Result<bool, PrivchatFfiError> {
-        self.mark_as_read(channel_id, server_message_id).await
+        read_pts: u64,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.mark_read_to_pts(channel_id, read_pts).await
     }
 
     pub async fn recall_message(
@@ -5856,19 +5817,6 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
-    pub async fn set_message_read(
-        &self,
-        message_id: u64,
-        channel_id: u64,
-        channel_type: i32,
-        is_read: bool,
-    ) -> Result<(), PrivchatFfiError> {
-        self.inner
-            .set_message_read(message_id, channel_id, channel_type, is_read)
-            .await
-            .map_err(PrivchatFfiError::from)
-    }
-
     pub async fn set_message_revoke(
         &self,
         message_id: u64,
@@ -5923,17 +5871,6 @@ impl PrivchatClient {
             .await
             .map_err(PrivchatFfiError::from)?;
         Ok(out.map(map_stored_message_extra))
-    }
-
-    pub async fn mark_channel_read(
-        &self,
-        channel_id: u64,
-        channel_type: i32,
-    ) -> Result<(), PrivchatFfiError> {
-        self.inner
-            .mark_channel_read(channel_id, channel_type)
-            .await
-            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn get_channel_unread_count(
@@ -6497,7 +6434,7 @@ impl PrivchatClient {
     }
 
     pub fn builder(&self) -> String {
-        "privchat-rust".to_string()
+        "livestreaming".to_string()
     }
 
     pub fn build(&self) -> String {
@@ -6703,13 +6640,9 @@ impl PrivchatClient {
     pub async fn mark_fully_read_at(
         &self,
         channel_id: u64,
-        server_message_id: u64,
-    ) -> Result<bool, PrivchatFfiError> {
-        // Keep remote read-receipt behavior compatible, and also best-effort
-        // update local unread state for local-first UX.
-        let out = self.mark_as_read(channel_id, server_message_id).await?;
-        let _ = self.mark_channel_read(channel_id, 1).await;
-        Ok(out)
+        read_pts: u64,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.mark_read_to_pts(channel_id, read_pts).await
     }
 
     pub fn on_connection_state_changed(&self) {

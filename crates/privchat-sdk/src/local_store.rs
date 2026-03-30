@@ -2733,64 +2733,6 @@ impl LocalStore {
         Ok(())
     }
 
-    pub fn set_message_read(
-        &self,
-        uid: &str,
-        message_id: u64,
-        channel_id: u64,
-        channel_type: i32,
-        is_read: bool,
-    ) -> Result<()> {
-        let conn = self.conn_for_user(uid)?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let (readed, unread_count, readed_count) = if is_read {
-            (1_i32, 0_i32, 1_i32)
-        } else {
-            (0_i32, 1_i32, 0_i32)
-        };
-        conn.execute(
-            "INSERT INTO message_extra (
-                message_id, channel_id, channel_type, readed, readed_count, unread_count, extra_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(message_id) DO UPDATE SET
-                readed=excluded.readed,
-                readed_count=excluded.readed_count,
-                unread_count=excluded.unread_count,
-                extra_version=excluded.extra_version",
-            params![
-                message_id as i64,
-                channel_id as i64,
-                channel_type,
-                readed,
-                readed_count,
-                unread_count,
-                now_ms
-            ],
-        )
-        .map_err(|e| Error::Storage(format!("set message read: {e}")))?;
-
-        let unread_total: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(unread_count), 0)
-                 FROM message_extra
-                 WHERE channel_id = ?1 AND channel_type = ?2",
-                params![channel_id as i64, channel_type],
-                |r| r.get(0),
-            )
-            .map_err(|e| Error::Storage(format!("query unread total: {e}")))?;
-
-        conn.execute(
-            "INSERT INTO channel (channel_id, channel_type, unread_count, updated_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(channel_id) DO UPDATE SET
-                unread_count=excluded.unread_count,
-                updated_at=excluded.updated_at",
-            params![channel_id as i64, channel_type, unread_total as i32, now_ms],
-        )
-        .map_err(|e| Error::Storage(format!("upsert channel unread: {e}")))?;
-        Ok(())
-    }
-
     pub fn set_message_revoke(
         &self,
         uid: &str,
@@ -2940,25 +2882,159 @@ impl LocalStore {
         .map_err(|e| Error::Storage(format!("get message extra: {e}")))
     }
 
-    pub fn mark_channel_read(&self, uid: &str, channel_id: u64, channel_type: i32) -> Result<()> {
-        let conn = self.conn_for_user(uid)?;
+    /// 基于 read cursor 精确投影本地读状态：
+    /// - message.pts <= last_read_pts 视为已读
+    /// - message.pts > last_read_pts 且非自己发送 视为未读
+    pub fn project_channel_read_cursor(
+        &self,
+        uid: &str,
+        channel_id: u64,
+        channel_type: i32,
+        last_read_pts: u64,
+    ) -> Result<()> {
+        let mut conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
-        conn.execute(
-            "UPDATE message_extra
-             SET readed = 1, unread_count = 0, readed_count = 1, extra_version = ?3
-             WHERE channel_id = ?1 AND channel_type = ?2",
-            params![channel_id as i64, channel_type, now_ms],
+        let uid_num = uid.parse::<u64>().unwrap_or(0);
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("project channel cursor begin tx: {e}")))?;
+        let existing_keep_pts: u64 = tx
+            .query_row(
+                "SELECT keep_pts
+                 FROM channel_extra
+                 WHERE channel_id = ?1 AND channel_type = ?2
+                 LIMIT 1",
+                params![channel_id as i64, channel_type],
+                |r| Ok(r.get::<_, i64>(0)? as u64),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("project channel cursor query keep_pts: {e}")))?
+            .unwrap_or(0);
+        let effective_read_pts = existing_keep_pts.max(last_read_pts);
+
+        if effective_read_pts == existing_keep_pts {
+            tx.commit()
+                .map_err(|e| Error::Storage(format!("project channel cursor commit tx: {e}")))?;
+            return Ok(());
+        }
+
+        tx.execute(
+            "INSERT INTO channel_extra (
+                channel_id, channel_type, browse_to, keep_pts, keep_offset_y,
+                draft, draft_updated_at, version
+            ) VALUES (?1, ?2, ?3, ?3, 0, '', 0, ?4)
+            ON CONFLICT(channel_id, channel_type) DO UPDATE SET
+                browse_to = MAX(channel_extra.browse_to, excluded.browse_to),
+                keep_pts = MAX(channel_extra.keep_pts, excluded.keep_pts),
+                version = excluded.version",
+            params![
+                channel_id as i64,
+                channel_type,
+                effective_read_pts as i64,
+                now_ms
+            ],
         )
-        .map_err(|e| Error::Storage(format!("mark channel read message_extra: {e}")))?;
-        conn.execute(
+        .map_err(|e| Error::Storage(format!("project channel cursor upsert channel_extra: {e}")))?;
+
+        tx.execute(
+            "INSERT INTO message_extra (
+                message_id, channel_id, channel_type, readed, readed_count, unread_count, extra_version
+            )
+            SELECT
+                m.id AS message_id,
+                m.channel_id,
+                m.channel_type,
+                1 AS readed,
+                1 AS readed_count,
+                0 AS unread_count,
+                ?6 AS extra_version
+            FROM message m
+            WHERE m.channel_id = ?1
+              AND m.channel_type = ?2
+              AND COALESCE(m.pts, 0) > ?3
+              AND COALESCE(m.pts, 0) <= ?4
+            ON CONFLICT(message_id) DO UPDATE SET
+                readed = 1,
+                readed_count = CASE
+                    WHEN message_extra.readed_count < 1 THEN 1
+                    ELSE message_extra.readed_count
+                END,
+                unread_count = 0,
+                extra_version = excluded.extra_version",
+            params![
+                channel_id as i64,
+                channel_type,
+                existing_keep_pts as i64,
+                effective_read_pts as i64,
+                now_ms
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("project channel cursor upsert message_extra: {e}")))?;
+
+        let newly_read_unread_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM message m
+                 WHERE m.channel_id = ?1
+                   AND m.channel_type = ?2
+                   AND m.from_uid != ?3
+                   AND COALESCE(m.pts, 0) > ?4
+                   AND COALESCE(m.pts, 0) <= ?5",
+                params![
+                    channel_id as i64,
+                    channel_type,
+                    uid_num as i64,
+                    existing_keep_pts as i64,
+                    effective_read_pts as i64
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("project channel cursor query newly read count: {e}")))?;
+
+        let existing_unread: Option<i64> = tx
+            .query_row(
+                "SELECT unread_count
+                 FROM channel
+                 WHERE channel_id = ?1
+                 LIMIT 1",
+                params![channel_id as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("project channel cursor query existing unread: {e}")))?;
+
+        let unread_total: i64 = if let Some(current) = existing_unread {
+            std::cmp::max(0, current.saturating_sub(newly_read_unread_count))
+        } else {
+            tx.query_row(
+                "SELECT COUNT(1)
+                 FROM message m
+                 WHERE m.channel_id = ?1
+                   AND m.channel_type = ?2
+                   AND m.from_uid != ?3
+                   AND COALESCE(m.pts, 0) > ?4",
+                params![
+                    channel_id as i64,
+                    channel_type,
+                    uid_num as i64,
+                    effective_read_pts as i64
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("project channel cursor query unread_total: {e}")))?
+        };
+
+        tx.execute(
             "INSERT INTO channel (channel_id, channel_type, unread_count, updated_at, created_at)
-             VALUES (?1, ?2, 0, ?3, ?3)
+             VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(channel_id) DO UPDATE SET
-                unread_count=0,
+                unread_count=excluded.unread_count,
                 updated_at=excluded.updated_at",
-            params![channel_id as i64, channel_type, now_ms],
+            params![channel_id as i64, channel_type, unread_total as i32, now_ms],
         )
-        .map_err(|e| Error::Storage(format!("mark channel read channel table: {e}")))?;
+        .map_err(|e| Error::Storage(format!("project channel cursor upsert channel: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("project channel cursor commit tx: {e}")))?;
         Ok(())
     }
 
@@ -3779,53 +3855,75 @@ mod tests {
     fn unread_count_lifecycle() {
         let store = test_store();
         let uid = "10006";
+        let uid_num = uid.parse::<u64>().expect("uid parse");
         let channel_id = 500_u64;
         let channel_type = 1_i32;
-        let input = NewMessage {
-            channel_id,
-            channel_type,
-            from_uid: 200,
-            message_type: 1,
-            content: "hello-unread".to_string(),
-            searchable_word: "hello-unread".to_string(),
-            setting: 0,
-            extra: "{}".to_string(),
-        };
-        let message_id = store
-            .create_local_message(uid, &input, 0)
-            .expect("create message");
+        store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 950001,
+                    local_message_id: 0,
+                    channel_id,
+                    channel_type,
+                    timestamp: 1_700_000_000_000,
+                    from_uid: 200,
+                    message_type: 1,
+                    content: "hello-unread".to_string(),
+                    status: 2,
+                    searchable_word: "hello-unread".to_string(),
+                    setting: 0,
+                    pts: 100,
+                    order_seq: 100,
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert message 1");
+        store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 950002,
+                    local_message_id: 0,
+                    channel_id,
+                    channel_type,
+                    timestamp: 1_700_000_000_001,
+                    from_uid: uid_num,
+                    message_type: 1,
+                    content: "self-sent".to_string(),
+                    status: 2,
+                    searchable_word: "self-sent".to_string(),
+                    setting: 0,
+                    pts: 101,
+                    order_seq: 101,
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert self message");
 
         store
-            .set_message_read(uid, message_id, channel_id, channel_type, false)
-            .expect("set unread");
+            .project_channel_read_cursor(uid, channel_id, channel_type, 0)
+            .expect("project unread");
         let unread1 = store
             .get_channel_unread_count(uid, channel_id, channel_type)
             .expect("get unread");
         assert_eq!(unread1, 1);
 
         store
-            .set_message_read(uid, message_id, channel_id, channel_type, true)
-            .expect("set read");
+            .project_channel_read_cursor(uid, channel_id, channel_type, 100)
+            .expect("project read to 100");
         let unread2 = store
             .get_channel_unread_count(uid, channel_id, channel_type)
             .expect("get unread2");
         assert_eq!(unread2, 0);
 
         store
-            .set_message_read(uid, message_id, channel_id, channel_type, false)
-            .expect("set unread again");
+            .project_channel_read_cursor(uid, channel_id, channel_type, 90)
+            .expect("project stale 90");
         let unread3 = store
             .get_channel_unread_count(uid, channel_id, channel_type)
             .expect("get unread3");
-        assert_eq!(unread3, 1);
-
-        store
-            .mark_channel_read(uid, channel_id, channel_type)
-            .expect("mark channel read");
-        let unread4 = store
-            .get_channel_unread_count(uid, channel_id, channel_type)
-            .expect("get unread4");
-        assert_eq!(unread4, 0);
+        assert_eq!(unread3, 0);
 
         store
             .upsert_channel(
@@ -3871,6 +3969,165 @@ mod tests {
             .expect("get total unread exclude muted");
         assert_eq!(total_all, 13);
         assert_eq!(total_no_mute, 5);
+    }
+
+    #[test]
+    fn project_channel_read_cursor_is_precise_and_monotonic() {
+        let store = test_store();
+        let uid = "10007001";
+        let uid_num = uid.parse::<u64>().expect("uid parse");
+        let channel_id = 700_u64;
+        let channel_type = 1_i32;
+
+        let m1 = store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 970001,
+                    local_message_id: 0,
+                    channel_id,
+                    channel_type,
+                    timestamp: 1_700_000_000_001,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: "m1".to_string(),
+                    status: 2,
+                    searchable_word: "m1".to_string(),
+                    setting: 0,
+                    pts: 10,
+                    order_seq: 10,
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert m1")
+            .message_id;
+        let m2 = store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 970002,
+                    local_message_id: 0,
+                    channel_id,
+                    channel_type,
+                    timestamp: 1_700_000_000_002,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: "m2".to_string(),
+                    status: 2,
+                    searchable_word: "m2".to_string(),
+                    setting: 0,
+                    pts: 20,
+                    order_seq: 20,
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert m2")
+            .message_id;
+        let m3 = store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 970003,
+                    local_message_id: 0,
+                    channel_id,
+                    channel_type,
+                    timestamp: 1_700_000_000_003,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: "m3".to_string(),
+                    status: 2,
+                    searchable_word: "m3".to_string(),
+                    setting: 0,
+                    pts: 30,
+                    order_seq: 30,
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert m3")
+            .message_id;
+        let m4_self = store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 970004,
+                    local_message_id: 0,
+                    channel_id,
+                    channel_type,
+                    timestamp: 1_700_000_000_004,
+                    from_uid: uid_num,
+                    message_type: 1,
+                    content: "self".to_string(),
+                    status: 2,
+                    searchable_word: "self".to_string(),
+                    setting: 0,
+                    pts: 40,
+                    order_seq: 40,
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert self")
+            .message_id;
+
+        store
+            .project_channel_read_cursor(uid, channel_id, channel_type, 20)
+            .expect("project read pts=20");
+        assert_eq!(
+            store
+                .get_channel_unread_count(uid, channel_id, channel_type)
+                .expect("unread after pts=20"),
+            1
+        );
+
+        let m1_extra = store
+            .get_message_extra(uid, m1)
+            .expect("extra m1")
+            .expect("extra m1 exists");
+        let m2_extra = store
+            .get_message_extra(uid, m2)
+            .expect("extra m2")
+            .expect("extra m2 exists");
+        let m3_extra = store
+            .get_message_extra(uid, m3)
+            .expect("extra m3")
+            .expect("extra m3 exists");
+        let m4_extra = store
+            .get_message_extra(uid, m4_self)
+            .expect("extra m4")
+            .expect("extra m4 exists");
+        assert_eq!(m1_extra.readed, 1);
+        assert_eq!(m2_extra.readed, 1);
+        assert_eq!(m3_extra.readed, 0);
+        assert_eq!(m4_extra.readed, 1);
+
+        store
+            .project_channel_read_cursor(uid, channel_id, channel_type, 10)
+            .expect("project stale read pts=10");
+        let extra_after_stale = store
+            .get_channel_extra(uid, channel_id, channel_type)
+            .expect("get extra after stale")
+            .expect("channel extra exists");
+        assert_eq!(extra_after_stale.keep_pts, 20);
+        assert_eq!(
+            store
+                .get_channel_unread_count(uid, channel_id, channel_type)
+                .expect("unread after stale pts=10"),
+            1
+        );
+
+        store
+            .project_channel_read_cursor(uid, channel_id, channel_type, 30)
+            .expect("project read pts=30");
+        assert_eq!(
+            store
+                .get_channel_unread_count(uid, channel_id, channel_type)
+                .expect("unread after pts=30"),
+            0
+        );
+        let m3_after = store
+            .get_message_extra(uid, m3)
+            .expect("extra m3 after")
+            .expect("extra m3 after exists");
+        assert_eq!(m3_after.readed, 1);
     }
 
     #[test]

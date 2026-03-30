@@ -39,7 +39,7 @@ use privchat_protocol::rpc::file::upload::{
 use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
-    ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelSyncPayload,
+    ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload, ChannelSyncPayload,
     ChannelUnreadSyncPayload, FriendSyncPayload, GroupMemberSyncPayload, GroupSyncPayload,
     MessageStatusSyncPayload, MessageSyncPayload, SyncEntityItem, UserSettingsSyncPayload,
 };
@@ -268,12 +268,6 @@ pub enum SdkEvent {
         channel_type: i32,
         message_id: u64,
         reason: String,
-    },
-    ReadReceiptUpdated {
-        channel_id: u64,
-        channel_type: i32,
-        message_id: u64,
-        is_read: bool,
     },
     MessageSendStatusChanged {
         message_id: u64,
@@ -1192,13 +1186,6 @@ enum Command {
         status: i32,
         resp: oneshot::Sender<Result<()>>,
     },
-    SetMessageRead {
-        message_id: u64,
-        channel_id: u64,
-        channel_type: i32,
-        is_read: bool,
-        resp: oneshot::Sender<Result<()>>,
-    },
     SetMessageRevoke {
         message_id: u64,
         revoked: bool,
@@ -1220,9 +1207,10 @@ enum Command {
         message_id: u64,
         resp: oneshot::Sender<Result<Option<StoredMessageExtra>>>,
     },
-    MarkChannelRead {
+    ProjectChannelReadCursor {
         channel_id: u64,
         channel_type: i32,
+        last_read_pts: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     GetChannelUnreadCount {
@@ -1660,11 +1648,7 @@ impl State {
                     channel_type,
                     ..
                 }
-                | SdkEvent::ReadReceiptUpdated {
-                    channel_id,
-                    channel_type,
-                    ..
-                } => self.invalidate_channel_cache_with_reason(
+                => self.invalidate_channel_cache_with_reason(
                     *channel_id,
                     *channel_type,
                     "event_apply",
@@ -2147,32 +2131,34 @@ impl State {
             Self::json_field_string(&payload_json, &["metadata", "notification_type"])?;
 
         match notification_type.as_str() {
-            // "消息已读"通知：只更新状态，不落 message 表
-            "read_receipt" => {
-                let message_id =
-                    Self::json_field_u64(&payload_json, &["metadata", "message_id"]).unwrap_or(0);
-                if message_id == 0 {
+            // 已读游标同步通知：走 channel_read_cursor 实体
+            "self_read_pts_updated" | "peer_read_pts_updated" | "user_read_pts" => {
+                let channel_id =
+                    Self::json_field_u64(&payload_json, &["metadata", "channel_id"]).unwrap_or(0);
+                let read_pts =
+                    Self::json_field_u64(&payload_json, &["metadata", "read_pts"]).unwrap_or(0);
+                if channel_id == 0 || read_pts == 0 {
                     return None;
                 }
+                let channel_type =
+                    Self::json_field_u64(&payload_json, &["metadata", "channel_type"]).unwrap_or(1);
+                let reader_id =
+                    Self::json_field_u64(&payload_json, &["metadata", "reader_id"]).unwrap_or(0);
                 let payload = serde_json::json!({
-                    "message_id": message_id,
-                    "server_message_id": message_id,
-                    "channel_id": push.channel_id,
-                    "channel_type": i32::from(push.channel_type),
-                    "is_read": true,
-                    "readed": true,
-                    "read": true,
+                    "channel_id": channel_id,
+                    "channel_type": channel_type as i32,
+                    "type": channel_type as i32,
+                    "reader_id": reader_id,
+                    "last_read_pts": read_pts,
                     "updated_at": i64::from(push.timestamp),
                 });
                 Some(SyncEntityItem {
-                    entity_id: message_id.to_string(),
+                    entity_id: format!("{}:{}", channel_id, reader_id),
                     version: u64::from(push.message_seq),
                     deleted: false,
                     payload: Some(payload),
                 })
             }
-            // "已读位置更新"通知：不落 message 表；当前通过 read_pts 事件路径处理
-            "user_read_pts" => None,
             _ => None,
         }
     }
@@ -2667,14 +2653,15 @@ impl State {
                         } else {
                             (0, String::new(), 0)
                         };
-                    // `channel_unread` sync may be unavailable on some server deployments.
-                    // Keep local unread as source-of-truth floor to avoid clearing badges on app restart.
+                    // `channel_unread` may be unavailable on some deployments.
+                    // If server sends unread_count, trust server value (can both increase and decrease).
+                    // If it does not send unread_count, keep current local value.
                     let existing_unread = existing.as_ref().map(|c| c.unread_count).unwrap_or(0);
                     let unread_count = channel_sync
                         .unread_count
                         .or_else(|| Self::json_get_i32(&payload, &["unread_count"]))
-                        .map(|incoming| incoming.max(existing_unread))
-                        .unwrap_or(existing_unread);
+                        .unwrap_or(existing_unread)
+                        .max(0);
                     self.storage
                         .upsert_channel(UpsertChannelInput {
                             channel_id,
@@ -3133,25 +3120,6 @@ impl State {
                     let channel_id = Self::json_get_u64(&payload, &["channel_id"])
                         .or(scoped_channel.map(|v| v.1))
                         .unwrap_or(0);
-                    if payload.get("readed").is_some()
-                        || payload.get("is_read").is_some()
-                        || payload.get("read").is_some()
-                    {
-                        if channel_id > 0 {
-                            let is_read =
-                                Self::json_get_bool(&payload, &["readed", "is_read", "read"])
-                                    .unwrap_or(false);
-                            self.storage
-                                .set_message_read(message_id, channel_id, channel_type, is_read)
-                                .await?;
-                            emitted.push(SdkEvent::ReadReceiptUpdated {
-                                channel_id,
-                                channel_type,
-                                message_id,
-                                is_read,
-                            });
-                        }
-                    }
                     if payload.get("revoke").is_some() || payload.get("is_revoked").is_some() {
                         let revoke = Self::json_get_bool(&payload, &["revoke", "is_revoked"])
                             .unwrap_or(false);
@@ -3421,26 +3389,50 @@ impl State {
                             server_message_id: Some(raw_message_id),
                         });
                     }
-                    if channel_id > 0 {
-                        if let Some(is_read) = status_sync
-                            .readed
-                            .or(status_sync.is_read)
-                            .or(status_sync.read)
-                        {
-                            let _ = self
-                                .storage
-                                .set_message_read(message_id, channel_id, channel_type, is_read)
-                                .await;
-                            emitted.push(SdkEvent::ReadReceiptUpdated {
-                                channel_id,
-                                channel_type,
-                                message_id,
-                                is_read,
-                            });
-                        }
-                    }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "message_status".to_string(),
+                        entity_id: item.entity_id.clone(),
+                        deleted: item.deleted,
+                    });
+                }
+            }
+            "channel_read_cursor" => {
+                let current_uid = self
+                    .current_uid
+                    .as_ref()
+                    .and_then(|uid| uid.parse::<u64>().ok())
+                    .unwrap_or(0);
+                for item in items {
+                    let payload = item
+                        .payload
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let read_cursor = serde_json::from_value::<ChannelReadCursorSyncPayload>(payload)
+                        .unwrap_or_default();
+                    let scoped_channel = Self::parse_channel_scope(scope);
+                    let channel_id = read_cursor
+                        .channel_id
+                        .or(scoped_channel.map(|v| v.1))
+                        .unwrap_or(0);
+                    if channel_id == 0 {
+                        continue;
+                    }
+                    let channel_type = read_cursor
+                        .channel_type
+                        .or(read_cursor.type_field)
+                        .or(scoped_channel.map(|v| v.0))
+                        .map(|v| if v == 0 { 1 } else { v })
+                        .unwrap_or(1);
+                    let reader_id = read_cursor.reader_id.unwrap_or(current_uid);
+                    let read_pts = read_cursor.last_read_pts.unwrap_or(0);
+                    if reader_id == current_uid && read_pts > 0 {
+                        let _ = self
+                            .storage
+                            .project_channel_read_cursor(channel_id, channel_type, read_pts)
+                            .await;
+                    }
+                    emitted.push(SdkEvent::SyncEntityChanged {
+                        entity_type: "channel_read_cursor".to_string(),
                         entity_id: item.entity_id.clone(),
                         deleted: item.deleted,
                     });
@@ -4031,7 +4023,7 @@ impl State {
         let app_id = std::env::var("PRIVCHAT_APP_ID")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "com.netonstream.privchat.rust".to_string());
+            .unwrap_or_else(|| "com.xxxxxxx.livestreaming".to_string());
         let req = RpcRequest {
             route: "account/auth/login".to_string(),
             body: serde_json::to_value(AuthLoginRequest {
@@ -4113,7 +4105,7 @@ impl State {
         let app_id = std::env::var("PRIVCHAT_APP_ID")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "com.netonstream.privchat.rust".to_string());
+            .unwrap_or_else(|| "com.xxxxxxx.livestreaming".to_string());
         let req = RpcRequest {
             route: routes::account_user::REGISTER.to_string(),
             body: serde_json::to_value(UserRegisterRequest {
@@ -4185,20 +4177,20 @@ impl State {
             auth_type: AuthType::JWT,
             auth_token: token,
             client_info: ClientInfo {
-                client_type: "privchat-rust".to_string(),
+                client_type: "livestreaming".to_string(),
                 version: "0.1.0".to_string(),
                 os: std::env::consts::OS.to_string(),
                 os_version: std::env::consts::OS.to_string(),
                 device_model: None,
-                app_package: Some("com.netonstream.privchat.rust".to_string()),
+                app_package: Some("com.xxxxxxx.livestreaming".to_string()),
             },
             device_info: DeviceInfo {
                 device_id,
                 device_type: DeviceType::from_str(std::env::consts::OS),
-                app_id: "com.netonstream.privchat.rust".to_string(),
+                app_id: "com.xxxxxxx.livestreaming".to_string(),
                 push_token: None,
                 push_channel: None,
-                device_name: "privchat-rust".to_string(),
+                device_name: "livestreaming".to_string(),
                 device_model: None,
                 os_version: Some(std::env::consts::OS.to_string()),
                 app_version: Some("0.1.0".to_string()),
@@ -4490,7 +4482,7 @@ impl State {
             return Ok(0);
         }
         let mut message_items = Vec::new();
-        let mut message_status_items = Vec::new();
+        let mut read_cursor_items = Vec::new();
         match message_type {
             MessageType::SendMessageRequest => {
                 let req: SendMessageRequest = decode_message(&data).map_err(|e| {
@@ -4532,7 +4524,7 @@ impl State {
                 let req: PushMessageRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
                 if let Some(status_item) = Self::push_message_to_status_sync_item(&req) {
-                    message_status_items.push(status_item);
+                    read_cursor_items.push(status_item);
                 } else {
                     message_items.push(Self::push_message_to_sync_item(req));
                 }
@@ -4542,7 +4534,7 @@ impl State {
                     .map_err(|e| Error::Serialization(format!("decode push batch: {e}")))?;
                 for push in req.messages {
                     if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
-                        message_status_items.push(status_item);
+                        read_cursor_items.push(status_item);
                     } else {
                         message_items.push(Self::push_message_to_sync_item(push));
                     }
@@ -4560,7 +4552,7 @@ impl State {
                         );
                     }
                     if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
-                        message_status_items.push(status_item);
+                        read_cursor_items.push(status_item);
                     } else {
                         message_items.push(Self::push_message_to_sync_item(push));
                     }
@@ -4573,7 +4565,7 @@ impl State {
                     }
                     for push in batch.messages {
                         if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
-                            message_status_items.push(status_item);
+                            read_cursor_items.push(status_item);
                         } else {
                             message_items.push(Self::push_message_to_sync_item(push));
                         }
@@ -4613,12 +4605,12 @@ impl State {
                 .enqueue_and_apply_sync_items("message".to_string(), None, message_items)
                 .await?;
         }
-        if !message_status_items.is_empty() {
+        if !read_cursor_items.is_empty() {
             applied += self
                 .enqueue_and_apply_sync_items(
-                    "message_status".to_string(),
+                    "channel_read_cursor".to_string(),
                     None,
-                    message_status_items,
+                    read_cursor_items,
                 )
                 .await?;
         }
@@ -4652,7 +4644,7 @@ impl State {
 
         // Keep order aligned with legacy SDK bootstrap strategy.
         // Core entities are required by local-first read models.
-        let core_entities = ["friend", "group", "channel", "user_settings"];
+        let core_entities = ["friend", "group", "channel", "channel_read_cursor", "user_settings"];
         // Optional entities depend on current server capability rollout.
         let optional_entities = ["user", "user_block", "channel_extra", "channel_unread"];
         eprintln!(
@@ -4665,6 +4657,7 @@ impl State {
             "user_block",
             "group",
             "channel",
+            "channel_read_cursor",
             "channel_extra",
             "channel_unread",
             "user_settings",
@@ -4906,13 +4899,13 @@ impl State {
             Err(e) => return Err(e),
         }
         match self
-            .sync_entities("message_status".to_string(), scope.clone())
+            .sync_entities("channel_read_cursor".to_string(), scope.clone())
             .await
         {
             Ok(v) => total += v,
             Err(e) if Self::is_unsupported_entity_error(&e) => {
                 eprintln!(
-                    "[SDK.actor] sync_channel skip unsupported entity_type=message_status scope={:?} reason={}",
+                    "[SDK.actor] sync_channel skip unsupported entity_type=channel_read_cursor scope={:?} reason={}",
                     scope, e
                 );
             }
@@ -4975,6 +4968,19 @@ impl State {
     async fn sync_all_channels(&mut self) -> Result<usize> {
         let mut total = 0usize;
         total += self.sync_entities("channel".to_string(), None).await?;
+        match self
+            .sync_entities("channel_read_cursor".to_string(), None)
+            .await
+        {
+            Ok(v) => total += v,
+            Err(e) if Self::is_unsupported_entity_error(&e) => {
+                eprintln!(
+                    "[SDK.actor] sync_all_channels skip unsupported entity_type=channel_read_cursor reason={}",
+                    e
+                );
+            }
+            Err(e) => return Err(e),
+        }
         match self.sync_entities("channel_extra".to_string(), None).await {
             Ok(v) => total += v,
             Err(e) if Self::is_unsupported_entity_error(&e) => {
@@ -5940,7 +5946,6 @@ impl PrivchatSdk {
         matches!(
             event,
             SdkEvent::TimelineUpdated { .. }
-                | SdkEvent::ReadReceiptUpdated { .. }
                 | SdkEvent::MessageSendStatusChanged { .. }
                 | SdkEvent::SyncEntityChanged { .. }
                 | SdkEvent::SyncChannelApplied { .. }
@@ -7163,43 +7168,6 @@ impl PrivchatSdk {
                         }
                         let _ = resp.send(result);
                     }
-                    Command::SetMessageRead {
-                        message_id,
-                        channel_id,
-                        channel_type,
-                        is_read,
-                        resp,
-                    } => {
-                        let result = match state.current_uid_required() {
-                            Ok(_) => {
-                                state
-                                    .storage
-                                    .set_message_read(message_id, channel_id, channel_type, is_read)
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        };
-                        if result.is_ok() {
-                            state.invalidate_channel_cache_with_reason(
-                                channel_id,
-                                channel_type,
-                                "set_message_read",
-                            );
-                            emit_sequenced_event(
-                                &actor_event_tx,
-                                &actor_event_history,
-                                &actor_event_seq,
-                                event_history_limit,
-                                SdkEvent::ReadReceiptUpdated {
-                                    channel_id,
-                                    channel_type,
-                                    message_id,
-                                    is_read,
-                                },
-                            );
-                        }
-                        let _ = resp.send(result);
-                    }
                     Command::SetMessageRevoke {
                         message_id,
                         revoked,
@@ -7336,27 +7304,25 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
-                    Command::MarkChannelRead {
+                    Command::ProjectChannelReadCursor {
                         channel_id,
                         channel_type,
+                        last_read_pts,
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
                             Ok(_) => {
                                 state
                                     .storage
-                                    .mark_channel_read(channel_id, channel_type)
+                                    .project_channel_read_cursor(
+                                        channel_id,
+                                        channel_type,
+                                        last_read_pts,
+                                    )
                                     .await
                             }
                             Err(e) => Err(e),
                         };
-                        if result.is_ok() {
-                            state.invalidate_channel_cache_with_reason(
-                                channel_id,
-                                channel_type,
-                                "mark_channel_read",
-                            );
-                        }
                         let _ = resp.send(result);
                     }
                     Command::GetChannelUnreadCount {
@@ -8730,28 +8696,6 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn set_message_read(
-        &self,
-        message_id: u64,
-        channel_id: u64,
-        channel_type: i32,
-        is_read: bool,
-    ) -> Result<()> {
-        self.ensure_running()?;
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(Command::SetMessageRead {
-                message_id,
-                channel_id,
-                channel_type,
-                is_read,
-                resp: resp_tx,
-            })
-            .await
-            .map_err(|_| self.actor_channel_error())?;
-        resp_rx.await.map_err(|_| self.actor_channel_error())?
-    }
-
     pub async fn set_message_revoke(
         &self,
         message_id: u64,
@@ -8819,13 +8763,19 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn mark_channel_read(&self, channel_id: u64, channel_type: i32) -> Result<()> {
+    pub async fn project_channel_read_cursor(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        last_read_pts: u64,
+    ) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(Command::MarkChannelRead {
+            .send(Command::ProjectChannelReadCursor {
                 channel_id,
                 channel_type,
+                last_read_pts,
                 resp: resp_tx,
             })
             .await

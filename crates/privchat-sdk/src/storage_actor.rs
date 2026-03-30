@@ -179,13 +179,6 @@ enum StorageCmd {
         status: i32,
         resp: oneshot::Sender<Result<()>>,
     },
-    SetMessageRead {
-        message_id: u64,
-        channel_id: u64,
-        channel_type: i32,
-        is_read: bool,
-        resp: oneshot::Sender<Result<()>>,
-    },
     SetMessageRevoke {
         message_id: u64,
         revoked: bool,
@@ -207,9 +200,10 @@ enum StorageCmd {
         message_id: u64,
         resp: oneshot::Sender<Result<Option<StoredMessageExtra>>>,
     },
-    MarkChannelRead {
+    ProjectChannelReadCursor {
         channel_id: u64,
         channel_type: i32,
+        last_read_pts: u64,
         resp: oneshot::Sender<Result<()>>,
     },
     GetChannelUnreadCount {
@@ -805,26 +799,6 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn set_message_read(
-        &self,
-        message_id: u64,
-        channel_id: u64,
-        channel_type: i32,
-        is_read: bool,
-    ) -> Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::SetMessageRead {
-                message_id,
-                channel_id,
-                channel_type,
-                is_read,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
-
     pub async fn set_message_revoke(
         &self,
         message_id: u64,
@@ -879,12 +853,18 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn mark_channel_read(&self, channel_id: u64, channel_type: i32) -> Result<()> {
+    pub async fn project_channel_read_cursor(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        last_read_pts: u64,
+    ) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::MarkChannelRead {
+            .send(StorageCmd::ProjectChannelReadCursor {
                 channel_id,
                 channel_type,
+                last_read_pts,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1640,21 +1620,6 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             with_uid!(resp, |uid| store
                 .update_message_status(&uid, message_id, status));
         }
-        StorageCmd::SetMessageRead {
-            message_id,
-            channel_id,
-            channel_type,
-            is_read,
-            resp,
-        } => {
-            with_uid!(resp, |uid| store.set_message_read(
-                &uid,
-                message_id,
-                channel_id,
-                channel_type,
-                is_read
-            ));
-        }
         StorageCmd::SetMessageRevoke {
             message_id,
             revoked,
@@ -1684,15 +1649,17 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         StorageCmd::GetMessageExtra { message_id, resp } => {
             with_uid!(resp, |uid| store.get_message_extra(&uid, message_id));
         }
-        StorageCmd::MarkChannelRead {
+        StorageCmd::ProjectChannelReadCursor {
             channel_id,
             channel_type,
+            last_read_pts,
             resp,
         } => {
-            with_uid!(resp, |uid| store.mark_channel_read(
+            with_uid!(resp, |uid| store.project_channel_read_cursor(
                 &uid,
                 channel_id,
-                channel_type
+                channel_type,
+                last_read_pts
             ));
         }
         StorageCmd::GetChannelUnreadCount {

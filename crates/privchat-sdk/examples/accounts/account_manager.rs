@@ -49,8 +49,8 @@ use privchat_protocol::rpc::{
     MessageReactionRemoveResponse, MessageReactionStatsRequest, MessageReactionStatsResponse,
     MessageReadListRequest, MessageReadListResponse, MessageReadStatsRequest,
     MessageReadStatsResponse, MessageRevokeRequest, MessageRevokeResponse,
-    MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadRequest,
-    MessageStatusReadResponse, ServerDecision, StickerPackageDetailRequest,
+    MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadPtsRequest,
+    MessageStatusReadPtsResponse, ServerDecision, StickerPackageDetailRequest,
     StickerPackageDetailResponse, StickerPackageListRequest, StickerPackageListResponse,
     UserQRCodeGenerateRequest, UserQRCodeGenerateResponse, UserQRCodeGetRequest,
     UserQRCodeGetResponse, UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
@@ -546,15 +546,15 @@ impl MultiAccountManager {
         &self,
         key: &str,
         channel_id: u64,
-        server_message_id: u64,
-    ) -> BoxResult<MessageStatusReadResponse> {
+        read_pts: u64,
+    ) -> BoxResult<MessageStatusReadPtsResponse> {
         self.rpc_typed(
             key,
-            routes::message_status::READ,
-            &MessageStatusReadRequest {
+            routes::message_status::READ_PTS,
+            &MessageStatusReadPtsRequest {
                 channel_id,
-                message_id: server_message_id,
-                user_id: 0,
+                read_pts,
+                last_read_message_id: None,
             },
         )
         .await
