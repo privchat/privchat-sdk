@@ -29,7 +29,8 @@ use privchat_protocol::rpc::{
     AccountSearchResponse, BlacklistAddRequest, BlacklistAddResponse, BlacklistCheckRequest,
     BlacklistCheckResponse, BlacklistListRequest, BlacklistRemoveRequest, BlacklistRemoveResponse,
     ChannelHideRequest, ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse,
-    ChannelPinRequest, ChannelPinResponse, ClientSubmitResponse, FileRequestUploadTokenRequest,
+    ChannelPinRequest, ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse,
+    GetChannelPtsRequest, GetChannelPtsResponse, FileRequestUploadTokenRequest,
     FileRequestUploadTokenResponse, FileUploadCallbackRequest, FileUploadCallbackResponse,
     FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse,
     FriendCheckRequest, FriendCheckResponse, FriendPendingRequest, FriendPendingResponse,
@@ -50,14 +51,12 @@ use privchat_protocol::rpc::{
     MessageReadListRequest, MessageReadListResponse, MessageReadStatsRequest,
     MessageReadStatsResponse, MessageRevokeRequest, MessageRevokeResponse,
     MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadPtsRequest,
-    MessageStatusReadPtsResponse, ServerDecision, StickerPackageDetailRequest,
+    MessageStatusReadPtsResponse, StickerPackageDetailRequest,
     StickerPackageDetailResponse, StickerPackageListRequest, StickerPackageListResponse,
     UserQRCodeGenerateRequest, UserQRCodeGenerateResponse, UserQRCodeGetRequest,
     UserQRCodeGetResponse, UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
 };
-use privchat_sdk::{
-    NewMessage, PrivchatConfig, PrivchatSdk, ServerEndpoint, SessionSnapshot, TransportProtocol,
-};
+use privchat_sdk::{PrivchatConfig, PrivchatSdk, ServerEndpoint, SessionSnapshot, TransportProtocol};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +66,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxResult<T> = Result<T, BoxError>;
 
 static LOCAL_MSG_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_local_message_id() -> u64 {
+    let seq = LOCAL_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+    ((now_millis() as u64) << 12) | (seq & 0x0fff)
+}
 
 struct ManagedAccount {
     cfg: AccountConfig,
@@ -85,6 +89,7 @@ pub struct MultiAccountManager {
 pub const DIRECT_SYNC_CHANNEL_TYPE: u8 = 1;
 pub const GROUP_SYNC_CHANNEL_TYPE: u8 = 2;
 
+#[allow(dead_code)]
 impl MultiAccountManager {
     pub async fn new() -> BoxResult<Self> {
         let host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -443,31 +448,35 @@ impl MultiAccountManager {
         channel_type: u8,
         text: &str,
     ) -> BoxResult<ClientSubmitResponse> {
-        let sdk = self.sdk(key)?;
-        let from_uid = self.user_id(key)?;
-        let local_message_id = sdk
-            .create_local_message(NewMessage {
+        let pts: GetChannelPtsResponse = self
+            .rpc_typed(
+                key,
+                routes::sync::GET_CHANNEL_PTS,
+                &GetChannelPtsRequest {
+                    channel_id,
+                    channel_type,
+                },
+            )
+            .await?;
+
+        self.rpc_typed(
+            key,
+            routes::sync::SUBMIT,
+            &ClientSubmitRequest {
+                local_message_id: next_local_message_id(),
                 channel_id,
-                channel_type: channel_type as i32,
-                from_uid,
-                message_type: 0,
-                content: text.to_string(),
-                searchable_word: String::new(),
-                setting: 0,
-                extra: String::new(),
-            })
-            .await?;
-        sdk.enqueue_outbound_message(local_message_id, Vec::new())
-            .await?;
-        Ok(ClientSubmitResponse {
-            decision: ServerDecision::Accepted,
-            pts: None,
-            server_msg_id: None,
-            server_timestamp: now_millis(),
-            local_message_id,
-            has_gap: false,
-            current_pts: 0,
-        })
+                channel_type,
+                last_pts: pts.current_pts,
+                command_type: "text".to_string(),
+                payload: serde_json::json!({
+                    "content": text,
+                    "metadata": serde_json::Value::Null,
+                }),
+                client_timestamp: now_millis(),
+                device_id: None,
+            },
+        )
+        .await
     }
 
     pub async fn message_history(
@@ -728,13 +737,25 @@ impl MultiAccountManager {
             user_id: 0,
         })?;
         let raw = sdk.rpc_call(routes::group::INFO.to_string(), body).await?;
-        let wrapped: GroupInfoWrapped = serde_json::from_str(&raw).map_err(|e| {
+        if let Ok(resp) = serde_json::from_str::<GroupInfoResponse>(&raw) {
+            return Ok(resp);
+        }
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
             boxed_err(format!(
                 "decode {} failed: {e}; raw={raw}",
                 routes::group::INFO
             ))
         })?;
-        Ok(wrapped.group_info)
+        let wrapped = value
+            .get("group_info")
+            .cloned()
+            .ok_or_else(|| boxed_err(format!("decode {} missing group_info; raw={raw}", routes::group::INFO)))?;
+        serde_json::from_value(wrapped).map_err(|e| {
+            boxed_err(format!(
+                "decode {} wrapped group_info failed: {e}; raw={raw}",
+                routes::group::INFO
+            ))
+        })
     }
 
     pub async fn group_member_add(
@@ -1354,11 +1375,6 @@ struct FriendApplyCompat {
 struct BlacklistCheckCompat {
     #[serde(alias = "blocked")]
     is_blocked: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct GroupInfoWrapped {
-    group_info: GroupInfoResponse,
 }
 
 #[derive(Debug, Deserialize)]

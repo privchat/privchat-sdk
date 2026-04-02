@@ -96,6 +96,8 @@ impl TestCoordinator {
             .await;
         self.run_phase(TestPhases::phase31_room(manager).await)
             .await;
+        self.run_phase(TestPhases::phase32_channel_state_resume_smoke(manager).await)
+            .await;
         Ok(())
     }
 

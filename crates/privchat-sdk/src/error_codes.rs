@@ -40,3 +40,9 @@ pub const INVALID_STATE: u32 = code(domain::STATE, 1);
 pub const ACTOR_CLOSED: u32 = code(domain::ACTOR, 1);
 pub const SHUTDOWN: u32 = code(domain::SHUTDOWN, 1);
 pub const INTERNAL_UNKNOWN: u32 = code(domain::INTERNAL, 1);
+
+pub const RESUME_RETRYABLE_TEMPORARY: u32 = code(domain::SYNC, 1);
+pub const RESUME_CHANNEL_RESYNC_REQUIRED: u32 = code(domain::SYNC, 2);
+pub const RESUME_ENTITY_RESYNC_REQUIRED: u32 = code(domain::SYNC, 3);
+pub const RESUME_FULL_REBUILD_REQUIRED: u32 = code(domain::SYNC, 4);
+pub const RESUME_FATAL_PROTOCOL_ERROR: u32 = code(domain::SYNC, 5);

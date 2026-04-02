@@ -15,7 +15,7 @@ privchat-sdk is the **single core engine** of the entire PrivChat client ecosyst
 - **Messaging** - Create, send, edit, revoke, and pin messages; manage the outbound queue
 - **Channel Management** - CRUD operations on channels, unread counts, read markers, subscribe/unsubscribe
 - **Entity Management** - CRUD for friends, groups, group members, and blocklist
-- **Data Synchronization** - Bootstrap full sync, incremental delta sync, per-entity-type and per-channel sync
+- **Data Synchronization** - Bootstrap full sync, reconnect resume sync, incremental delta sync, per-entity-type and per-channel sync
 - **Local Storage** - SQLite + SQLCipher encrypted database + Sled KV store with multi-account switching
 - **Event-Driven** - Broadcast connection state changes, sync completion, timeline updates, read receipts, etc.
 - **Extended Features** - Message reactions, @mentions, reminders, presence, typing indicators, generic RPC calls
@@ -135,6 +135,7 @@ privchat-sdk/
 | Method | Description |
 |--------|-------------|
 | `run_bootstrap_sync()` | Initial full sync |
+| `resume sync` | Reconnect recovery by `since_version` + per-channel `pts` |
 | `sync_entities(entity_type, scope)` | Sync by entity type |
 | `sync_channel()` / `sync_all_channels()` | Channel sync |
 | `get_difference()` | Incremental delta pull |
@@ -147,7 +148,6 @@ privchat-sdk/
 | `record_mention()` / `get_unread_mention_count()` | @mentions |
 | `subscribe_presence()` / `fetch_presence()` | Presence status |
 | `send_typing()` | Typing indicators |
-| `kv_put()` / `kv_get()` / `kv_scan_prefix()` | KV storage |
 | `rpc_call(route, body_json)` | Generic RPC calls |
 
 ## Building
@@ -162,6 +162,26 @@ cargo build -p privchat-sdk-ffi --release
 # Run core tests
 cargo test -p privchat-sdk --lib
 ```
+
+## Local Sync Regression
+
+Use the local sync regression script to validate the current production sync contract end to end:
+
+```bash
+./scripts/run_local_sync_regression.sh
+```
+
+It runs:
+
+- `privchat-server` full `cargo test`
+- local DB integration test `entity_sync_version_db_test` when `DATABASE_URL` or
+  `PRIVCHAT_TEST_DATABASE_URL` is set
+- targeted `privchat-sdk` recovery and entity-version tests
+- `accounts` example smoke flow
+
+The current validated smoke result is:
+
+- `accounts`: `32 / 32 passed`
 
 ## Generating Language Bindings
 
@@ -226,3 +246,4 @@ This project is not intended for direct use by application developers. Instead, 
 
 - [Architecture Spec](docs/architecture-spec.md) - Actor model / local-first / FFI constraints
 - [Public API v2](docs/public-api-v2.md) - SDK public API and call flows
+- [Sync Resume Spec](../privchat-docs/spec/03-protocol-sdk/SDK_SYNC_RESUME_SPEC.md) - Reconnect recovery using entity versions and per-channel `pts`

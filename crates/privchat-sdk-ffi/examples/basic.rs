@@ -281,27 +281,6 @@ async fn main() {
         eprintln!("[basic] expected unread_after=0, got {unread_after}");
         std::process::exit(29);
     }
-    if let Err(e) = client
-        .kv_put(
-            "basic:last_message_id".to_string(),
-            message_id.to_string().into_bytes(),
-        )
-        .await
-    {
-        eprintln!("[basic] kv_put failed: {e}");
-        std::process::exit(13);
-    }
-    let kv_v = match client.kv_get("basic:last_message_id".to_string()).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[basic] kv_get failed: {e}");
-            std::process::exit(14);
-        }
-    };
-    if kv_v.is_none() {
-        eprintln!("[basic] kv_get empty");
-        std::process::exit(15);
-    }
     let paths = match client.user_storage_paths().await {
         Ok(v) => v,
         Err(e) => {

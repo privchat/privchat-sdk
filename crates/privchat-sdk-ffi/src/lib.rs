@@ -99,9 +99,6 @@ use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast::error::TryRecvError, Mutex as AsyncMutex};
 
-const USER_SETTINGS_KEY: &str = "__user_settings_json__";
-const USER_SETTINGS_ITEM_PREFIX: &str = "entity_sync:user_settings:";
-
 async fn poll_wait(remain: std::time::Duration) {
     let wait = std::cmp::min(std::time::Duration::from_millis(10), remain);
     if wait.is_zero() {
@@ -132,30 +129,6 @@ struct AuthRefreshResponse {
     refresh_token: Option<String>,
     expires_at: String,
     device_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ChannelPrefsState {
-    #[serde(default)]
-    notification_mode: i32,
-    #[serde(default)]
-    favourite: bool,
-    #[serde(default)]
-    low_priority: bool,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(flatten)]
-    extra: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct GroupSettingsCache {
-    #[serde(default)]
-    group_id: u64,
-    #[serde(default)]
-    mute_all: bool,
-    #[serde(flatten)]
-    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, uniffi::Record)]
@@ -393,11 +366,6 @@ pub struct GroupApprovalItemView {
     pub message: Option<String>,
     pub created_at: String,
     pub expires_at: Option<String>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct UserSettingsView {
-    pub settings_json: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -889,24 +857,6 @@ fn now_millis() -> i64 {
     }
 }
 
-fn channel_prefs_key(channel_id: u64, channel_type: i32) -> String {
-    format!("__channel_prefs__:{channel_id}:{channel_type}")
-}
-
-fn group_settings_key(group_id: u64) -> String {
-    format!("__group_settings__:{group_id}")
-}
-
-fn decode_channel_prefs(raw: Option<Vec<u8>>) -> ChannelPrefsState {
-    raw.and_then(|b| serde_json::from_slice::<ChannelPrefsState>(&b).ok())
-        .unwrap_or_default()
-}
-
-fn decode_group_settings_cache(raw: Option<Vec<u8>>) -> GroupSettingsCache {
-    raw.and_then(|b| serde_json::from_slice::<GroupSettingsCache>(&b).ok())
-        .unwrap_or_default()
-}
-
 fn json_encode<T: Serialize>(value: &T, what: &str) -> Result<String, PrivchatFfiError> {
     serde_json::to_string(value).map_err(|e| PrivchatFfiError::SdkError {
         code: privchat_protocol::ErrorCode::InvalidJson as u32,
@@ -1040,6 +990,23 @@ pub enum NetworkHint {
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
+pub enum ResumeFailureClass {
+    RetryableTemporaryError,
+    ChannelResyncRequired,
+    EntityResyncRequired,
+    FullRebuildRequired,
+    FatalProtocolError,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ResumeEscalationScope {
+    Retry,
+    ChannelScopedResync,
+    EntityScopedResync,
+    FullRebuild,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum SdkEvent {
     ConnectionStateChanged {
         from: ConnectionState,
@@ -1047,6 +1014,44 @@ pub enum SdkEvent {
     },
     BootstrapCompleted {
         user_id: u64,
+    },
+    ResumeSyncStarted,
+    ResumeSyncCompleted {
+        entity_types_synced: u64,
+        channels_scanned: u64,
+        channels_applied: u64,
+        channel_failures: u64,
+    },
+    ResumeSyncFailed {
+        classification: ResumeFailureClass,
+        scope: ResumeEscalationScope,
+        error_code: u32,
+        message: String,
+    },
+    ResumeSyncEscalated {
+        classification: ResumeFailureClass,
+        scope: ResumeEscalationScope,
+        reason: String,
+        entity_type: Option<String>,
+        channel_id: Option<u64>,
+        channel_type: Option<i32>,
+    },
+    ResumeSyncChannelStarted {
+        channel_id: u64,
+        channel_type: i32,
+    },
+    ResumeSyncChannelCompleted {
+        channel_id: u64,
+        channel_type: i32,
+        applied: u64,
+    },
+    ResumeSyncChannelFailed {
+        channel_id: u64,
+        channel_type: i32,
+        classification: ResumeFailureClass,
+        scope: ResumeEscalationScope,
+        error_code: u32,
+        message: String,
     },
     SyncEntitiesApplied {
         entity_type: String,
@@ -1627,6 +1632,43 @@ fn map_sdk_network_hint(v: SdkNetworkHint) -> NetworkHint {
     }
 }
 
+fn map_sdk_resume_failure_class(v: privchat_sdk::ResumeFailureClass) -> ResumeFailureClass {
+    match v {
+        privchat_sdk::ResumeFailureClass::RetryableTemporaryError => {
+            ResumeFailureClass::RetryableTemporaryError
+        }
+        privchat_sdk::ResumeFailureClass::ChannelResyncRequired => {
+            ResumeFailureClass::ChannelResyncRequired
+        }
+        privchat_sdk::ResumeFailureClass::EntityResyncRequired => {
+            ResumeFailureClass::EntityResyncRequired
+        }
+        privchat_sdk::ResumeFailureClass::FullRebuildRequired => {
+            ResumeFailureClass::FullRebuildRequired
+        }
+        privchat_sdk::ResumeFailureClass::FatalProtocolError => {
+            ResumeFailureClass::FatalProtocolError
+        }
+    }
+}
+
+fn map_sdk_resume_escalation_scope(
+    v: privchat_sdk::ResumeEscalationScope,
+) -> ResumeEscalationScope {
+    match v {
+        privchat_sdk::ResumeEscalationScope::Retry => ResumeEscalationScope::Retry,
+        privchat_sdk::ResumeEscalationScope::ChannelScopedResync => {
+            ResumeEscalationScope::ChannelScopedResync
+        }
+        privchat_sdk::ResumeEscalationScope::EntityScopedResync => {
+            ResumeEscalationScope::EntityScopedResync
+        }
+        privchat_sdk::ResumeEscalationScope::FullRebuild => {
+            ResumeEscalationScope::FullRebuild
+        }
+    }
+}
+
 #[cfg(test)]
 fn parse_read_list_entries(raw: &str) -> Vec<serde_json::Value> {
     fn to_values(
@@ -1706,6 +1748,75 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
         privchat_sdk::SdkEvent::BootstrapCompleted { user_id } => {
             SdkEvent::BootstrapCompleted { user_id }
         }
+        privchat_sdk::SdkEvent::ResumeSyncStarted => SdkEvent::ResumeSyncStarted,
+        privchat_sdk::SdkEvent::ResumeSyncCompleted {
+            entity_types_synced,
+            channels_scanned,
+            channels_applied,
+            channel_failures,
+        } => SdkEvent::ResumeSyncCompleted {
+            entity_types_synced: entity_types_synced as u64,
+            channels_scanned: channels_scanned as u64,
+            channels_applied: channels_applied as u64,
+            channel_failures: channel_failures as u64,
+        },
+        privchat_sdk::SdkEvent::ResumeSyncFailed {
+            classification,
+            scope,
+            error_code,
+            message,
+        } => SdkEvent::ResumeSyncFailed {
+            classification: map_sdk_resume_failure_class(classification),
+            scope: map_sdk_resume_escalation_scope(scope),
+            error_code,
+            message,
+        },
+        privchat_sdk::SdkEvent::ResumeSyncEscalated {
+            classification,
+            scope,
+            reason,
+            entity_type,
+            channel_id,
+            channel_type,
+        } => SdkEvent::ResumeSyncEscalated {
+            classification: map_sdk_resume_failure_class(classification),
+            scope: map_sdk_resume_escalation_scope(scope),
+            reason,
+            entity_type,
+            channel_id,
+            channel_type,
+        },
+        privchat_sdk::SdkEvent::ResumeSyncChannelStarted {
+            channel_id,
+            channel_type,
+        } => SdkEvent::ResumeSyncChannelStarted {
+            channel_id,
+            channel_type,
+        },
+        privchat_sdk::SdkEvent::ResumeSyncChannelCompleted {
+            channel_id,
+            channel_type,
+            applied,
+        } => SdkEvent::ResumeSyncChannelCompleted {
+            channel_id,
+            channel_type,
+            applied: applied as u64,
+        },
+        privchat_sdk::SdkEvent::ResumeSyncChannelFailed {
+            channel_id,
+            channel_type,
+            classification,
+            scope,
+            error_code,
+            message,
+        } => SdkEvent::ResumeSyncChannelFailed {
+            channel_id,
+            channel_type,
+            classification: map_sdk_resume_failure_class(classification),
+            scope: map_sdk_resume_escalation_scope(scope),
+            error_code,
+            message,
+        },
         privchat_sdk::SdkEvent::SyncEntitiesApplied {
             entity_type,
             scope,
@@ -1825,6 +1936,83 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
         SdkEvent::BootstrapCompleted { user_id } => json!({
             "type": "bootstrap_completed",
             "user_id": user_id
+        }),
+        SdkEvent::ResumeSyncStarted => json!({
+            "type": "resume_sync_started"
+        }),
+        SdkEvent::ResumeSyncCompleted {
+            entity_types_synced,
+            channels_scanned,
+            channels_applied,
+            channel_failures,
+        } => json!({
+            "type": "resume_sync_completed",
+            "entity_types_synced": entity_types_synced,
+            "channels_scanned": channels_scanned,
+            "channels_applied": channels_applied,
+            "channel_failures": channel_failures
+        }),
+        SdkEvent::ResumeSyncFailed {
+            classification,
+            scope,
+            error_code,
+            message,
+        } => json!({
+            "type": "resume_sync_failed",
+            "classification": format!("{classification:?}"),
+            "scope": format!("{scope:?}"),
+            "error_code": error_code,
+            "message": message
+        }),
+        SdkEvent::ResumeSyncEscalated {
+            classification,
+            scope,
+            reason,
+            entity_type,
+            channel_id,
+            channel_type,
+        } => json!({
+            "type": "resume_sync_escalated",
+            "classification": format!("{classification:?}"),
+            "scope": format!("{scope:?}"),
+            "reason": reason,
+            "entity_type": entity_type,
+            "channel_id": channel_id,
+            "channel_type": channel_type
+        }),
+        SdkEvent::ResumeSyncChannelStarted {
+            channel_id,
+            channel_type,
+        } => json!({
+            "type": "resume_sync_channel_started",
+            "channel_id": channel_id,
+            "channel_type": channel_type
+        }),
+        SdkEvent::ResumeSyncChannelCompleted {
+            channel_id,
+            channel_type,
+            applied,
+        } => json!({
+            "type": "resume_sync_channel_completed",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "applied": applied
+        }),
+        SdkEvent::ResumeSyncChannelFailed {
+            channel_id,
+            channel_type,
+            classification,
+            scope,
+            error_code,
+            message,
+        } => json!({
+            "type": "resume_sync_channel_failed",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "classification": format!("{classification:?}"),
+            "scope": format!("{scope:?}"),
+            "error_code": error_code,
+            "message": message
         }),
         SdkEvent::SyncEntitiesApplied {
             entity_type,
@@ -1957,7 +2145,12 @@ fn is_timeline_event(evt: &SdkEvent) -> bool {
 fn is_network_event(evt: &SdkEvent) -> bool {
     matches!(
         evt,
-        SdkEvent::ConnectionStateChanged { .. } | SdkEvent::NetworkHintChanged { .. }
+        SdkEvent::ConnectionStateChanged { .. }
+            | SdkEvent::NetworkHintChanged { .. }
+            | SdkEvent::ResumeSyncStarted
+            | SdkEvent::ResumeSyncCompleted { .. }
+            | SdkEvent::ResumeSyncFailed { .. }
+            | SdkEvent::ResumeSyncEscalated { .. }
     )
 }
 
@@ -2021,6 +2214,7 @@ fn map_upsert_channel(v: UpsertChannelInput) -> SdkUpsertChannelInput {
         last_msg_timestamp: v.last_msg_timestamp,
         last_local_message_id: v.last_local_message_id,
         last_msg_content: v.last_msg_content,
+        version: v.last_msg_timestamp.max(0),
     }
 }
 
@@ -2112,6 +2306,7 @@ fn map_upsert_user(v: UpsertUserInput) -> SdkUpsertUserInput {
         user_type: v.user_type,
         is_deleted: v.is_deleted,
         channel_id: v.channel_id,
+        version: v.updated_at.max(0),
         updated_at: v.updated_at,
     }
 }
@@ -2136,6 +2331,7 @@ fn map_upsert_friend(v: UpsertFriendInput) -> SdkUpsertFriendInput {
         tags: v.tags,
         is_pinned: v.is_pinned,
         created_at: v.created_at,
+        version: v.updated_at.max(0),
         updated_at: v.updated_at,
     }
 }
@@ -2174,6 +2370,7 @@ fn map_upsert_group(v: UpsertGroupInput) -> SdkUpsertGroupInput {
         owner_id: v.owner_id,
         is_dismissed: v.is_dismissed,
         created_at: v.created_at,
+        version: v.updated_at.max(0),
         updated_at: v.updated_at,
     }
 }
@@ -2199,6 +2396,7 @@ fn map_upsert_group_member(v: UpsertGroupMemberInput) -> SdkUpsertGroupMemberInp
         alias: v.alias,
         is_muted: v.is_muted,
         joined_at: v.joined_at,
+        version: v.updated_at.max(0),
         updated_at: v.updated_at,
     }
 }
@@ -3595,6 +3793,7 @@ impl PrivchatClient {
                 owner_id: Some(resp.owner_id),
                 is_dismissed: resp.is_archived.unwrap_or(false),
                 created_at,
+                version: updated_at.max(0),
                 updated_at,
             })
             .await;
@@ -3653,6 +3852,7 @@ impl PrivchatClient {
                     alias: alias.clone(),
                     is_muted,
                     joined_at,
+                    version: updated_at.max(0),
                     updated_at,
                 })
                 .await;
@@ -4285,6 +4485,7 @@ impl PrivchatClient {
                     tags: None,
                     is_pinned: false,
                     created_at: ts,
+                    version: ts.max(0),
                     updated_at: ts,
                 })
                 .await;
@@ -4731,6 +4932,7 @@ impl PrivchatClient {
                     alias: None,
                     is_muted: false,
                     joined_at: now,
+                    version: now.max(0),
                     updated_at: now,
                 })
                 .await;
@@ -4823,6 +5025,7 @@ impl PrivchatClient {
                 alias: None,
                 is_muted: true,
                 joined_at: now,
+                version: now.max(0),
                 updated_at: now,
             })
             .await;
@@ -4856,6 +5059,7 @@ impl PrivchatClient {
                 alias: None,
                 is_muted: false,
                 joined_at: now,
+                version: now.max(0),
                 updated_at: now,
             })
             .await;
@@ -4892,6 +5096,7 @@ impl PrivchatClient {
                 owner_id: Some(target_user_id),
                 is_dismissed: existing.as_ref().map(|g| g.is_dismissed).unwrap_or(false),
                 created_at: existing.as_ref().map(|g| g.created_at).unwrap_or(now),
+                version: now.max(0),
                 updated_at: now,
             })
             .await;
@@ -4932,6 +5137,7 @@ impl PrivchatClient {
                 alias: None,
                 is_muted: false,
                 joined_at: now,
+                version: now.max(0),
                 updated_at: now,
             })
             .await;
@@ -4955,10 +5161,8 @@ impl PrivchatClient {
         )
         .await?;
         let _ = self
-            .kv_put(
-                group_settings_key(group_id),
-                json_encode(&resp, "group_get_settings cache")?.into_bytes(),
-            )
+            .inner
+            .cache_group_settings_json(group_id, json_encode(&resp, "group_get_settings cache")?)
             .await;
         Ok(GroupSettingsView {
             group_id: resp.group_id,
@@ -4995,7 +5199,8 @@ impl PrivchatClient {
         if req.group_id > 0 {
             let settings_json = json_encode(&req, "group_update_settings cache")?;
             let _ = self
-                .kv_put(group_settings_key(req.group_id), settings_json.into_bytes())
+                .inner
+                .cache_group_settings_json(req.group_id, settings_json)
                 .await;
         }
         Ok(resp.success)
@@ -5017,13 +5222,7 @@ impl PrivchatClient {
             },
         )
         .await?;
-        let key = group_settings_key(group_id);
-        let raw = self.kv_get(key.clone()).await?;
-        let mut state = decode_group_settings_cache(raw);
-        state.group_id = group_id;
-        state.mute_all = enabled;
-        let payload = json_encode(&state, "group_mute_all cache")?.into_bytes();
-        let _ = self.kv_put(key, payload).await;
+        let _ = self.inner.update_group_mute_all_cache(group_id, enabled).await;
         Ok(GroupMuteAllView {
             success: resp.success,
             group_id: resp.group_id,
@@ -5941,15 +6140,10 @@ impl PrivchatClient {
         channel_type: i32,
         mode: i32,
     ) -> Result<(), PrivchatFfiError> {
-        let key = channel_prefs_key(channel_id, channel_type);
-        let raw = self.kv_get(key.clone()).await?;
-        let mut state = decode_channel_prefs(raw);
-        state.notification_mode = mode;
-        self.kv_put(
-            key,
-            json_encode(&state, "channel_prefs notification_mode")?.into_bytes(),
-        )
-        .await
+        self.inner
+            .set_channel_notification_mode_pref(channel_id, channel_type, mode)
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn channel_notification_mode(
@@ -5957,9 +6151,10 @@ impl PrivchatClient {
         channel_id: u64,
         channel_type: i32,
     ) -> Result<i32, PrivchatFfiError> {
-        let key = channel_prefs_key(channel_id, channel_type);
-        let raw = self.kv_get(key).await?;
-        Ok(decode_channel_prefs(raw).notification_mode)
+        self.inner
+            .channel_notification_mode_pref(channel_id, channel_type)
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn set_channel_favourite(
@@ -5968,15 +6163,10 @@ impl PrivchatClient {
         channel_type: i32,
         enabled: bool,
     ) -> Result<(), PrivchatFfiError> {
-        let key = channel_prefs_key(channel_id, channel_type);
-        let raw = self.kv_get(key.clone()).await?;
-        let mut state = decode_channel_prefs(raw);
-        state.favourite = enabled;
-        self.kv_put(
-            key,
-            json_encode(&state, "channel_prefs favourite")?.into_bytes(),
-        )
-        .await
+        self.inner
+            .set_channel_favourite_pref(channel_id, channel_type, enabled)
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn set_channel_low_priority(
@@ -5985,15 +6175,10 @@ impl PrivchatClient {
         channel_type: i32,
         enabled: bool,
     ) -> Result<(), PrivchatFfiError> {
-        let key = channel_prefs_key(channel_id, channel_type);
-        let raw = self.kv_get(key.clone()).await?;
-        let mut state = decode_channel_prefs(raw);
-        state.low_priority = enabled;
-        self.kv_put(
-            key,
-            json_encode(&state, "channel_prefs low_priority")?.into_bytes(),
-        )
-        .await
+        self.inner
+            .set_channel_low_priority_pref(channel_id, channel_type, enabled)
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn channel_tags(
@@ -6001,9 +6186,10 @@ impl PrivchatClient {
         channel_id: u64,
         channel_type: i32,
     ) -> Result<Vec<String>, PrivchatFfiError> {
-        let key = channel_prefs_key(channel_id, channel_type);
-        let raw = self.kv_get(key).await?;
-        Ok(decode_channel_prefs(raw).tags)
+        self.inner
+            .channel_tags_pref(channel_id, channel_type)
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn upsert_user(&self, input: UpsertUserInput) -> Result<(), PrivchatFfiError> {
@@ -6344,32 +6530,6 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
-    pub async fn kv_put(&self, key: String, value: Vec<u8>) -> Result<(), PrivchatFfiError> {
-        self.inner
-            .kv_put(key, value)
-            .await
-            .map_err(PrivchatFfiError::from)
-    }
-
-    pub async fn kv_get(&self, key: String) -> Result<Option<Vec<u8>>, PrivchatFfiError> {
-        self.inner.kv_get(key).await.map_err(PrivchatFfiError::from)
-    }
-
-    pub async fn kv_scan_prefix(
-        &self,
-        prefix: String,
-    ) -> Result<Vec<KeyValueEntry>, PrivchatFfiError> {
-        let out = self
-            .inner
-            .kv_scan_prefix(prefix)
-            .await
-            .map_err(PrivchatFfiError::from)?;
-        Ok(out
-            .into_iter()
-            .map(|(key, value)| KeyValueEntry { key, value })
-            .collect())
-    }
-
     pub async fn user_storage_paths(&self) -> Result<UserStoragePaths, PrivchatFfiError> {
         let out = self
             .inner
@@ -6457,116 +6617,6 @@ impl PrivchatClient {
             }
         }
         Ok(None)
-    }
-
-    pub async fn get_all_user_settings(&self) -> Result<UserSettingsView, PrivchatFfiError> {
-        let mut map = serde_json::Map::<String, serde_json::Value>::new();
-        let entries = self
-            .kv_scan_prefix(USER_SETTINGS_ITEM_PREFIX.to_string())
-            .await?;
-        for entry in entries {
-            if !entry.key.starts_with(USER_SETTINGS_ITEM_PREFIX) {
-                continue;
-            }
-            let setting_key = entry
-                .key
-                .trim_start_matches(USER_SETTINGS_ITEM_PREFIX)
-                .to_string();
-            if setting_key.is_empty() {
-                continue;
-            }
-            let raw = String::from_utf8(entry.value).map_err(|e| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InternalError as u32,
-                detail: format!("invalid user setting payload for key={setting_key}: {e}"),
-            })?;
-            let parsed = serde_json::from_str::<serde_json::Value>(&raw)
-                .unwrap_or_else(|_| serde_json::Value::String(raw));
-            map.insert(setting_key, parsed);
-        }
-        if map.is_empty() {
-            let raw = self.kv_get(USER_SETTINGS_KEY.to_string()).await?;
-            if let Some(buf) = raw {
-                let value = String::from_utf8(buf).map_err(|e| PrivchatFfiError::SdkError {
-                    code: privchat_protocol::ErrorCode::InternalError as u32,
-                    detail: format!("invalid user settings payload: {e}"),
-                })?;
-                let parsed = serde_json::from_str::<serde_json::Value>(&value).map_err(|e| {
-                    PrivchatFfiError::SdkError {
-                        code: privchat_protocol::ErrorCode::InternalError as u32,
-                        detail: format!("invalid user settings json: {e}"),
-                    }
-                })?;
-                match parsed {
-                    serde_json::Value::Object(obj) => {
-                        if let Some(items) = obj.get("items").and_then(|v| v.as_array()) {
-                            for item in items {
-                                let key = item
-                                    .get("entity_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string();
-                                if key.is_empty() {
-                                    continue;
-                                }
-                                if item
-                                    .get("deleted")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false)
-                                {
-                                    continue;
-                                }
-                                let payload = item
-                                    .get("payload")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                                map.insert(key, payload);
-                            }
-                        } else {
-                            map = obj;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(UserSettingsView {
-            settings_json: serde_json::Value::Object(map).to_string(),
-        })
-    }
-
-    pub async fn get_user_setting(&self, key: String) -> Result<Option<String>, PrivchatFfiError> {
-        let all = self.get_all_user_settings().await?.settings_json;
-        let map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&all).map_err(|e| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InternalError as u32,
-                detail: format!("invalid settings json: {e}"),
-            })?;
-        Ok(map.get(&key).map(|v| {
-            v.as_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| v.to_string())
-        }))
-    }
-
-    pub async fn set_user_setting(
-        &self,
-        key: String,
-        value: String,
-    ) -> Result<(), PrivchatFfiError> {
-        let all = self.get_all_user_settings().await?.settings_json;
-        let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&all)
-            .map_err(|e| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InternalError as u32,
-                detail: format!("invalid settings json: {e}"),
-            })?;
-        map.insert(key.clone(), serde_json::Value::String(value.clone()));
-        self.kv_put(
-            format!("{USER_SETTINGS_ITEM_PREFIX}{key}"),
-            serde_json::Value::String(value).to_string().into_bytes(),
-        )
-        .await?;
-        let payload = serde_json::Value::Object(map).to_string().into_bytes();
-        self.kv_put(USER_SETTINGS_KEY.to_string(), payload).await
     }
 
     pub async fn get_presence_stats(&self) -> Result<PresenceStatsView, PrivchatFfiError> {

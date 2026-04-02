@@ -39,9 +39,10 @@ use privchat_protocol::rpc::file::upload::{
 use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
-    ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload, ChannelSyncPayload,
-    ChannelUnreadSyncPayload, FriendSyncPayload, GroupMemberSyncPayload, GroupSyncPayload,
-    MessageStatusSyncPayload, MessageSyncPayload, SyncEntityItem, UserSettingsSyncPayload,
+    ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload,
+    ChannelSyncPayload, FriendSyncPayload,
+    GetDifferenceRequest, GetDifferenceResponse, GroupMemberSyncPayload, GroupSyncPayload,
+    MessageStatusSyncPayload, MessageSyncPayload, SyncEntityItem,
 };
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
@@ -233,6 +234,44 @@ pub enum SdkEvent {
     BootstrapCompleted {
         user_id: u64,
     },
+    ResumeSyncStarted,
+    ResumeSyncCompleted {
+        entity_types_synced: usize,
+        channels_scanned: usize,
+        channels_applied: usize,
+        channel_failures: usize,
+    },
+    ResumeSyncFailed {
+        classification: ResumeFailureClass,
+        scope: ResumeEscalationScope,
+        error_code: u32,
+        message: String,
+    },
+    ResumeSyncEscalated {
+        classification: ResumeFailureClass,
+        scope: ResumeEscalationScope,
+        reason: String,
+        entity_type: Option<String>,
+        channel_id: Option<u64>,
+        channel_type: Option<i32>,
+    },
+    ResumeSyncChannelStarted {
+        channel_id: u64,
+        channel_type: i32,
+    },
+    ResumeSyncChannelCompleted {
+        channel_id: u64,
+        channel_type: i32,
+        applied: usize,
+    },
+    ResumeSyncChannelFailed {
+        channel_id: u64,
+        channel_type: i32,
+        classification: ResumeFailureClass,
+        scope: ResumeEscalationScope,
+        error_code: u32,
+        message: String,
+    },
     SyncEntitiesApplied {
         entity_type: String,
         scope: Option<String>,
@@ -299,8 +338,86 @@ pub struct SequencedSdkEvent {
 }
 
 const DEFAULT_EVENT_HISTORY_LIMIT: usize = 1024;
-const USER_SETTINGS_KEY: &str = "__user_settings_json__";
-const USER_SETTINGS_ITEM_PREFIX: &str = "entity_sync:user_settings:";
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ChannelPrefsState {
+    #[serde(default)]
+    notification_mode: i32,
+    #[serde(default)]
+    favourite: bool,
+    #[serde(default)]
+    low_priority: bool,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct GroupSettingsCache {
+    #[serde(default)]
+    group_id: u64,
+    #[serde(default)]
+    mute_all: bool,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn channel_prefs_key(channel_id: u64, channel_type: i32) -> String {
+    format!("__channel_prefs__:{channel_id}:{channel_type}")
+}
+
+fn group_settings_key(group_id: u64) -> String {
+    format!("__group_settings__:{group_id}")
+}
+
+fn decode_channel_prefs(raw: Option<Vec<u8>>) -> ChannelPrefsState {
+    raw.and_then(|b| serde_json::from_slice::<ChannelPrefsState>(&b).ok())
+        .unwrap_or_default()
+}
+
+fn decode_group_settings_cache(raw: Option<Vec<u8>>) -> GroupSettingsCache {
+    raw.and_then(|b| serde_json::from_slice::<GroupSettingsCache>(&b).ok())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResumeFailureClass {
+    RetryableTemporaryError,
+    ChannelResyncRequired,
+    EntityResyncRequired,
+    FullRebuildRequired,
+    FatalProtocolError,
+}
+
+impl ResumeFailureClass {
+    pub fn sdk_code(self) -> u32 {
+        match self {
+            ResumeFailureClass::RetryableTemporaryError => {
+                error_codes::RESUME_RETRYABLE_TEMPORARY
+            }
+            ResumeFailureClass::ChannelResyncRequired => {
+                error_codes::RESUME_CHANNEL_RESYNC_REQUIRED
+            }
+            ResumeFailureClass::EntityResyncRequired => {
+                error_codes::RESUME_ENTITY_RESYNC_REQUIRED
+            }
+            ResumeFailureClass::FullRebuildRequired => {
+                error_codes::RESUME_FULL_REBUILD_REQUIRED
+            }
+            ResumeFailureClass::FatalProtocolError => {
+                error_codes::RESUME_FATAL_PROTOCOL_ERROR
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResumeEscalationScope {
+    Retry,
+    ChannelScopedResync,
+    EntityScopedResync,
+    FullRebuild,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaProcessOp {
@@ -399,6 +516,16 @@ async fn stop_inbound_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
 fn inbound_logs_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("PRIVCHAT_INBOUND_LOG").ok().as_deref() == Some("1"))
+}
+
+fn rpc_logs_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PRIVCHAT_RPC_LOG").ok().as_deref() == Some("1"))
+}
+
+fn actor_logs_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PRIVCHAT_ACTOR_LOG").ok().as_deref() == Some("1"))
 }
 
 async fn start_inbound_task(
@@ -615,6 +742,7 @@ pub struct UpsertChannelInput {
     pub last_msg_timestamp: i64,
     pub last_local_message_id: u64,
     pub last_msg_content: String,
+    pub version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -630,6 +758,7 @@ pub struct StoredChannel {
     pub last_msg_timestamp: i64,
     pub last_local_message_id: u64,
     pub last_msg_content: String,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -684,6 +813,7 @@ pub struct UpsertUserInput {
     pub user_type: i32,
     pub is_deleted: bool,
     pub channel_id: String,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -697,6 +827,7 @@ pub struct StoredUser {
     pub user_type: i32,
     pub is_deleted: bool,
     pub channel_id: String,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -706,6 +837,7 @@ pub struct UpsertFriendInput {
     pub tags: Option<String>,
     pub is_pinned: bool,
     pub created_at: i64,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -719,6 +851,7 @@ pub struct StoredFriend {
     pub tags: Option<String>,
     pub is_pinned: bool,
     pub created_at: i64,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -744,6 +877,7 @@ pub struct UpsertGroupInput {
     pub owner_id: Option<u64>,
     pub is_dismissed: bool,
     pub created_at: i64,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -755,6 +889,7 @@ pub struct StoredGroup {
     pub owner_id: Option<u64>,
     pub is_dismissed: bool,
     pub created_at: i64,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -767,6 +902,7 @@ pub struct UpsertGroupMemberInput {
     pub alias: Option<String>,
     pub is_muted: bool,
     pub joined_at: i64,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -779,6 +915,7 @@ pub struct StoredGroupMember {
     pub alias: Option<String>,
     pub is_muted: bool,
     pub joined_at: i64,
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -1371,10 +1508,6 @@ enum Command {
         key: String,
         resp: oneshot::Sender<Result<Option<Vec<u8>>>>,
     },
-    KvScanPrefix {
-        prefix: String,
-        resp: oneshot::Sender<Result<Vec<(String, Vec<u8>)>>>,
-    },
     GetUserStoragePaths {
         resp: oneshot::Sender<Result<UserStoragePaths>>,
     },
@@ -1421,6 +1554,27 @@ struct ChannelMessageCache {
     messages: VecDeque<StoredMessage>,
     estimated_bytes: usize,
     has_more_before: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ResumeFailureTarget {
+    Global,
+    EntityType(String),
+    Channel { channel_id: u64, channel_type: i32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeFailureHandling {
+    Continue,
+    Abort,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ResumeRunStats {
+    entity_types_synced: usize,
+    channels_scanned: usize,
+    channels_applied: usize,
+    channel_failures: usize,
 }
 
 impl SessionState {
@@ -1495,6 +1649,37 @@ impl State {
         format!("__sync_version__:{entity_type}:{scope_part}")
     }
 
+    fn resume_repair_channel_key(channel_id: u64, channel_type: i32) -> String {
+        format!("__resume_repair__:channel:{channel_type}:{channel_id}")
+    }
+
+    fn resume_repair_entity_key(entity_type: &str) -> String {
+        format!("__resume_repair__:entity:{entity_type}")
+    }
+
+    fn resume_repair_full_rebuild_key() -> String {
+        "__resume_repair__:full_rebuild".to_string()
+    }
+
+    fn resume_repair_payload(
+        classification: ResumeFailureClass,
+        reason: &str,
+    ) -> Vec<u8> {
+        serde_json::json!({
+            "classification": classification,
+            "reason": reason,
+            "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    async fn clear_resume_repair_key(&self, key: String) {
+        if let Err(err) = self.storage.kv_delete(key).await {
+            eprintln!("[SDK.actor] clear resume repair marker failed: {err}");
+        }
+    }
+
     async fn load_sync_since_version(&self, entity_type: &str, scope: Option<&str>) -> Option<u64> {
         let key = Self::sync_version_key(entity_type, scope);
         let raw = self.storage.kv_get(key).await.ok().flatten()?;
@@ -1512,6 +1697,11 @@ impl State {
         self.storage
             .kv_put(key, version.to_string().into_bytes())
             .await
+    }
+
+    #[cfg(test)]
+    fn should_apply_entity_version(existing_version: Option<u64>, incoming_version: u64) -> bool {
+        existing_version.map(|v| incoming_version >= v).unwrap_or(true)
     }
 
     fn should_persist_sync_cursor(entity_type: &str, scope: Option<&str>) -> bool {
@@ -1541,6 +1731,356 @@ impl State {
 
     fn network_disconnected_error(&self) -> Error {
         Error::Transport(NETWORK_DISCONNECTED_MESSAGE.to_string())
+    }
+
+    fn classify_resume_error(err: &Error) -> ResumeFailureClass {
+        match err {
+            Error::Transport(_) | Error::NotConnected | Error::ActorClosed => {
+                ResumeFailureClass::RetryableTemporaryError
+            }
+            Error::Serialization(_) => ResumeFailureClass::FatalProtocolError,
+            Error::Storage(_) => ResumeFailureClass::FullRebuildRequired,
+            Error::Auth(message) => Self::classify_resume_message(
+                message,
+                ResumeFailureClass::FullRebuildRequired,
+            ),
+            Error::Shutdown => ResumeFailureClass::RetryableTemporaryError,
+            Error::InvalidState(message) => {
+                let lowered = message.to_ascii_lowercase();
+                if lowered.contains("session_ready rejected")
+                    || lowered.contains("requires authenticated")
+                {
+                    ResumeFailureClass::FullRebuildRequired
+                } else if lowered.contains("paging stalled")
+                    || lowered.contains("since_version")
+                    || lowered.contains("entity resync")
+                {
+                    ResumeFailureClass::EntityResyncRequired
+                } else if lowered.contains("max paging iterations")
+                    || lowered.contains("last_pts")
+                    || lowered.contains("gap")
+                    || lowered.contains("channel resync")
+                {
+                    ResumeFailureClass::ChannelResyncRequired
+                } else {
+                    ResumeFailureClass::FatalProtocolError
+                }
+            }
+        }
+    }
+
+    fn classify_resume_message(
+        message: &str,
+        default: ResumeFailureClass,
+    ) -> ResumeFailureClass {
+        let lowered = message.to_ascii_lowercase();
+        if lowered.contains("code=20900")
+            || lowered.contains("syncchannelresyncrequired")
+            || lowered.contains("channel scoped resync required")
+        {
+            ResumeFailureClass::ChannelResyncRequired
+        } else if lowered.contains("code=20901")
+            || lowered.contains("syncentityresyncrequired")
+            || lowered.contains("entity scoped resync required")
+        {
+            ResumeFailureClass::EntityResyncRequired
+        } else if lowered.contains("code=20902")
+            || lowered.contains("syncfullrebuildrequired")
+            || lowered.contains("full rebuild required")
+        {
+            ResumeFailureClass::FullRebuildRequired
+        } else if lowered.contains("pts too old")
+            || lowered.contains("gap")
+            || lowered.contains("channel resync")
+            || lowered.contains("message history window")
+            || lowered.contains("last_pts")
+        {
+            ResumeFailureClass::ChannelResyncRequired
+        } else if lowered.contains("entity resync")
+            || lowered.contains("since_version")
+            || lowered.contains("version too old")
+        {
+            ResumeFailureClass::EntityResyncRequired
+        } else if lowered.contains("resume token invalid")
+            || lowered.contains("session not found")
+            || lowered.contains("invalid token")
+            || lowered.contains("full rebuild")
+            || lowered.contains("bootstrap")
+            || lowered.contains("session_ready rejected")
+        {
+            ResumeFailureClass::FullRebuildRequired
+        } else if lowered.contains("decode") || lowered.contains("schema") {
+            ResumeFailureClass::FatalProtocolError
+        } else {
+            default
+        }
+    }
+
+    fn sync_rpc_rejection(op: &str, code: i32, message: String) -> Error {
+        let protocol_code = u32::try_from(code).ok().and_then(ErrorCode::from_code);
+        match protocol_code {
+            Some(ErrorCode::SyncChannelResyncRequired) => Error::InvalidState(format!(
+                "{op} channel resync required: code={code} message={message}"
+            )),
+            Some(ErrorCode::SyncEntityResyncRequired) => Error::InvalidState(format!(
+                "{op} entity resync required: code={code} message={message}"
+            )),
+            Some(ErrorCode::SyncFullRebuildRequired) => {
+                Error::Auth(format!("{op} full rebuild required: code={code} message={message}"))
+            }
+            Some(ErrorCode::ProtocolError)
+            | Some(ErrorCode::DecodingError)
+            | Some(ErrorCode::EncodingError) => {
+                Error::InvalidState(format!("{op} protocol error: code={code} message={message}"))
+            }
+            _ => Error::Auth(format!("{op} rejected: code={code} message={message}")),
+        }
+    }
+
+    fn resume_escalation_scope(
+        classification: ResumeFailureClass,
+        target: &ResumeFailureTarget,
+    ) -> ResumeEscalationScope {
+        match classification {
+            ResumeFailureClass::RetryableTemporaryError => ResumeEscalationScope::Retry,
+            ResumeFailureClass::ChannelResyncRequired => {
+                ResumeEscalationScope::ChannelScopedResync
+            }
+            ResumeFailureClass::EntityResyncRequired => {
+                ResumeEscalationScope::EntityScopedResync
+            }
+            ResumeFailureClass::FullRebuildRequired => ResumeEscalationScope::FullRebuild,
+            ResumeFailureClass::FatalProtocolError => match target {
+                ResumeFailureTarget::Channel { .. } => ResumeEscalationScope::ChannelScopedResync,
+                ResumeFailureTarget::EntityType(_) => ResumeEscalationScope::EntityScopedResync,
+                ResumeFailureTarget::Global => ResumeEscalationScope::FullRebuild,
+            },
+        }
+    }
+
+    fn queue_resume_started(&mut self) {
+        self.pending_events.push(SdkEvent::ResumeSyncStarted);
+    }
+
+    fn queue_resume_completed(&mut self, stats: ResumeRunStats) {
+        self.pending_events.push(SdkEvent::ResumeSyncCompleted {
+            entity_types_synced: stats.entity_types_synced,
+            channels_scanned: stats.channels_scanned,
+            channels_applied: stats.channels_applied,
+            channel_failures: stats.channel_failures,
+        });
+    }
+
+    async fn execute_channel_scoped_resync(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        classification: ResumeFailureClass,
+        reason: &str,
+    ) -> Result<()> {
+        let key = Self::resume_repair_channel_key(channel_id, channel_type);
+        self.storage
+            .kv_put(key.clone(), Self::resume_repair_payload(classification, reason))
+            .await?;
+        match self.sync_channel(channel_id, channel_type).await {
+            Ok(applied) => {
+                self.storage.kv_delete(key).await?;
+                self.pending_events.push(SdkEvent::SyncChannelApplied {
+                    channel_id,
+                    channel_type,
+                    applied,
+                });
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!(
+                    "[SDK.actor] channel scoped resync failed: channel_id={} channel_type={} err={}",
+                    channel_id, channel_type, err
+                );
+                Err(err)
+            }
+        }
+    }
+
+    async fn execute_entity_scoped_resync(
+        &mut self,
+        entity_type: &str,
+        classification: ResumeFailureClass,
+        reason: &str,
+    ) -> Result<()> {
+        let key = Self::resume_repair_entity_key(entity_type);
+        self.storage
+            .kv_put(key.clone(), Self::resume_repair_payload(classification, reason))
+            .await?;
+        match self.sync_entities(entity_type.to_string(), None).await {
+            Ok(applied) => {
+                self.storage.kv_delete(key).await?;
+                self.queue_last_sync_events(entity_type.to_string(), None, applied);
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!(
+                    "[SDK.actor] entity scoped resync failed: entity_type={} err={}",
+                    entity_type, err
+                );
+                Err(err)
+            }
+        }
+    }
+
+    async fn execute_full_rebuild_required(
+        &mut self,
+        classification: ResumeFailureClass,
+        reason: &str,
+    ) -> Result<()> {
+        let key = Self::resume_repair_full_rebuild_key();
+        self.storage
+            .kv_put(key, Self::resume_repair_payload(classification, reason))
+            .await?;
+        self.bootstrap_completed = false;
+        if let Some(uid) = &self.current_uid {
+            self.storage
+                .set_bootstrap_completed(uid.clone(), false)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_resume_failure(
+        &mut self,
+        target: ResumeFailureTarget,
+        err: &Error,
+    ) -> ResumeFailureHandling {
+        let classification = Self::classify_resume_error(err);
+        let scope = Self::resume_escalation_scope(classification, &target);
+        let message = err.to_string();
+
+        match &target {
+            ResumeFailureTarget::Channel {
+                channel_id,
+                channel_type,
+            } => {
+                self.pending_events.push(SdkEvent::ResumeSyncChannelFailed {
+                    channel_id: *channel_id,
+                    channel_type: *channel_type,
+                    classification,
+                    scope,
+                    error_code: classification.sdk_code(),
+                    message: message.clone(),
+                });
+            }
+            ResumeFailureTarget::EntityType(_) | ResumeFailureTarget::Global => {}
+        }
+
+        let (entity_type, channel_id, channel_type) = match &target {
+            ResumeFailureTarget::Global => (None, None, None),
+            ResumeFailureTarget::EntityType(entity_type) => {
+                (Some(entity_type.clone()), None, None)
+            }
+            ResumeFailureTarget::Channel {
+                channel_id,
+                channel_type,
+            } => (None, Some(*channel_id), Some(*channel_type)),
+        };
+        self.pending_events.push(SdkEvent::ResumeSyncEscalated {
+            classification,
+            scope,
+            reason: message.clone(),
+            entity_type,
+            channel_id,
+            channel_type,
+        });
+
+        match scope {
+            ResumeEscalationScope::ChannelScopedResync => {
+                if let ResumeFailureTarget::Channel {
+                    channel_id,
+                    channel_type,
+                } = target
+                {
+                    if let Err(resync_err) = self
+                        .execute_channel_scoped_resync(
+                            channel_id,
+                            channel_type,
+                            classification,
+                            &message,
+                        )
+                        .await
+                    {
+                        self.pending_events.push(SdkEvent::ResumeSyncFailed {
+                            classification,
+                            scope,
+                            error_code: classification.sdk_code(),
+                            message: resync_err.to_string(),
+                        });
+                    }
+                }
+                ResumeFailureHandling::Continue
+            }
+            ResumeEscalationScope::EntityScopedResync => {
+                if let ResumeFailureTarget::EntityType(entity_type) = target {
+                    match self
+                        .execute_entity_scoped_resync(&entity_type, classification, &message)
+                        .await
+                    {
+                        Ok(()) => ResumeFailureHandling::Continue,
+                        Err(resync_err) => {
+                            self.pending_events.push(SdkEvent::ResumeSyncFailed {
+                                classification,
+                                scope,
+                                error_code: classification.sdk_code(),
+                                message: resync_err.to_string(),
+                            });
+                            ResumeFailureHandling::Abort
+                        }
+                    }
+                } else {
+                    self.pending_events.push(SdkEvent::ResumeSyncFailed {
+                        classification,
+                        scope,
+                        error_code: classification.sdk_code(),
+                        message,
+                    });
+                    ResumeFailureHandling::Abort
+                }
+            }
+            ResumeEscalationScope::Retry
+            | ResumeEscalationScope::FullRebuild => {
+                if scope == ResumeEscalationScope::FullRebuild {
+                    if let Err(rebuild_err) = self
+                        .execute_full_rebuild_required(classification, &message)
+                        .await
+                    {
+                        self.pending_events.push(SdkEvent::ResumeSyncFailed {
+                            classification,
+                            scope,
+                            error_code: classification.sdk_code(),
+                            message: rebuild_err.to_string(),
+                        });
+                        return ResumeFailureHandling::Abort;
+                    }
+                }
+                self.pending_events.push(SdkEvent::ResumeSyncFailed {
+                    classification,
+                    scope,
+                    error_code: classification.sdk_code(),
+                    message,
+                });
+                ResumeFailureHandling::Abort
+            }
+        }
+    }
+
+    fn queue_last_sync_events(&mut self, event_entity_type: String, event_scope: Option<String>, applied: usize) {
+        self.pending_events
+            .extend(self.last_sync_entity_events.iter().cloned());
+        self.pending_events.push(SdkEvent::SyncEntitiesApplied {
+            entity_type: event_entity_type,
+            scope: event_scope,
+            queued: self.last_sync_queued,
+            applied,
+            dropped_duplicates: self.last_sync_dropped_duplicates,
+        });
     }
 
     fn push_connection_transition_event(
@@ -1820,7 +2360,7 @@ impl State {
         timeout: Duration,
         context: &str,
     ) -> Result<Bytes> {
-        if biz_type == MessageType::RpcRequest as u8 {
+        if biz_type == MessageType::RpcRequest as u8 && rpc_logs_enabled() {
             match decode_message::<RpcRequest>(&payload) {
                 Ok(req) => {
                     let body_preview = {
@@ -1859,7 +2399,7 @@ impl State {
             .with_timeout(timeout);
         match transport.request_with_options(payload, opt).await {
             Ok(raw) => {
-                if biz_type == MessageType::RpcRequest as u8 {
+                if biz_type == MessageType::RpcRequest as u8 && rpc_logs_enabled() {
                     match decode_message::<RpcResponse>(&raw) {
                         Ok(resp) => {
                             let data_preview = resp
@@ -2001,6 +2541,34 @@ impl State {
         None
     }
 
+    fn resolve_channel_unread_count(existing_unread: Option<i32>, synced_unread: Option<i32>) -> i32 {
+        existing_unread
+            .unwrap_or_else(|| synced_unread.unwrap_or(0))
+            .max(0)
+    }
+
+    fn resolve_channel_last_message_fields(
+        existing: Option<&StoredChannel>,
+        synced_timestamp: Option<i64>,
+        synced_content: Option<String>,
+    ) -> (i64, String, u64) {
+        if let Some(existing) = existing {
+            if existing.last_local_message_id > 0 || existing.last_msg_timestamp > 0 {
+                return (
+                    existing.last_msg_timestamp,
+                    existing.last_msg_content.clone(),
+                    existing.last_local_message_id,
+                );
+            }
+        }
+
+        (
+            synced_timestamp.unwrap_or_default(),
+            synced_content.unwrap_or_default(),
+            0,
+        )
+    }
+
     fn parse_two_ids(entity_id: &str) -> Option<(u64, u64)> {
         let parts: Vec<u64> = entity_id
             .split([':', '/', '|', ','])
@@ -2051,60 +2619,250 @@ impl State {
         }
     }
 
-    fn push_payload_content(payload: &[u8]) -> String {
-        if payload.is_empty() {
-            return String::new();
-        }
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
-            if let Some(content) = Self::json_get_string(&value, &["content", "text", "body"]) {
-                return content;
-            }
-            return value.to_string();
-        }
-        String::from_utf8_lossy(payload).to_string()
+    fn should_log_unsupported_entity_skip(entity_type: &str) -> bool {
+        !matches!(entity_type, "user_block" | "channel_extra" | "channel_unread")
     }
 
-    fn push_message_to_sync_item(push: PushMessageRequest) -> SyncEntityItem {
+    fn log_unsupported_sync_skip(
+        &self,
+        phase: &str,
+        entity_type: &str,
+        scope: Option<String>,
+        err: &Error,
+    ) {
+        if !Self::should_log_unsupported_entity_skip(entity_type) {
+            return;
+        }
+        match scope {
+            Some(scope) => eprintln!(
+                "[SDK.actor] {} skip unsupported entity_type={} scope={} reason={}",
+                phase, entity_type, scope, err
+            ),
+            None => eprintln!(
+                "[SDK.actor] {} skip unsupported entity_type={} reason={}",
+                phase, entity_type, err
+            ),
+        }
+    }
+
+    fn normalized_message_type_from_str(message_type: &str) -> i32 {
+        let normalized = match message_type.trim().to_ascii_lowercase().as_str() {
+            "image" => ContentMessageType::Image,
+            "file" => ContentMessageType::File,
+            "voice" => ContentMessageType::Voice,
+            "video" => ContentMessageType::Video,
+            "system" => ContentMessageType::System,
+            "audio" => ContentMessageType::Audio,
+            "location" => ContentMessageType::Location,
+            "contact_card" | "contactcard" | "card" => ContentMessageType::ContactCard,
+            "sticker" => ContentMessageType::Sticker,
+            "forward" => ContentMessageType::Forward,
+            _ => ContentMessageType::Text,
+        };
+        i32::try_from(normalized.as_u32()).unwrap_or(0)
+    }
+
+    fn normalized_message_content_and_extra(payload: &serde_json::Value) -> (String, Option<String>) {
+        match payload {
+            serde_json::Value::Null => (String::new(), None),
+            serde_json::Value::String(text) => (text.clone(), None),
+            serde_json::Value::Object(_) => (
+                Self::json_get_string(payload, &["content"])
+                    .or_else(|| Self::json_get_string(payload, &["text"]))
+                    .or_else(|| Self::json_get_string(payload, &["body"]))
+                    .or_else(|| Self::json_get_string(payload, &["content", "text"]))
+                    .or_else(|| Self::json_get_string(payload, &["content", "body"]))
+                    .unwrap_or_default(),
+                Some(payload.to_string()),
+            ),
+            serde_json::Value::Array(_) => (String::new(), Some(payload.to_string())),
+            other => (other.to_string(), None),
+        }
+    }
+
+    fn payload_bytes_to_message_content_and_extra(payload: &[u8]) -> (String, Option<String>) {
+        if payload.is_empty() {
+            return (String::new(), None);
+        }
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
+            return Self::normalized_message_content_and_extra(&value);
+        }
+        (String::from_utf8_lossy(payload).to_string(), None)
+    }
+
+    fn build_message_sync_item(
+        server_message_id: u64,
+        local_message_id: u64,
+        channel_id: u64,
+        channel_type: i32,
+        timestamp_ms: i64,
+        from_uid: u64,
+        message_type: i32,
+        content: String,
+        extra: Option<String>,
+        status: i32,
+        pts: i64,
+        setting: i32,
+        order_seq: i64,
+        topic: Option<String>,
+        stream_no: Option<String>,
+        stream_seq: Option<i64>,
+        stream_flag: Option<i64>,
+        msg_key: Option<String>,
+        expire: Option<i64>,
+    ) -> SyncEntityItem {
         let payload = serde_json::to_value(MessageSyncPayload {
-            server_message_id: Some(push.server_message_id),
-            message_id: Some(push.server_message_id),
-            id: Some(push.server_message_id),
-            local_message_id: Some(push.local_message_id),
-            channel_id: Some(push.channel_id),
-            channel_type: Some(i32::from(push.channel_type)),
-            type_field: Some(i32::from(push.channel_type)),
-            conversation_type: Some(i32::from(push.channel_type)),
-            timestamp: Some(push.timestamp as i64),
-            created_at: Some(push.timestamp as i64),
-            send_time: Some(push.timestamp as i64),
-            from_uid: Some(push.from_uid),
-            sender_id: Some(push.from_uid),
-            from: Some(push.from_uid),
-            uid: Some(push.from_uid),
-            message_type: i32::try_from(push.message_type).ok(),
-            content: Some(Self::push_payload_content(&push.payload)),
+            server_message_id: Some(server_message_id),
+            message_id: Some(server_message_id),
+            id: Some(server_message_id),
+            local_message_id: Some(local_message_id),
+            channel_id: Some(channel_id),
+            channel_type: Some(channel_type),
+            type_field: Some(channel_type),
+            conversation_type: Some(channel_type),
+            timestamp: Some(timestamp_ms),
+            created_at: Some(timestamp_ms),
+            send_time: Some(timestamp_ms),
+            from_uid: Some(from_uid),
+            sender_id: Some(from_uid),
+            from: Some(from_uid),
+            uid: Some(from_uid),
+            message_type: Some(message_type),
+            content: Some(content),
             text: None,
             body: None,
-            status: Some(2),
-            pts: Some(push.message_seq as i64),
-            setting: Some(if push.setting.need_receipt { 1 } else { 0 }),
-            order_seq: Some(push.message_seq as i64),
+            status: Some(status),
+            pts: Some(pts),
+            setting: Some(setting),
+            order_seq: Some(order_seq),
             searchable_word: None,
-            extra: None,
-            topic: Some(push.topic),
-            stream_no: Some(push.stream_no),
-            stream_seq: Some(push.stream_seq as i64),
-            stream_flag: Some(push.stream_flag as i64),
-            msg_key: Some(push.msg_key),
-            expire: Some(push.expire as i64),
+            extra,
+            topic,
+            stream_no,
+            stream_seq,
+            stream_flag,
+            msg_key,
+            expire,
         })
         .unwrap_or_else(|_| serde_json::json!({}));
         SyncEntityItem {
-            entity_id: push.server_message_id.to_string(),
-            version: u64::from(push.message_seq),
+            entity_id: server_message_id.to_string(),
+            version: u64::try_from(pts.max(0)).unwrap_or(0),
             deleted: false,
             payload: Some(payload),
         }
+    }
+
+    fn sync_item_from_difference_commit(commit: &privchat_protocol::rpc::sync::ServerCommit) -> (String, SyncEntityItem) {
+        match commit.message_type.as_str() {
+            "message.revoke" | "message_extra" | "message_ext" => {
+                let mut payload = commit.content.clone();
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.entry("channel_id".to_string())
+                        .or_insert_with(|| serde_json::json!(commit.channel_id));
+                    obj.entry("channel_type".to_string())
+                        .or_insert_with(|| serde_json::json!(i32::from(commit.channel_type)));
+                    obj.entry("message_id".to_string())
+                        .or_insert_with(|| serde_json::json!(commit.server_msg_id));
+                }
+                (
+                    "message_extra".to_string(),
+                    SyncEntityItem {
+                        entity_id: commit.server_msg_id.to_string(),
+                        version: commit.pts,
+                        deleted: false,
+                        payload: Some(payload),
+                    },
+                )
+            }
+            "message_reaction" | "reaction" | "message.reaction" => {
+                let mut payload = commit.content.clone();
+                let entity_id = if let Some(obj) = payload.as_object_mut() {
+                    obj.entry("channel_id".to_string())
+                        .or_insert_with(|| serde_json::json!(commit.channel_id));
+                    obj.entry("channel_type".to_string())
+                        .or_insert_with(|| serde_json::json!(i32::from(commit.channel_type)));
+                    let message_id = obj
+                        .get("message_id")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(commit.server_msg_id);
+                    let uid = obj.get("uid").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let emoji = obj
+                        .get("emoji")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if uid > 0 && !emoji.is_empty() {
+                        format!("{message_id}:{uid}:{emoji}")
+                    } else {
+                        commit.server_msg_id.to_string()
+                    }
+                } else {
+                    commit.server_msg_id.to_string()
+                };
+                (
+                    "message_reaction".to_string(),
+                    SyncEntityItem {
+                        entity_id,
+                        version: commit.pts,
+                        deleted: false,
+                        payload: Some(payload),
+                    },
+                )
+            }
+            _ => {
+                let (content, extra) = Self::normalized_message_content_and_extra(&commit.content);
+                (
+                    "message".to_string(),
+                    Self::build_message_sync_item(
+                        commit.server_msg_id,
+                        commit.local_message_id.unwrap_or(0),
+                        commit.channel_id,
+                        i32::from(commit.channel_type),
+                        commit.server_timestamp,
+                        commit.sender_id,
+                        Self::normalized_message_type_from_str(&commit.message_type),
+                        content,
+                        extra,
+                        2,
+                        i64::try_from(commit.pts).unwrap_or(i64::MAX),
+                        0,
+                        i64::try_from(commit.pts).unwrap_or(i64::MAX),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+            }
+        }
+    }
+
+    fn push_message_to_sync_item(push: PushMessageRequest) -> SyncEntityItem {
+        let (content, extra) = Self::payload_bytes_to_message_content_and_extra(&push.payload);
+        Self::build_message_sync_item(
+            push.server_message_id,
+            push.local_message_id,
+            push.channel_id,
+            i32::from(push.channel_type),
+            i64::from(push.timestamp),
+            push.from_uid,
+            i32::try_from(push.message_type).unwrap_or(0),
+            content,
+            extra,
+            2,
+            i64::from(push.message_seq),
+            if push.setting.need_receipt { 1 } else { 0 },
+            i64::from(push.message_seq),
+            Some(push.topic),
+            Some(push.stream_no),
+            Some(i64::from(push.stream_seq)),
+            Some(i64::from(push.stream_flag)),
+            Some(push.msg_key),
+            Some(i64::from(push.expire)),
+        )
     }
 
     fn json_field_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
@@ -2171,48 +2929,28 @@ impl State {
             return None;
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let payload = serde_json::to_value(MessageSyncPayload {
-            // Compatibility path: some server deployments forward SendMessageRequest
-            // directly to recipients without PushMessageRequest wrapping.
-            server_message_id: Some(req.local_message_id),
-            message_id: Some(req.local_message_id),
-            id: Some(req.local_message_id),
-            local_message_id: Some(req.local_message_id),
-            channel_id: Some(req.channel_id),
-            channel_type: Some(i32::from(channel_type)),
-            type_field: Some(i32::from(channel_type)),
-            conversation_type: Some(i32::from(channel_type)),
-            timestamp: Some(now_ms),
-            created_at: Some(now_ms),
-            send_time: Some(now_ms),
-            from_uid: Some(req.from_uid),
-            sender_id: Some(req.from_uid),
-            from: Some(req.from_uid),
-            uid: Some(req.from_uid),
-            message_type: i32::try_from(req.message_type).ok(),
-            content: Some(Self::push_payload_content(&req.payload)),
-            text: None,
-            body: None,
-            status: Some(2),
-            pts: Some(0),
-            setting: Some(if req.setting.need_receipt { 1 } else { 0 }),
-            order_seq: Some(0),
-            searchable_word: None,
-            extra: None,
-            topic: Some(req.topic),
-            stream_no: Some(req.stream_no),
-            stream_seq: Some(0),
-            stream_flag: Some(0),
-            msg_key: Some(String::new()),
-            expire: Some(req.expire as i64),
-        })
-        .unwrap_or_else(|_| serde_json::json!({}));
-        Some(SyncEntityItem {
-            entity_id: req.local_message_id.to_string(),
-            version: 0,
-            deleted: false,
-            payload: Some(payload),
-        })
+        let (content, extra) = Self::payload_bytes_to_message_content_and_extra(&req.payload);
+        Some(Self::build_message_sync_item(
+            req.local_message_id,
+            req.local_message_id,
+            req.channel_id,
+            i32::from(channel_type),
+            now_ms,
+            req.from_uid,
+            i32::try_from(req.message_type).unwrap_or(0),
+            content,
+            extra,
+            2,
+            0,
+            if req.setting.need_receipt { 1 } else { 0 },
+            0,
+            Some(req.topic),
+            Some(req.stream_no),
+            Some(0),
+            Some(0),
+            Some(String::new()),
+            Some(req.expire as i64),
+        ))
     }
 
     fn log_inbound_decoded(message_type: MessageType, data: &[u8]) {
@@ -2358,11 +3096,11 @@ impl State {
                         });
                         continue;
                     }
-                    self.storage
-                        .upsert_friend(UpsertFriendInput {
-                            user_id,
-                            tags: friend_sync.tags.clone(),
-                            is_pinned: friend_sync
+                            self.storage
+                            .upsert_friend(UpsertFriendInput {
+                                user_id,
+                                tags: friend_sync.tags.clone(),
+                                is_pinned: friend_sync
                                 .is_pinned
                                 .or(friend_sync.pinned)
                                 .unwrap_or(false),
@@ -2370,6 +3108,7 @@ impl State {
                                 .created_at
                                 .or(friend_meta.created_at)
                                 .unwrap_or(now_ms),
+                            version: item.version as i64,
                             updated_at: friend_sync
                                 .updated_at
                                 .or(friend_meta.updated_at)
@@ -2402,6 +3141,7 @@ impl State {
                                     .unwrap_or(0),
                                 is_deleted: false,
                                 channel_id: String::new(),
+                                version: item.version as i64,
                                 updated_at: embedded_user
                                     .updated_at
                                     .or(embedded_user.version)
@@ -2409,12 +3149,14 @@ impl State {
                             })
                             .await?;
                     }
-                    eprintln!(
-                        "[SDK.actor] friend sync hydrated user: user_id={} username={:?} nickname={:?}",
-                        user_id,
-                        embedded_user.username,
-                        embedded_user.nickname.or(embedded_user.name)
-                    );
+                    if actor_logs_enabled() {
+                        eprintln!(
+                            "[SDK.actor] friend sync hydrated user: user_id={} username={:?} nickname={:?}",
+                            user_id,
+                            embedded_user.username,
+                            embedded_user.nickname.or(embedded_user.name)
+                        );
+                    }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "friend".to_string(),
                         entity_id: item.entity_id.clone(),
@@ -2491,6 +3233,7 @@ impl State {
                                 || Self::json_get_bool(&payload, &["is_deleted"]).unwrap_or(false),
                             channel_id: Self::json_get_string(&payload, &["channel_id"])
                                 .unwrap_or_default(),
+                            version: item.version as i64,
                             updated_at: Self::json_get_i64(&payload, &["updated_at", "version"])
                                 .unwrap_or(item.version as i64),
                         })
@@ -2542,6 +3285,7 @@ impl State {
                                 .created_at
                                 .or_else(|| Self::json_get_i64(&payload, &["created_at"]))
                                 .unwrap_or(now_ms),
+                            version: item.version as i64,
                             updated_at: group_sync
                                 .updated_at
                                 .or_else(|| {
@@ -2596,6 +3340,7 @@ impl State {
                             alias: group_member.alias,
                             is_muted: group_member.is_muted.unwrap_or(false),
                             joined_at: group_member.joined_at.unwrap_or(now_ms),
+                            version: item.version as i64,
                             updated_at: group_member
                                 .updated_at
                                 .or(group_member.version)
@@ -2640,28 +3385,25 @@ impl State {
                         continue;
                     };
                     let existing = self.storage.get_channel_by_id(channel_id).await?;
-                    // Local-first rule:
-                    // channel last message fields are derived from local message table only.
-                    // Server channel sync must not overwrite local preview/timestamp.
                     let (last_msg_timestamp, last_msg_content, last_local_message_id) =
-                        if let Some(existing) = existing.as_ref() {
-                            (
-                                existing.last_msg_timestamp,
-                                existing.last_msg_content.clone(),
-                                existing.last_local_message_id,
-                            )
-                        } else {
-                            (0, String::new(), 0)
-                        };
-                    // `channel_unread` may be unavailable on some deployments.
-                    // If server sends unread_count, trust server value (can both increase and decrease).
-                    // If it does not send unread_count, keep current local value.
-                    let existing_unread = existing.as_ref().map(|c| c.unread_count).unwrap_or(0);
-                    let unread_count = channel_sync
-                        .unread_count
-                        .or_else(|| Self::json_get_i32(&payload, &["unread_count"]))
-                        .unwrap_or(existing_unread)
-                        .max(0);
+                        Self::resolve_channel_last_message_fields(
+                            existing.as_ref(),
+                            channel_sync.last_msg_timestamp,
+                            channel_sync.last_msg_content.clone(),
+                        );
+                    // Unread is kept as a local projection from message timeline + read cursor
+                    // once the channel already exists locally. Server channel sync only provides
+                    // the cold-start baseline for channels not yet materialized on device.
+                    let unread_count = Self::resolve_channel_unread_count(
+                        existing.as_ref().map(|c| c.unread_count),
+                        channel_sync.unread_count,
+                    );
+                    let top = channel_sync
+                        .top
+                        .unwrap_or_else(|| existing.as_ref().map(|c| c.top).unwrap_or(0));
+                    let mute = channel_sync
+                        .mute
+                        .unwrap_or_else(|| existing.as_ref().map(|c| c.mute).unwrap_or(0));
                     self.storage
                         .upsert_channel(UpsertChannelInput {
                             channel_id,
@@ -2682,17 +3424,12 @@ impl State {
                                 .or_else(|| Self::json_get_string(&payload, &["avatar"]))
                                 .unwrap_or_default(),
                             unread_count,
-                            top: channel_sync
-                                .top
-                                .or_else(|| Self::json_get_i32(&payload, &["top"]))
-                                .unwrap_or(0),
-                            mute: channel_sync
-                                .mute
-                                .or_else(|| Self::json_get_i32(&payload, &["mute"]))
-                                .unwrap_or(0),
+                            top,
+                            mute,
                             last_msg_timestamp,
                             last_local_message_id,
                             last_msg_content,
+                            version: item.version as i64,
                         })
                         .await?;
                     emitted.push(SdkEvent::SyncEntityChanged {
@@ -2820,6 +3557,7 @@ impl State {
                                 user_type: 0,
                                 is_deleted: false,
                                 channel_id: String::new(),
+                                version: item.version as i64,
                                 updated_at: channel_member
                                     .updated_at
                                     .or(channel_member.version)
@@ -2878,66 +3616,6 @@ impl State {
             }
             "channel_unread" | "channel_unread_count" => {
                 for item in items {
-                    let payload = item
-                        .payload
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let channel_unread =
-                        serde_json::from_value::<ChannelUnreadSyncPayload>(payload)
-                            .unwrap_or_default();
-                    let scoped_channel = Self::parse_channel_scope(scope);
-                    let channel_id = channel_unread
-                        .channel_id
-                        .or(scoped_channel.map(|v| v.1))
-                        .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
-                        .unwrap_or(0);
-                    let channel_type = channel_unread
-                        .channel_type
-                        .or(channel_unread.type_field)
-                        .and_then(|v| i32::try_from(v).ok())
-                        .or(scoped_channel.map(|v| v.0))
-                        .map(|v| if v == 0 { 1 } else { v })
-                        .unwrap_or(1);
-                    if channel_id == 0 {
-                        continue;
-                    }
-                    let unread_count = channel_unread.unread_count.unwrap_or(0);
-                    let mut channel = self.storage.get_channel_by_id(channel_id).await?;
-                    if let Some(existing) = channel.as_mut() {
-                        existing.unread_count = unread_count;
-                        existing.updated_at = now_ms;
-                        self.storage
-                            .upsert_channel(UpsertChannelInput {
-                                channel_id: existing.channel_id,
-                                channel_type: existing.channel_type,
-                                channel_name: existing.channel_name.clone(),
-                                channel_remark: existing.channel_remark.clone(),
-                                avatar: existing.avatar.clone(),
-                                unread_count: existing.unread_count,
-                                top: existing.top,
-                                mute: existing.mute,
-                                last_msg_timestamp: existing.last_msg_timestamp,
-                                last_local_message_id: existing.last_local_message_id,
-                                last_msg_content: existing.last_msg_content.clone(),
-                            })
-                            .await?;
-                    } else {
-                        self.storage
-                            .upsert_channel(UpsertChannelInput {
-                                channel_id,
-                                channel_type,
-                                channel_name: String::new(),
-                                channel_remark: String::new(),
-                                avatar: String::new(),
-                                unread_count,
-                                top: 0,
-                                mute: 0,
-                                last_msg_timestamp: now_ms,
-                                last_local_message_id: 0,
-                                last_msg_content: String::new(),
-                            })
-                            .await?;
-                    }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "channel_unread".to_string(),
                         entity_id: item.entity_id.clone(),
@@ -3063,7 +3741,7 @@ impl State {
                         .await?;
                     let message_id = upserted.message_id;
                     // During bootstrap/periodic sync, do NOT bump unread —
-                    // the authoritative count comes from `channel_unread` entity sync.
+                    // the authoritative count is a local projection from message timeline + read cursor.
                     // For realtime push messages, bump_unread_on_incoming is true.
                     let from_self = current_user_id.map(|v| v == from_uid).unwrap_or(false);
                     let _ = self
@@ -3103,11 +3781,11 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let message_id =
+                    let raw_message_id =
                         Self::json_get_u64(&payload, &["message_id", "server_message_id", "id"])
                             .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
                             .unwrap_or(0);
-                    if message_id == 0 {
+                    if raw_message_id == 0 {
                         continue;
                     }
                     let scoped_channel = Self::parse_channel_scope(scope);
@@ -3120,6 +3798,18 @@ impl State {
                     let channel_id = Self::json_get_u64(&payload, &["channel_id"])
                         .or(scoped_channel.map(|v| v.1))
                         .unwrap_or(0);
+                    let message_id = if channel_id > 0 {
+                        self.storage
+                            .get_message_id_by_server_message_id(
+                                channel_id,
+                                channel_type,
+                                raw_message_id,
+                            )
+                            .await?
+                            .unwrap_or(raw_message_id)
+                    } else {
+                        raw_message_id
+                    };
                     if payload.get("revoke").is_some() || payload.get("is_revoked").is_some() {
                         let revoke = Self::json_get_bool(&payload, &["revoke", "is_revoked"])
                             .unwrap_or(false);
@@ -3165,7 +3855,7 @@ impl State {
                         .payload
                         .clone()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    let message_id =
+                    let raw_message_id =
                         Self::json_get_u64(&payload, &["message_id", "server_message_id", "id"])
                             .or_else(|| Self::parse_entity_id_u64(&item.entity_id))
                             .unwrap_or(0);
@@ -3179,6 +3869,18 @@ impl State {
                     let channel_id = Self::json_get_u64(&payload, &["channel_id"])
                         .or(scoped_channel.map(|v| v.1))
                         .unwrap_or(0);
+                    let message_id = if channel_id > 0 && raw_message_id > 0 {
+                        self.storage
+                            .get_message_id_by_server_message_id(
+                                channel_id,
+                                channel_type,
+                                raw_message_id,
+                            )
+                            .await?
+                            .unwrap_or(raw_message_id)
+                    } else {
+                        raw_message_id
+                    };
                     let uid =
                         Self::json_get_u64(&payload, &["uid", "user_id", "sender_id"]).unwrap_or(0);
                     let emoji = Self::json_get_string(&payload, &["emoji"]).unwrap_or_default();
@@ -3437,46 +4139,6 @@ impl State {
                         deleted: item.deleted,
                     });
                 }
-            }
-            "user_settings" => {
-                for item in items {
-                    let payload = item
-                        .payload
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let settings_sync =
-                        serde_json::from_value::<UserSettingsSyncPayload>(payload.clone())
-                            .unwrap_or_default();
-                    let setting_key = settings_sync
-                        .setting_key
-                        .clone()
-                        .unwrap_or_else(|| item.entity_id.clone());
-                    let key = format!("{USER_SETTINGS_ITEM_PREFIX}{setting_key}");
-                    if item.deleted {
-                        self.storage.kv_delete(key).await?;
-                    } else {
-                        let value = settings_sync
-                            .value
-                            .unwrap_or(payload)
-                            .to_string()
-                            .into_bytes();
-                        self.storage.kv_put(key, value).await?;
-                    }
-                    emitted.push(SdkEvent::SyncEntityChanged {
-                        entity_type: "user_settings".to_string(),
-                        entity_id: setting_key,
-                        deleted: item.deleted,
-                    });
-                }
-                let snapshot = serde_json::json!({
-                    "items": items,
-                    "updated_at": now_ms
-                })
-                .to_string()
-                .into_bytes();
-                self.storage
-                    .kv_put(USER_SETTINGS_KEY.to_string(), snapshot)
-                    .await?;
             }
             _ => {}
         }
@@ -3786,40 +4448,50 @@ impl State {
     }
 
     async fn connect(&mut self) -> Result<()> {
-        eprintln!(
-            "[SDK.actor] connect: enter (has_transport={}, endpoints={})",
-            self.transport.is_some(),
-            self.config.endpoints.len()
-        );
+        if actor_logs_enabled() {
+            eprintln!(
+                "[SDK.actor] connect: enter (has_transport={}, endpoints={})",
+                self.transport.is_some(),
+                self.config.endpoints.len()
+            );
+        }
         if let Some(transport) = self.transport.as_ref() {
             if transport.is_connected().await {
-                eprintln!("[SDK.actor] connect: already connected");
+                if actor_logs_enabled() {
+                    eprintln!("[SDK.actor] connect: already connected");
+                }
                 return Ok(());
             }
-            eprintln!("[SDK.actor] connect: found stale transport, rebuilding");
+            if actor_logs_enabled() {
+                eprintln!("[SDK.actor] connect: found stale transport, rebuilding");
+            }
             self.transport = None;
         }
         let endpoints = self.config.endpoints.clone();
         let mut last_err = None;
         for ep in endpoints {
-            match ep.protocol {
-                TransportProtocol::WebSocket => {
-                    eprintln!(
-                        "[SDK.actor] connect: trying {:?} {}:{} tls={}",
-                        ep.protocol, ep.host, ep.port, ep.use_tls
-                    );
-                }
-                _ => {
-                    eprintln!(
-                        "[SDK.actor] connect: trying {:?} {}:{}",
-                        ep.protocol, ep.host, ep.port
-                    );
+            if actor_logs_enabled() {
+                match ep.protocol {
+                    TransportProtocol::WebSocket => {
+                        eprintln!(
+                            "[SDK.actor] connect: trying {:?} {}:{} tls={}",
+                            ep.protocol, ep.host, ep.port, ep.use_tls
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[SDK.actor] connect: trying {:?} {}:{}",
+                            ep.protocol, ep.host, ep.port
+                        );
+                    }
                 }
             }
             match timeout(self.timeout(), self.connect_one(&ep)).await {
                 Ok(Ok(c)) => {
                     self.transport = Some(c);
-                    eprintln!("[SDK.actor] connect: success");
+                    if actor_logs_enabled() {
+                        eprintln!("[SDK.actor] connect: success");
+                    }
                     return Ok(());
                 }
                 Ok(Err(e)) => {
@@ -3951,7 +4623,9 @@ impl State {
     }
 
     async fn connect_one(&self, ep: &ServerEndpoint) -> Result<TransportClient> {
-        eprintln!("[SDK.actor] connect_one: begin");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.actor] connect_one: begin");
+        }
         let timeout = self.timeout();
         let target = Self::resolve_target(&ep.host, ep.port).await?;
         let mut client = match ep.protocol {
@@ -4000,7 +4674,9 @@ impl State {
             .connect()
             .await
             .map_err(|e| Error::Transport(format!("connect: {e}")))?;
-        eprintln!("[SDK.actor] connect_one: connected");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.actor] connect_one: connected");
+        }
         Ok(client)
     }
 
@@ -4010,7 +4686,9 @@ impl State {
         password: String,
         device_id: String,
     ) -> Result<LoginResult> {
-        eprintln!("[SDK.actor] login: enter");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.actor] login: enter");
+        }
         let timeout = self.timeout();
         let os = std::env::consts::OS.to_string();
         let device_name = std::env::var("PRIVCHAT_DEVICE_NAME")
@@ -4083,7 +4761,9 @@ impl State {
         if let Err(e) = self.replay_prelogin_inbound_frames().await {
             eprintln!("[SDK.inbound] replay after login failed: {e}");
         }
-        eprintln!("[SDK.actor] login: success user_id={}", out.user_id);
+        if actor_logs_enabled() {
+            eprintln!("[SDK.actor] login: success user_id={}", out.user_id);
+        }
         Ok(out)
     }
 
@@ -4169,7 +4849,9 @@ impl State {
     }
 
     async fn authenticate(&mut self, user_id: u64, token: String, device_id: String) -> Result<()> {
-        eprintln!("[SDK.actor] authenticate: enter user_id={user_id}");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.actor] authenticate: enter user_id={user_id}");
+        }
         let timeout = self.timeout();
         let token_for_persist = token.clone();
         let device_id_for_persist = device_id.clone();
@@ -4240,7 +4922,9 @@ impl State {
             .await?;
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
-        eprintln!("[SDK.actor] authenticate: success");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.actor] authenticate: success");
+        }
         Ok(())
     }
 
@@ -4306,19 +4990,27 @@ impl State {
                         }
                     })
                     .unwrap_or_else(|| "<none>".to_string());
-                eprintln!(
-                    "[SDK.actor] sync_entities rpc rejected: entity_type={} scope={:?} since_version={} code={} message={} data={}",
-                    entity_type_for_apply,
-                    scope_for_apply,
-                    since_version,
+                if Self::should_log_unsupported_entity_skip(&entity_type_for_apply)
+                    || !matches!(rpc_resp.code, 10100)
+                {
+                    eprintln!(
+                        "[SDK.actor] sync_entities rpc rejected: entity_type={} scope={:?} since_version={} code={} message={} data={}",
+                        entity_type_for_apply,
+                        scope_for_apply,
+                        since_version,
+                        rpc_resp.code,
+                        rpc_resp.message,
+                        data_preview
+                    );
+                }
+                return Err(Self::sync_rpc_rejection(
+                    &format!(
+                        "sync_entities entity_type={} scope={:?} since_version={}",
+                        entity_type_for_apply, scope_for_apply, since_version
+                    ),
                     rpc_resp.code,
                     rpc_resp.message,
-                    data_preview
-                );
-                return Err(Error::Auth(format!(
-                    "sync_entities rejected: entity_type={} scope={:?} since_version={} code={} message={}",
-                    entity_type_for_apply, scope_for_apply, since_version, rpc_resp.code, rpc_resp.message
-                )));
+                ));
             }
             let body = rpc_resp
                 .data
@@ -4391,7 +5083,313 @@ impl State {
         self.last_sync_dropped_duplicates = total_dropped;
         self.invalidate_cache_for_events(&entity_events);
         self.last_sync_entity_events = entity_events;
+        if scope_for_apply.is_none() {
+            self.clear_resume_repair_key(Self::resume_repair_entity_key(&entity_type_for_apply))
+                .await;
+        }
         Ok(applied)
+    }
+
+    async fn send_session_ready(&mut self) -> Result<()> {
+        let timeout = self.timeout();
+        let ready_req = privchat_protocol::rpc::sync::SessionReadyRequest {};
+        let ready_rpc = RpcRequest {
+            route: routes::sync::SESSION_READY.to_string(),
+            body: serde_json::to_value(ready_req)
+                .map_err(|e| Error::Serialization(format!("encode session_ready body: {e}")))?,
+        };
+        let payload = encode_message(&ready_rpc)
+            .map_err(|e| Error::Serialization(format!("encode session_ready rpc: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc session_ready",
+            )
+            .await?;
+        let rpc_resp: RpcResponse = decode_message(&raw)
+            .map_err(|e| Error::Serialization(format!("decode session_ready rpc: {e}")))?;
+        if rpc_resp.code != 0 {
+            return Err(Self::sync_rpc_rejection(
+                "session_ready",
+                rpc_resp.code,
+                rpc_resp.message,
+            ));
+        }
+        let body = rpc_resp
+            .data
+            .ok_or_else(|| Error::Serialization("empty session_ready data".into()))?;
+        let ready_ok: privchat_protocol::rpc::sync::SessionReadyResponse =
+            serde_json::from_value(body)
+                .map_err(|e| Error::Serialization(format!("decode session_ready response: {e}")))?;
+        if !ready_ok {
+            return Err(Error::InvalidState(
+                "session_ready rejected by server".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn get_difference(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        last_pts: u64,
+        limit: Option<u32>,
+    ) -> Result<GetDifferenceResponse> {
+        let timeout = self.timeout();
+        let req = GetDifferenceRequest {
+            channel_id,
+            channel_type: u8::try_from(channel_type).unwrap_or(1),
+            last_pts,
+            limit,
+        };
+        let request = RpcRequest {
+            route: routes::sync::GET_DIFFERENCE.to_string(),
+            body: serde_json::to_value(req)
+                .map_err(|e| Error::Serialization(format!("encode get_difference body: {e}")))?,
+        };
+        let payload = encode_message(&request)
+            .map_err(|e| Error::Serialization(format!("encode get_difference rpc: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc get_difference",
+            )
+            .await?;
+        let rpc_resp: RpcResponse = decode_message(&raw)
+            .map_err(|e| Error::Serialization(format!("decode get_difference rpc: {e}")))?;
+        if rpc_resp.code != 0 {
+            return Err(Self::sync_rpc_rejection(
+                &format!(
+                    "get_difference channel_id={} channel_type={} last_pts={}",
+                    channel_id, channel_type, last_pts
+                ),
+                rpc_resp.code,
+                rpc_resp.message,
+            ));
+        }
+        let body = rpc_resp
+            .data
+            .ok_or_else(|| Error::Serialization("empty get_difference data".into()))?;
+        serde_json::from_value(body)
+            .map_err(|e| Error::Serialization(format!("decode get_difference response: {e}")))
+    }
+
+    async fn resume_channel_difference(&mut self, channel_id: u64, channel_type: i32) -> Result<usize> {
+        let scope = Some(format!("{channel_type}:{channel_id}"));
+        let mut last_pts = self.storage.max_message_pts(channel_id, channel_type).await?;
+        let mut total_applied = 0usize;
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            if pages > 64 {
+                return Err(Error::InvalidState(format!(
+                    "resume_channel_difference exceeded max paging iterations: channel_id={} channel_type={}",
+                    channel_id, channel_type
+                )));
+            }
+            let response = self
+                .get_difference(channel_id, channel_type, last_pts, Some(200))
+                .await?;
+            if response.commits.is_empty() {
+                break;
+            }
+            for commit in response.commits.iter() {
+                let (entity_type, item) = Self::sync_item_from_difference_commit(commit);
+                let applied = self
+                    .enqueue_and_apply_sync_items(entity_type.clone(), scope.clone(), vec![item])
+                    .await?;
+                total_applied += applied;
+                self.queue_last_sync_events(entity_type, scope.clone(), applied);
+            }
+            let next_last_pts = response
+                .commits
+                .iter()
+                .map(|commit| commit.pts)
+                .max()
+                .unwrap_or(last_pts);
+            if next_last_pts <= last_pts {
+                break;
+            }
+            last_pts = next_last_pts;
+            if !response.has_more {
+                break;
+            }
+        }
+        Ok(total_applied)
+    }
+
+    async fn run_resume_sync(&mut self) -> Result<()> {
+        if self.session_state != SessionState::Authenticated {
+            let err = Error::InvalidState(
+                "run_resume_sync requires authenticated state".to_string(),
+            );
+            let _ = self
+                .handle_resume_failure(ResumeFailureTarget::Global, &err)
+                .await;
+            return Err(err);
+        }
+        if !self.bootstrap_completed {
+            return Ok(());
+        }
+        let mut stats = ResumeRunStats::default();
+        self.queue_resume_started();
+        if let Err(err) = self.send_session_ready().await {
+            let _ = self
+                .handle_resume_failure(ResumeFailureTarget::Global, &err)
+                .await;
+            return Err(err);
+        }
+
+        let entity_order = [
+            "friend",
+            "group",
+            "channel",
+            "user",
+            "channel_read_cursor",
+        ];
+        for entity_type in entity_order {
+            match self.sync_entities(entity_type.to_string(), None).await {
+                Ok(applied) => {
+                    stats.entity_types_synced += 1;
+                    self.queue_last_sync_events(entity_type.to_string(), None, applied);
+                }
+                Err(e) if Self::is_unsupported_entity_error(&e) => {
+                    self.log_unsupported_sync_skip("resume sync", entity_type, None, &e);
+                }
+                Err(e) => {
+                    let handling = self
+                        .handle_resume_failure(
+                            ResumeFailureTarget::EntityType(entity_type.to_string()),
+                            &e,
+                        )
+                        .await;
+                    if handling == ResumeFailureHandling::Abort {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        let mut group_offset = 0usize;
+        let group_page_size = 500usize;
+        loop {
+            let groups = self
+                .storage
+                .list_groups(group_page_size, group_offset)
+                .await?;
+            if groups.is_empty() {
+                break;
+            }
+            for group in groups.iter() {
+                match self
+                    .sync_entities("group_member".to_string(), Some(group.group_id.to_string()))
+                    .await
+                {
+                    Ok(applied) => {
+                        stats.entity_types_synced += 1;
+                        self.queue_last_sync_events(
+                            "group_member".to_string(),
+                            Some(group.group_id.to_string()),
+                            applied,
+                        );
+                    }
+                    Err(e) if Self::is_unsupported_entity_error(&e) => {
+                        self.log_unsupported_sync_skip(
+                            "resume sync",
+                            "group_member",
+                            Some(group.group_id.to_string()),
+                            &e,
+                        );
+                    }
+                    Err(e) => {
+                        let handling = self
+                            .handle_resume_failure(
+                                ResumeFailureTarget::EntityType("group_member".to_string()),
+                                &e,
+                            )
+                            .await;
+                        if handling == ResumeFailureHandling::Abort {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            if groups.len() < group_page_size {
+                break;
+            }
+            group_offset += group_page_size;
+        }
+
+        let mut channel_offset = 0usize;
+        let channel_page_size = 500usize;
+        loop {
+            let channels = self.storage.list_channels(channel_page_size, channel_offset).await?;
+            if channels.is_empty() {
+                break;
+            }
+            for channel in channels.iter() {
+                stats.channels_scanned += 1;
+                self.pending_events.push(SdkEvent::ResumeSyncChannelStarted {
+                    channel_id: channel.channel_id,
+                    channel_type: channel.channel_type,
+                });
+                match self
+                    .resume_channel_difference(channel.channel_id, channel.channel_type)
+                    .await
+                {
+                    Ok(applied) => {
+                        if applied > 0 {
+                            stats.channels_applied += 1;
+                            self.pending_events.push(SdkEvent::SyncChannelApplied {
+                                channel_id: channel.channel_id,
+                                channel_type: channel.channel_type,
+                                applied,
+                            });
+                        }
+                        self.pending_events.push(SdkEvent::ResumeSyncChannelCompleted {
+                            channel_id: channel.channel_id,
+                            channel_type: channel.channel_type,
+                            applied,
+                        });
+                    }
+                    Err(err) => {
+                        stats.channel_failures += 1;
+                        let handling = self
+                            .handle_resume_failure(
+                                ResumeFailureTarget::Channel {
+                                    channel_id: channel.channel_id,
+                                    channel_type: channel.channel_type,
+                                },
+                                &err,
+                            )
+                            .await;
+                        if handling == ResumeFailureHandling::Abort {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+            if channels.len() < channel_page_size {
+                break;
+            }
+            channel_offset += channel_page_size;
+        }
+        self.queue_resume_completed(stats);
+        Ok(())
+    }
+
+    async fn full_rebuild_required(&self) -> bool {
+        self.storage
+            .kv_get(Self::resume_repair_full_rebuild_key())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     async fn enqueue_and_apply_sync_items(
@@ -4642,41 +5640,55 @@ impl State {
             ));
         }
 
-        // Keep order aligned with legacy SDK bootstrap strategy.
-        // Core entities are required by local-first read models.
-        let core_entities = ["friend", "group", "channel", "channel_read_cursor", "user_settings"];
-        // Optional entities depend on current server capability rollout.
-        let optional_entities = ["user", "user_block", "channel_extra", "channel_unread"];
-        eprintln!(
-            "[SDK.actor] bootstrap sync plan core={:?} optional={:?}",
-            core_entities, optional_entities
-        );
-        let order = [
+        if self.bootstrap_completed && !self.full_rebuild_required().await {
+            match self.run_resume_sync().await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if !self.full_rebuild_required().await {
+                        return Err(err);
+                    }
+                    eprintln!(
+                        "[SDK.actor] bootstrap sync escalate to full rebuild after resume failure: {}",
+                        err
+                    );
+                }
+            }
+        }
+
+        let core_entities = [
             "friend",
-            "user",
-            "user_block",
             "group",
             "channel",
+            "user",
             "channel_read_cursor",
-            "channel_extra",
-            "channel_unread",
-            "user_settings",
+        ];
+        let optional_entities = ["user_block", "channel_extra", "channel_unread"];
+        if actor_logs_enabled() {
+            eprintln!(
+                "[SDK.actor] bootstrap sync plan core={:?} optional={:?}",
+                core_entities, optional_entities
+            );
+        }
+        let order = [
+            "friend",
+            "group",
+            "channel",
+            "user",
+            "channel_read_cursor",
+            "user_block",
         ];
         for entity_type in order {
             match self.sync_entities(entity_type.to_string(), None).await {
                 Ok(count) => {
-                    eprintln!(
-                        "[SDK.actor] bootstrap sync entity={} count={}",
-                        entity_type, count
-                    );
+                    if actor_logs_enabled() {
+                        eprintln!(
+                            "[SDK.actor] bootstrap sync entity={} count={}",
+                            entity_type, count
+                        );
+                    }
                 }
                 Err(e) if Self::is_unsupported_entity_error(&e) => {
-                    eprintln!(
-                        "[SDK.actor] bootstrap sync skip unsupported entity_type={} reason={} (core_required={})",
-                        entity_type,
-                        e,
-                        core_entities.contains(&entity_type)
-                    );
+                    self.log_unsupported_sync_skip("bootstrap sync", entity_type, None, &e);
                 }
                 Err(e) => return Err(e),
             }
@@ -4705,15 +5717,19 @@ impl State {
                     .await
                 {
                     Ok(count) => {
-                        eprintln!(
-                            "[SDK.actor] bootstrap sync entity=group_member scope=group:{} count={}",
-                            group.group_id, count
-                        );
+                        if actor_logs_enabled() {
+                            eprintln!(
+                                "[SDK.actor] bootstrap sync entity=group_member scope=group:{} count={}",
+                                group.group_id, count
+                            );
+                        }
                     }
                     Err(e) if Self::is_unsupported_entity_error(&e) => {
-                        eprintln!(
-                            "[SDK.actor] bootstrap sync skip unsupported entity_type=group_member scope=group:{} reason={}",
-                            group.group_id, e
+                        self.log_unsupported_sync_skip(
+                            "bootstrap sync",
+                            "group_member",
+                            Some(format!("group:{}", group.group_id)),
+                            &e,
                         );
                     }
                     Err(e) => return Err(e),
@@ -4730,42 +5746,12 @@ impl State {
                 .set_bootstrap_completed(uid.clone(), true)
                 .await?;
         }
+        self.clear_resume_repair_key(Self::resume_repair_full_rebuild_key())
+            .await;
 
         // Notify server that bootstrap is finished and this session is ready
         // to receive catch-up and realtime pushes. This endpoint is idempotent.
-        let timeout = self.timeout();
-        let ready_req = privchat_protocol::rpc::sync::SessionReadyRequest {};
-        let ready_rpc = RpcRequest {
-            route: routes::sync::SESSION_READY.to_string(),
-            body: serde_json::to_value(ready_req)
-                .map_err(|e| Error::Serialization(format!("encode session_ready body: {e}")))?,
-        };
-        let payload = encode_message(&ready_rpc)
-            .map_err(|e| Error::Serialization(format!("encode session_ready rpc: {e}")))?;
-        let raw = self
-            .request_bytes(
-                Bytes::from(payload),
-                MessageType::RpcRequest as u8,
-                timeout,
-                "rpc session_ready",
-            )
-            .await?;
-        let rpc_resp: RpcResponse = decode_message(&raw)
-            .map_err(|e| Error::Serialization(format!("decode session_ready rpc: {e}")))?;
-        if rpc_resp.code != 0 {
-            return Err(Error::Auth(rpc_resp.message));
-        }
-        let body = rpc_resp
-            .data
-            .ok_or_else(|| Error::Serialization("empty session_ready data".into()))?;
-        let ready_ok: privchat_protocol::rpc::sync::SessionReadyResponse =
-            serde_json::from_value(body)
-                .map_err(|e| Error::Serialization(format!("decode session_ready response: {e}")))?;
-        if !ready_ok {
-            return Err(Error::InvalidState(
-                "session_ready rejected by server".to_string(),
-            ));
-        }
+        self.send_session_ready().await?;
 
         self.hydrate_system_channel_messages_from_history().await?;
 
@@ -4860,7 +5846,8 @@ impl State {
                     .await?
                     .message_id;
                 // Bootstrap history hydration should not bump unread —
-                // channel_unread sync provides the authoritative count.
+                // Bootstrap history hydration should not bump unread.
+                // Unread is derived locally from message timeline + read cursor projection.
                 let _ = self
                     .update_channel_last_message(
                         item.channel_id,
@@ -4878,75 +5865,30 @@ impl State {
     }
 
     async fn sync_channel(&mut self, channel_id: u64, channel_type: i32) -> Result<usize> {
-        // Keep channel-targeted sync aligned with local-first bootstrap:
-        // channel base + message timeline + status + extra + unread + (group member for group channels).
+        // Keep channel-targeted sync aligned with the existing minimum set:
+        // channel state + timeline + read cursor + group member hydration.
+        // `user` remains a collection-scoped entity family and should not be fetched with a
+        // channel scope, otherwise the SDK just emits unsupported/no-op requests.
+        // Timeline recovery must keep using `get_difference`; `message` is not a sync_entities
+        // family in the approved existing-data sync model.
         let scope = Some(format!("{channel_type}:{channel_id}"));
         let mut total = 0usize;
         total += self
             .sync_entities("channel".to_string(), scope.clone())
             .await?;
         match self
-            .sync_entities("message".to_string(), scope.clone())
-            .await
-        {
-            Ok(v) => total += v,
-            Err(e) if Self::is_unsupported_entity_error(&e) => {
-                eprintln!(
-                    "[SDK.actor] sync_channel skip unsupported entity_type=message scope={:?} reason={}",
-                    scope, e
-                );
-            }
-            Err(e) => return Err(e),
-        }
-        match self
             .sync_entities("channel_read_cursor".to_string(), scope.clone())
             .await
         {
             Ok(v) => total += v,
             Err(e) if Self::is_unsupported_entity_error(&e) => {
-                eprintln!(
-                    "[SDK.actor] sync_channel skip unsupported entity_type=channel_read_cursor scope={:?} reason={}",
-                    scope, e
-                );
+                self.log_unsupported_sync_skip("sync_channel", "channel_read_cursor", scope, &e);
             }
             Err(e) => return Err(e),
         }
-        match self.sync_entities("user".to_string(), scope.clone()).await {
-            Ok(v) => total += v,
-            Err(e) if Self::is_unsupported_entity_error(&e) => {
-                eprintln!(
-                    "[SDK.actor] sync_channel skip unsupported entity_type=user scope={:?} reason={}",
-                    scope, e
-                );
-            }
-            Err(e) => return Err(e),
-        }
-        match self
-            .sync_entities("channel_extra".to_string(), scope.clone())
-            .await
-        {
-            Ok(v) => total += v,
-            Err(e) if Self::is_unsupported_entity_error(&e) => {
-                eprintln!(
-                    "[SDK.actor] sync_channel skip unsupported entity_type=channel_extra scope={:?} reason={}",
-                    scope, e
-                );
-            }
-            Err(e) => return Err(e),
-        }
-        match self
-            .sync_entities("channel_unread".to_string(), scope.clone())
-            .await
-        {
-            Ok(v) => total += v,
-            Err(e) if Self::is_unsupported_entity_error(&e) => {
-                eprintln!(
-                    "[SDK.actor] sync_channel skip unsupported entity_type=channel_unread scope={:?} reason={}",
-                    scope, e
-                );
-            }
-            Err(e) => return Err(e),
-        }
+        total += self
+            .resume_channel_difference(channel_id, channel_type)
+            .await?;
         if channel_type == 2 {
             match self
                 .sync_entities("group_member".to_string(), Some(channel_id.to_string()))
@@ -4954,50 +5896,34 @@ impl State {
             {
                 Ok(v) => total += v,
                 Err(e) if Self::is_unsupported_entity_error(&e) => {
-                    eprintln!(
-                        "[SDK.actor] sync_channel skip unsupported entity_type=group_member scope=Some(\"{}\") reason={}",
-                        channel_id, e
+                    self.log_unsupported_sync_skip(
+                        "sync_channel",
+                        "group_member",
+                        Some(channel_id.to_string()),
+                        &e,
                     );
                 }
                 Err(e) => return Err(e),
             }
         }
+        self.clear_resume_repair_key(Self::resume_repair_channel_key(channel_id, channel_type))
+            .await;
         Ok(total)
     }
 
     async fn sync_all_channels(&mut self) -> Result<usize> {
         let mut total = 0usize;
+        total += self.sync_entities("friend".to_string(), None).await?;
+        total += self.sync_entities("group".to_string(), None).await?;
         total += self.sync_entities("channel".to_string(), None).await?;
+        total += self.sync_entities("user".to_string(), None).await?;
         match self
             .sync_entities("channel_read_cursor".to_string(), None)
             .await
         {
             Ok(v) => total += v,
             Err(e) if Self::is_unsupported_entity_error(&e) => {
-                eprintln!(
-                    "[SDK.actor] sync_all_channels skip unsupported entity_type=channel_read_cursor reason={}",
-                    e
-                );
-            }
-            Err(e) => return Err(e),
-        }
-        match self.sync_entities("channel_extra".to_string(), None).await {
-            Ok(v) => total += v,
-            Err(e) if Self::is_unsupported_entity_error(&e) => {
-                eprintln!(
-                    "[SDK.actor] sync_all_channels skip unsupported entity_type=channel_extra reason={}",
-                    e
-                );
-            }
-            Err(e) => return Err(e),
-        }
-        match self.sync_entities("channel_unread".to_string(), None).await {
-            Ok(v) => total += v,
-            Err(e) if Self::is_unsupported_entity_error(&e) => {
-                eprintln!(
-                    "[SDK.actor] sync_all_channels skip unsupported entity_type=channel_unread reason={}",
-                    e
-                );
+                self.log_unsupported_sync_skip("sync_all_channels", "channel_read_cursor", None, &e);
             }
             Err(e) => return Err(e),
         }
@@ -5018,9 +5944,11 @@ impl State {
                 {
                     Ok(v) => total += v,
                     Err(e) if Self::is_unsupported_entity_error(&e) => {
-                        eprintln!(
-                            "[SDK.actor] sync_all_channels skip unsupported entity_type=group_member scope=Some(\"{}\") reason={}",
-                            group.group_id, e
+                        self.log_unsupported_sync_skip(
+                            "sync_all_channels",
+                            "group_member",
+                            Some(group.group_id.to_string()),
+                            &e,
                         );
                     }
                     Err(e) => return Err(e),
@@ -5907,6 +6835,12 @@ impl State {
                     if bump_unread { 1 } else { 0 },
                 )
             };
+        let existing_version = self
+            .storage
+            .get_channel_by_id(channel_id)
+            .await?
+            .map(|c| c.version)
+            .unwrap_or(0);
         self.storage
             .upsert_channel(UpsertChannelInput {
                 channel_id,
@@ -5920,6 +6854,10 @@ impl State {
                 last_msg_timestamp: timestamp_ms,
                 last_local_message_id: message_id,
                 last_msg_content: content.to_string(),
+                // Timeline preview updates must not mint a synthetic entity version.
+                // Keep the existing channel entity version so later sync_entities(channel)
+                // payloads can still apply top/mute/name changes from the server.
+                version: existing_version,
             })
             .await?;
         Ok(())
@@ -5957,7 +6895,12 @@ impl PrivchatSdk {
     fn is_network_like_event(event: &SdkEvent) -> bool {
         matches!(
             event,
-            SdkEvent::ConnectionStateChanged { .. } | SdkEvent::NetworkHintChanged { .. }
+            SdkEvent::ConnectionStateChanged { .. }
+                | SdkEvent::NetworkHintChanged { .. }
+                | SdkEvent::ResumeSyncStarted
+                | SdkEvent::ResumeSyncCompleted { .. }
+                | SdkEvent::ResumeSyncFailed { .. }
+                | SdkEvent::ResumeSyncEscalated { .. }
         )
     }
 
@@ -5996,11 +6939,13 @@ impl PrivchatSdk {
             });
         let actor_snowflake = snowflake.clone();
         let actor_task = runtime_provider.spawn(async move {
-            eprintln!("[SDK.actor] loop: started");
-            if configured_data_dir.trim().is_empty() {
-                eprintln!("[SDK.actor] storage base: <default>");
-            } else {
-                eprintln!("[SDK.actor] storage base: {}", configured_data_dir);
+            if actor_logs_enabled() {
+                eprintln!("[SDK.actor] loop: started");
+                if configured_data_dir.trim().is_empty() {
+                    eprintln!("[SDK.actor] storage base: <default>");
+                } else {
+                    eprintln!("[SDK.actor] storage base: {}", configured_data_dir);
+                }
             }
             let storage = match if configured_data_dir.trim().is_empty() {
                 StorageHandle::start()
@@ -6092,6 +7037,13 @@ impl PrivchatSdk {
                                     state.session_state = next;
                                     start_inbound_task(&state, actor_cmd_tx.clone(), &mut inbound_task)
                                         .await;
+                                    if state.session_state == SessionState::Authenticated
+                                        && state.bootstrap_completed
+                                    {
+                                        if let Err(err) = state.run_resume_sync().await {
+                                            eprintln!("[SDK.actor] resume sync failed after reconnect: {err}");
+                                        }
+                                    }
                                     emit_sequenced_event(
                                         &actor_event_tx,
                                         &actor_event_history,
@@ -6128,7 +7080,9 @@ impl PrivchatSdk {
                         let Some(cmd) = cmd else { break; };
                         match cmd {
                     Command::Connect { resp } => {
-                        eprintln!("[SDK.actor] loop: cmd connect");
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd connect");
+                        }
                         if !state.network_hint.is_online() {
                             let _ = resp.send(Err(state.network_disconnected_error()));
                         } else {
@@ -6167,7 +7121,9 @@ impl PrivchatSdk {
                         }
                     }
                     Command::Disconnect { resp } => {
-                        eprintln!("[SDK.actor] loop: cmd disconnect");
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd disconnect");
+                        }
                         state.should_auto_reconnect = false;
                         stop_inbound_task(&mut inbound_task).await;
                         let from_state = state.session_state.as_connection_state();
@@ -6260,6 +7216,13 @@ impl PrivchatSdk {
                                     state.session_state = next;
                                     start_inbound_task(&state, actor_cmd_tx.clone(), &mut inbound_task)
                                         .await;
+                                    if state.session_state == SessionState::Authenticated
+                                        && state.bootstrap_completed
+                                    {
+                                        if let Err(err) = state.run_resume_sync().await {
+                                            eprintln!("[SDK.actor] resume sync failed after network recovery: {err}");
+                                        }
+                                    }
                                     emit_sequenced_event(
                                         &actor_event_tx,
                                         &actor_event_history,
@@ -6316,7 +7279,9 @@ impl PrivchatSdk {
                         device_id,
                         resp,
                     } => {
-                        eprintln!("[SDK.actor] loop: cmd login");
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd login");
+                        }
                         let from_state = state.session_state.as_connection_state();
                         let result = match state.session_state.can(Action::Login) {
                             Ok(next_state) => match timeout(
@@ -6355,7 +7320,9 @@ impl PrivchatSdk {
                         device_id,
                         resp,
                     } => {
-                        eprintln!("[SDK.actor] loop: cmd register");
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd register");
+                        }
                         let from_state = state.session_state.as_connection_state();
                         let result = match state.session_state.can(Action::Login) {
                             Ok(next_state) => match timeout(
@@ -6394,7 +7361,9 @@ impl PrivchatSdk {
                         device_id,
                         resp,
                     } => {
-                        eprintln!("[SDK.actor] loop: cmd authenticate");
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd authenticate");
+                        }
                         let from_state = state.session_state.as_connection_state();
                         let result = match state.session_state.can(Action::Authenticate) {
                             Ok(next_state) => match timeout(
@@ -6432,7 +7401,9 @@ impl PrivchatSdk {
                         scope,
                         resp,
                     } => {
-                        eprintln!("[SDK.actor] loop: cmd sync_entities");
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd sync_entities");
+                        }
                         let event_entity_type = entity_type.clone();
                         let event_scope = scope.clone();
                         let result = if state.session_state != SessionState::Authenticated {
@@ -6696,7 +7667,9 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::RunBootstrapSync { resp } => {
-                        eprintln!("[SDK.actor] loop: cmd run_bootstrap_sync");
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd run_bootstrap_sync");
+                        }
                         let result = match timeout(
                             Duration::from_secs(60),
                             state.run_bootstrap_sync(),
@@ -7717,13 +8690,6 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
-                    Command::KvScanPrefix { prefix, resp } => {
-                        let result = match state.current_uid_required() {
-                            Ok(_) => state.storage.kv_scan_prefix(prefix).await,
-                            Err(e) => Err(e),
-                        };
-                        let _ = resp.send(result);
-                    }
                     Command::GetUserStoragePaths { resp } => {
                         let result = match state.current_uid_required() {
                             Ok(_) => state.storage.get_storage_paths().await.map(|paths| {
@@ -7823,7 +8789,9 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::Shutdown { resp } => {
-                        eprintln!("[SDK.actor] loop: cmd shutdown");
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd shutdown");
+                        }
                         state.should_auto_reconnect = false;
                         stop_inbound_task(&mut inbound_task).await;
                         emit_sequenced_event(
@@ -7873,7 +8841,9 @@ impl PrivchatSdk {
                 }
             }
             stop_inbound_task(&mut inbound_task).await;
-            eprintln!("[SDK.actor] loop: receiver closed");
+            if actor_logs_enabled() {
+                eprintln!("[SDK.actor] loop: receiver closed");
+            }
         });
         task_registry.track(actor_task);
 
@@ -7914,14 +8884,18 @@ impl PrivchatSdk {
 
     pub async fn connect(&self) -> Result<()> {
         self.ensure_running()?;
-        eprintln!("[SDK.api] connect: send");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.api] connect: send");
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::Connect { resp: resp_tx })
             .await
             .map_err(|_| self.actor_channel_error())?;
         let out = resp_rx.await.map_err(|_| self.actor_channel_error())?;
-        eprintln!("[SDK.api] connect: recv");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.api] connect: recv");
+        }
         out
     }
 
@@ -8117,7 +9091,9 @@ impl PrivchatSdk {
         device_id: String,
     ) -> Result<LoginResult> {
         self.ensure_running()?;
-        eprintln!("[SDK.api] login: send");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.api] login: send");
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::Login {
@@ -8129,7 +9105,9 @@ impl PrivchatSdk {
             .await
             .map_err(|_| self.actor_channel_error())?;
         let out = resp_rx.await.map_err(|_| self.actor_channel_error())?;
-        eprintln!("[SDK.api] login: recv");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.api] login: recv");
+        }
         out
     }
 
@@ -8155,7 +9133,9 @@ impl PrivchatSdk {
 
     pub async fn authenticate(&self, user_id: u64, token: String, device_id: String) -> Result<()> {
         self.ensure_running()?;
-        eprintln!("[SDK.api] authenticate: send");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.api] authenticate: send");
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::Authenticate {
@@ -8167,7 +9147,9 @@ impl PrivchatSdk {
             .await
             .map_err(|_| self.actor_channel_error())?;
         let out = resp_rx.await.map_err(|_| self.actor_channel_error())?;
-        eprintln!("[SDK.api] authenticate: recv");
+        if actor_logs_enabled() {
+            eprintln!("[SDK.api] authenticate: recv");
+        }
         out
     }
 
@@ -9264,7 +10246,7 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn kv_put(&self, key: String, value: Vec<u8>) -> Result<()> {
+    async fn kv_put_local(&self, key: String, value: Vec<u8>) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -9278,7 +10260,7 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn kv_get(&self, key: String) -> Result<Option<Vec<u8>>> {
+    async fn kv_get_local(&self, key: String) -> Result<Option<Vec<u8>>> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -9288,17 +10270,89 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn kv_scan_prefix(&self, prefix: String) -> Result<Vec<(String, Vec<u8>)>> {
-        self.ensure_running()?;
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(Command::KvScanPrefix {
-                prefix,
-                resp: resp_tx,
-            })
+    pub async fn set_channel_notification_mode_pref(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        mode: i32,
+    ) -> Result<()> {
+        let key = channel_prefs_key(channel_id, channel_type);
+        let raw = self.kv_get_local(key.clone()).await?;
+        let mut state = decode_channel_prefs(raw);
+        state.notification_mode = mode;
+        self.kv_put_local(key, serde_json::to_vec(&state).map_err(|e| {
+            Error::Serialization(format!("encode channel prefs notification_mode failed: {e}"))
+        })?)
+        .await
+    }
+
+    pub async fn channel_notification_mode_pref(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<i32> {
+        let key = channel_prefs_key(channel_id, channel_type);
+        let raw = self.kv_get_local(key).await?;
+        Ok(decode_channel_prefs(raw).notification_mode)
+    }
+
+    pub async fn set_channel_favourite_pref(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        enabled: bool,
+    ) -> Result<()> {
+        let key = channel_prefs_key(channel_id, channel_type);
+        let raw = self.kv_get_local(key.clone()).await?;
+        let mut state = decode_channel_prefs(raw);
+        state.favourite = enabled;
+        self.kv_put_local(key, serde_json::to_vec(&state).map_err(|e| {
+            Error::Serialization(format!("encode channel prefs favourite failed: {e}"))
+        })?)
+        .await
+    }
+
+    pub async fn set_channel_low_priority_pref(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        enabled: bool,
+    ) -> Result<()> {
+        let key = channel_prefs_key(channel_id, channel_type);
+        let raw = self.kv_get_local(key.clone()).await?;
+        let mut state = decode_channel_prefs(raw);
+        state.low_priority = enabled;
+        self.kv_put_local(key, serde_json::to_vec(&state).map_err(|e| {
+            Error::Serialization(format!("encode channel prefs low_priority failed: {e}"))
+        })?)
+        .await
+    }
+
+    pub async fn channel_tags_pref(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<Vec<String>> {
+        let key = channel_prefs_key(channel_id, channel_type);
+        let raw = self.kv_get_local(key).await?;
+        Ok(decode_channel_prefs(raw).tags)
+    }
+
+    pub async fn cache_group_settings_json(&self, group_id: u64, payload_json: String) -> Result<()> {
+        self.kv_put_local(group_settings_key(group_id), payload_json.into_bytes())
             .await
-            .map_err(|_| self.actor_channel_error())?;
-        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn update_group_mute_all_cache(&self, group_id: u64, enabled: bool) -> Result<()> {
+        let key = group_settings_key(group_id);
+        let raw = self.kv_get_local(key.clone()).await?;
+        let mut state = decode_group_settings_cache(raw);
+        state.group_id = group_id;
+        state.mute_all = enabled;
+        self.kv_put_local(key, serde_json::to_vec(&state).map_err(|e| {
+            Error::Serialization(format!("encode group settings cache failed: {e}"))
+        })?)
+        .await
     }
 
     pub async fn user_storage_paths(&self) -> Result<UserStoragePaths> {
@@ -9345,10 +10399,126 @@ impl PrivchatSdk {
 #[cfg(test)]
 mod tests {
     use super::{
-        error_codes, Action, ConnectionState, Error, NetworkHint, PrivchatConfig, PrivchatSdk,
-        SdkEvent, SessionState, State, NETWORK_DISCONNECTED_MESSAGE,
+        channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
+        group_settings_key, Action, ConnectionState, Error, ErrorCode, LoginResult, NetworkHint,
+        MessageCachePolicy, PrivchatConfig, PrivchatSdk, ResumeEscalationScope,
+        ResumeFailureClass, ResumeFailureTarget, SdkEvent, SessionState, State,
+        UpsertChannelInput, UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput,
+        UpsertMessageReactionInput, UpsertRemoteMessageInput, UpsertUserInput,
+        NETWORK_DISCONNECTED_MESSAGE,
     };
+    use crate::local_store::LocalStore;
+    use crate::storage_actor::StorageHandle;
+    use crate::receive_pipeline::ReceivePipeline;
     use privchat_protocol::PushMessageRequest;
+    use privchat_protocol::rpc::sync::SyncEntityItem;
+    use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("privchat-sdk-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    async fn new_seeded_sdk(name: &str) -> (PrivchatSdk, PathBuf) {
+        let dir = unique_test_dir(name);
+        let store = LocalStore::open_at(dir.clone()).expect("open local store");
+        let login = LoginResult {
+            user_id: 10001,
+            token: "token".to_string(),
+            device_id: "device".to_string(),
+            refresh_token: None,
+            expires_at: String::new(),
+        };
+        store.save_login("10001", &login).expect("seed login");
+        store
+            .set_bootstrap_completed("10001", true)
+            .expect("seed bootstrap completed");
+        drop(store);
+
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        let sdk = PrivchatSdk::new(config);
+        sdk.set_current_uid("10001".to_string())
+            .await
+            .expect("restore seeded current uid");
+
+        for _ in 0..20 {
+            if sdk
+                .is_bootstrap_completed()
+                .await
+                .expect("query bootstrap completed")
+            {
+                return (sdk, dir);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("sdk actor did not load seeded bootstrap state");
+    }
+
+    async fn new_seeded_state(name: &str) -> (State, PathBuf) {
+        let dir = unique_test_dir(name);
+        let storage = StorageHandle::start_at(dir.clone()).expect("start storage at test dir");
+        let login = LoginResult {
+            user_id: 10001,
+            token: "token".to_string(),
+            device_id: "device".to_string(),
+            refresh_token: None,
+            expires_at: String::new(),
+        };
+        storage
+            .save_login("10001".to_string(), login)
+            .await
+            .expect("seed login");
+        storage
+            .set_bootstrap_completed("10001".to_string(), true)
+            .await
+            .expect("seed bootstrap completed");
+        storage
+            .save_current_uid("10001".to_string())
+            .await
+            .expect("seed current uid");
+
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        let state = State {
+            config,
+            transport: None,
+            session_state: SessionState::Authenticated,
+            bootstrap_completed: true,
+            snowflake: Arc::new(
+                snowflake_me::Snowflake::builder()
+                    .finalize()
+                    .expect("test snowflake"),
+            ),
+            storage,
+            current_uid: Some("10001".to_string()),
+            should_auto_reconnect: false,
+            network_hint: NetworkHint::Unknown,
+            receive_pipeline: ReceivePipeline::default(),
+            last_sync_queued: 0,
+            last_sync_dropped_duplicates: 0,
+            last_sync_entity_events: Vec::new(),
+            video_process_hook: None,
+            last_tmp_cleanup_day: None,
+            pending_events: Vec::new(),
+            message_cache_policy: MessageCachePolicy::default(),
+            channel_message_cache: HashMap::new(),
+            channel_cache_generation: HashMap::new(),
+            channel_cache_lru: VecDeque::new(),
+            channel_cache_total_bytes: 0,
+            cache_debug_log: false,
+            cache_hit_count: 0,
+            cache_miss_count: 0,
+            pending_prelogin_inbound_frames: Vec::new(),
+        };
+        (state, dir)
+    }
 
     #[test]
     fn state_machine_allows_token_auth_restore_from_connected() {
@@ -9449,6 +10619,72 @@ mod tests {
     }
 
     #[test]
+    fn channel_unread_prefers_local_projection_once_materialized() {
+        assert_eq!(State::resolve_channel_unread_count(None, Some(7)), 7);
+        assert_eq!(State::resolve_channel_unread_count(Some(3), Some(7)), 3);
+        assert_eq!(State::resolve_channel_unread_count(Some(-2), Some(7)), 0);
+        assert_eq!(State::resolve_channel_unread_count(None, Some(-5)), 0);
+    }
+
+    #[test]
+    fn difference_commit_maps_revoke_to_message_extra() {
+        let commit = privchat_protocol::rpc::sync::ServerCommit {
+            pts: 12,
+            server_msg_id: 9001,
+            local_message_id: None,
+            channel_id: 100,
+            channel_type: 1,
+            message_type: "message.revoke".to_string(),
+            content: serde_json::json!({
+                "message_id": 777,
+                "revoke": true,
+                "revoked_by": 42,
+            }),
+            server_timestamp: 1_700_000_000_000,
+            sender_id: 42,
+            sender_info: None,
+        };
+
+        let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
+        assert_eq!(entity_type, "message_extra");
+        assert_eq!(item.version, 12);
+        let payload = item.payload.expect("payload");
+        assert_eq!(payload.get("message_id").and_then(|v| v.as_u64()), Some(777));
+        assert_eq!(payload.get("channel_id").and_then(|v| v.as_u64()), Some(100));
+        assert_eq!(payload.get("revoke").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn difference_commit_maps_reaction_to_message_reaction() {
+        let commit = privchat_protocol::rpc::sync::ServerCommit {
+            pts: 34,
+            server_msg_id: 9002,
+            local_message_id: None,
+            channel_id: 101,
+            channel_type: 1,
+            message_type: "message_reaction".to_string(),
+            content: serde_json::json!({
+                "message_id": 778,
+                "uid": 43,
+                "emoji": "👍",
+                "deleted": true,
+            }),
+            server_timestamp: 1_700_000_100_000,
+            sender_id: 43,
+            sender_info: None,
+        };
+
+        let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
+        assert_eq!(entity_type, "message_reaction");
+        assert_eq!(item.version, 34);
+        assert_eq!(item.entity_id, "778:43:👍");
+        let payload = item.payload.expect("payload");
+        assert_eq!(payload.get("message_id").and_then(|v| v.as_u64()), Some(778));
+        assert_eq!(payload.get("uid").and_then(|v| v.as_u64()), Some(43));
+        assert_eq!(payload.get("deleted").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
     fn stable_sdk_error_codes_are_mapped() {
         assert_eq!(
             Error::Transport("x".to_string()).sdk_code(),
@@ -9471,6 +10707,73 @@ mod tests {
             Error::InvalidState("x".to_string()).sdk_code(),
             error_codes::INVALID_STATE
         );
+        assert_eq!(
+            ResumeFailureClass::RetryableTemporaryError.sdk_code(),
+            error_codes::RESUME_RETRYABLE_TEMPORARY
+        );
+        assert_eq!(
+            ResumeFailureClass::ChannelResyncRequired.sdk_code(),
+            error_codes::RESUME_CHANNEL_RESYNC_REQUIRED
+        );
+        assert_eq!(
+            ResumeFailureClass::EntityResyncRequired.sdk_code(),
+            error_codes::RESUME_ENTITY_RESYNC_REQUIRED
+        );
+        assert_eq!(
+            ResumeFailureClass::FullRebuildRequired.sdk_code(),
+            error_codes::RESUME_FULL_REBUILD_REQUIRED
+        );
+        assert_eq!(
+            ResumeFailureClass::FatalProtocolError.sdk_code(),
+            error_codes::RESUME_FATAL_PROTOCOL_ERROR
+        );
+    }
+
+    #[test]
+    fn resume_error_classification_prefers_channel_gap() {
+        let err = Error::Auth("get_difference rejected: pts too old, gap detected".to_string());
+        assert_eq!(
+            State::classify_resume_error(&err),
+            ResumeFailureClass::ChannelResyncRequired
+        );
+    }
+
+    #[test]
+    fn resume_error_classification_uses_sync_protocol_codes() {
+        let err = State::sync_rpc_rejection(
+            "get_difference",
+            ErrorCode::SyncChannelResyncRequired.code() as i32,
+            "message history window unavailable".to_string(),
+        );
+        assert_eq!(
+            State::classify_resume_error(&err),
+            ResumeFailureClass::ChannelResyncRequired
+        );
+
+        let err = State::sync_rpc_rejection(
+            "sync_entities",
+            ErrorCode::SyncFullRebuildRequired.code() as i32,
+            "session rebuild required".to_string(),
+        );
+        assert_eq!(
+            State::classify_resume_error(&err),
+            ResumeFailureClass::FullRebuildRequired
+        );
+    }
+
+    #[test]
+    fn channel_resume_failure_isolated_as_channel_scoped_resync() {
+        let err = Error::Serialization("decode get_difference response: bad schema".to_string());
+        let classification = State::classify_resume_error(&err);
+        let scope = State::resume_escalation_scope(
+            classification,
+            &ResumeFailureTarget::Channel {
+                channel_id: 42,
+                channel_type: 1,
+            },
+        );
+        assert_eq!(classification, ResumeFailureClass::FatalProtocolError);
+        assert_eq!(scope, ResumeEscalationScope::ChannelScopedResync);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9601,5 +10904,1368 @@ mod tests {
             )),
             "expected offline->unknown network hint event"
         );
+    }
+
+    #[test]
+    fn entity_version_gate_rejects_stale_payloads() {
+        assert!(State::should_apply_entity_version(None, 1));
+        assert!(State::should_apply_entity_version(Some(5), 5));
+        assert!(State::should_apply_entity_version(Some(5), 6));
+        assert!(!State::should_apply_entity_version(Some(5), 4));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_prefs_roundtrip_through_semantic_api() {
+        let (sdk, dir) = new_seeded_sdk("channel-prefs").await;
+
+        sdk.set_channel_notification_mode_pref(42, 1, 3)
+            .await
+            .expect("set notification mode");
+        sdk.set_channel_favourite_pref(42, 1, true)
+            .await
+            .expect("set favourite");
+        sdk.set_channel_low_priority_pref(42, 1, true)
+            .await
+            .expect("set low priority");
+
+        let mode = sdk
+            .channel_notification_mode_pref(42, 1)
+            .await
+            .expect("get notification mode");
+        assert_eq!(mode, 3);
+
+        let raw = sdk
+            .kv_get_local(channel_prefs_key(42, 1))
+            .await
+            .expect("read channel prefs");
+        let state = decode_channel_prefs(raw);
+        assert!(state.favourite);
+        assert!(state.low_priority);
+        assert_eq!(state.notification_mode, 3);
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_settings_cache_updates_mute_all_without_extra_model() {
+        let (sdk, dir) = new_seeded_sdk("group-settings").await;
+
+        sdk.cache_group_settings_json(
+            7,
+            serde_json::json!({
+                "group_id": 7,
+                "name": "team",
+                "mute_all": false
+            })
+            .to_string(),
+        )
+        .await
+        .expect("cache group settings");
+        sdk.update_group_mute_all_cache(7, true)
+            .await
+            .expect("update mute all");
+
+        let raw = sdk
+            .kv_get_local(group_settings_key(7))
+            .await
+            .expect("read group settings cache");
+        let state = decode_group_settings_cache(raw);
+        assert_eq!(state.group_id, 7);
+        assert!(state.mute_all);
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_member_tombstone_removes_local_member() {
+        let (mut state, dir) = new_seeded_state("group-member-tombstone").await;
+
+        state
+            .storage
+            .upsert_group_member(UpsertGroupMemberInput {
+                group_id: 30001,
+                user_id: 20001,
+                role: 0,
+                status: 0,
+                alias: Some("owner".to_string()),
+                is_muted: false,
+                joined_at: 1000,
+                version: 10,
+                updated_at: 1000,
+            })
+            .await
+            .expect("seed group member");
+
+        let deleted = SyncEntityItem {
+            entity_id: "30001:20001".to_string(),
+            version: 11,
+            deleted: true,
+            payload: Some(serde_json::json!({
+                "group_id": 30001,
+                "user_id": 20001
+            })),
+        };
+        state
+            .apply_sync_entities("group_member", Some("30001"), &[deleted], false)
+            .await
+            .expect("apply group member tombstone");
+
+        let members = state
+            .storage
+            .list_group_members(30001, 20, 0)
+            .await
+            .expect("list group members");
+        assert!(members.is_empty(), "group member tombstone should remove local member");
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_sync_uses_server_unread_for_cold_start() {
+        let (mut state, dir) = new_seeded_state("channel-cold-start").await;
+
+        let item = SyncEntityItem {
+            entity_id: "90001".to_string(),
+            version: 5,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 90001,
+                "channel_type": 2,
+                "channel_name": "project-room",
+                "avatar": "https://example.com/room.png",
+                "unread_count": 7,
+                "top": 1,
+                "mute": 1
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[item], false)
+            .await
+            .expect("apply cold-start channel");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(90001)
+            .await
+            .expect("read channel")
+            .expect("channel exists");
+        assert_eq!(channel.channel_name, "project-room");
+        assert_eq!(channel.unread_count, 7);
+        assert_eq!(channel.top, 1);
+        assert_eq!(channel.mute, 1);
+        assert_eq!(channel.version, 5);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_sync_rejects_stale_version_and_keeps_local_projection() {
+        let (mut state, dir) = new_seeded_state("channel-stale-sync").await;
+
+        state
+            .storage
+            .upsert_channel(UpsertChannelInput {
+                channel_id: 91001,
+                channel_type: 2,
+                channel_name: "latest-room".to_string(),
+                channel_remark: "latest-remark".to_string(),
+                avatar: "https://example.com/latest.png".to_string(),
+                unread_count: 3,
+                top: 1,
+                mute: 0,
+                last_msg_timestamp: 111,
+                last_local_message_id: 9,
+                last_msg_content: "latest".to_string(),
+                version: 10,
+            })
+            .await
+            .expect("seed current channel");
+
+        let stale = SyncEntityItem {
+            entity_id: "91001".to_string(),
+            version: 9,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 91001,
+                "channel_type": 2,
+                "channel_name": "stale-room",
+                "avatar": "https://example.com/stale.png",
+                "unread_count": 99,
+                "top": 0,
+                "mute": 1
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[stale], false)
+            .await
+            .expect("apply stale channel");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(91001)
+            .await
+            .expect("read channel after stale sync")
+            .expect("channel exists");
+        assert_eq!(channel.channel_name, "latest-room");
+        assert_eq!(channel.avatar, "https://example.com/latest.png");
+        assert_eq!(channel.unread_count, 3);
+        assert_eq!(channel.top, 1);
+        assert_eq!(channel.mute, 0);
+        assert_eq!(channel.version, 10);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_like_recovery_applies_entities_then_timeline_mutations() {
+        let (mut state, dir) = new_seeded_state("resume-like-recovery").await;
+
+        let channel = SyncEntityItem {
+            entity_id: "92001".to_string(),
+            version: 12,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 92001,
+                "channel_type": 2,
+                "channel_name": "resume-room",
+                "avatar": "https://example.com/resume-room.png",
+                "unread_count": 4,
+                "top": 1,
+                "mute": 0
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[channel], false)
+            .await
+            .expect("apply channel entity");
+
+        let seeded = state
+            .storage
+            .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                server_message_id: 70001,
+                local_message_id: 0,
+                channel_id: 92001,
+                channel_type: 2,
+                timestamp: 1_709_999_999_000,
+                from_uid: 20001,
+                message_type: 1,
+                content: "{\"content\":\"hello\"}".to_string(),
+                status: 2,
+                pts: 20,
+                setting: 0,
+                order_seq: 20,
+                searchable_word: "hello".to_string(),
+                extra: "{}".to_string(),
+            })
+            .await
+            .expect("seed remote message");
+        let local_message_id = seeded.message_id;
+
+        let revoke_commit = privchat_protocol::rpc::sync::ServerCommit {
+            pts: 21,
+            server_msg_id: 70001,
+            local_message_id: None,
+            channel_id: 92001,
+            channel_type: 2,
+            message_type: "message.revoke".to_string(),
+            content: serde_json::json!({
+                "message_id": 70001,
+                "revoke": true,
+                "revoked_by": 10001
+            }),
+            server_timestamp: 1_710_000_000_000,
+            sender_id: 10001,
+            sender_info: None,
+        };
+        let (entity_type, item) = State::sync_item_from_difference_commit(&revoke_commit);
+        state
+            .enqueue_and_apply_sync_items(
+                entity_type,
+                Some("2:92001".to_string()),
+                vec![item],
+            )
+            .await
+            .expect("apply revoke difference");
+
+        let reaction_commit = privchat_protocol::rpc::sync::ServerCommit {
+            pts: 22,
+            server_msg_id: 70002,
+            local_message_id: None,
+            channel_id: 92001,
+            channel_type: 2,
+            message_type: "message_reaction".to_string(),
+            content: serde_json::json!({
+                "message_id": 70001,
+                "uid": 20001,
+                "emoji": "👍",
+                "deleted": false
+            }),
+            server_timestamp: 1_710_000_000_100,
+            sender_id: 20001,
+            sender_info: None,
+        };
+        let (entity_type, item) = State::sync_item_from_difference_commit(&reaction_commit);
+        state
+            .enqueue_and_apply_sync_items(
+                entity_type,
+                Some("2:92001".to_string()),
+                vec![item],
+            )
+            .await
+            .expect("apply reaction difference");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(92001)
+            .await
+            .expect("read channel")
+            .expect("channel exists");
+        assert_eq!(channel.channel_name, "resume-room");
+        assert_eq!(channel.unread_count, 4);
+        assert_eq!(channel.top, 1);
+        assert_eq!(channel.version, 12);
+
+        let extra = state
+            .storage
+            .get_message_extra(local_message_id)
+            .await
+            .expect("read message extra")
+            .expect("message extra exists");
+        assert!(extra.revoke);
+
+        let reactions = state
+            .storage
+            .list_message_reactions(local_message_id, 20, 0)
+            .await
+            .expect("list reactions");
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].emoji, "👍");
+        assert!(!reactions[0].is_deleted);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_read_cursor_projection_takes_over_unread_after_materialization() {
+        let (mut state, dir) = new_seeded_state("channel-read-cursor-unread").await;
+
+        let channel = SyncEntityItem {
+            entity_id: "93001".to_string(),
+            version: 30,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 93001,
+                "channel_type": 2,
+                "channel_name": "cursor-room",
+                "unread_count": 7,
+                "top": 0,
+                "mute": 0
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[channel], false)
+            .await
+            .expect("apply channel baseline");
+
+        state
+            .storage
+            .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                server_message_id: 71001,
+                local_message_id: 0,
+                channel_id: 93001,
+                channel_type: 2,
+                timestamp: 1_710_100_000_001,
+                from_uid: 20001,
+                message_type: 1,
+                content: "{\"content\":\"m1\"}".to_string(),
+                status: 2,
+                pts: 10,
+                setting: 0,
+                order_seq: 10,
+                searchable_word: "m1".to_string(),
+                extra: "{}".to_string(),
+            })
+            .await
+            .expect("seed m1");
+        state
+            .storage
+            .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                server_message_id: 71002,
+                local_message_id: 0,
+                channel_id: 93001,
+                channel_type: 2,
+                timestamp: 1_710_100_000_002,
+                from_uid: 20001,
+                message_type: 1,
+                content: "{\"content\":\"m2\"}".to_string(),
+                status: 2,
+                pts: 20,
+                setting: 0,
+                order_seq: 20,
+                searchable_word: "m2".to_string(),
+                extra: "{}".to_string(),
+            })
+            .await
+            .expect("seed m2");
+        state
+            .storage
+            .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                server_message_id: 71003,
+                local_message_id: 0,
+                channel_id: 93001,
+                channel_type: 2,
+                timestamp: 1_710_100_000_003,
+                from_uid: 20001,
+                message_type: 1,
+                content: "{\"content\":\"m3\"}".to_string(),
+                status: 2,
+                pts: 30,
+                setting: 0,
+                order_seq: 30,
+                searchable_word: "m3".to_string(),
+                extra: "{}".to_string(),
+            })
+            .await
+            .expect("seed m3");
+
+        let cursor = SyncEntityItem {
+            entity_id: "93001:10001".to_string(),
+            version: 31,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 93001,
+                "channel_type": 2,
+                "reader_id": 10001,
+                "last_read_pts": 20
+            })),
+        };
+        state
+            .apply_sync_entities("channel_read_cursor", None, &[cursor], false)
+            .await
+            .expect("apply read cursor");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(93001)
+            .await
+            .expect("read channel after cursor")
+            .expect("channel exists");
+        assert_eq!(channel.unread_count, 5);
+
+        let stale_channel = SyncEntityItem {
+            entity_id: "93001".to_string(),
+            version: 29,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 93001,
+                "channel_type": 2,
+                "channel_name": "stale-cursor-room",
+                "unread_count": 99,
+                "top": 1,
+                "mute": 1
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[stale_channel], false)
+            .await
+            .expect("apply stale channel payload");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(93001)
+            .await
+            .expect("read channel after stale payload")
+            .expect("channel exists");
+        assert_eq!(channel.channel_name, "cursor-room");
+        assert_eq!(channel.unread_count, 5);
+        assert_eq!(channel.top, 0);
+        assert_eq!(channel.mute, 0);
+        assert_eq!(channel.version, 30);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_channel_read_cursor_does_not_regress_local_unread_projection() {
+        let (mut state, dir) = new_seeded_state("stale-read-cursor").await;
+
+        let channel = SyncEntityItem {
+            entity_id: "94001".to_string(),
+            version: 40,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 94001,
+                "channel_type": 2,
+                "channel_name": "stale-cursor-room",
+                "unread_count": 6,
+                "top": 0,
+                "mute": 0
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[channel], false)
+            .await
+            .expect("apply channel baseline");
+
+        for (server_message_id, pts) in [(72001_u64, 10_i64), (72002_u64, 20_i64), (72003_u64, 30_i64)] {
+            state
+                .storage
+                .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                    server_message_id,
+                    local_message_id: 0,
+                    channel_id: 94001,
+                    channel_type: 2,
+                    timestamp: 1_710_200_000_000 + pts,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: format!("{{\"content\":\"m{pts}\"}}"),
+                    status: 2,
+                    pts,
+                    setting: 0,
+                    order_seq: pts,
+                    searchable_word: format!("m{pts}"),
+                    extra: "{}".to_string(),
+                })
+                .await
+                .expect("seed message");
+        }
+
+        let fresh_cursor = SyncEntityItem {
+            entity_id: "94001:10001".to_string(),
+            version: 41,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 94001,
+                "channel_type": 2,
+                "reader_id": 10001,
+                "last_read_pts": 20
+            })),
+        };
+        state
+            .apply_sync_entities("channel_read_cursor", None, &[fresh_cursor], false)
+            .await
+            .expect("apply fresh cursor");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(94001)
+            .await
+            .expect("read channel after fresh cursor")
+            .expect("channel exists");
+        assert_eq!(channel.unread_count, 4);
+
+        let stale_cursor = SyncEntityItem {
+            entity_id: "94001:10001".to_string(),
+            version: 42,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 94001,
+                "channel_type": 2,
+                "reader_id": 10001,
+                "last_read_pts": 10
+            })),
+        };
+        state
+            .apply_sync_entities("channel_read_cursor", None, &[stale_cursor], false)
+            .await
+            .expect("apply stale cursor");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(94001)
+            .await
+            .expect("read channel after stale cursor")
+            .expect("channel exists");
+        assert_eq!(channel.unread_count, 4);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn newer_channel_payload_keeps_materialized_local_unread_projection() {
+        let (mut state, dir) = new_seeded_state("newer-channel-keeps-unread").await;
+
+        let channel = SyncEntityItem {
+            entity_id: "95001".to_string(),
+            version: 50,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 95001,
+                "channel_type": 2,
+                "channel_name": "initial-room",
+                "unread_count": 8,
+                "top": 0,
+                "mute": 0
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[channel], false)
+            .await
+            .expect("apply initial channel");
+
+        for (server_message_id, pts) in [(73001_u64, 10_i64), (73002_u64, 20_i64), (73003_u64, 30_i64)] {
+            state
+                .storage
+                .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                    server_message_id,
+                    local_message_id: 0,
+                    channel_id: 95001,
+                    channel_type: 2,
+                    timestamp: 1_710_300_000_000 + pts,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: format!("{{\"content\":\"m{pts}\"}}"),
+                    status: 2,
+                    pts,
+                    setting: 0,
+                    order_seq: pts,
+                    searchable_word: format!("m{pts}"),
+                    extra: "{}".to_string(),
+                })
+                .await
+                .expect("seed message");
+        }
+
+        let cursor = SyncEntityItem {
+            entity_id: "95001:10001".to_string(),
+            version: 51,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 95001,
+                "channel_type": 2,
+                "reader_id": 10001,
+                "last_read_pts": 20
+            })),
+        };
+        state
+            .apply_sync_entities("channel_read_cursor", None, &[cursor], false)
+            .await
+            .expect("apply cursor");
+
+        let newer_channel = SyncEntityItem {
+            entity_id: "95001".to_string(),
+            version: 52,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 95001,
+                "channel_type": 2,
+                "channel_name": "renamed-room",
+                "unread_count": 99,
+                "top": 1,
+                "mute": 1
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[newer_channel], false)
+            .await
+            .expect("apply newer channel");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(95001)
+            .await
+            .expect("read channel")
+            .expect("channel exists");
+        assert_eq!(channel.channel_name, "renamed-room");
+        assert_eq!(channel.unread_count, 6);
+        assert_eq!(channel.top, 1);
+        assert_eq!(channel.mute, 1);
+        assert_eq!(channel.version, 52);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_last_message_refresh_does_not_block_newer_channel_entity_state() {
+        let (mut state, dir) = new_seeded_state("channel-entity-after-local-preview").await;
+
+        let baseline = SyncEntityItem {
+            entity_id: "96001".to_string(),
+            version: 60,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 96001,
+                "channel_type": 1,
+                "channel_name": "alice",
+                "unread_count": 0,
+                "top": 0,
+                "mute": 0
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[baseline], false)
+            .await
+            .expect("apply baseline channel");
+
+        state
+            .update_channel_last_message(
+                96001,
+                1,
+                "{\"content\":\"hello\"}",
+                1_710_400_000_000,
+                12345,
+                Some(20001),
+                true,
+            )
+            .await
+            .expect("update local last message");
+
+        let after_preview = state
+            .storage
+            .get_channel_by_id(96001)
+            .await
+            .expect("read channel after preview")
+            .expect("channel exists");
+        assert_eq!(after_preview.version, 60);
+
+        let newer = SyncEntityItem {
+            entity_id: "96001".to_string(),
+            version: 61,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 96001,
+                "channel_type": 1,
+                "channel_name": "alice-renamed",
+                "unread_count": 9,
+                "top": 1,
+                "mute": 1
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[newer], false)
+            .await
+            .expect("apply newer channel entity");
+
+        let final_channel = state
+            .storage
+            .get_channel_by_id(96001)
+            .await
+            .expect("read final channel")
+            .expect("channel exists");
+        assert_eq!(final_channel.channel_name, "alice-renamed");
+        assert_eq!(final_channel.top, 1);
+        assert_eq!(final_channel.mute, 1);
+        assert_eq!(final_channel.version, 61);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_channel_methods_return_synced_preview_baseline() {
+        let (sdk, dir) = new_seeded_sdk("sdk-channel-preview-baseline").await;
+        let store = LocalStore::open_at(dir.clone()).expect("open local store for seeding");
+
+        store
+            .upsert_channel(
+                "10001",
+                &UpsertChannelInput {
+                    channel_id: 97001,
+                    channel_type: 2,
+                    channel_name: "sdk-preview-room".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 2,
+                    top: 1,
+                    mute: 0,
+                    last_msg_timestamp: 1_710_500_000_000,
+                    last_local_message_id: 0,
+                    last_msg_content: "synced-preview-baseline".to_string(),
+                    version: 70,
+                },
+            )
+            .expect("seed synced channel");
+        drop(store);
+
+        let channel = sdk
+            .get_channel_by_id(97001)
+            .await
+            .expect("sdk get channel")
+            .expect("channel exists");
+        assert_eq!(channel.channel_name, "sdk-preview-room");
+        assert_eq!(channel.last_msg_timestamp, 1_710_500_000_000);
+        assert_eq!(channel.last_msg_content, "synced-preview-baseline");
+        assert_eq!(channel.last_local_message_id, 0);
+
+        let channels = sdk.list_channels(20, 0).await.expect("sdk list channels");
+        let listed = channels
+            .into_iter()
+            .find(|row| row.channel_id == 97001)
+            .expect("listed channel exists");
+        assert_eq!(listed.last_msg_timestamp, 1_710_500_000_000);
+        assert_eq!(listed.last_msg_content, "synced-preview-baseline");
+
+        let messages = sdk
+            .list_messages(97001, 2, 20, 0)
+            .await
+            .expect("sdk list messages");
+        assert!(messages.is_empty());
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_channel_methods_prefer_materialized_local_message() {
+        let (sdk, dir) = new_seeded_sdk("sdk-channel-materialized-message").await;
+        let store = LocalStore::open_at(dir.clone()).expect("open local store for seeding");
+
+        store
+            .upsert_channel(
+                "10001",
+                &UpsertChannelInput {
+                    channel_id: 97002,
+                    channel_type: 2,
+                    channel_name: "sdk-materialized-room".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 1,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 0,
+                    last_msg_content: "old-synced-preview".to_string(),
+                    version: 71,
+                },
+            )
+            .expect("seed channel");
+        let inserted = store
+            .upsert_remote_message_with_result(
+                "10001",
+                &UpsertRemoteMessageInput {
+                    server_message_id: 89001,
+                    local_message_id: 0,
+                    channel_id: 97002,
+                    channel_type: 2,
+                    timestamp: 1_710_600_000_000,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: "{\"content\":\"materialized-message\"}".to_string(),
+                    status: 2,
+                    pts: 33,
+                    setting: 0,
+                    order_seq: 33,
+                    searchable_word: "materialized message".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("seed materialized message");
+        drop(store);
+
+        let messages = sdk
+            .list_messages(97002, 2, 20, 0)
+            .await
+            .expect("sdk list messages");
+        assert_eq!(messages.len(), 1);
+
+        let channel = sdk
+            .get_channel_by_id(97002)
+            .await
+            .expect("sdk get channel")
+            .expect("channel exists");
+        assert_eq!(channel.last_msg_timestamp, messages[0].created_at);
+        assert_eq!(channel.last_msg_content, "{\"content\":\"materialized-message\"}");
+        assert_eq!(channel.last_local_message_id, inserted.message_id);
+
+        let channels = sdk.list_channels(20, 0).await.expect("sdk list channels");
+        let listed = channels
+            .into_iter()
+            .find(|row| row.channel_id == 97002)
+            .expect("listed channel exists");
+        assert_eq!(listed.last_msg_timestamp, messages[0].created_at);
+        assert_eq!(listed.last_msg_content, "{\"content\":\"materialized-message\"}");
+        assert_eq!(listed.last_local_message_id, inserted.message_id);
+
+        assert_eq!(messages[0].message_id, inserted.message_id);
+        assert_eq!(messages[0].content, "{\"content\":\"materialized-message\"}");
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_friend_methods_return_materialized_friend_view() {
+        let (sdk, dir) = new_seeded_sdk("sdk-friend-view").await;
+        let store = LocalStore::open_at(dir.clone()).expect("open local store for seeding");
+
+        store
+            .upsert_user(
+                "10001",
+                &UpsertUserInput {
+                    user_id: 88001,
+                    username: Some("alice".to_string()),
+                    nickname: Some("Alice".to_string()),
+                    alias: Some("A".to_string()),
+                    avatar: "avatar://alice".to_string(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: "friend-88001".to_string(),
+                    version: 101,
+                    updated_at: 101,
+                },
+            )
+            .expect("seed user");
+        store
+            .upsert_friend(
+                "10001",
+                &UpsertFriendInput {
+                    user_id: 88001,
+                    tags: Some("work".to_string()),
+                    is_pinned: true,
+                    created_at: 200,
+                    version: 202,
+                    updated_at: 202,
+                },
+            )
+            .expect("seed friend");
+        drop(store);
+
+        let friends = sdk.list_friends(20, 0).await.expect("sdk list friends");
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].user_id, 88001);
+        assert_eq!(friends[0].username.as_deref(), Some("alice"));
+        assert_eq!(friends[0].nickname.as_deref(), Some("Alice"));
+        assert_eq!(friends[0].alias.as_deref(), Some("A"));
+        assert_eq!(friends[0].tags.as_deref(), Some("work"));
+        assert!(friends[0].is_pinned);
+        assert_eq!(friends[0].version, 202);
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_group_methods_return_materialized_group_view() {
+        let (sdk, dir) = new_seeded_sdk("sdk-group-view").await;
+        let store = LocalStore::open_at(dir.clone()).expect("open local store for seeding");
+
+        store
+            .upsert_group(
+                "10001",
+                &UpsertGroupInput {
+                    group_id: 88002,
+                    name: Some("group-a".to_string()),
+                    avatar: "avatar://group-a".to_string(),
+                    owner_id: Some(88001),
+                    is_dismissed: false,
+                    created_at: 300,
+                    version: 303,
+                    updated_at: 303,
+                },
+            )
+            .expect("seed group");
+        drop(store);
+
+        let groups = sdk.list_groups(20, 0).await.expect("sdk list groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_id, 88002);
+        assert_eq!(groups[0].name.as_deref(), Some("group-a"));
+        assert_eq!(groups[0].owner_id, Some(88001));
+        assert!(!groups[0].is_dismissed);
+        assert_eq!(groups[0].version, 303);
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_group_member_methods_return_materialized_member_view() {
+        let (sdk, dir) = new_seeded_sdk("sdk-group-member-view").await;
+        let store = LocalStore::open_at(dir.clone()).expect("open local store for seeding");
+
+        store
+            .upsert_group_member(
+                "10001",
+                &UpsertGroupMemberInput {
+                    group_id: 88003,
+                    user_id: 88001,
+                    role: 1,
+                    status: 0,
+                    alias: Some("captain".to_string()),
+                    is_muted: true,
+                    joined_at: 400,
+                    version: 404,
+                    updated_at: 404,
+                },
+            )
+            .expect("seed group member");
+        drop(store);
+
+        let members = sdk
+            .list_group_members(88003, 20, 0)
+            .await
+            .expect("sdk list group members");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].group_id, 88003);
+        assert_eq!(members[0].user_id, 88001);
+        assert_eq!(members[0].role, 1);
+        assert_eq!(members[0].status, 0);
+        assert_eq!(members[0].alias.as_deref(), Some("captain"));
+        assert!(members[0].is_muted);
+        assert_eq!(members[0].version, 404);
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_user_methods_return_materialized_user_views() {
+        let (sdk, dir) = new_seeded_sdk("sdk-user-views").await;
+
+        sdk.upsert_user(UpsertUserInput {
+            user_id: 88101,
+            username: Some("u-one".to_string()),
+            nickname: Some("User One".to_string()),
+            alias: Some("UNO".to_string()),
+            avatar: "avatar://u-one".to_string(),
+            user_type: 0,
+            is_deleted: false,
+            channel_id: "friend-88101".to_string(),
+            version: 501,
+            updated_at: 501,
+        })
+        .await
+        .expect("upsert user one");
+        sdk.upsert_user(UpsertUserInput {
+            user_id: 88102,
+            username: Some("u-two".to_string()),
+            nickname: Some("User Two".to_string()),
+            alias: None,
+            avatar: "avatar://u-two".to_string(),
+            user_type: 0,
+            is_deleted: false,
+            channel_id: "friend-88102".to_string(),
+            version: 502,
+            updated_at: 502,
+        })
+        .await
+        .expect("upsert user two");
+
+        let one = sdk
+            .get_user_by_id(88101)
+            .await
+            .expect("get user by id")
+            .expect("user one exists");
+        assert_eq!(one.user_id, 88101);
+        assert_eq!(one.username.as_deref(), Some("u-one"));
+        assert_eq!(one.nickname.as_deref(), Some("User One"));
+        assert_eq!(one.alias.as_deref(), Some("UNO"));
+        assert_eq!(one.version, 501);
+
+        let users = sdk
+            .list_users_by_ids(vec![88102, 88101])
+            .await
+            .expect("list users by ids");
+        assert_eq!(users.len(), 2);
+        let first = users.iter().find(|row| row.user_id == 88101).expect("first user");
+        let second = users.iter().find(|row| row.user_id == 88102).expect("second user");
+        assert_eq!(first.nickname.as_deref(), Some("User One"));
+        assert_eq!(second.nickname.as_deref(), Some("User Two"));
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_read_cursor_methods_return_projected_unread_views() {
+        let dir = unique_test_dir("sdk-read-cursor-views");
+        let store = LocalStore::open_at(dir.clone()).expect("open local store for seeding");
+        let login = LoginResult {
+            user_id: 10001,
+            token: "token".to_string(),
+            device_id: "device".to_string(),
+            refresh_token: None,
+            expires_at: String::new(),
+        };
+        store.save_login("10001", &login).expect("seed login");
+        store
+            .set_bootstrap_completed("10001", true)
+            .expect("seed bootstrap completed");
+        store
+            .upsert_channel(
+                "10001",
+                &UpsertChannelInput {
+                    channel_id: 97101,
+                    channel_type: 2,
+                    channel_name: "cursor-room".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 2,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 0,
+                    last_msg_content: "cursor baseline".to_string(),
+                    version: 601,
+                },
+            )
+            .expect("seed channel");
+        store
+            .upsert_remote_message_with_result(
+                "10001",
+                &UpsertRemoteMessageInput {
+                    server_message_id: 89101,
+                    local_message_id: 0,
+                    channel_id: 97101,
+                    channel_type: 2,
+                    timestamp: 1_710_700_000_000,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: "{\"content\":\"cursor-message-1\"}".to_string(),
+                    status: 2,
+                    pts: 10,
+                    setting: 0,
+                    order_seq: 10,
+                    searchable_word: "cursor message 1".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("seed message one");
+        store
+            .upsert_remote_message_with_result(
+                "10001",
+                &UpsertRemoteMessageInput {
+                    server_message_id: 89102,
+                    local_message_id: 0,
+                    channel_id: 97101,
+                    channel_type: 2,
+                    timestamp: 1_710_700_100_000,
+                    from_uid: 20002,
+                    message_type: 1,
+                    content: "{\"content\":\"cursor-message-2\"}".to_string(),
+                    status: 2,
+                    pts: 20,
+                    setting: 0,
+                    order_seq: 20,
+                    searchable_word: "cursor message 2".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("seed message two");
+        drop(store);
+
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        let sdk = PrivchatSdk::new(config);
+        sdk.set_current_uid("10001".to_string())
+            .await
+            .expect("restore seeded current uid");
+
+        assert_eq!(
+            sdk.get_channel_unread_count(97101, 2)
+                .await
+                .expect("initial channel unread"),
+            2
+        );
+        assert_eq!(
+            sdk.get_total_unread_count(false)
+                .await
+                .expect("initial total unread"),
+            2
+        );
+
+        sdk.project_channel_read_cursor(97101, 2, 10)
+            .await
+            .expect("project cursor");
+
+        assert_eq!(
+            sdk.get_channel_unread_count(97101, 2)
+                .await
+                .expect("projected channel unread"),
+            1
+        );
+        assert_eq!(
+            sdk.get_total_unread_count(false)
+                .await
+                .expect("projected total unread"),
+            1
+        );
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_message_extra_methods_return_materialized_revoke_view() {
+        let dir = unique_test_dir("sdk-message-extra-view");
+        let store = LocalStore::open_at(dir.clone()).expect("open local store for seeding");
+        let login = LoginResult {
+            user_id: 10001,
+            token: "token".to_string(),
+            device_id: "device".to_string(),
+            refresh_token: None,
+            expires_at: String::new(),
+        };
+        store.save_login("10001", &login).expect("seed login");
+        store
+            .set_bootstrap_completed("10001", true)
+            .expect("seed bootstrap completed");
+        store
+            .upsert_channel(
+                "10001",
+                &UpsertChannelInput {
+                    channel_id: 97102,
+                    channel_type: 2,
+                    channel_name: "extra-room".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 1,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 0,
+                    last_msg_content: "extra baseline".to_string(),
+                    version: 602,
+                },
+            )
+            .expect("seed channel");
+        let inserted = store
+            .upsert_remote_message_with_result(
+                "10001",
+                &UpsertRemoteMessageInput {
+                    server_message_id: 89201,
+                    local_message_id: 0,
+                    channel_id: 97102,
+                    channel_type: 2,
+                    timestamp: 1_710_701_000_000,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: "{\"content\":\"revoke-target\"}".to_string(),
+                    status: 2,
+                    pts: 30,
+                    setting: 0,
+                    order_seq: 30,
+                    searchable_word: "revoke target".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("seed message");
+        drop(store);
+
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        let sdk = PrivchatSdk::new(config);
+        sdk.set_current_uid("10001".to_string())
+            .await
+            .expect("restore seeded current uid");
+
+        sdk.set_message_revoke(inserted.message_id, true, Some(30001))
+            .await
+            .expect("set revoke");
+
+        let extra = sdk
+            .get_message_extra(inserted.message_id)
+            .await
+            .expect("get message extra")
+            .expect("message extra exists");
+        assert!(extra.revoke);
+        assert_eq!(extra.revoker, Some(30001));
+        assert_eq!(extra.message_id, inserted.message_id);
+        assert_eq!(extra.channel_id, 97102);
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sdk_message_reaction_methods_return_materialized_reaction_view() {
+        let dir = unique_test_dir("sdk-message-reaction-view");
+        let store = LocalStore::open_at(dir.clone()).expect("open local store for seeding");
+        let login = LoginResult {
+            user_id: 10001,
+            token: "token".to_string(),
+            device_id: "device".to_string(),
+            refresh_token: None,
+            expires_at: String::new(),
+        };
+        store.save_login("10001", &login).expect("seed login");
+        store
+            .set_bootstrap_completed("10001", true)
+            .expect("seed bootstrap completed");
+        store
+            .upsert_channel(
+                "10001",
+                &UpsertChannelInput {
+                    channel_id: 97103,
+                    channel_type: 2,
+                    channel_name: "reaction-room".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 1,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 0,
+                    last_msg_content: "reaction baseline".to_string(),
+                    version: 603,
+                },
+            )
+            .expect("seed channel");
+        let inserted = store
+            .upsert_remote_message_with_result(
+                "10001",
+                &UpsertRemoteMessageInput {
+                    server_message_id: 89301,
+                    local_message_id: 0,
+                    channel_id: 97103,
+                    channel_type: 2,
+                    timestamp: 1_710_702_000_000,
+                    from_uid: 20001,
+                    message_type: 1,
+                    content: "{\"content\":\"reaction-target\"}".to_string(),
+                    status: 2,
+                    pts: 40,
+                    setting: 0,
+                    order_seq: 40,
+                    searchable_word: "reaction target".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("seed message");
+        drop(store);
+
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        let sdk = PrivchatSdk::new(config);
+        sdk.set_current_uid("10001".to_string())
+            .await
+            .expect("restore seeded current uid");
+
+        sdk.upsert_message_reaction(UpsertMessageReactionInput {
+            channel_id: 97103,
+            channel_type: 2,
+            uid: 10001,
+            name: "thumbs-up".to_string(),
+            emoji: "👍".to_string(),
+            message_id: inserted.message_id,
+            seq: 901,
+            is_deleted: false,
+            created_at: 1_710_702_100_000,
+        })
+        .await
+        .expect("upsert reaction");
+
+        let reactions = sdk
+            .list_message_reactions(inserted.message_id, 20, 0)
+            .await
+            .expect("list message reactions");
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].message_id, inserted.message_id);
+        assert_eq!(reactions[0].uid, 10001);
+        assert_eq!(reactions[0].emoji, "👍");
+        assert_eq!(reactions[0].name, "thumbs-up");
+        assert!(!reactions[0].is_deleted);
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -23,12 +23,13 @@ use tokio::sync::oneshot;
 use crate::local_store::{LocalAccountEntry, LocalStore, StoragePaths};
 use crate::{
     Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
-    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
-    StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
-    StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
-    UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
-    UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
-    UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
+    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend,
+    StoredGroup, StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction,
+    StoredReminder, StoredUser, UnreadMentionCount, UpsertBlacklistInput,
+    UpsertChannelExtraInput, UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput,
+    UpsertGroupInput, UpsertGroupMemberInput,
+    UpsertMessageReactionInput, UpsertReminderInput, UpsertRemoteMessageInput,
+    UpsertRemoteMessageResult, UpsertUserInput,
 };
 
 enum StorageCmd {
@@ -131,6 +132,11 @@ enum StorageCmd {
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
+    },
+    MaxMessagePts {
+        channel_id: u64,
+        channel_type: i32,
+        resp: oneshot::Sender<Result<u64>>,
     },
     UpsertChannel {
         input: UpsertChannelInput,
@@ -367,10 +373,6 @@ enum StorageCmd {
     KvDelete {
         key: String,
         resp: oneshot::Sender<Result<()>>,
-    },
-    KvScanPrefix {
-        prefix: String,
-        resp: oneshot::Sender<Result<Vec<(String, Vec<u8>)>>>,
     },
     GetStoragePaths {
         resp: oneshot::Sender<Result<StoragePaths>>,
@@ -663,6 +665,18 @@ impl StorageHandle {
                 channel_type,
                 limit,
                 offset,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn max_message_pts(&self, channel_id: u64, channel_type: i32) -> Result<u64> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::MaxMessagePts {
+                channel_id,
+                channel_type,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1318,17 +1332,6 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn kv_scan_prefix(&self, prefix: String) -> Result<Vec<(String, Vec<u8>)>> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::KvScanPrefix {
-                prefix,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
-
     pub async fn get_storage_paths(&self) -> Result<StoragePaths> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -1546,6 +1549,13 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 limit,
                 offset
             ));
+        }
+        StorageCmd::MaxMessagePts {
+            channel_id,
+            channel_type,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.max_message_pts(&uid, channel_id, channel_type));
         }
         StorageCmd::UpsertChannel { input, resp } => {
             with_uid!(resp, |uid| store.upsert_channel(&uid, &input));
@@ -1887,9 +1897,6 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::KvDelete { key, resp } => {
             with_uid!(resp, |uid| store.kv_delete(&uid, &key));
-        }
-        StorageCmd::KvScanPrefix { prefix, resp } => {
-            with_uid!(resp, |uid| store.kv_scan_prefix(&uid, &prefix));
         }
         StorageCmd::GetStoragePaths { resp } => {
             with_uid!(resp, |uid| store.ensure_user_storage(&uid));

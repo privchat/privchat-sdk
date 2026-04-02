@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AccountConfig {
     pub key: String,
@@ -45,6 +46,7 @@ pub struct PhaseResult {
     pub metrics: PhaseMetrics,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct TestSummary {
     pub total: usize,

@@ -1743,7 +1743,7 @@ impl TestPhases {
 
         // --- Step 6: 群聊 typing 测试 ---
         let group_channel_id = manager
-            .cached_group_channel("test_group")
+            .cached_group_channel("main_group")
             .ok_or_else(|| boxed_err("missing group channel for typing test"))?;
 
         let charlie_sdk = manager.sdk("charlie")?;
@@ -2560,6 +2560,7 @@ impl TestPhases {
                 owner_id: Some(manager.user_id("alice")?),
                 is_dismissed: false,
                 created_at: now_millis(),
+                version: now_millis(),
                 updated_at: now_millis(),
             })
             .await?;
@@ -2576,6 +2577,7 @@ impl TestPhases {
                 last_msg_timestamp: now_millis(),
                 last_local_message_id: 0,
                 last_msg_content: String::new(),
+                version: now_millis(),
             })
             .await?;
         metrics.rpc_calls += 2;
@@ -2859,8 +2861,8 @@ impl TestPhases {
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(9090);
-        let service_key =
-            std::env::var("SERVICE_MASTER_KEY").unwrap_or_else(|_| String::new());
+        let service_key = std::env::var("SERVICE_MASTER_KEY")
+            .unwrap_or_else(|_| "your_service_master_key_here".to_string());
         let admin_base = format!("http://{}:{}", admin_host, admin_port);
 
         let client = reqwest::Client::new();
@@ -3036,6 +3038,105 @@ impl TestPhases {
             metrics,
         })
     }
+
+    pub async fn phase32_channel_state_resume_smoke(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let channel_id = manager
+            .cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("missing alice-bob direct channel for channel-state smoke"))?;
+
+        let pin = manager.channel_pin("alice", channel_id, true).await?;
+        metrics.rpc_calls += 1;
+        if pin {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push("channel pin returned false".to_string());
+        }
+
+        let mute = manager.channel_mute("alice", channel_id, true).await?;
+        metrics.rpc_calls += 1;
+        if mute {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push("channel mute returned false".to_string());
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        manager.refresh_local_views("alice").await?;
+        metrics.rpc_calls += 1;
+
+        let before = manager
+            .list_local_channels("alice")
+            .await?
+            .into_iter()
+            .find(|c| c.channel_id == channel_id)
+            .ok_or_else(|| boxed_err("alice local direct channel missing before reconnect"))?;
+        metrics.rpc_calls += 1;
+
+        if before.top == 1 && before.mute == 1 {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "before reconnect top/mute mismatch top={} mute={}",
+                before.top, before.mute
+            ));
+        }
+
+        let sdk = manager.sdk("alice")?;
+        let _ = sdk.disconnect().await;
+        reconnect_account(manager, "alice").await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        let after = manager
+            .list_local_channels("alice")
+            .await?
+            .into_iter()
+            .find(|c| c.channel_id == channel_id)
+            .ok_or_else(|| boxed_err("alice local direct channel missing after reconnect"))?;
+        metrics.rpc_calls += 1;
+
+        if after.top == 1 && after.mute == 1 {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "after reconnect top/mute mismatch top={} mute={}",
+                after.top, after.mute
+            ));
+        }
+
+        let unpin = manager.channel_pin("alice", channel_id, false).await?;
+        metrics.rpc_calls += 1;
+        if unpin {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("channel unpin cleanup returned false".to_string());
+        }
+
+        let unmute = manager.channel_mute("alice", channel_id, false).await?;
+        metrics.rpc_calls += 1;
+        if unmute {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("channel unmute cleanup returned false".to_string());
+        }
+
+        Ok(PhaseResult {
+            phase_name: "channel-state-resume-smoke".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: "alice pin/mute survives reconnect and local refresh".to_string(),
+            metrics,
+        })
+    }
 }
 
 // --- Admin API response types for phase31 ---
@@ -3188,10 +3289,7 @@ async fn reconnect_account(manager: &MultiAccountManager, key: &str) -> BoxResul
     let sdk = manager.sdk(key)?;
     let cfg = manager.account_config(key)?;
     sdk.connect().await?;
-    let login = sdk
-        .login(cfg.username, cfg.password, cfg.device_id.clone())
-        .await?;
-    sdk.authenticate(login.user_id, login.token, cfg.device_id)
+    sdk.authenticate(cfg.user_id, cfg.token.clone(), cfg.device_id.clone())
         .await?;
     sdk.run_bootstrap_sync().await?;
     manager.refresh_local_views(key).await?;

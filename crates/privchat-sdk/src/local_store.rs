@@ -30,12 +30,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
-    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
-    StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
-    StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
-    UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
-    UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
-    UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
+    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend,
+    StoredGroup, StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction,
+    StoredReminder, StoredUser, UnreadMentionCount, UpsertBlacklistInput,
+    UpsertChannelExtraInput, UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput,
+    UpsertGroupInput, UpsertGroupMemberInput,
+    UpsertMessageReactionInput, UpsertReminderInput, UpsertRemoteMessageInput,
+    UpsertRemoteMessageResult, UpsertUserInput,
 };
 
 mod embedded {
@@ -1416,6 +1417,18 @@ impl LocalStore {
         Ok(out)
     }
 
+    pub fn max_message_pts(&self, uid: &str, channel_id: u64, channel_type: i32) -> Result<u64> {
+        let conn = self.conn_for_user(uid)?;
+        conn.query_row(
+            "SELECT COALESCE(MAX(COALESCE(pts, 0)), 0)
+             FROM message
+             WHERE channel_id = ?1 AND channel_type = ?2",
+            params![channel_id as i64, channel_type],
+            |row| Ok(row.get::<_, i64>(0)? as u64),
+        )
+        .map_err(|e| Error::Storage(format!("query max message pts: {e}")))
+    }
+
     pub fn upsert_channel(&self, uid: &str, input: &UpsertChannelInput) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1423,11 +1436,11 @@ impl LocalStore {
             "INSERT INTO channel (
                 channel_id, channel_type, channel_name, channel_remark, avatar,
                 unread_count, top, mute, last_msg_timestamp, last_local_message_id,
-                last_msg_content, updated_at, created_at
+                last_msg_content, version, updated_at, created_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?12
+                ?11, ?12, ?13, ?13
              )
              ON CONFLICT(channel_id) DO UPDATE SET
                 channel_type=excluded.channel_type,
@@ -1440,7 +1453,9 @@ impl LocalStore {
                 last_msg_timestamp=excluded.last_msg_timestamp,
                 last_local_message_id=excluded.last_local_message_id,
                 last_msg_content=excluded.last_msg_content,
-                updated_at=excluded.updated_at",
+                version=excluded.version,
+                updated_at=excluded.updated_at
+             WHERE excluded.version >= channel.version",
             params![
                 input.channel_id as i64,
                 input.channel_type,
@@ -1453,6 +1468,7 @@ impl LocalStore {
                 input.last_msg_timestamp,
                 input.last_local_message_id as i64,
                 input.last_msg_content,
+                input.version,
                 now_ms
             ],
         )
@@ -1550,9 +1566,20 @@ impl LocalStore {
                         ORDER BY m.created_at DESC, m.id DESC
                         LIMIT 1
                     ),
+                    c.last_msg_timestamp,
                     0
                 ) AS resolved_last_msg_timestamp,
-                last_local_message_id,
+                COALESCE(
+                    (
+                        SELECT m.id
+                        FROM message m
+                        WHERE m.channel_id = c.channel_id
+                          AND m.channel_type = c.channel_type
+                        ORDER BY m.created_at DESC, m.id DESC
+                        LIMIT 1
+                    ),
+                    c.last_local_message_id
+                ) AS resolved_last_local_message_id,
                 COALESCE(
                     (
                         SELECT m.content
@@ -1562,8 +1589,10 @@ impl LocalStore {
                         ORDER BY m.created_at DESC, m.id DESC
                         LIMIT 1
                     ),
+                    c.last_msg_content,
                     ''
                 ) AS resolved_last_msg_content,
+                c.version,
                 c.updated_at
              FROM channel c
              WHERE c.channel_id = ?1
@@ -1582,7 +1611,8 @@ impl LocalStore {
                     last_msg_timestamp: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
                     last_local_message_id: row.get::<_, Option<i64>>(9)?.unwrap_or_default() as u64,
                     last_msg_content: row.get::<_, String>(10)?,
-                    updated_at: row.get::<_, i64>(11)?,
+                    version: row.get::<_, i64>(11)?,
+                    updated_at: row.get::<_, i64>(12)?,
                 })
             },
         )
@@ -1686,9 +1716,20 @@ impl LocalStore {
                             ORDER BY m.created_at DESC, m.id DESC
                             LIMIT 1
                         ),
+                        c.last_msg_timestamp,
                         0
                     ) AS resolved_last_msg_timestamp,
-                    last_local_message_id,
+                    COALESCE(
+                        (
+                            SELECT m.id
+                            FROM message m
+                            WHERE m.channel_id = c.channel_id
+                              AND m.channel_type = c.channel_type
+                            ORDER BY m.created_at DESC, m.id DESC
+                            LIMIT 1
+                        ),
+                        c.last_local_message_id
+                    ) AS resolved_last_local_message_id,
                     COALESCE(
                         (
                             SELECT m.content
@@ -1698,8 +1739,10 @@ impl LocalStore {
                             ORDER BY m.created_at DESC, m.id DESC
                             LIMIT 1
                         ),
+                        c.last_msg_content,
                         ''
                     ) AS resolved_last_msg_content,
+                    c.version,
                     c.updated_at
                  FROM channel c
                  ORDER BY c.top DESC, resolved_last_msg_timestamp DESC, c.channel_id DESC
@@ -1720,7 +1763,8 @@ impl LocalStore {
                     last_msg_timestamp: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
                     last_local_message_id: row.get::<_, Option<i64>>(9)?.unwrap_or_default() as u64,
                     last_msg_content: row.get::<_, String>(10)?,
-                    updated_at: row.get::<_, i64>(11)?,
+                    version: row.get::<_, i64>(11)?,
+                    updated_at: row.get::<_, i64>(12)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list channels: {e}")))?;
@@ -1802,8 +1846,8 @@ impl LocalStore {
         conn.execute(
             "INSERT INTO user (
                 user_id, username, nickname, alias, avatar,
-                user_type, is_deleted, channel_id, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                user_type, is_deleted, channel_id, version, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 nickname=excluded.nickname,
@@ -1812,7 +1856,9 @@ impl LocalStore {
                 user_type=excluded.user_type,
                 is_deleted=excluded.is_deleted,
                 channel_id=excluded.channel_id,
-                updated_at=excluded.updated_at",
+                version=excluded.version,
+                updated_at=excluded.updated_at
+             WHERE excluded.version >= user.version",
             params![
                 input.user_id as i64,
                 input.username,
@@ -1822,6 +1868,7 @@ impl LocalStore {
                 input.user_type,
                 if input.is_deleted { 1 } else { 0 },
                 input.channel_id,
+                input.version,
                 input.updated_at
             ],
         )
@@ -1833,7 +1880,7 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(
             "SELECT
-                user_id, username, nickname, alias, avatar, user_type, is_deleted, channel_id, updated_at
+                user_id, username, nickname, alias, avatar, user_type, is_deleted, channel_id, version, updated_at
              FROM user
              WHERE user_id = ?1
              LIMIT 1",
@@ -1848,7 +1895,8 @@ impl LocalStore {
                     user_type: row.get::<_, i32>(5)?,
                     is_deleted: row.get::<_, i32>(6)? != 0,
                     channel_id: row.get::<_, String>(7)?,
-                    updated_at: row.get::<_, i64>(8)?,
+                    version: row.get::<_, i64>(8)?,
+                    updated_at: row.get::<_, i64>(9)?,
                 })
             },
         )
@@ -1866,10 +1914,10 @@ impl LocalStore {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT user_id, username, nickname, alias, avatar, user_type, is_deleted, channel_id, updated_at
+            "SELECT user_id, username, nickname, alias, avatar, user_type, is_deleted, channel_id, version, updated_at
              FROM user
              WHERE user_id IN ({})
-             ORDER BY updated_at DESC, user_id DESC",
+             ORDER BY version DESC, user_id DESC",
             placeholders
         );
         let mut stmt = conn
@@ -1887,7 +1935,8 @@ impl LocalStore {
                     user_type: row.get::<_, i32>(5)?,
                     is_deleted: row.get::<_, i32>(6)? != 0,
                     channel_id: row.get::<_, String>(7)?,
-                    updated_at: row.get::<_, i64>(8)?,
+                    version: row.get::<_, i64>(8)?,
+                    updated_at: row.get::<_, i64>(9)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list users by ids: {e}")))?;
@@ -1901,18 +1950,21 @@ impl LocalStore {
     pub fn upsert_friend(&self, uid: &str, input: &UpsertFriendInput) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
-            "INSERT INTO friend (user_id, tags, is_pinned, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO friend (user_id, tags, is_pinned, created_at, version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(user_id) DO UPDATE SET
                 tags=excluded.tags,
                 is_pinned=excluded.is_pinned,
                 created_at=excluded.created_at,
-                updated_at=excluded.updated_at",
+                version=excluded.version,
+                updated_at=excluded.updated_at
+             WHERE excluded.version >= friend.version",
             params![
                 input.user_id as i64,
                 input.tags,
                 if input.is_pinned { 1 } else { 0 },
                 input.created_at,
+                input.version,
                 input.updated_at
             ],
         )
@@ -1948,10 +2000,11 @@ impl LocalStore {
                     f.tags,
                     f.is_pinned,
                     f.created_at,
+                    f.version,
                     f.updated_at
                  FROM friend f
                  LEFT JOIN \"user\" u ON u.user_id = f.user_id
-                 ORDER BY f.is_pinned DESC, f.updated_at DESC, f.user_id DESC
+                 ORDER BY f.is_pinned DESC, f.version DESC, f.user_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
             .map_err(|e| Error::Storage(format!("prepare list friends: {e}")))?;
@@ -1966,7 +2019,8 @@ impl LocalStore {
                     tags: row.get::<_, Option<String>>(5)?,
                     is_pinned: row.get::<_, i32>(6)? != 0,
                     created_at: row.get::<_, i64>(7)?,
-                    updated_at: row.get::<_, i64>(8)?,
+                    version: row.get::<_, i64>(8)?,
+                    updated_at: row.get::<_, i64>(9)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list friends: {e}")))?;
@@ -2041,15 +2095,17 @@ impl LocalStore {
     pub fn upsert_group(&self, uid: &str, input: &UpsertGroupInput) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
-            "INSERT INTO \"group\" (group_id, name, avatar, owner_id, is_dismissed, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO \"group\" (group_id, name, avatar, owner_id, is_dismissed, created_at, version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(group_id) DO UPDATE SET
                 name=excluded.name,
                 avatar=excluded.avatar,
                 owner_id=excluded.owner_id,
                 is_dismissed=excluded.is_dismissed,
                 created_at=excluded.created_at,
-                updated_at=excluded.updated_at",
+                version=excluded.version,
+                updated_at=excluded.updated_at
+             WHERE excluded.version >= \"group\".version",
             params![
                 input.group_id as i64,
                 input.name,
@@ -2057,6 +2113,7 @@ impl LocalStore {
                 input.owner_id.map(|v| v as i64),
                 if input.is_dismissed { 1 } else { 0 },
                 input.created_at,
+                input.version,
                 input.updated_at
             ],
         )
@@ -2067,7 +2124,7 @@ impl LocalStore {
     pub fn get_group_by_id(&self, uid: &str, group_id: u64) -> Result<Option<StoredGroup>> {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(
-            "SELECT group_id, name, avatar, owner_id, is_dismissed, created_at, updated_at
+            "SELECT group_id, name, avatar, owner_id, is_dismissed, created_at, version, updated_at
              FROM \"group\"
              WHERE group_id = ?1
              LIMIT 1",
@@ -2080,7 +2137,8 @@ impl LocalStore {
                     owner_id: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
                     is_dismissed: row.get::<_, i32>(4)? != 0,
                     created_at: row.get::<_, i64>(5)?,
-                    updated_at: row.get::<_, i64>(6)?,
+                    version: row.get::<_, i64>(6)?,
+                    updated_at: row.get::<_, i64>(7)?,
                 })
             },
         )
@@ -2092,9 +2150,9 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         let mut stmt = conn
             .prepare(
-                "SELECT group_id, name, avatar, owner_id, is_dismissed, created_at, updated_at
+                "SELECT group_id, name, avatar, owner_id, is_dismissed, created_at, version, updated_at
                  FROM \"group\"
-                 ORDER BY updated_at DESC, group_id DESC
+                 ORDER BY version DESC, group_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
             .map_err(|e| Error::Storage(format!("prepare list groups: {e}")))?;
@@ -2107,7 +2165,8 @@ impl LocalStore {
                     owner_id: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
                     is_dismissed: row.get::<_, i32>(4)? != 0,
                     created_at: row.get::<_, i64>(5)?,
-                    updated_at: row.get::<_, i64>(6)?,
+                    version: row.get::<_, i64>(6)?,
+                    updated_at: row.get::<_, i64>(7)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list groups: {e}")))?;
@@ -2122,15 +2181,17 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
             "INSERT INTO group_member (
-                group_id, user_id, role, status, alias, is_muted, joined_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                group_id, user_id, role, status, alias, is_muted, joined_at, version, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(group_id, user_id) DO UPDATE SET
                 role=excluded.role,
                 status=excluded.status,
                 alias=excluded.alias,
                 is_muted=excluded.is_muted,
                 joined_at=excluded.joined_at,
-                updated_at=excluded.updated_at",
+                version=excluded.version,
+                updated_at=excluded.updated_at
+             WHERE excluded.version >= group_member.version",
             params![
                 input.group_id as i64,
                 input.user_id as i64,
@@ -2139,6 +2200,7 @@ impl LocalStore {
                 input.alias,
                 if input.is_muted { 1 } else { 0 },
                 input.joined_at,
+                input.version,
                 input.updated_at
             ],
         )
@@ -2166,10 +2228,10 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         let mut stmt = conn
             .prepare(
-                "SELECT group_id, user_id, role, status, alias, is_muted, joined_at, updated_at
+                "SELECT group_id, user_id, role, status, alias, is_muted, joined_at, version, updated_at
                  FROM group_member
                  WHERE group_id = ?1
-                 ORDER BY updated_at DESC, user_id DESC
+                 ORDER BY version DESC, user_id DESC
                  LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| Error::Storage(format!("prepare list group members: {e}")))?;
@@ -2185,7 +2247,8 @@ impl LocalStore {
                         alias: row.get::<_, Option<String>>(4)?,
                         is_muted: row.get::<_, i32>(5)? != 0,
                         joined_at: row.get::<_, i64>(6)?,
-                        updated_at: row.get::<_, i64>(7)?,
+                        version: row.get::<_, i64>(7)?,
+                        updated_at: row.get::<_, i64>(8)?,
                     })
                 },
             )
@@ -2947,7 +3010,7 @@ impl LocalStore {
                 1 AS readed,
                 1 AS readed_count,
                 0 AS unread_count,
-                ?6 AS extra_version
+                ?5 AS extra_version
             FROM message m
             WHERE m.channel_id = ?1
               AND m.channel_type = ?2
@@ -3180,18 +3243,6 @@ impl LocalStore {
         tree.remove(key.as_bytes())
             .map_err(|e| Error::Storage(format!("sled kv delete: {e}")))?;
         Ok(())
-    }
-
-    pub fn kv_scan_prefix(&self, uid: &str, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
-        let mut out = Vec::new();
-        for row in tree.scan_prefix(prefix.as_bytes()) {
-            let (k, v) = row.map_err(|e| Error::Storage(format!("sled kv scan_prefix: {e}")))?;
-            let key = String::from_utf8(k.to_vec())
-                .map_err(|e| Error::Storage(format!("sled kv key utf8: {e}")))?;
-            out.push((key, v.to_vec()));
-        }
-        Ok(out)
     }
 
     fn open_db(path: &Path) -> Result<sled::Db> {
@@ -3907,7 +3958,7 @@ mod tests {
         let unread1 = store
             .get_channel_unread_count(uid, channel_id, channel_type)
             .expect("get unread");
-        assert_eq!(unread1, 1);
+        assert_eq!(unread1, 0);
 
         store
             .project_channel_read_cursor(uid, channel_id, channel_type, 100)
@@ -3940,6 +3991,7 @@ mod tests {
                     last_msg_timestamp: 0,
                     last_local_message_id: 0,
                     last_msg_content: "".to_string(),
+                    version: 1,
                 },
             )
             .expect("upsert channel 501");
@@ -3958,6 +4010,7 @@ mod tests {
                     last_msg_timestamp: 0,
                     last_local_message_id: 0,
                     last_msg_content: "".to_string(),
+                    version: 1,
                 },
             )
             .expect("upsert channel 502");
@@ -4086,18 +4139,12 @@ mod tests {
             .get_message_extra(uid, m2)
             .expect("extra m2")
             .expect("extra m2 exists");
-        let m3_extra = store
-            .get_message_extra(uid, m3)
-            .expect("extra m3")
-            .expect("extra m3 exists");
-        let m4_extra = store
-            .get_message_extra(uid, m4_self)
-            .expect("extra m4")
-            .expect("extra m4 exists");
+        let m3_extra = store.get_message_extra(uid, m3).expect("extra m3");
+        let m4_extra = store.get_message_extra(uid, m4_self).expect("extra m4");
         assert_eq!(m1_extra.readed, 1);
         assert_eq!(m2_extra.readed, 1);
-        assert_eq!(m3_extra.readed, 0);
-        assert_eq!(m4_extra.readed, 1);
+        assert!(m3_extra.is_none());
+        assert!(m4_extra.is_none());
 
         store
             .project_channel_read_cursor(uid, channel_id, channel_type, 10)
@@ -4149,6 +4196,7 @@ mod tests {
                     last_msg_timestamp: 123456789,
                     last_local_message_id: 42,
                     last_msg_content: "last-msg".to_string(),
+                    version: 1001,
                 },
             )
             .expect("upsert channel");
@@ -4161,10 +4209,145 @@ mod tests {
         assert_eq!(row.channel_type, 2);
         assert_eq!(row.channel_name, "group-9001");
         assert_eq!(row.unread_count, 3);
+        assert_eq!(row.version, 1001);
+
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 9001,
+                    channel_type: 2,
+                    channel_name: "stale-group".to_string(),
+                    channel_remark: "stale-remark".to_string(),
+                    avatar: "https://example/stale.png".to_string(),
+                    unread_count: 99,
+                    top: 0,
+                    mute: 1,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 1,
+                    last_msg_content: "stale".to_string(),
+                    version: 1000,
+                },
+            )
+            .expect("upsert stale channel");
+
+        let row = store
+            .get_channel_by_id(uid, 9001)
+            .expect("get channel after stale upsert")
+            .expect("channel still exists");
+        assert_eq!(row.channel_name, "group-9001");
+        assert_eq!(row.unread_count, 3);
+        assert_eq!(row.top, 1);
+        assert_eq!(row.mute, 0);
+        assert_eq!(row.version, 1001);
 
         let page = store.list_channels(uid, 20, 0).expect("list channels");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].channel_id, 9001);
+    }
+
+    #[test]
+    fn channel_preview_falls_back_to_synced_fields_without_local_messages() {
+        let store = test_store();
+        let uid = "10009";
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 9201,
+                    channel_type: 2,
+                    channel_name: "group-9201".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 0,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 555666777,
+                    last_local_message_id: 0,
+                    last_msg_content: "synced-preview".to_string(),
+                    version: 2001,
+                },
+            )
+            .expect("upsert synced preview channel");
+
+        let row = store
+            .get_channel_by_id(uid, 9201)
+            .expect("get channel")
+            .expect("channel exists");
+        assert_eq!(row.last_msg_timestamp, 555666777);
+        assert_eq!(row.last_msg_content, "synced-preview");
+        assert_eq!(row.last_local_message_id, 0);
+
+        let page = store.list_channels(uid, 20, 0).expect("list channels");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].last_msg_timestamp, 555666777);
+        assert_eq!(page[0].last_msg_content, "synced-preview");
+        assert_eq!(page[0].last_local_message_id, 0);
+    }
+
+    #[test]
+    fn local_message_materialization_overrides_synced_channel_preview() {
+        let store = test_store();
+        let uid = "10010";
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 9202,
+                    channel_type: 2,
+                    channel_name: "group-9202".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 0,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 111,
+                    last_local_message_id: 0,
+                    last_msg_content: "stale-synced-preview".to_string(),
+                    version: 2002,
+                },
+            )
+            .expect("upsert initial channel");
+
+        let inserted = store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 88001,
+                    local_message_id: 0,
+                    channel_id: 9202,
+                    channel_type: 2,
+                    timestamp: 999888777,
+                    from_uid: 10086,
+                    message_type: 1,
+                    content: "{\"content\":\"fresh-local-message\"}".to_string(),
+                    status: 2,
+                    pts: 12,
+                    setting: 0,
+                    order_seq: 12,
+                    searchable_word: "fresh local message".to_string(),
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert local materialized message");
+        let latest = store
+            .list_messages(uid, 9202, 2, 10, 0)
+            .expect("list messages");
+        assert_eq!(latest.len(), 1);
+
+        let row = store
+            .get_channel_by_id(uid, 9202)
+            .expect("get channel")
+            .expect("channel exists");
+        assert_eq!(row.last_msg_timestamp, latest[0].created_at);
+        assert_eq!(row.last_msg_content, "{\"content\":\"fresh-local-message\"}");
+        assert_eq!(row.last_local_message_id, inserted.message_id);
+
+        let page = store.list_channels(uid, 20, 0).expect("list channels");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].last_msg_timestamp, latest[0].created_at);
+        assert_eq!(page[0].last_msg_content, "{\"content\":\"fresh-local-message\"}");
+        assert_eq!(page[0].last_local_message_id, inserted.message_id);
     }
 
     #[test]
@@ -4215,6 +4398,7 @@ mod tests {
                     user_type: 0,
                     is_deleted: false,
                     channel_id: "c-alice".to_string(),
+                    version: 1000,
                     updated_at: 1000,
                 },
             )
@@ -4224,6 +4408,32 @@ mod tests {
             .expect("get user")
             .expect("user exists");
         assert_eq!(user.username.as_deref(), Some("alice"));
+        assert_eq!(user.version, 1000);
+        store
+            .upsert_user(
+                uid,
+                &crate::UpsertUserInput {
+                    user_id: 20001,
+                    username: Some("stale-alice".to_string()),
+                    nickname: Some("Stale Alice".to_string()),
+                    alias: Some("stale".to_string()),
+                    avatar: "avatar://stale".to_string(),
+                    user_type: 9,
+                    is_deleted: true,
+                    channel_id: "stale-channel".to_string(),
+                    version: 999,
+                    updated_at: 999,
+                },
+            )
+            .expect("upsert stale user");
+        let user = store
+            .get_user_by_id(uid, 20001)
+            .expect("get user after stale upsert")
+            .expect("user exists after stale upsert");
+        assert_eq!(user.username.as_deref(), Some("alice"));
+        assert_eq!(user.nickname.as_deref(), Some("Alice"));
+        assert_eq!(user.alias.as_deref(), Some("A"));
+        assert_eq!(user.version, 1000);
 
         store
             .upsert_friend(
@@ -4233,6 +4443,7 @@ mod tests {
                     tags: Some("work".to_string()),
                     is_pinned: true,
                     created_at: 1000,
+                    version: 1001,
                     updated_at: 1001,
                 },
             )
@@ -4241,6 +4452,27 @@ mod tests {
         assert_eq!(friends.len(), 1);
         assert_eq!(friends[0].user_id, 20001);
         assert!(friends[0].is_pinned);
+        assert_eq!(friends[0].version, 1001);
+        store
+            .upsert_friend(
+                uid,
+                &crate::UpsertFriendInput {
+                    user_id: 20001,
+                    tags: Some("stale".to_string()),
+                    is_pinned: false,
+                    created_at: 999,
+                    version: 1000,
+                    updated_at: 1000,
+                },
+            )
+            .expect("upsert stale friend");
+        let friends = store
+            .list_friends(uid, 20, 0)
+            .expect("list friends after stale upsert");
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].tags.as_deref(), Some("work"));
+        assert!(friends[0].is_pinned);
+        assert_eq!(friends[0].version, 1001);
         store.delete_friend(uid, 20001).expect("delete friend");
         let friends = store
             .list_friends(uid, 20, 0)
@@ -4279,6 +4511,7 @@ mod tests {
                     owner_id: Some(20001),
                     is_dismissed: false,
                     created_at: 1000,
+                    version: 1002,
                     updated_at: 1002,
                 },
             )
@@ -4288,6 +4521,30 @@ mod tests {
             .expect("get group")
             .expect("group exists");
         assert_eq!(group.name.as_deref(), Some("group-a"));
+        assert_eq!(group.version, 1002);
+        store
+            .upsert_group(
+                uid,
+                &crate::UpsertGroupInput {
+                    group_id: 30001,
+                    name: Some("stale-group".to_string()),
+                    avatar: "avatar://stale-group".to_string(),
+                    owner_id: Some(99999),
+                    is_dismissed: true,
+                    created_at: 999,
+                    version: 1001,
+                    updated_at: 1001,
+                },
+            )
+            .expect("upsert stale group");
+        let group = store
+            .get_group_by_id(uid, 30001)
+            .expect("get group after stale upsert")
+            .expect("group exists after stale upsert");
+        assert_eq!(group.name.as_deref(), Some("group-a"));
+        assert_eq!(group.owner_id, Some(20001));
+        assert!(!group.is_dismissed);
+        assert_eq!(group.version, 1002);
 
         store
             .upsert_group_member(
@@ -4300,6 +4557,7 @@ mod tests {
                     alias: Some("owner".to_string()),
                     is_muted: false,
                     joined_at: 1003,
+                    version: 1004,
                     updated_at: 1004,
                 },
             )
@@ -4309,6 +4567,32 @@ mod tests {
             .expect("list group members");
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].user_id, 20001);
+        assert_eq!(members[0].version, 1004);
+        store
+            .upsert_group_member(
+                uid,
+                &crate::UpsertGroupMemberInput {
+                    group_id: 30001,
+                    user_id: 20001,
+                    role: 2,
+                    status: 9,
+                    alias: Some("stale".to_string()),
+                    is_muted: true,
+                    joined_at: 1002,
+                    version: 1003,
+                    updated_at: 1003,
+                },
+            )
+            .expect("upsert stale group member");
+        let members = store
+            .list_group_members(uid, 30001, 20, 0)
+            .expect("list group members after stale upsert");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].role, 0);
+        assert_eq!(members[0].status, 0);
+        assert_eq!(members[0].alias.as_deref(), Some("owner"));
+        assert!(!members[0].is_muted);
+        assert_eq!(members[0].version, 1004);
         store
             .delete_group_member(uid, 30001, 20001)
             .expect("delete group member");
