@@ -3394,10 +3394,24 @@ impl State {
                     // Unread is kept as a local projection from message timeline + read cursor
                     // once the channel already exists locally. Server channel sync only provides
                     // the cold-start baseline for channels not yet materialized on device.
-                    let unread_count = Self::resolve_channel_unread_count(
+                    let materialized_unread = if existing.is_some() {
+                        self.storage
+                            .count_materialized_unread(channel_id, channel_type)
+                            .await
+                            .ok()
+                    } else {
+                        None
+                    };
+                    let unread_count = match (
                         existing.as_ref().map(|c| c.unread_count),
                         channel_sync.unread_count,
-                    );
+                        materialized_unread,
+                    ) {
+                        (Some(_existing_unread), Some(0), Some(0)) => 0,
+                        (existing_unread, synced_unread, _) => {
+                            Self::resolve_channel_unread_count(existing_unread, synced_unread)
+                        }
+                    };
                     let top = channel_sync
                         .top
                         .unwrap_or_else(|| existing.as_ref().map(|c| c.top).unwrap_or(0));
@@ -5220,7 +5234,50 @@ impl State {
                 break;
             }
         }
+        self.reconcile_channel_unread_after_difference(channel_id, channel_type)
+            .await?;
         Ok(total_applied)
+    }
+
+    async fn reconcile_channel_unread_after_difference(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<()> {
+        let Some(channel) = self.storage.get_channel_by_id(channel_id).await? else {
+            return Ok(());
+        };
+        let Some(extra) = self.storage.get_channel_extra(channel_id, channel_type).await? else {
+            return Ok(());
+        };
+        let max_pts = self.storage.max_message_pts(channel_id, channel_type).await?;
+        if max_pts == 0 || extra.keep_pts < max_pts {
+            return Ok(());
+        }
+        let exact_unread = self
+            .storage
+            .count_materialized_unread(channel_id, channel_type)
+            .await?;
+        if channel.unread_count == exact_unread {
+            return Ok(());
+        }
+        self.storage
+            .upsert_channel(UpsertChannelInput {
+                channel_id: channel.channel_id,
+                channel_type: channel.channel_type,
+                channel_name: channel.channel_name,
+                channel_remark: channel.channel_remark,
+                avatar: channel.avatar,
+                unread_count: exact_unread,
+                top: channel.top,
+                mute: channel.mute,
+                last_msg_timestamp: channel.last_msg_timestamp,
+                last_local_message_id: channel.last_local_message_id,
+                last_msg_content: channel.last_msg_content,
+                version: channel.version,
+            })
+            .await?;
+        Ok(())
     }
 
     async fn run_resume_sync(&mut self) -> Result<()> {
@@ -11655,6 +11712,142 @@ mod tests {
         assert_eq!(final_channel.top, 1);
         assert_eq!(final_channel.mute, 1);
         assert_eq!(final_channel.version, 61);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_sync_zero_unread_heals_stale_local_unread_when_materialized_projection_is_zero() {
+        let (mut state, dir) = new_seeded_state("channel-zero-unread-heal").await;
+
+        let baseline = SyncEntityItem {
+            entity_id: "96011".to_string(),
+            version: 60,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": 96011,
+                "channel_type": 1,
+                "channel_name": "alice",
+                "unread_count": 1,
+                "top": 0,
+                "mute": 0
+            })),
+        };
+        state
+            .apply_sync_entities("channel", None, &[baseline], false)
+            .await
+            .expect("apply baseline channel");
+
+        state
+            .storage
+            .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                server_message_id: 896011,
+                local_message_id: 0,
+                channel_id: 96011,
+                channel_type: 1,
+                timestamp: 1_710_500_000_010,
+                from_uid: 20001,
+                message_type: 1,
+                content: "{\"content\":\"peer\"}".to_string(),
+                status: 2,
+                pts: 10,
+                setting: 0,
+                order_seq: 10,
+                searchable_word: "peer".to_string(),
+                extra: "{}".to_string(),
+            })
+            .await
+            .expect("seed peer message");
+        state
+            .storage
+            .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                server_message_id: 896012,
+                local_message_id: 0,
+                channel_id: 96011,
+                channel_type: 1,
+                timestamp: 1_710_500_000_020,
+                from_uid: 10001,
+                message_type: 1,
+                content: "{\"content\":\"self\"}".to_string(),
+                status: 2,
+                pts: 20,
+                setting: 0,
+                order_seq: 20,
+                searchable_word: "self".to_string(),
+                extra: "{}".to_string(),
+            })
+            .await
+            .expect("seed self message");
+        state
+            .apply_sync_entities(
+                "channel_read_cursor",
+                None,
+                &[SyncEntityItem {
+                    entity_id: "96011:10001".to_string(),
+                    version: 61,
+                    deleted: false,
+                    payload: Some(serde_json::json!({
+                        "channel_id": 96011,
+                        "channel_type": 1,
+                        "reader_id": 10001,
+                        "last_read_pts": 20
+                    })),
+                }],
+                false,
+            )
+            .await
+            .expect("apply read cursor");
+
+        state
+            .storage
+            .upsert_channel(UpsertChannelInput {
+                channel_id: 96011,
+                channel_type: 1,
+                channel_name: "alice".to_string(),
+                channel_remark: String::new(),
+                avatar: String::new(),
+                unread_count: 1,
+                top: 0,
+                mute: 0,
+                last_msg_timestamp: 1_710_500_000_020,
+                last_local_message_id: 0,
+                last_msg_content: "{\"content\":\"self\"}".to_string(),
+                version: 61,
+            })
+            .await
+            .expect("reinject stale local unread");
+
+        state
+            .apply_sync_entities(
+                "channel",
+                None,
+                &[SyncEntityItem {
+                    entity_id: "96011".to_string(),
+                    version: 62,
+                    deleted: false,
+                    payload: Some(serde_json::json!({
+                        "channel_id": 96011,
+                        "channel_type": 1,
+                        "channel_name": "alice",
+                        "unread_count": 0,
+                        "top": 0,
+                        "mute": 0
+                    })),
+                }],
+                false,
+            )
+            .await
+            .expect("apply zero unread channel sync");
+
+        let channel = state
+            .storage
+            .get_channel_by_id(96011)
+            .await
+            .expect("read healed channel")
+            .expect("channel exists");
+        assert_eq!(channel.unread_count, 0);
+        assert_eq!(channel.version, 62);
 
         state.storage.shutdown();
         let _ = std::fs::remove_dir_all(dir);

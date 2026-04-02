@@ -3131,6 +3131,41 @@ impl LocalStore {
         Ok(from_extra as i32)
     }
 
+    pub fn count_materialized_unread(
+        &self,
+        uid: &str,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<i32> {
+        let conn = self.conn_for_user(uid)?;
+        let uid_num = uid.parse::<u64>().unwrap_or(0);
+        let keep_pts: i64 = conn
+            .query_row(
+                "SELECT keep_pts
+                 FROM channel_extra
+                 WHERE channel_id = ?1 AND channel_type = ?2
+                 LIMIT 1",
+                params![channel_id as i64, channel_type],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("query channel keep_pts: {e}")))?
+            .unwrap_or(0);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM message m
+                 WHERE m.channel_id = ?1
+                   AND m.channel_type = ?2
+                   AND m.from_uid != ?3
+                   AND COALESCE(m.pts, 0) > ?4",
+                params![channel_id as i64, channel_type, uid_num as i64, keep_pts],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("count materialized unread: {e}")))?;
+        Ok(count as i32)
+    }
+
     pub fn get_total_unread_count(&self, uid: &str, exclude_muted: bool) -> Result<i32> {
         let conn = self.conn_for_user(uid)?;
         let sql = if exclude_muted {

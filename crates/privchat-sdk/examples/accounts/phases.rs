@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use privchat_protocol::rpc::routes::sync;
 use privchat_protocol::rpc::{AccountSearchResponse, ClientSubmitResponse};
 use serde::Deserialize;
 
@@ -3134,6 +3135,264 @@ impl TestPhases {
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
             details: "alice pin/mute survives reconnect and local refresh".to_string(),
+            metrics,
+        })
+    }
+
+    pub async fn phase33_unread_resume_strict(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let channel_id = manager
+            .cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("missing alice-bob direct channel for unread resume"))?;
+
+        let probe = format!("phase33 unread probe {}", now_millis());
+        let submit = manager
+            .send_text("bob", channel_id, DIRECT_SYNC_CHANNEL_TYPE, &probe)
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.messages_sent += 1;
+        if submit_ok(&submit) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("phase33 bob->alice submit rejected".to_string());
+        }
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        manager.refresh_local_views("alice").await?;
+        metrics.rpc_calls += 1;
+
+        let unread_before_mark = manager
+            .list_local_channels("alice")
+            .await?
+            .into_iter()
+            .find(|c| c.channel_id == channel_id)
+            .ok_or_else(|| boxed_err("alice local direct channel missing before mark_read"))?
+            .unread_count;
+        metrics.rpc_calls += 1;
+        if unread_before_mark >= 1 {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "expected unread before mark_read >= 1, actual={unread_before_mark}"
+            ));
+        }
+
+        let pts_before_read: privchat_protocol::rpc::GetChannelPtsResponse = manager
+            .rpc_typed(
+                "alice",
+                sync::GET_CHANNEL_PTS,
+                &privchat_protocol::rpc::GetChannelPtsRequest {
+                    channel_id,
+                    channel_type: DIRECT_SYNC_CHANNEL_TYPE,
+                },
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        let read = manager
+            .mark_read("alice", channel_id, pts_before_read.current_pts)
+            .await?;
+        metrics.rpc_calls += 1;
+        if read.last_read_pts >= pts_before_read.current_pts {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "mark_read did not advance to current pts: read={} current={}",
+                read.last_read_pts, pts_before_read.current_pts
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        manager.refresh_local_views("alice").await?;
+        metrics.rpc_calls += 1;
+
+        let unread_after_mark = manager
+            .list_local_channels("alice")
+            .await?
+            .into_iter()
+            .find(|c| c.channel_id == channel_id)
+            .ok_or_else(|| boxed_err("alice local direct channel missing after mark_read"))?
+            .unread_count;
+        metrics.rpc_calls += 1;
+        if unread_after_mark == 0 {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "expected unread after mark_read == 0, actual={unread_after_mark}"
+            ));
+        }
+
+        let self_text = format!("phase33 self send {}", now_millis());
+        let self_submit = manager
+            .send_text("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE, &self_text)
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.messages_sent += 1;
+        if submit_ok(&self_submit) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("phase33 alice self-send rejected".to_string());
+        }
+
+        let read_target_pts = self_submit
+            .pts
+            .or(self_submit.server_msg_id.map(|_| self_submit.current_pts))
+            .filter(|pts| *pts > 0)
+            .ok_or_else(|| boxed_err("phase33 self-send missing accepted pts"))?;
+
+        let read_after_self_send = manager
+            .mark_read("alice", channel_id, read_target_pts)
+            .await?;
+        metrics.rpc_calls += 1;
+        if read_after_self_send.last_read_pts >= read_target_pts {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "mark_read after self-send did not advance to current pts: read={} current={}",
+                read_after_self_send.last_read_pts, read_target_pts
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        manager.refresh_local_views("alice").await?;
+        metrics.rpc_calls += 1;
+
+        let before_reconnect = manager
+            .list_local_channels("alice")
+            .await?
+            .into_iter()
+            .find(|c| c.channel_id == channel_id)
+            .ok_or_else(|| boxed_err("alice local direct channel missing before reconnect"))?;
+        metrics.rpc_calls += 1;
+        let before_extra = manager
+            .get_local_channel_extra("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE as i32)
+            .await?;
+        metrics.rpc_calls += 1;
+        let before_sdk_unread = manager
+            .get_local_channel_unread("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE as i32)
+            .await?;
+        metrics.rpc_calls += 1;
+        if before_reconnect.unread_count == 0 {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "expected unread before reconnect == 0, actual={} sdk_unread={} keep_pts={}",
+                before_reconnect.unread_count,
+                before_sdk_unread,
+                before_extra.as_ref().map(|v| v.keep_pts).unwrap_or(0)
+            ));
+        }
+
+        let pts_before_reconnect: privchat_protocol::rpc::GetChannelPtsResponse = manager
+            .rpc_typed(
+                "alice",
+                sync::GET_CHANNEL_PTS,
+                &privchat_protocol::rpc::GetChannelPtsRequest {
+                    channel_id,
+                    channel_type: DIRECT_SYNC_CHANNEL_TYPE,
+                },
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        reconnect_account(manager, "alice").await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        let after_reconnect = manager
+            .list_local_channels("alice")
+            .await?
+            .into_iter()
+            .find(|c| c.channel_id == channel_id)
+            .ok_or_else(|| boxed_err("alice local direct channel missing after reconnect"))?;
+        metrics.rpc_calls += 1;
+        let after_messages = manager
+            .list_local_messages(
+                "alice",
+                channel_id,
+                DIRECT_SYNC_CHANNEL_TYPE as i32,
+                6,
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        let after_extra = manager
+            .get_local_channel_extra("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE as i32)
+            .await?;
+        metrics.rpc_calls += 1;
+        let after_sdk_unread = manager
+            .get_local_channel_unread("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE as i32)
+            .await?;
+        metrics.rpc_calls += 1;
+        if after_reconnect.unread_count == 0 {
+            metrics.rpc_successes += 1;
+        } else {
+            let after_message_brief = after_messages
+                .iter()
+                .take(4)
+                .map(|m| {
+                    format!(
+                        "id={} sid={:?} lid={:?} from={} status={}",
+                        m.message_id, m.server_message_id, m.local_message_id, m.from_uid, m.status
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            metrics.errors.push(format!(
+                "expected unread after reconnect == 0, actual={} sdk_unread={} keep_pts={} version={} msgs=[{}]",
+                after_reconnect.unread_count,
+                after_sdk_unread,
+                after_extra.as_ref().map(|v| v.keep_pts).unwrap_or(0),
+                after_reconnect.version,
+                after_message_brief
+            ));
+        }
+
+        let pts_after_reconnect: privchat_protocol::rpc::GetChannelPtsResponse = manager
+            .rpc_typed(
+                "alice",
+                sync::GET_CHANNEL_PTS,
+                &privchat_protocol::rpc::GetChannelPtsRequest {
+                    channel_id,
+                    channel_type: DIRECT_SYNC_CHANNEL_TYPE,
+                },
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        if pts_after_reconnect.current_pts >= pts_before_reconnect.current_pts {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "pts regressed across reconnect: before={} after={}",
+                pts_before_reconnect.current_pts, pts_after_reconnect.current_pts
+            ));
+        }
+
+        let server_unread_after = manager.message_status_count("alice", Some(channel_id)).await?;
+        metrics.rpc_calls += 1;
+        if server_unread_after.unread_count == 0 {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "server unread after reconnect expected 0 actual={}",
+                server_unread_after.unread_count
+            ));
+        }
+
+        Ok(PhaseResult {
+            phase_name: "unread-resume-strict".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: "alice read-acks bob message, self-sends, reconnects, unread stays zero and pts does not regress".to_string(),
             metrics,
         })
     }

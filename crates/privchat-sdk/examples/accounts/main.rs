@@ -30,7 +30,7 @@ type BoxResult<T> = Result<T, BoxError>;
 async fn main() -> BoxResult<()> {
     println!("\nPrivChat SDK Multi-Account Example (accounts)");
     println!("================================================");
-    println!("Phases: full 32-phase business interoperability + local-first naming/cache rules + room + channel-state-resume smoke\n");
+    println!("Phases: full 33-phase business interoperability + local-first naming/cache rules + room + channel-state-resume smoke + unread-resume strict\n");
 
     let started = std::time::Instant::now();
     let mut manager = MultiAccountManager::new().await?;

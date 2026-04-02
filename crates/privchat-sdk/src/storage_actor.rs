@@ -217,6 +217,11 @@ enum StorageCmd {
         channel_type: i32,
         resp: oneshot::Sender<Result<i32>>,
     },
+    CountMaterializedUnread {
+        channel_id: u64,
+        channel_type: i32,
+        resp: oneshot::Sender<Result<i32>>,
+    },
     GetTotalUnreadCount {
         exclude_muted: bool,
         resp: oneshot::Sender<Result<i32>>,
@@ -893,6 +898,22 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::GetChannelUnreadCount {
+                channel_id,
+                channel_type,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn count_materialized_unread(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<i32> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::CountMaterializedUnread {
                 channel_id,
                 channel_type,
                 resp: resp_tx,
@@ -1678,6 +1699,17 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             resp,
         } => {
             with_uid!(resp, |uid| store.get_channel_unread_count(
+                &uid,
+                channel_id,
+                channel_type
+            ));
+        }
+        StorageCmd::CountMaterializedUnread {
+            channel_id,
+            channel_type,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.count_materialized_unread(
                 &uid,
                 channel_id,
                 channel_type

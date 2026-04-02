@@ -367,6 +367,7 @@ impl MultiAccountManager {
         let _ = sdk.sync_entities("friend".to_string(), None).await?;
         let _ = sdk.sync_entities("group".to_string(), None).await?;
         let _ = sdk.sync_entities("channel".to_string(), None).await?;
+        let _ = sdk.sync_entities("channel_read_cursor".to_string(), None).await?;
         Ok(())
     }
 
@@ -382,6 +383,32 @@ impl MultiAccountManager {
         key: &str,
     ) -> BoxResult<Vec<privchat_sdk::StoredChannel>> {
         Ok(self.account(key)?.sdk.list_channels(500, 0).await?)
+    }
+
+    pub async fn get_local_channel_extra(
+        &self,
+        key: &str,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> BoxResult<Option<privchat_sdk::StoredChannelExtra>> {
+        Ok(self
+            .account(key)?
+            .sdk
+            .get_channel_extra(channel_id, channel_type)
+            .await?)
+    }
+
+    pub async fn get_local_channel_unread(
+        &self,
+        key: &str,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> BoxResult<i32> {
+        Ok(self
+            .account(key)?
+            .sdk
+            .get_channel_unread_count(channel_id, channel_type)
+            .await?)
     }
 
     pub async fn list_local_messages(
