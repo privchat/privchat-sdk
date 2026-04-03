@@ -1479,7 +1479,7 @@ impl LocalStore {
     pub fn get_channel_by_id(&self, uid: &str, channel_id: u64) -> Result<Option<StoredChannel>> {
         let conn = self.conn_for_user(uid)?;
         let uid_i64 = uid.parse::<i64>().unwrap_or_default();
-        conn.query_row(
+        let mut channel = conn.query_row(
             "SELECT
                 c.channel_id,
                 c.channel_type,
@@ -1617,7 +1617,12 @@ impl LocalStore {
             },
         )
         .optional()
-        .map_err(|e| Error::Storage(format!("get channel by id: {e}")))
+        .map_err(|e| Error::Storage(format!("get channel by id: {e}")))?;
+        if let Some(existing) = channel.as_mut() {
+            existing.unread_count =
+                self.resolve_channel_unread_on_read(&conn, uid_i64, existing)?;
+        }
+        Ok(channel)
     }
 
     pub fn list_channels(
@@ -1771,9 +1776,83 @@ impl LocalStore {
 
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| Error::Storage(format!("decode list channels row: {e}")))?);
+            let mut channel =
+                row.map_err(|e| Error::Storage(format!("decode list channels row: {e}")))?;
+            channel.unread_count =
+                self.resolve_channel_unread_on_read(&conn, uid_i64, &channel)?;
+            out.push(channel);
         }
         Ok(out)
+    }
+
+    fn resolve_channel_unread_on_read(
+        &self,
+        conn: &Connection,
+        uid_i64: i64,
+        channel: &StoredChannel,
+    ) -> Result<i32> {
+        let keep_pts: Option<i64> = conn
+            .query_row(
+                "SELECT keep_pts
+                 FROM channel_extra
+                 WHERE channel_id = ?1 AND channel_type = ?2
+                 LIMIT 1",
+                params![channel.channel_id as i64, channel.channel_type],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("resolve channel unread query keep_pts: {e}")))?;
+        let Some(keep_pts) = keep_pts else {
+            return Ok(channel.unread_count.max(0));
+        };
+
+        let max_pts: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(pts), 0)
+                 FROM message
+                 WHERE channel_id = ?1 AND channel_type = ?2",
+                params![channel.channel_id as i64, channel.channel_type],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("resolve channel unread query max_pts: {e}")))?;
+        if max_pts == 0 || keep_pts < max_pts {
+            return Ok(channel.unread_count.max(0));
+        }
+
+        let exact_unread: i32 = conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM message
+                 WHERE channel_id = ?1
+                   AND channel_type = ?2
+                   AND from_uid != ?3
+                   AND COALESCE(pts, 0) > ?4",
+                params![
+                    channel.channel_id as i64,
+                    channel.channel_type,
+                    uid_i64,
+                    keep_pts
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("resolve channel unread exact count: {e}")))?;
+        let exact_unread = exact_unread.max(0);
+
+        if exact_unread != channel.unread_count.max(0) {
+            conn.execute(
+                "UPDATE channel
+                 SET unread_count = ?2, updated_at = ?3
+                 WHERE channel_id = ?1",
+                params![
+                    channel.channel_id as i64,
+                    exact_unread,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )
+            .map_err(|e| Error::Storage(format!("resolve channel unread persist self-heal: {e}")))?;
+        }
+
+        Ok(exact_unread)
     }
 
     pub fn upsert_channel_extra(&self, uid: &str, input: &UpsertChannelExtraInput) -> Result<()> {
@@ -4279,6 +4358,86 @@ mod tests {
         let page = store.list_channels(uid, 20, 0).expect("list channels");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].channel_id, 9001);
+    }
+
+    #[test]
+    fn channel_reads_self_heal_stale_unread_when_materialized_projection_is_zero() {
+        let store = test_store();
+        let uid = "10011";
+        let uid_num = uid.parse::<u64>().expect("uid parse");
+        let channel_id = 9301;
+        let channel_type = 1;
+
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id,
+                    channel_type,
+                    channel_name: "dm-9301".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 1,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1_700_000_000_020,
+                    last_local_message_id: 0,
+                    last_msg_content: "self-message".to_string(),
+                    version: 3001,
+                },
+            )
+            .expect("upsert stale unread channel");
+        store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 89301,
+                    local_message_id: 0,
+                    channel_id,
+                    channel_type,
+                    timestamp: 1_700_000_000_020,
+                    from_uid: uid_num,
+                    message_type: 1,
+                    content: "{\"content\":\"self-message\"}".to_string(),
+                    status: 2,
+                    pts: 20,
+                    order_seq: 20,
+                    searchable_word: "self-message".to_string(),
+                    setting: 0,
+                    extra: "{}".to_string(),
+                },
+            )
+            .expect("insert self message");
+        store
+            .upsert_channel_extra(
+                uid,
+                &UpsertChannelExtraInput {
+                    channel_id,
+                    channel_type,
+                    browse_to: 20,
+                    keep_pts: 20,
+                    keep_offset_y: 0,
+                    draft: String::new(),
+                    draft_updated_at: 0,
+                },
+            )
+            .expect("seed keep pts");
+
+        let row = store
+            .get_channel_by_id(uid, channel_id)
+            .expect("get channel after self-heal")
+            .expect("channel exists");
+        assert_eq!(row.unread_count, 0);
+
+        let page = store.list_channels(uid, 20, 0).expect("list channels");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].unread_count, 0);
+
+        let persisted = store
+            .get_channel_by_id(uid, channel_id)
+            .expect("get persisted channel")
+            .expect("channel exists");
+        assert_eq!(persisted.unread_count, 0);
     }
 
     #[test]

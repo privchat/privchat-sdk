@@ -51,6 +51,7 @@ use privchat_protocol::{
     PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse, RpcRequest,
     RpcResponse, SendMessageRequest, SendMessageResponse, SubscribeRequest, SubscribeResponse,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -5855,13 +5856,9 @@ impl State {
                 before_server_message_id: None,
                 limit: Some(20),
             };
-            let body = serde_json::to_value(req)
-                .map_err(|e| Error::Serialization(format!("encode history req: {e}")))?;
-            let raw = self
-                .rpc_call_json(routes::message_history::GET.to_string(), body)
+            let resp: MessageHistoryResponse = self
+                .rpc_call_typed(routes::message_history::GET, &req)
                 .await?;
-            let resp: MessageHistoryResponse = serde_json::from_value(raw)
-                .map_err(|e| Error::Serialization(format!("decode history resp: {e}")))?;
             eprintln!(
                 "[SDK.actor] bootstrap hydrate history channel={} messages={}",
                 channel.channel_id,
@@ -6458,15 +6455,8 @@ impl State {
             file_type,
             business_type: "message".to_string(),
         };
-        let value = self
-            .rpc_call_json(
-                routes::file::REQUEST_UPLOAD_TOKEN.to_string(),
-                serde_json::to_value(payload)
-                    .map_err(|e| Error::Serialization(format!("encode upload token body: {e}")))?,
-            )
-            .await?;
-        serde_json::from_value::<FileRequestUploadTokenResponse>(value)
-            .map_err(|e| Error::Serialization(format!("decode upload token response: {e}")))
+        self.rpc_call_typed(routes::file::REQUEST_UPLOAD_TOKEN, &payload)
+            .await
     }
 
     async fn upload_file_bytes(
@@ -6526,13 +6516,8 @@ impl State {
             user_id,
             status: "uploaded".to_string(),
         };
-        let value = self
-            .rpc_call_json(
-                routes::file::UPLOAD_CALLBACK.to_string(),
-                serde_json::to_value(payload).map_err(|e| {
-                    Error::Serialization(format!("encode upload callback body: {e}"))
-                })?,
-            )
+        let value: serde_json::Value = self
+            .rpc_call_typed(routes::file::UPLOAD_CALLBACK, &payload)
             .await?;
         if let Some(ok) = value.as_bool() {
             if ok {
@@ -6841,6 +6826,22 @@ impl State {
             return Err(Error::Auth(rpc_resp.message));
         }
         Ok(rpc_resp.data.unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn rpc_call_typed<Req, Resp>(&mut self, route: &str, body: &Req) -> Result<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let value = self
+            .rpc_call_json(
+                route.to_string(),
+                serde_json::to_value(body)
+                    .map_err(|e| Error::Serialization(format!("encode {route} body: {e}")))?,
+            )
+            .await?;
+        serde_json::from_value::<Resp>(value)
+            .map_err(|e| Error::Serialization(format!("decode {route} response: {e}")))
     }
 
     async fn update_channel_last_message(
@@ -9366,6 +9367,18 @@ impl PrivchatSdk {
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn rpc_call_typed<Req, Resp>(&self, route: &str, req: &Req) -> Result<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let body_json = serde_json::to_string(req)
+            .map_err(|e| Error::Serialization(format!("encode {route} body: {e}")))?;
+        let raw = self.rpc_call(route.to_string(), body_json).await?;
+        serde_json::from_str(&raw)
+            .map_err(|e| Error::Serialization(format!("decode {route} response: {e}; raw={raw}")))
     }
 
     pub async fn is_bootstrap_completed(&self) -> Result<bool> {

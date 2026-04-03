@@ -241,11 +241,7 @@ impl MultiAccountManager {
         Resp: DeserializeOwned,
     {
         let sdk = &self.account(key)?.sdk;
-        let body = serde_json::to_string(req)?;
-        let raw = sdk.rpc_call(route.to_string(), body).await?;
-        let resp: Resp = serde_json::from_str(&raw)
-            .map_err(|e| boxed_err(format!("decode {route} failed: {e}; raw={raw}")))?;
-        Ok(resp)
+        Ok(sdk.rpc_call_typed(route, req).await?)
     }
 
     pub async fn search_users(&self, from: &str, query: &str) -> BoxResult<AccountSearchResponse> {
@@ -267,23 +263,19 @@ impl MultiAccountManager {
         from: &str,
         to_user_id: u64,
     ) -> BoxResult<FriendApplyResponse> {
-        let sdk = &self.account(from)?.sdk;
-        let body = serde_json::to_string(&FriendApplyRequest {
-            target_user_id: to_user_id,
-            message: Some("hello from accounts example".to_string()),
-            source: Some("friend".to_string()),
-            source_id: Some(to_user_id.to_string()),
-            from_user_id: 0,
-        })?;
-        let raw = sdk
-            .rpc_call(routes::friend::APPLY.to_string(), body)
+        let resp: FriendApplyCompat = self
+            .rpc_typed(
+                from,
+                routes::friend::APPLY,
+                &FriendApplyRequest {
+                    target_user_id: to_user_id,
+                    message: Some("hello from accounts example".to_string()),
+                    source: Some("friend".to_string()),
+                    source_id: Some(to_user_id.to_string()),
+                    from_user_id: 0,
+                },
+            )
             .await?;
-        let resp: FriendApplyCompat = serde_json::from_str(&raw).map_err(|e| {
-            boxed_err(format!(
-                "decode {} failed: {e}; raw={raw}",
-                routes::friend::APPLY
-            ))
-        })?;
         Ok(FriendApplyResponse {
             user_id: resp.user_id,
             username: resp.username,
@@ -650,37 +642,25 @@ impl MultiAccountManager {
         key: &str,
         target_user_id: u64,
     ) -> BoxResult<BlacklistCheckResponse> {
-        let sdk = &self.account(key)?.sdk;
-        let body = serde_json::to_string(&BlacklistCheckRequest {
-            user_id: 0,
-            target_user_id,
-        })?;
-        let raw = sdk
-            .rpc_call(routes::blacklist::CHECK.to_string(), body)
+        let resp: BlacklistCheckCompat = self
+            .rpc_typed(
+                key,
+                routes::blacklist::CHECK,
+                &BlacklistCheckRequest {
+                    user_id: 0,
+                    target_user_id,
+                },
+            )
             .await?;
-        let resp: BlacklistCheckCompat = serde_json::from_str(&raw).map_err(|e| {
-            boxed_err(format!(
-                "decode {} failed: {e}; raw={raw}",
-                routes::blacklist::CHECK
-            ))
-        })?;
         Ok(BlacklistCheckResponse {
             is_blocked: resp.is_blocked,
         })
     }
 
     pub async fn blacklist_list_user_ids(&self, key: &str) -> BoxResult<Vec<u64>> {
-        let sdk = &self.account(key)?.sdk;
-        let body = serde_json::to_string(&BlacklistListRequest { user_id: 0 })?;
-        let raw = sdk
-            .rpc_call(routes::blacklist::LIST.to_string(), body)
+        let resp: BlacklistListCompat = self
+            .rpc_typed(key, routes::blacklist::LIST, &BlacklistListRequest { user_id: 0 })
             .await?;
-        let resp: BlacklistListCompat = serde_json::from_str(&raw).map_err(|e| {
-            boxed_err(format!(
-                "decode {} failed: {e}; raw={raw}",
-                routes::blacklist::LIST
-            ))
-        })?;
         Ok(resp
             .users
             .into_iter()
@@ -758,28 +738,26 @@ impl MultiAccountManager {
     }
 
     pub async fn group_info(&self, key: &str, group_id: u64) -> BoxResult<GroupInfoResponse> {
-        let sdk = &self.account(key)?.sdk;
-        let body = serde_json::to_string(&GroupInfoRequest {
-            group_id,
-            user_id: 0,
-        })?;
-        let raw = sdk.rpc_call(routes::group::INFO.to_string(), body).await?;
-        if let Ok(resp) = serde_json::from_str::<GroupInfoResponse>(&raw) {
+        let raw: serde_json::Value = self
+            .rpc_typed(
+                key,
+                routes::group::INFO,
+                &GroupInfoRequest {
+                    group_id,
+                    user_id: 0,
+                },
+            )
+            .await?;
+        if let Ok(resp) = serde_json::from_value::<GroupInfoResponse>(raw.clone()) {
             return Ok(resp);
         }
-        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            boxed_err(format!(
-                "decode {} failed: {e}; raw={raw}",
-                routes::group::INFO
-            ))
-        })?;
-        let wrapped = value
+        let wrapped = raw
             .get("group_info")
             .cloned()
-            .ok_or_else(|| boxed_err(format!("decode {} missing group_info; raw={raw}", routes::group::INFO)))?;
+            .ok_or_else(|| boxed_err(format!("decode {} missing group_info", routes::group::INFO)))?;
         serde_json::from_value(wrapped).map_err(|e| {
             boxed_err(format!(
-                "decode {} wrapped group_info failed: {e}; raw={raw}",
+                "decode {} wrapped group_info failed: {e}",
                 routes::group::INFO
             ))
         })
@@ -1063,24 +1041,20 @@ impl MultiAccountManager {
         mime: &str,
         file_type: &str,
     ) -> BoxResult<FileRequestUploadTokenResponse> {
-        let sdk = &self.account(key)?.sdk;
-        let body = serde_json::to_string(&FileRequestUploadTokenRequest {
-            user_id: self.user_id(key)?,
-            filename: Some(filename.to_string()),
-            file_size: size,
-            mime_type: mime.to_string(),
-            file_type: file_type.to_string(),
-            business_type: "message".to_string(),
-        })?;
-        let raw = sdk
-            .rpc_call(routes::file::REQUEST_UPLOAD_TOKEN.to_string(), body)
+        let resp: FileRequestUploadTokenCompat = self
+            .rpc_typed(
+                key,
+                routes::file::REQUEST_UPLOAD_TOKEN,
+                &FileRequestUploadTokenRequest {
+                    user_id: self.user_id(key)?,
+                    filename: Some(filename.to_string()),
+                    file_size: size,
+                    mime_type: mime.to_string(),
+                    file_type: file_type.to_string(),
+                    business_type: "message".to_string(),
+                },
+            )
             .await?;
-        let resp: FileRequestUploadTokenCompat = serde_json::from_str(&raw).map_err(|e| {
-            boxed_err(format!(
-                "decode {} failed: {e}; raw={raw}",
-                routes::file::REQUEST_UPLOAD_TOKEN
-            ))
-        })?;
         Ok(FileRequestUploadTokenResponse {
             token: resp.token,
             upload_url: resp.upload_url,
