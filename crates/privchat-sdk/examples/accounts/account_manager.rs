@@ -30,18 +30,17 @@ use privchat_protocol::rpc::{
     BlacklistCheckResponse, BlacklistListRequest, BlacklistRemoveRequest, BlacklistRemoveResponse,
     ChannelHideRequest, ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse,
     ChannelPinRequest, ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse,
-    GetChannelPtsRequest, GetChannelPtsResponse, FileRequestUploadTokenRequest,
-    FileRequestUploadTokenResponse, FileUploadCallbackRequest, FileUploadCallbackResponse,
-    FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse,
-    FriendCheckRequest, FriendCheckResponse, FriendPendingRequest, FriendPendingResponse,
-    FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest, FriendRemoveResponse,
-    GetDifferenceRequest, GetDifferenceResponse, GetOrCreateDirectChannelRequest,
-    GetOrCreateDirectChannelResponse, GroupApprovalListRequest, GroupApprovalListResponse,
-    GroupCreateRequest, GroupCreateResponse, GroupInfoRequest, GroupInfoResponse,
-    GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberLeaveRequest,
-    GroupMemberLeaveResponse, GroupMemberListRequest, GroupMemberListResponse,
-    GroupMemberMuteRequest, GroupMemberRemoveRequest, GroupMemberRemoveResponse,
-    GroupMemberUnmuteRequest, GroupMuteAllRequest, GroupMuteAllResponse,
+    FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
+    FileUploadCallbackResponse, FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest,
+    FriendApplyResponse, FriendCheckRequest, FriendCheckResponse, FriendPendingRequest,
+    FriendPendingResponse, FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest,
+    FriendRemoveResponse, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
+    GetDifferenceResponse, GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
+    GroupApprovalListRequest, GroupApprovalListResponse, GroupCreateRequest, GroupCreateResponse,
+    GroupInfoRequest, GroupInfoResponse, GroupMemberAddRequest, GroupMemberAddResponse,
+    GroupMemberLeaveRequest, GroupMemberLeaveResponse, GroupMemberListRequest,
+    GroupMemberListResponse, GroupMemberMuteRequest, GroupMemberRemoveRequest,
+    GroupMemberRemoveResponse, GroupMemberUnmuteRequest, GroupMuteAllRequest, GroupMuteAllResponse,
     GroupQRCodeGenerateRequest, GroupQRCodeGenerateResponse, GroupRoleSetRequest,
     GroupRoleSetResponse, GroupSettingsGetRequest, GroupSettingsGetResponse, GroupSettingsPatch,
     GroupSettingsUpdateRequest, GroupSettingsUpdateResponse, MessageHistoryGetRequest,
@@ -51,12 +50,14 @@ use privchat_protocol::rpc::{
     MessageReadListRequest, MessageReadListResponse, MessageReadStatsRequest,
     MessageReadStatsResponse, MessageRevokeRequest, MessageRevokeResponse,
     MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadPtsRequest,
-    MessageStatusReadPtsResponse, StickerPackageDetailRequest,
-    StickerPackageDetailResponse, StickerPackageListRequest, StickerPackageListResponse,
-    UserQRCodeGenerateRequest, UserQRCodeGenerateResponse, UserQRCodeGetRequest,
-    UserQRCodeGetResponse, UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
+    MessageStatusReadPtsResponse, StickerPackageDetailRequest, StickerPackageDetailResponse,
+    StickerPackageListRequest, StickerPackageListResponse, UserQRCodeGenerateRequest,
+    UserQRCodeGenerateResponse, UserQRCodeGetRequest, UserQRCodeGetResponse,
+    UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
 };
-use privchat_sdk::{PrivchatConfig, PrivchatSdk, ServerEndpoint, SessionSnapshot, TransportProtocol};
+use privchat_sdk::{
+    PrivchatConfig, PrivchatSdk, ServerEndpoint, SessionSnapshot, TransportProtocol,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -359,7 +360,9 @@ impl MultiAccountManager {
         let _ = sdk.sync_entities("friend".to_string(), None).await?;
         let _ = sdk.sync_entities("group".to_string(), None).await?;
         let _ = sdk.sync_entities("channel".to_string(), None).await?;
-        let _ = sdk.sync_entities("channel_read_cursor".to_string(), None).await?;
+        let _ = sdk
+            .sync_entities("channel_read_cursor".to_string(), None)
+            .await?;
         Ok(())
     }
 
@@ -659,7 +662,11 @@ impl MultiAccountManager {
 
     pub async fn blacklist_list_user_ids(&self, key: &str) -> BoxResult<Vec<u64>> {
         let resp: BlacklistListCompat = self
-            .rpc_typed(key, routes::blacklist::LIST, &BlacklistListRequest { user_id: 0 })
+            .rpc_typed(
+                key,
+                routes::blacklist::LIST,
+                &BlacklistListRequest { user_id: 0 },
+            )
             .await?;
         Ok(resp
             .users
@@ -751,10 +758,9 @@ impl MultiAccountManager {
         if let Ok(resp) = serde_json::from_value::<GroupInfoResponse>(raw.clone()) {
             return Ok(resp);
         }
-        let wrapped = raw
-            .get("group_info")
-            .cloned()
-            .ok_or_else(|| boxed_err(format!("decode {} missing group_info", routes::group::INFO)))?;
+        let wrapped = raw.get("group_info").cloned().ok_or_else(|| {
+            boxed_err(format!("decode {} missing group_info", routes::group::INFO))
+        })?;
         serde_json::from_value(wrapped).map_err(|e| {
             boxed_err(format!(
                 "decode {} wrapped group_info failed: {e}",
@@ -1306,9 +1312,9 @@ impl MultiAccountManager {
                             0,
                         )
                         .await?;
-                    let has_login_notice = messages.iter().any(|m| {
-                        m.from_uid == 1 && m.content.contains("设备登录了")
-                    });
+                    let has_login_notice = messages
+                        .iter()
+                        .any(|m| m.from_uid == 1 && m.content.contains("设备登录了"));
                     details = format!(
                         "system_channel={} unread={} messages={} has_login_notice={}",
                         system_channel.channel_id,

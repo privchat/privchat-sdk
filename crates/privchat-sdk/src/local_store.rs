@@ -30,13 +30,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
-    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend,
-    StoredGroup, StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction,
-    StoredReminder, StoredUser, UnreadMentionCount, UpsertBlacklistInput,
-    UpsertChannelExtraInput, UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput,
-    UpsertGroupInput, UpsertGroupMemberInput,
-    UpsertMessageReactionInput, UpsertReminderInput, UpsertRemoteMessageInput,
-    UpsertRemoteMessageResult, UpsertUserInput,
+    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
+    StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
+    StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
+    UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
+    UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
+    UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
 };
 
 mod embedded {
@@ -1778,8 +1777,7 @@ impl LocalStore {
         for row in rows {
             let mut channel =
                 row.map_err(|e| Error::Storage(format!("decode list channels row: {e}")))?;
-            channel.unread_count =
-                self.resolve_channel_unread_on_read(&conn, uid_i64, &channel)?;
+            channel.unread_count = self.resolve_channel_unread_on_read(&conn, uid_i64, &channel)?;
             out.push(channel);
         }
         Ok(out)
@@ -1849,7 +1847,9 @@ impl LocalStore {
                     chrono::Utc::now().timestamp_millis()
                 ],
             )
-            .map_err(|e| Error::Storage(format!("resolve channel unread persist self-heal: {e}")))?;
+            .map_err(|e| {
+                Error::Storage(format!("resolve channel unread persist self-heal: {e}"))
+            })?;
         }
 
         Ok(exact_unread)
@@ -3131,7 +3131,11 @@ impl LocalStore {
                 ],
                 |r| r.get(0),
             )
-            .map_err(|e| Error::Storage(format!("project channel cursor query newly read count: {e}")))?;
+            .map_err(|e| {
+                Error::Storage(format!(
+                    "project channel cursor query newly read count: {e}"
+                ))
+            })?;
 
         let existing_unread: Option<i64> = tx
             .query_row(
@@ -3143,7 +3147,9 @@ impl LocalStore {
                 |r| r.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|e| Error::Storage(format!("project channel cursor query existing unread: {e}")))?;
+            .map_err(|e| {
+                Error::Storage(format!("project channel cursor query existing unread: {e}"))
+            })?;
 
         let unread_total: i64 = if let Some(current) = existing_unread {
             std::cmp::max(0, current.saturating_sub(newly_read_unread_count))
@@ -3163,7 +3169,9 @@ impl LocalStore {
                 ],
                 |r| r.get(0),
             )
-            .map_err(|e| Error::Storage(format!("project channel cursor query unread_total: {e}")))?
+            .map_err(|e| {
+                Error::Storage(format!("project channel cursor query unread_total: {e}"))
+            })?
         };
 
         tx.execute(
@@ -4534,13 +4542,19 @@ mod tests {
             .expect("get channel")
             .expect("channel exists");
         assert_eq!(row.last_msg_timestamp, latest[0].created_at);
-        assert_eq!(row.last_msg_content, "{\"content\":\"fresh-local-message\"}");
+        assert_eq!(
+            row.last_msg_content,
+            "{\"content\":\"fresh-local-message\"}"
+        );
         assert_eq!(row.last_local_message_id, inserted.message_id);
 
         let page = store.list_channels(uid, 20, 0).expect("list channels");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].last_msg_timestamp, latest[0].created_at);
-        assert_eq!(page[0].last_msg_content, "{\"content\":\"fresh-local-message\"}");
+        assert_eq!(
+            page[0].last_msg_content,
+            "{\"content\":\"fresh-local-message\"}"
+        );
         assert_eq!(page[0].last_local_message_id, inserted.message_id);
     }
 

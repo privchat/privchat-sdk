@@ -1567,6 +1567,7 @@ dependencies = [
  "hex",
  "hkdf",
  "image",
+ "libc",
  "msgtrans",
  "privchat-protocol",
  "rand 0.8.5",

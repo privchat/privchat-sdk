@@ -796,8 +796,9 @@ impl TestPhases {
         metrics.rpc_successes += 1;
 
         let bob_uid = manager.user_id("bob")?;
-        let expected_texts: std::collections::HashSet<String> =
-            (0..3).map(|idx| format!("phase13 offline msg {idx}")).collect();
+        let expected_texts: std::collections::HashSet<String> = (0..3)
+            .map(|idx| format!("phase13 offline msg {idx}"))
+            .collect();
 
         for idx in 0..3 {
             let submit = manager
@@ -825,7 +826,8 @@ impl TestPhases {
             current_pts: before.current_pts,
             has_more: false,
         };
-        let mut matched_diff_texts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut matched_diff_texts: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for _ in 0..8 {
             let diff = manager
                 .get_difference(
@@ -952,9 +954,7 @@ impl TestPhases {
             metrics.messages_sent += 1;
             phase14_sent_ok = true;
         } else {
-            metrics
-                .errors
-                .push("phase14 submit rejected".to_string());
+            metrics.errors.push("phase14 submit rejected".to_string());
         }
 
         let mut p2 = p1.clone();
@@ -1754,7 +1754,9 @@ impl TestPhases {
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
-        charlie_sdk.subscribe_channel(group_channel_id, 1, None).await?;
+        charlie_sdk
+            .subscribe_channel(group_channel_id, 1, None)
+            .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
@@ -1765,7 +1767,12 @@ impl TestPhases {
 
         // alice 在群里发 typing
         alice_sdk
-            .send_typing(group_channel_id, 1, true, privchat_sdk::TypingActionType::Typing)
+            .send_typing(
+                group_channel_id,
+                1,
+                true,
+                privchat_sdk::TypingActionType::Typing,
+            )
             .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
@@ -2191,7 +2198,11 @@ impl TestPhases {
                 )
                 .await?;
             metrics.rpc_calls += 1;
-            if group_pts_after.current_pts >= group_pts_before.current_pts.saturating_add(expected_group_count as u64) {
+            if group_pts_after.current_pts
+                >= group_pts_before
+                    .current_pts
+                    .saturating_add(expected_group_count as u64)
+            {
                 metrics.rpc_successes += 1;
             } else {
                 metrics.errors.push(format!(
@@ -2273,12 +2284,17 @@ impl TestPhases {
                         before_pts.saturating_add(*count as u64)
                     ));
                 }
-                let direct_history = manager.message_history(offline, *direct_channel, 300).await?;
+                let direct_history = manager
+                    .message_history(offline, *direct_channel, 300)
+                    .await?;
                 metrics.rpc_calls += 1;
                 let direct_history_matched = direct_history
                     .messages
                     .iter()
-                    .filter(|m| m.content.starts_with(&format!("{tag} direct {sender}->{offline} ")))
+                    .filter(|m| {
+                        m.content
+                            .starts_with(&format!("{tag} direct {sender}->{offline} "))
+                    })
                     .count();
                 if direct_history_matched == *count {
                     metrics.rpc_successes += 1;
@@ -2371,7 +2387,9 @@ impl TestPhases {
             phase_name: "pts-offline-strict".to_string(),
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
-            details: "3 rounds offline->send->online + 2 rounds all-accounts reconnect pts stability".to_string(),
+            details:
+                "3 rounds offline->send->online + 2 rounds all-accounts reconnect pts stability"
+                    .to_string(),
             metrics,
         })
     }
@@ -2383,8 +2401,10 @@ impl TestPhases {
         let mut metrics = PhaseMetrics::default();
         manager.refresh_all_local_views().await?;
 
-        let mut expected_friend_map: std::collections::HashMap<&str, std::collections::HashSet<u64>> =
-            std::collections::HashMap::new();
+        let mut expected_friend_map: std::collections::HashMap<
+            &str,
+            std::collections::HashSet<u64>,
+        > = std::collections::HashMap::new();
         expected_friend_map.insert(
             "alice",
             [manager.user_id("bob")?, manager.user_id("charlie")?]
@@ -2410,7 +2430,8 @@ impl TestPhases {
             let expected = expected_friend_map
                 .get(viewer)
                 .ok_or_else(|| boxed_err(format!("missing expected friend map for {viewer}")))?;
-            let actual: std::collections::HashSet<u64> = friends.iter().map(|f| f.user_id).collect();
+            let actual: std::collections::HashSet<u64> =
+                friends.iter().map(|f| f.user_id).collect();
             if &actual != expected {
                 metrics.errors.push(format!(
                     "{viewer} local friend set mismatch expected={:?} actual={:?}",
@@ -2423,9 +2444,9 @@ impl TestPhases {
 
         let pairs = [("alice", "bob"), ("alice", "charlie"), ("bob", "charlie")];
         for (left, right) in pairs {
-            let channel_id = manager
-                .cached_direct_channel(left, right)
-                .ok_or_else(|| boxed_err(format!("missing direct channel cache for {left}-{right}")))?;
+            let channel_id = manager.cached_direct_channel(left, right).ok_or_else(|| {
+                boxed_err(format!("missing direct channel cache for {left}-{right}"))
+            })?;
             for (viewer, peer) in [(left, right), (right, left)] {
                 let sdk = manager.sdk(viewer)?;
                 let peer_uid = manager.user_id(peer)?;
@@ -2433,9 +2454,9 @@ impl TestPhases {
                 metrics.rpc_calls += 1;
                 let channel = channels.into_iter().find(|c| c.channel_id == channel_id);
                 if channel.is_none() {
-                    metrics
-                        .errors
-                        .push(format!("{viewer} missing cached direct channel {channel_id}"));
+                    metrics.errors.push(format!(
+                        "{viewer} missing cached direct channel {channel_id}"
+                    ));
                     continue;
                 }
                 let friends = manager.list_local_friends(viewer).await?;
@@ -2488,13 +2509,11 @@ impl TestPhases {
                                     .as_ref()
                                     .map(|s| !s.trim().is_empty())
                                     .unwrap_or(false)
-                                    || u
-                                        .nickname
+                                    || u.nickname
                                         .as_ref()
                                         .map(|s| !s.trim().is_empty())
                                         .unwrap_or(false)
-                                    || u
-                                        .username
+                                    || u.username
                                         .as_ref()
                                         .map(|s| !s.trim().is_empty())
                                         .unwrap_or(false)
@@ -2536,19 +2555,23 @@ impl TestPhases {
         let mut metrics = PhaseMetrics::default();
         manager.refresh_all_local_views().await?;
 
-        let expected_direct_ids_by_user: std::collections::HashMap<&str, std::collections::HashSet<u64>> =
-            [("alice", [("alice", "bob"), ("alice", "charlie")]),
-             ("bob", [("alice", "bob"), ("bob", "charlie")]),
-             ("charlie", [("alice", "charlie"), ("bob", "charlie")])]
+        let expected_direct_ids_by_user: std::collections::HashMap<
+            &str,
+            std::collections::HashSet<u64>,
+        > = [
+            ("alice", [("alice", "bob"), ("alice", "charlie")]),
+            ("bob", [("alice", "bob"), ("bob", "charlie")]),
+            ("charlie", [("alice", "charlie"), ("bob", "charlie")]),
+        ]
+        .into_iter()
+        .map(|(viewer, pairs)| {
+            let ids = pairs
                 .into_iter()
-                .map(|(viewer, pairs)| {
-                    let ids = pairs
-                        .into_iter()
-                        .filter_map(|(a, b)| manager.cached_direct_channel(a, b))
-                        .collect::<std::collections::HashSet<_>>();
-                    (viewer, ids)
-                })
-                .collect();
+                .filter_map(|(a, b)| manager.cached_direct_channel(a, b))
+                .collect::<std::collections::HashSet<_>>();
+            (viewer, ids)
+        })
+        .collect();
 
         // Inject one synthetic empty-name group channel to verify fallback title materialization.
         let synthetic_group_id: u64 = 9_900_000_001;
@@ -2694,9 +2717,9 @@ impl TestPhases {
 
         // Strict direct-channel title checks by friend display rule (alias > nickname > username > user_id).
         for (left, right) in [("alice", "bob"), ("alice", "charlie"), ("bob", "charlie")] {
-            let channel_id = manager
-                .cached_direct_channel(left, right)
-                .ok_or_else(|| boxed_err(format!("missing cached direct channel: {left}-{right}")))?;
+            let channel_id = manager.cached_direct_channel(left, right).ok_or_else(|| {
+                boxed_err(format!("missing cached direct channel: {left}-{right}"))
+            })?;
             for (viewer, peer) in [(left, right), (right, left)] {
                 let sdk = manager.sdk(viewer)?;
                 let channels = manager.list_local_channels(viewer).await?;
@@ -2839,8 +2862,9 @@ impl TestPhases {
             phase_name: "timeline-cache-local-first".to_string(),
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
-            details: "repeat list_messages consistency + local create invalidation/visibility check"
-                .to_string(),
+            details:
+                "repeat list_messages consistency + local create invalidation/visibility check"
+                    .to_string(),
             metrics,
         })
     }
@@ -2856,8 +2880,7 @@ impl TestPhases {
         let start = std::time::Instant::now();
         let mut metrics = PhaseMetrics::default();
 
-        let admin_host =
-            std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let admin_host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let admin_port = std::env::var("PRIVCHAT_ADMIN_API_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
@@ -2905,7 +2928,11 @@ impl TestPhases {
         let mut bob_events = bob_sdk.subscribe_events();
         let mut charlie_events = charlie_sdk.subscribe_events();
 
-        for (name, sdk) in [("alice", &alice_sdk), ("bob", &bob_sdk), ("charlie", &charlie_sdk)] {
+        for (name, sdk) in [
+            ("alice", &alice_sdk),
+            ("bob", &bob_sdk),
+            ("charlie", &charlie_sdk),
+        ] {
             match sdk.subscribe_channel(channel_id, 2, None).await {
                 Ok(_) => {
                     metrics.rpc_calls += 1;
@@ -2925,7 +2952,10 @@ impl TestPhases {
         // --- Step 3: 通过 Admin API 广播消息 ---
         let broadcast_content = format!("hello-room-{}", now_millis());
         let broadcast_resp = client
-            .post(format!("{}/api/admin/room/{}/broadcast", admin_base, channel_id))
+            .post(format!(
+                "{}/api/admin/room/{}/broadcast",
+                admin_base, channel_id
+            ))
             .header("X-Service-Key", &service_key)
             .json(&serde_json::json!({
                 "content": broadcast_content,
@@ -2972,7 +3002,12 @@ impl TestPhases {
             loop {
                 match events.try_recv() {
                     Ok(event) => {
-                        if let privchat_sdk::SdkEvent::SubscriptionMessageReceived { channel_id: cid, payload, .. } = &event {
+                        if let privchat_sdk::SdkEvent::SubscriptionMessageReceived {
+                            channel_id: cid,
+                            payload,
+                            ..
+                        } = &event
+                        {
                             if *cid == channel_id {
                                 let content = String::from_utf8_lossy(payload);
                                 if content.contains("hello-room-") {
@@ -2999,7 +3034,11 @@ impl TestPhases {
         }
 
         // --- Step 5: 取消订阅 ---
-        for (name, sdk) in [("alice", &alice_sdk), ("bob", &bob_sdk), ("charlie", &charlie_sdk)] {
+        for (name, sdk) in [
+            ("alice", &alice_sdk),
+            ("bob", &bob_sdk),
+            ("charlie", &charlie_sdk),
+        ] {
             if let Err(e) = sdk.unsubscribe_channel(channel_id, 2).await {
                 metrics
                     .errors
@@ -3055,7 +3094,9 @@ impl TestPhases {
         if pin {
             metrics.rpc_successes += 1;
         } else {
-            metrics.errors.push("channel pin returned false".to_string());
+            metrics
+                .errors
+                .push("channel pin returned false".to_string());
         }
 
         let mute = manager.channel_mute("alice", channel_id, true).await?;
@@ -3063,7 +3104,9 @@ impl TestPhases {
         if mute {
             metrics.rpc_successes += 1;
         } else {
-            metrics.errors.push("channel mute returned false".to_string());
+            metrics
+                .errors
+                .push("channel mute returned false".to_string());
         }
 
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3317,12 +3360,7 @@ impl TestPhases {
             .ok_or_else(|| boxed_err("alice local direct channel missing after reconnect"))?;
         metrics.rpc_calls += 1;
         let after_messages = manager
-            .list_local_messages(
-                "alice",
-                channel_id,
-                DIRECT_SYNC_CHANNEL_TYPE as i32,
-                6,
-            )
+            .list_local_messages("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE as i32, 6)
             .await?;
         metrics.rpc_calls += 1;
         let after_extra = manager
@@ -3377,7 +3415,9 @@ impl TestPhases {
             ));
         }
 
-        let server_unread_after = manager.message_status_count("alice", Some(channel_id)).await?;
+        let server_unread_after = manager
+            .message_status_count("alice", Some(channel_id))
+            .await?;
         metrics.rpc_calls += 1;
         if server_unread_after.unread_count == 0 {
             metrics.rpc_successes += 1;

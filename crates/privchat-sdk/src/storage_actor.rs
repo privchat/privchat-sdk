@@ -23,13 +23,12 @@ use tokio::sync::oneshot;
 use crate::local_store::{LocalAccountEntry, LocalStore, StoragePaths};
 use crate::{
     Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
-    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend,
-    StoredGroup, StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction,
-    StoredReminder, StoredUser, UnreadMentionCount, UpsertBlacklistInput,
-    UpsertChannelExtraInput, UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput,
-    UpsertGroupInput, UpsertGroupMemberInput,
-    UpsertMessageReactionInput, UpsertReminderInput, UpsertRemoteMessageInput,
-    UpsertRemoteMessageResult, UpsertUserInput,
+    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
+    StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
+    StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
+    UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
+    UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
+    UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
 };
 
 enum StorageCmd {
@@ -1540,7 +1539,8 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             with_uid!(resp, |uid| store.get_message_by_id(&uid, message_id));
         }
         StorageCmd::UpsertRemoteMessageWithResult { input, resp } => {
-            with_uid!(resp, |uid| store.upsert_remote_message_with_result(&uid, &input));
+            with_uid!(resp, |uid| store
+                .upsert_remote_message_with_result(&uid, &input));
         }
         StorageCmd::BatchUpsertRemoteMessages { inputs, resp } => {
             let result = match store.load_current_uid() {
@@ -1576,7 +1576,11 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             channel_type,
             resp,
         } => {
-            with_uid!(resp, |uid| store.max_message_pts(&uid, channel_id, channel_type));
+            with_uid!(resp, |uid| store.max_message_pts(
+                &uid,
+                channel_id,
+                channel_type
+            ));
         }
         StorageCmd::UpsertChannel { input, resp } => {
             with_uid!(resp, |uid| store.upsert_channel(&uid, &input));

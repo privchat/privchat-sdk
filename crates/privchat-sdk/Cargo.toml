@@ -29,3 +29,4 @@ rand.workspace = true
 snowflake_me = { version = "0.5.0", features = ["ip-fallback"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
