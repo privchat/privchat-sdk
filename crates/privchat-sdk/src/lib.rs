@@ -34,13 +34,14 @@ use privchat_protocol::presence::{
 };
 use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
 use privchat_protocol::rpc::file::upload::{
-    FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
+    FileRequestUploadTokenRequest,
 };
 use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
     ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload,
-    ChannelSyncPayload, FriendSyncPayload, GetDifferenceRequest, GetDifferenceResponse,
+    ChannelSyncPayload, FriendSyncPayload, GetChannelPtsRequest, GetChannelPtsResponse,
+    GetDifferenceRequest, GetDifferenceResponse,
     GroupMemberSyncPayload, GroupSyncPayload, MessageStatusSyncPayload, MessageSyncPayload,
     SyncEntityItem,
 };
@@ -55,7 +56,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::time::{interval, timeout, MissedTickBehavior};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
 pub mod error_codes;
 mod local_store;
@@ -288,7 +289,7 @@ pub struct LoginResult {
     pub token: String,
     pub device_id: String,
     pub refresh_token: Option<String>,
-    pub expires_at: String,
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,6 +531,22 @@ pub type VideoProcessHook = Arc<
 struct UploadedFileInfo {
     file_id: String,
     storage_source_id: u32,
+    file_url: String,
+    thumbnail_url: Option<String>,
+    file_size: u64,
+    original_size: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    mime_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UploadTokenCompatResponse {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    upload_token: Option<String>,
+    upload_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1751,6 +1768,10 @@ impl State {
         "__resume_repair__:full_rebuild".to_string()
     }
 
+    fn resume_channel_pts_key(channel_id: u64, channel_type: i32) -> String {
+        format!("__resume_pts__:{channel_type}:{channel_id}")
+    }
+
     fn resume_repair_payload(classification: ResumeFailureClass, reason: &str) -> Vec<u8> {
         serde_json::json!({
             "classification": classification,
@@ -1783,6 +1804,25 @@ impl State {
         let key = Self::sync_version_key(entity_type, scope);
         self.storage
             .kv_put(key, version.to_string().into_bytes())
+            .await
+    }
+
+    async fn load_resume_channel_pts(&self, channel_id: u64, channel_type: i32) -> Option<u64> {
+        let key = Self::resume_channel_pts_key(channel_id, channel_type);
+        let raw = self.storage.kv_get(key).await.ok().flatten()?;
+        let text = String::from_utf8(raw).ok()?;
+        text.trim().parse::<u64>().ok()
+    }
+
+    async fn save_resume_channel_pts(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        pts: u64,
+    ) -> Result<()> {
+        let key = Self::resume_channel_pts_key(channel_id, channel_type);
+        self.storage
+            .kv_put(key, pts.to_string().into_bytes())
             .await
     }
 
@@ -4429,6 +4469,28 @@ impl State {
                     processed += 1;
                 }
                 Err(e) => {
+                    // Reconciliation for "server committed but response lost":
+                    // sync/push may land slightly later than request timeout; poll briefly.
+                    if let Some(server_message_id) = self
+                        .await_server_message_id(message_id, 12, Duration::from_millis(80))
+                        .await
+                    {
+                        let _ = self.storage.normal_queue_ack(vec![message_id]).await;
+                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                            kind: "normal".to_string(),
+                            action: "dequeue_reconciled".to_string(),
+                            message_id: Some(message_id),
+                            queue_index: None,
+                        });
+                        self.pending_events
+                            .push(SdkEvent::MessageSendStatusChanged {
+                                message_id,
+                                status: 2,
+                                server_message_id: Some(server_message_id),
+                            });
+                        processed += 1;
+                        continue;
+                    }
                     let _ = self.storage.update_message_status(message_id, 3).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "normal".to_string(),
@@ -4527,24 +4589,88 @@ impl State {
                     processed += 1;
                 }
                 Err(e) => {
-                    let _ = self.storage.update_message_status(message_id, 3).await;
-                    self.pending_events.push(SdkEvent::OutboundQueueUpdated {
-                        kind: "file".to_string(),
-                        action: "failed".to_string(),
-                        message_id: Some(message_id),
-                        queue_index: Some(queue_index),
-                    });
-                    self.pending_events
-                        .push(SdkEvent::MessageSendStatusChanged {
-                            message_id,
-                            status: 3,
-                            server_message_id: None,
+                    // Reconciliation for "server committed but response lost":
+                    // sync/push may land slightly later than request timeout; poll briefly.
+                    if let Some(server_message_id) = self
+                        .await_server_message_id(message_id, 12, Duration::from_millis(80))
+                        .await
+                    {
+                        let _ = self
+                            .storage
+                            .file_queue_ack(queue_index, vec![message_id])
+                            .await;
+                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                            kind: "file".to_string(),
+                            action: "dequeue_reconciled".to_string(),
+                            message_id: Some(message_id),
+                            queue_index: Some(queue_index),
                         });
+                        self.pending_events
+                            .push(SdkEvent::MessageSendStatusChanged {
+                                message_id,
+                                status: 2,
+                                server_message_id: Some(server_message_id),
+                            });
+                        processed += 1;
+                        continue;
+                    }
+                    eprintln!(
+                        "[SDK.actor] file queue send failed: queue_index={} message_id={} error={}",
+                        queue_index, message_id, e
+                    );
+                    if Self::is_permanent_send_rejection(&e) {
+                        let _ = self.storage.update_message_status(message_id, 3).await;
+                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                            kind: "file".to_string(),
+                            action: "failed".to_string(),
+                            message_id: Some(message_id),
+                            queue_index: Some(queue_index),
+                        });
+                        self.pending_events
+                            .push(SdkEvent::MessageSendStatusChanged {
+                                message_id,
+                                status: 3,
+                                server_message_id: None,
+                            });
+                        let _ = self
+                            .storage
+                            .file_queue_ack(queue_index, vec![message_id])
+                            .await;
+                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                            kind: "file".to_string(),
+                            action: "failed_drop".to_string(),
+                            message_id: Some(message_id),
+                            queue_index: Some(queue_index),
+                        });
+                        processed += 1;
+                        continue;
+                    }
+                    // Transient failures (timeout/transport hiccup) should stay queued.
+                    // Do not mark failed or ack-drop; let next drain retry.
                     return Err(e);
                 }
             }
         }
         Ok(processed)
+    }
+
+    async fn await_server_message_id(
+        &self,
+        message_id: u64,
+        attempts: usize,
+        delay: Duration,
+    ) -> Option<u64> {
+        for idx in 0..attempts.max(1) {
+            if let Ok(Some(latest)) = self.storage.get_message_by_id(message_id).await {
+                if let Some(server_message_id) = latest.server_message_id {
+                    return Some(server_message_id);
+                }
+            }
+            if idx + 1 < attempts {
+                sleep(delay).await;
+            }
+        }
+        None
     }
 
     async fn drain_outbound_queues(&mut self) -> Result<usize> {
@@ -5032,7 +5158,7 @@ impl State {
                     token: token_for_persist,
                     device_id: device_id_for_persist,
                     refresh_token: None,
-                    expires_at: String::new(),
+                    expires_at: 0,
                 },
             )
             .await?;
@@ -5295,16 +5421,123 @@ impl State {
             .map_err(|e| Error::Serialization(format!("decode get_difference response: {e}")))
     }
 
+    async fn get_channel_pts(&mut self, channel_id: u64, channel_type: i32) -> Result<u64> {
+        let timeout = self.timeout();
+        let req = GetChannelPtsRequest {
+            channel_id,
+            channel_type: u8::try_from(channel_type).unwrap_or(1),
+        };
+        let request = RpcRequest {
+            route: routes::sync::GET_CHANNEL_PTS.to_string(),
+            body: serde_json::to_value(req)
+                .map_err(|e| Error::Serialization(format!("encode get_channel_pts body: {e}")))?,
+        };
+        let payload = encode_message(&request)
+            .map_err(|e| Error::Serialization(format!("encode get_channel_pts rpc: {e}")))?;
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::RpcRequest as u8,
+                timeout,
+                "rpc get_channel_pts",
+            )
+            .await?;
+        let rpc_resp: RpcResponse = decode_message(&raw)
+            .map_err(|e| Error::Serialization(format!("decode get_channel_pts rpc: {e}")))?;
+        if rpc_resp.code != 0 {
+            return Err(Self::sync_rpc_rejection(
+                &format!(
+                    "get_channel_pts channel_id={} channel_type={}",
+                    channel_id, channel_type
+                ),
+                rpc_resp.code,
+                rpc_resp.message,
+            ));
+        }
+        let body = rpc_resp
+            .data
+            .ok_or_else(|| Error::Serialization("empty get_channel_pts data".into()))?;
+        let resp: GetChannelPtsResponse = serde_json::from_value(body)
+            .map_err(|e| Error::Serialization(format!("decode get_channel_pts response: {e}")))?;
+        Ok(resp.current_pts)
+    }
+
+    async fn hydrate_channel_messages_from_history(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        limit: u32,
+    ) -> Result<usize> {
+        let req = MessageHistoryGetRequest {
+            user_id: 0,
+            channel_id,
+            before_server_message_id: None,
+            limit: Some(limit),
+        };
+        let resp: MessageHistoryResponse = self
+            .rpc_call_typed(routes::message_history::GET, &req)
+            .await?;
+        if resp.messages.is_empty() {
+            return Ok(0);
+        }
+
+        let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        let mut applied = 0usize;
+        for item in resp.messages {
+            let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
+            let message_type = match item.message_type.as_str() {
+                "image" => i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(0),
+                "audio" => i32::try_from(ContentMessageType::Audio.as_u32()).unwrap_or(0),
+                "video" => i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(0),
+                "file" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
+                _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
+            };
+            let message_id = self
+                .storage
+                .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                    server_message_id: item.message_id,
+                    local_message_id: 0,
+                    channel_id: item.channel_id,
+                    channel_type: normalized_channel_type,
+                    timestamp: timestamp_ms,
+                    from_uid: item.sender_id,
+                    message_type,
+                    content: item.content.clone(),
+                    status: 2,
+                    pts: 0,
+                    setting: 0,
+                    order_seq: 0,
+                    searchable_word: String::new(),
+                    extra: String::new(),
+                })
+                .await?
+                .message_id;
+            let _ = self
+                .update_channel_last_message(
+                    item.channel_id,
+                    normalized_channel_type,
+                    &item.content,
+                    timestamp_ms,
+                    message_id,
+                    Some(item.sender_id),
+                    false,
+                )
+                .await;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
     async fn resume_channel_difference(
         &mut self,
         channel_id: u64,
         channel_type: i32,
     ) -> Result<usize> {
         let scope = Some(format!("{channel_type}:{channel_id}"));
-        let mut last_pts = self
-            .storage
-            .max_message_pts(channel_id, channel_type)
-            .await?;
+        let mut last_pts = self.storage.max_message_pts(channel_id, channel_type).await?;
+        if let Some(cursor_pts) = self.load_resume_channel_pts(channel_id, channel_type).await {
+            last_pts = last_pts.max(cursor_pts);
+        }
         let mut total_applied = 0usize;
         let mut pages = 0usize;
         loop {
@@ -5315,9 +5548,27 @@ impl State {
                     channel_id, channel_type
                 )));
             }
-            let response = self
+            let response = match self
                 .get_difference(channel_id, channel_type, last_pts, Some(200))
-                .await?;
+                .await
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    if Self::classify_resume_error(&err)
+                        == ResumeFailureClass::ChannelResyncRequired
+                    {
+                        let current_pts = self.get_channel_pts(channel_id, channel_type).await?;
+                        self.save_resume_channel_pts(channel_id, channel_type, current_pts)
+                            .await?;
+                        let recovered = self
+                            .hydrate_channel_messages_from_history(channel_id, channel_type, 100)
+                            .await
+                            .unwrap_or(0);
+                        return Ok(total_applied + recovered);
+                    }
+                    return Err(err);
+                }
+            };
             if response.commits.is_empty() {
                 break;
             }
@@ -5339,6 +5590,8 @@ impl State {
                 break;
             }
             last_pts = next_last_pts;
+            self.save_resume_channel_pts(channel_id, channel_type, last_pts)
+                .await?;
             if !response.has_more {
                 break;
             }
@@ -5661,17 +5914,15 @@ impl State {
                     .current_uid
                     .as_ref()
                     .and_then(|v| v.parse::<u64>().ok());
-                // Avoid self-echo duplicates:
-                // Some transports/server paths can bounce our own SendMessageRequest back.
-                // Our outbound path already wrote the local row and later push/ack will reconcile it.
-                if current_user_id == Some(req.from_uid) {
-                    if inbound_logs_enabled() {
-                        eprintln!(
-                            "[SDK.inbound] ignore self SendMessageRequest echo: from_uid={} local_message_id={}",
-                            req.from_uid, req.local_message_id
-                        );
-                    }
-                    return Ok(0);
+                // Accept self-echo SendMessageRequest as a reconciliation signal.
+                // In some transport paths the outbound request can be committed on server
+                // while response correlation is dropped; processing self-echo lets local
+                // status converge to sent instead of remaining failed.
+                if inbound_logs_enabled() && current_user_id == Some(req.from_uid) {
+                    eprintln!(
+                        "[SDK.inbound] process self SendMessageRequest echo: from_uid={} local_message_id={}",
+                        req.from_uid, req.local_message_id
+                    );
                 }
                 let channel_type = self
                     .storage
@@ -5979,9 +6230,7 @@ impl State {
             }
 
             for item in resp.messages {
-                let timestamp_ms = chrono::DateTime::parse_from_rfc3339(&item.timestamp)
-                    .map(|dt| dt.timestamp_millis())
-                    .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+                let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
                 let message_type = match item.message_type.as_str() {
                     "image" => i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(0),
                     "audio" => i32::try_from(ContentMessageType::Audio.as_u32()).unwrap_or(0),
@@ -6361,10 +6610,46 @@ impl State {
         let message_type = u32::try_from(message.message_type).map_err(|_| {
             Error::InvalidState(format!("invalid message_type: {}", message.message_type))
         })?;
-        let metadata_value = serde_json::from_str::<serde_json::Value>(&message.extra)
-            .unwrap_or(serde_json::Value::Null);
+        let mut metadata_value =
+            serde_json::from_str::<serde_json::Value>(&message.extra).unwrap_or(serde_json::Value::Null);
+        let mut payload_content = content.clone();
+
+        // Media payload compatibility:
+        // some call sites pass attachment json in `content` (file_id/thumbnail_file_id/...).
+        // Server validates media by `metadata.file_id`, so promote these fields into metadata.
+        if let Ok(attachment_obj) = serde_json::from_str::<serde_json::Value>(&content) {
+            if attachment_obj
+                .get("file_id")
+                .or_else(|| attachment_obj.get("thumbnail_file_id"))
+                .is_some()
+            {
+                payload_content = attachment_obj
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(&message.content)
+                            .file_name()
+                            .and_then(|v| v.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "attachment".to_string())
+                    });
+
+                match (&mut metadata_value, attachment_obj) {
+                    (serde_json::Value::Object(target), serde_json::Value::Object(source)) => {
+                        for (k, v) in source {
+                            target.insert(k, v);
+                        }
+                    }
+                    (_, other) => {
+                        metadata_value = other;
+                    }
+                }
+            }
+        }
+
         let payload = serde_json::to_vec(&serde_json::json!({
-            "content": content,
+            "content": payload_content,
             "metadata": metadata_value,
         }))
         .map_err(|e| Error::Serialization(format!("encode send payload: {e}")))?;
@@ -6556,7 +6841,9 @@ impl State {
             (nw, nh)
         };
         let thumb = img.resize_exact(tw, th, image::imageops::FilterType::Triangle);
-        let rgba = thumb.to_rgba8();
+        // JPEG does not support RGBA pixel format on this encoder path.
+        // Convert to RGB explicitly to avoid "Rgba8 not supported" failures.
+        let rgb = thumb.to_rgb8();
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::Storage(format!("create thumb dir failed: {e}")))?;
@@ -6567,10 +6854,10 @@ impl State {
         let mut encoder = JpegEncoder::new_with_quality(&mut writer, quality);
         encoder
             .encode(
-                rgba.as_raw(),
+                rgb.as_raw(),
                 thumb.width(),
                 thumb.height(),
-                image::ExtendedColorType::Rgba8,
+                image::ExtendedColorType::Rgb8,
             )
             .map_err(|e| Error::Storage(format!("encode thumb failed: {e}")))?;
         writer
@@ -6590,7 +6877,7 @@ impl State {
         file_size: i64,
         mime_type: String,
         file_type: String,
-    ) -> Result<FileRequestUploadTokenResponse> {
+    ) -> Result<UploadTokenCompatResponse> {
         let payload = FileRequestUploadTokenRequest {
             user_id,
             filename: Some(filename),
@@ -6599,8 +6886,20 @@ impl State {
             file_type,
             business_type: "message".to_string(),
         };
-        self.rpc_call_typed(routes::file::REQUEST_UPLOAD_TOKEN, &payload)
-            .await
+        let response: UploadTokenCompatResponse = self
+            .rpc_call_typed(routes::file::REQUEST_UPLOAD_TOKEN, &payload)
+            .await?;
+        if response
+            .token
+            .as_deref()
+            .or(response.upload_token.as_deref())
+            .is_none()
+        {
+            return Err(Error::Serialization(
+                "decode file/request_upload_token response: missing token/upload_token".to_string(),
+            ));
+        }
+        Ok(response)
     }
 
     async fn upload_file_bytes(
@@ -6648,20 +6947,64 @@ impl State {
             .get("storage_source_id")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
+        let file_url = value
+            .get("file_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let thumbnail_url = value
+            .get("thumbnail_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let file_size = value.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let original_size = value.get("original_size").and_then(|v| v.as_u64());
+        let width = value
+            .get("width")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        let height = value
+            .get("height")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        let resp_mime = value
+            .get("mime_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or(mime_type)
+            .to_string();
         Ok(UploadedFileInfo {
             file_id,
             storage_source_id,
+            file_url,
+            thumbnail_url,
+            file_size,
+            original_size,
+            width,
+            height,
+            mime_type: resp_mime,
         })
     }
 
-    async fn upload_callback(&mut self, user_id: u64, file_id: String) -> Result<()> {
-        let payload = FileUploadCallbackRequest {
-            file_id,
-            user_id,
-            status: "uploaded".to_string(),
-        };
+    async fn upload_callback(
+        &mut self,
+        user_id: u64,
+        upload_token: &str,
+        uploaded: &UploadedFileInfo,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "upload_token": upload_token,
+            "file_id": uploaded.file_id,
+            "file_url": uploaded.file_url,
+            "thumbnail_url": uploaded.thumbnail_url,
+            "file_size": uploaded.file_size,
+            "original_size": uploaded.original_size,
+            "mime_type": uploaded.mime_type,
+            "width": uploaded.width,
+            "height": uploaded.height,
+            "user_id": user_id,
+            "status": "uploaded",
+        });
         let value: serde_json::Value = self
-            .rpc_call_typed(routes::file::UPLOAD_CALLBACK, &payload)
+            .rpc_call_json(routes::file::UPLOAD_CALLBACK.to_string(), payload)
             .await?;
         if let Some(ok) = value.as_bool() {
             if ok {
@@ -6885,18 +7228,27 @@ impl State {
                     "image".to_string(),
                 )
                 .await?;
+            let thumb_upload_token = thumb_token
+                .token
+                .clone()
+                .or(thumb_token.upload_token.clone())
+                .ok_or_else(|| {
+                    Error::Serialization(
+                        "file/request_upload_token response missing token/upload_token".to_string(),
+                    )
+                })?;
             let thumb_bytes = std::fs::read(&thumb_path)
                 .map_err(|e| Error::Storage(format!("read thumb file failed: {e}")))?;
             let uploaded_thumb = self
                 .upload_file_bytes(
                     &thumb_token.upload_url,
-                    &thumb_token.token,
+                    &thumb_upload_token,
                     &thumb_name,
                     &thumb_mime,
                     thumb_bytes,
                 )
                 .await?;
-            self.upload_callback(message.from_uid, uploaded_thumb.file_id.clone())
+            self.upload_callback(message.from_uid, &thumb_upload_token, &uploaded_thumb)
                 .await?;
             Some(uploaded_thumb.file_id)
         } else {
@@ -6912,16 +7264,25 @@ impl State {
                 file_type,
             )
             .await?;
+        let upload_token = token
+            .token
+            .clone()
+            .or(token.upload_token.clone())
+            .ok_or_else(|| {
+                Error::Serialization(
+                    "file/request_upload_token response missing token/upload_token".to_string(),
+                )
+            })?;
         let uploaded = self
             .upload_file_bytes(
                 &token.upload_url,
-                &token.token,
+                &upload_token,
                 &upload_filename,
                 &mime_type,
                 upload_payload,
             )
             .await?;
-        self.upload_callback(message.from_uid, uploaded.file_id.clone())
+        self.upload_callback(message.from_uid, &upload_token, &uploaded)
             .await?;
 
         let attachment_content = if let Some(thumb_file_id) = thumbnail_file_id {
@@ -10672,7 +11033,7 @@ mod tests {
             token: "token".to_string(),
             device_id: "device".to_string(),
             refresh_token: None,
-            expires_at: String::new(),
+            expires_at: 0,
         };
         store.save_login("10001", &login).expect("seed login");
         store
@@ -10708,7 +11069,7 @@ mod tests {
             token: "token".to_string(),
             device_id: "device".to_string(),
             refresh_token: None,
-            expires_at: String::new(),
+            expires_at: 0,
         };
         storage
             .save_login("10001".to_string(), login)
@@ -12387,7 +12748,7 @@ mod tests {
             token: "token".to_string(),
             device_id: "device".to_string(),
             refresh_token: None,
-            expires_at: String::new(),
+            expires_at: 0,
         };
         store.save_login("10001", &login).expect("seed login");
         store
@@ -12506,7 +12867,7 @@ mod tests {
             token: "token".to_string(),
             device_id: "device".to_string(),
             refresh_token: None,
-            expires_at: String::new(),
+            expires_at: 0,
         };
         store.save_login("10001", &login).expect("seed login");
         store
@@ -12588,7 +12949,7 @@ mod tests {
             token: "token".to_string(),
             device_id: "device".to_string(),
             refresh_token: None,
-            expires_at: String::new(),
+            expires_at: 0,
         };
         store.save_login("10001", &login).expect("seed login");
         store

@@ -127,7 +127,7 @@ struct AuthRefreshResponse {
     user_id: u64,
     token: String,
     refresh_token: Option<String>,
-    expires_at: String,
+    expires_at: u64,
     device_id: String,
 }
 
@@ -216,7 +216,7 @@ pub struct BlacklistCheckResult {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SeenByEntry {
     pub user_id: u64,
-    pub read_at: Option<String>,
+    pub read_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -240,7 +240,7 @@ pub trait VideoProcessHook: Send + Sync {
 pub struct ProfileView {
     pub status: String,
     pub action: String,
-    pub timestamp: String,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -260,7 +260,7 @@ pub struct PrivacySettingsView {
     pub allow_search_by_qrcode: bool,
     pub allow_view_by_non_friend: bool,
     pub allow_receive_message_from_non_friend: bool,
-    pub updated_at: String,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -290,8 +290,8 @@ pub struct QrCodeEntryView {
     pub qr_code: String,
     pub qr_type: String,
     pub target_id: String,
-    pub created_at: String,
-    pub expire_at: Option<String>,
+    pub created_at: u64,
+    pub expire_at: Option<u64>,
     pub used_count: u32,
     pub max_usage: Option<u32>,
     pub revoked: bool,
@@ -302,21 +302,21 @@ pub struct QrCodeRefreshView {
     pub old_qr_key: String,
     pub new_qr_key: String,
     pub new_qr_code: String,
-    pub revoked_at: String,
+    pub revoked_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct QrCodeRevokeView {
     pub success: bool,
     pub qr_key: String,
-    pub revoked_at: String,
+    pub revoked_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UserQrCodeGetView {
     pub qr_key: String,
     pub qr_code: String,
-    pub created_at: String,
+    pub created_at: u64,
     pub used_count: u32,
 }
 
@@ -324,7 +324,7 @@ pub struct UserQrCodeGetView {
 pub struct UserQrCodeGenerateView {
     pub qr_key: String,
     pub qr_code: String,
-    pub created_at: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -336,8 +336,8 @@ pub struct GroupSettingsView {
     pub max_members: u64,
     pub announcement: Option<String>,
     pub description: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -347,7 +347,7 @@ pub struct GroupMuteAllView {
     pub all_muted: bool,
     pub message: String,
     pub operator_id: String,
-    pub updated_at: String,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -364,8 +364,8 @@ pub struct GroupApprovalItemView {
     pub inviter_id: Option<String>,
     pub qr_code_id: Option<String>,
     pub message: Option<String>,
-    pub created_at: String,
-    pub expires_at: Option<String>,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -545,7 +545,7 @@ pub struct ChannelBroadcastCreateInput {
 pub struct ChannelBroadcastCreateView {
     pub status: String,
     pub action: String,
-    pub timestamp: String,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -563,7 +563,7 @@ pub struct ChannelBroadcastListInput {
 pub struct ChannelBroadcastListView {
     pub status: String,
     pub action: String,
-    pub timestamp: String,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -578,7 +578,7 @@ pub struct ChannelContentPublishInput {
 pub struct ChannelContentPublishView {
     pub status: String,
     pub action: String,
-    pub timestamp: String,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -592,7 +592,7 @@ pub struct ChannelContentListInput {
 pub struct ChannelContentListView {
     pub status: String,
     pub action: String,
-    pub timestamp: String,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -648,8 +648,8 @@ pub struct GroupInfoView {
     pub description: Option<String>,
     pub avatar_url: Option<String>,
     pub owner_id: u64,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: u64,
+    pub updated_at: u64,
     pub member_count: u32,
     pub message_count: Option<u32>,
     pub is_archived: Option<bool>,
@@ -743,7 +743,7 @@ pub struct MessageHistoryItemView {
     pub sender_id: u64,
     pub content: String,
     pub message_type: String,
-    pub timestamp: String,
+    pub timestamp: u64,
     pub reply_to_message_id: Option<u64>,
     pub metadata_json: Option<String>,
     pub revoked: bool,
@@ -763,7 +763,7 @@ pub struct MessageReadUserView {
     pub username: Option<String>,
     pub nickname: Option<String>,
     pub avatar_url: Option<String>,
-    pub read_at: Option<String>,
+    pub read_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -778,8 +778,8 @@ pub struct QrCodeGenerateView {
     pub qr_code: String,
     pub qr_type: String,
     pub target_id: u64,
-    pub created_at: String,
-    pub expire_at: Option<String>,
+    pub created_at: u64,
+    pub expire_at: Option<u64>,
     pub max_usage: Option<u32>,
     pub used_count: u32,
 }
@@ -792,7 +792,7 @@ pub struct QrCodeResolveView {
     pub data_json: Option<String>,
     pub used_count: u32,
     pub max_usage: Option<u32>,
-    pub expire_at: Option<String>,
+    pub expire_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -806,14 +806,14 @@ pub struct AccountSearchResultView {
 pub struct AccountUserShareCardView {
     pub share_key: String,
     pub share_url: String,
-    pub expire_at: Option<String>,
+    pub expire_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GroupTransferOwnerView {
     pub group_id: u64,
     pub new_owner_id: u64,
-    pub transferred_at: Option<String>,
+    pub transferred_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -821,16 +821,16 @@ pub struct GroupRoleSetView {
     pub group_id: u64,
     pub user_id: u64,
     pub role: String,
-    pub updated_at: Option<String>,
+    pub updated_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GroupQrCodeGenerateView {
     pub qr_key: String,
     pub qr_code: String,
-    pub expire_at: Option<String>,
+    pub expire_at: Option<u64>,
     pub group_id: u64,
-    pub created_at: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -960,7 +960,7 @@ pub struct LoginResult {
     pub token: String,
     pub device_id: String,
     pub refresh_token: Option<String>,
-    pub expires_at: String,
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1145,8 +1145,9 @@ pub struct SearchUserEntry {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FriendPendingEntry {
     pub from_user_id: u64,
+    pub user: SearchUserEntry,
     pub message: Option<String>,
-    pub created_at: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1154,7 +1155,7 @@ pub struct FriendRequestResult {
     pub user_id: u64,
     pub username: String,
     pub status: String,
-    pub added_at: String,
+    pub added_at: u64,
     pub message: Option<String>,
 }
 
@@ -1170,7 +1171,7 @@ pub struct GroupCreateResult {
     pub name: String,
     pub description: Option<String>,
     pub member_count: u32,
-    pub created_at: String,
+    pub created_at: u64,
     pub creator_id: u64,
 }
 
@@ -1180,9 +1181,9 @@ pub struct GroupQrCodeJoinResult {
     pub group_id: u64,
     pub request_id: Option<String>,
     pub message: Option<String>,
-    pub expires_at: Option<String>,
+    pub expires_at: Option<u64>,
     pub user_id: Option<u64>,
-    pub joined_at: Option<String>,
+    pub joined_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1663,9 +1664,7 @@ fn map_sdk_resume_escalation_scope(
         privchat_sdk::ResumeEscalationScope::EntityScopedResync => {
             ResumeEscalationScope::EntityScopedResync
         }
-        privchat_sdk::ResumeEscalationScope::FullRebuild => {
-            ResumeEscalationScope::FullRebuild
-        }
+        privchat_sdk::ResumeEscalationScope::FullRebuild => ResumeEscalationScope::FullRebuild,
     }
 }
 
@@ -3453,7 +3452,12 @@ impl PrivchatClient {
     /// 订阅频道事件（进入聊天页面时调用，接收 typing / presence 等状态事件）
     /// channel_type: 0=Private, 1=Group, 2=Room
     /// token: 可选，Room 类型订阅时传入业务 API 签发的 ticket（JWT）
-    pub async fn subscribe_channel(&self, channel_id: u64, channel_type: u8, token: Option<String>) -> Result<(), PrivchatFfiError> {
+    pub async fn subscribe_channel(
+        &self,
+        channel_id: u64,
+        channel_type: u8,
+        token: Option<String>,
+    ) -> Result<(), PrivchatFfiError> {
         self.inner
             .subscribe_channel(channel_id, channel_type, token)
             .await
@@ -3462,7 +3466,11 @@ impl PrivchatClient {
 
     /// 取消订阅频道事件（离开聊天页面时调用）
     /// channel_type: 0=Private, 1=Group, 2=Room
-    pub async fn unsubscribe_channel(&self, channel_id: u64, channel_type: u8) -> Result<(), PrivchatFfiError> {
+    pub async fn unsubscribe_channel(
+        &self,
+        channel_id: u64,
+        channel_type: u8,
+    ) -> Result<(), PrivchatFfiError> {
         self.inner
             .unsubscribe_channel(channel_id, channel_type)
             .await
@@ -3670,10 +3678,23 @@ impl PrivchatClient {
         Ok(resp
             .requests
             .into_iter()
-            .map(|item| FriendPendingEntry {
-                from_user_id: item.from_user_id,
-                message: item.message,
-                created_at: item.created_at,
+            .map(|item| {
+                let u = item.user;
+                FriendPendingEntry {
+                    from_user_id: item.from_user_id,
+                    user: SearchUserEntry {
+                        user_id: u.user_id,
+                        username: u.username,
+                        nickname: u.nickname,
+                        avatar_url: u.avatar_url,
+                        user_type: u.user_type as i32,
+                        search_session_id: u.search_session_id,
+                        is_friend: u.is_friend,
+                        can_send_message: u.can_send_message,
+                    },
+                    message: item.message,
+                    created_at: item.created_at,
+                }
             })
             .collect())
     }
@@ -5222,7 +5243,10 @@ impl PrivchatClient {
             },
         )
         .await?;
-        let _ = self.inner.update_group_mute_all_cache(group_id, enabled).await;
+        let _ = self
+            .inner
+            .update_group_mute_all_cache(group_id, enabled)
+            .await;
         Ok(GroupMuteAllView {
             success: resp.success,
             group_id: resp.group_id,
@@ -6203,12 +6227,62 @@ impl PrivchatClient {
         &self,
         user_id: u64,
     ) -> Result<Option<StoredUser>, PrivchatFfiError> {
-        let out = self
+        // 1. 优先本地缓存
+        if let Some(user) = self
+            .inner
+            .get_user_by_id(user_id)
+            .await
+            .map_err(PrivchatFfiError::from)?
+        {
+            return Ok(Some(map_stored_user(user)));
+        }
+
+        // 2. 本地没有 → RPC 拉远程
+        let remote: Option<AccountUserDetailResponse> = rpc_call_typed(
+            &self.inner,
+            routes::account_user::DETAIL,
+            &AccountUserDetailRequest {
+                target_user_id: user_id,
+                source: "user_cache".to_string(),
+                source_id: user_id.to_string(),
+                user_id: 0,
+            },
+        )
+        .await
+        .ok();
+
+        let Some(remote) = remote else {
+            return Ok(None);
+        };
+
+        // 3. 写回本地 user 表
+        let updated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.inner
+            .upsert_user(SdkUpsertUserInput {
+                user_id,
+                username: Some(remote.username).filter(|s| !s.is_empty()),
+                nickname: Some(remote.nickname).filter(|s| !s.is_empty()),
+                alias: None,
+                avatar: remote.avatar_url.unwrap_or_default(),
+                user_type: remote.user_type as i32,
+                is_deleted: false,
+                channel_id: String::new(),
+                version: 0,
+                updated_at,
+            })
+            .await
+            .map_err(PrivchatFfiError::from)?;
+
+        // 4. 返回刚写入的数据
+        let user = self
             .inner
             .get_user_by_id(user_id)
             .await
             .map_err(PrivchatFfiError::from)?;
-        Ok(out.map(map_stored_user))
+        Ok(user.map(map_stored_user))
     }
 
     pub async fn list_users_by_ids(

@@ -536,7 +536,10 @@ impl LocalStore {
             let _ = auth.remove(K_REFRESH_TOKEN_ENC);
             let _ = auth.remove(K_REFRESH_TOKEN_NONCE);
         }
-        auth.insert(K_TOKEN_EXPIRE_AT, login.expires_at.as_bytes())
+        auth.insert(
+            K_TOKEN_EXPIRE_AT,
+            i64_to_be_bytes(i64::try_from(login.expires_at).unwrap_or(i64::MAX)),
+        )
             .map_err(|e| Error::Storage(format!("save token expire_at: {e}")))?;
         drop(auth);
         drop(profile);
@@ -595,7 +598,7 @@ impl LocalStore {
             token: legacy.token.clone(),
             device_id: legacy.device_id.clone(),
             refresh_token: None,
-            expires_at: String::new(),
+            expires_at: 0,
         };
         self.save_login(uid, &login)?;
         self.set_bootstrap_completed(uid, legacy.bootstrap_completed)?;
@@ -3575,7 +3578,7 @@ mod tests {
             token: "token-secret-value".to_string(),
             device_id: "device-a".to_string(),
             refresh_token: Some("refresh-secret-value".to_string()),
-            expires_at: "0".to_string(),
+            expires_at: 0,
         };
         store.save_login(uid, &login).expect("save login");
         let snap = store
