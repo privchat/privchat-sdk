@@ -38,6 +38,7 @@ use privchat_protocol::rpc::file::upload::{
     FileRequestUploadTokenRequest,
 };
 use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
+use privchat_protocol::rpc::contact::friend::FriendPendingResponse;
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
     ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload,
@@ -9953,8 +9954,54 @@ impl PrivchatSdk {
         let body_json = serde_json::to_string(req)
             .map_err(|e| Error::Serialization(format!("encode {route} body: {e}")))?;
         let raw = self.rpc_call(route.to_string(), body_json).await?;
+        self.apply_rpc_side_effects(route, &raw).await?;
         serde_json::from_str(&raw)
             .map_err(|e| Error::Serialization(format!("decode {route} response: {e}; raw={raw}")))
+    }
+
+    async fn apply_rpc_side_effects(&self, route: &str, raw: &str) -> Result<()> {
+        if route == routes::friend::PENDING {
+            let parsed = serde_json::from_str::<FriendPendingResponse>(raw).map_err(|e| {
+                Error::Serialization(format!(
+                    "decode {} side-effect response: {e}; raw={raw}",
+                    routes::friend::PENDING
+                ))
+            })?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            for item in parsed.requests {
+                self.upsert_user(UpsertUserInput {
+                    user_id: item.user.user_id,
+                    username: Some(item.user.username),
+                    nickname: Some(item.user.nickname),
+                    alias: None,
+                    avatar: item.user.avatar_url.unwrap_or_default(),
+                    user_type: item.user.user_type as i32,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 0,
+                    updated_at: now_ms,
+                })
+                .await?;
+            }
+            return Ok(());
+        }
+
+        if route == routes::friend::ACCEPT {
+            // Keep local entities fresh so direct-channel title can resolve from user table.
+            let channel_id = serde_json::from_str::<u64>(raw).map_err(|e| {
+                Error::Serialization(format!(
+                    "decode {} side-effect response: {e}; raw={raw}",
+                    routes::friend::ACCEPT
+                ))
+            })?;
+            if channel_id > 0 {
+                let _ = self.sync_channel(channel_id, 1).await;
+            }
+            let _ = self.sync_entities("friend".to_string(), None).await;
+            let _ = self.sync_entities("user".to_string(), None).await;
+        }
+
+        Ok(())
     }
 
     pub async fn is_bootstrap_completed(&self) -> Result<bool> {

@@ -1568,7 +1568,8 @@ impl LocalStore {
                         ORDER BY m.created_at DESC, m.id DESC
                         LIMIT 1
                     ),
-                    c.last_msg_timestamp,
+                    NULLIF(c.last_msg_timestamp, 0),
+                    c.updated_at,
                     0
                 ) AS resolved_last_msg_timestamp,
                 COALESCE(
@@ -1723,7 +1724,8 @@ impl LocalStore {
                             ORDER BY m.created_at DESC, m.id DESC
                             LIMIT 1
                         ),
-                        c.last_msg_timestamp,
+                        NULLIF(c.last_msg_timestamp, 0),
+                        c.updated_at,
                         0
                     ) AS resolved_last_msg_timestamp,
                     COALESCE(
