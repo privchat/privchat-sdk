@@ -27,6 +27,7 @@ use msgtrans::protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfi
 use msgtrans::transport::client::{TransportClient, TransportClientBuilder};
 use msgtrans::transport::TransportOptions;
 use msgtrans::ClientEvent;
+use privchat_protocol::message::MessagePayloadEnvelope;
 use privchat_protocol::presence::{
     GetOnlineStatusRequest, GetOnlineStatusResponse, OnlineStatusInfo, SubscribePresenceRequest,
     SubscribePresenceResponse, TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
@@ -6610,48 +6611,57 @@ impl State {
         let message_type = u32::try_from(message.message_type).map_err(|_| {
             Error::InvalidState(format!("invalid message_type: {}", message.message_type))
         })?;
-        let mut metadata_value =
-            serde_json::from_str::<serde_json::Value>(&message.extra).unwrap_or(serde_json::Value::Null);
-        let mut payload_content = content.clone();
+        let mut envelope = MessagePayloadEnvelope {
+            content: content.clone(),
+            metadata: serde_json::from_str::<serde_json::Value>(&message.extra)
+                .ok()
+                .and_then(|value| if value.is_null() { None } else { Some(value) }),
+            reply_to_message_id: None,
+            mentioned_user_ids: None,
+            message_source: None,
+        };
 
-        // Media payload compatibility:
-        // some call sites pass attachment json in `content` (file_id/thumbnail_file_id/...).
-        // Server validates media by `metadata.file_id`, so promote these fields into metadata.
-        if let Ok(attachment_obj) = serde_json::from_str::<serde_json::Value>(&content) {
-            if attachment_obj
+        if let Ok(content_json) = serde_json::from_str::<serde_json::Value>(&content) {
+            // Only treat as canonical envelope when payload explicitly carries envelope keys.
+            let looks_like_envelope = content_json
+                .as_object()
+                .map(|obj| {
+                    obj.contains_key("content")
+                        || obj.contains_key("metadata")
+                        || obj.contains_key("reply_to_message_id")
+                        || obj.contains_key("mentioned_user_ids")
+                        || obj.contains_key("message_source")
+                })
+                .unwrap_or(false);
+
+            if looks_like_envelope {
+                if let Ok(parsed_envelope) =
+                    serde_json::from_value::<MessagePayloadEnvelope>(content_json.clone())
+                {
+                    envelope = parsed_envelope;
+                }
+            } else if content_json
                 .get("file_id")
-                .or_else(|| attachment_obj.get("thumbnail_file_id"))
+                .or_else(|| content_json.get("thumbnail_file_id"))
                 .is_some()
             {
-                payload_content = attachment_obj
+                // Backward compatibility: attachment callers may still pass raw metadata json.
+                envelope.content = content_json
                     .get("filename")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
+                    .map(str::to_string)
                     .unwrap_or_else(|| {
                         std::path::Path::new(&message.content)
                             .file_name()
                             .and_then(|v| v.to_str())
-                            .map(|s| s.to_string())
+                            .map(str::to_string)
                             .unwrap_or_else(|| "attachment".to_string())
                     });
-
-                match (&mut metadata_value, attachment_obj) {
-                    (serde_json::Value::Object(target), serde_json::Value::Object(source)) => {
-                        for (k, v) in source {
-                            target.insert(k, v);
-                        }
-                    }
-                    (_, other) => {
-                        metadata_value = other;
-                    }
-                }
+                envelope.metadata = Some(content_json);
             }
         }
 
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "content": payload_content,
-            "metadata": metadata_value,
-        }))
+        let payload = serde_json::to_vec(&envelope)
         .map_err(|e| Error::Serialization(format!("encode send payload: {e}")))?;
 
         Ok(privchat_protocol::protocol::SendMessageRequest {
@@ -6736,6 +6746,34 @@ impl State {
     }
 
     fn is_permanent_send_rejection(err: &Error) -> bool {
+        if matches!(
+            err,
+            Error::Auth(_) | Error::Serialization(_) | Error::InvalidState(_)
+        ) {
+            return true;
+        }
+        if let Error::Storage(message) = err {
+            let lower = message.to_ascii_lowercase();
+            // File/image pre-processing failures are deterministic and will block the queue forever
+            // if we keep retrying the same head item.
+            if lower.contains("decode image failed")
+                || lower.contains("not recognized as an image format")
+                || lower.contains("mime")
+                || lower.contains("invalid image")
+            {
+                return true;
+            }
+        }
+        if let Error::Transport(message) = err {
+            if message.contains("upload failed: status=400")
+                || message.contains("upload failed: status=401")
+                || message.contains("upload failed: status=403")
+                || message.contains("upload failed: status=404")
+                || message.contains("upload failed: status=413")
+            {
+                return true;
+            }
+        }
         let Some(reason_code) = Self::transport_reason_code(err) else {
             return false;
         };
@@ -6744,13 +6782,16 @@ impl State {
     }
 
     fn guess_file_type(message_type: i32, filename: &str, mime: &str) -> &'static str {
-        if message_type == 2 || mime.starts_with("image/") {
+        let image_type = privchat_protocol::message::ContentMessageType::Image as i32;
+        let video_type = privchat_protocol::message::ContentMessageType::Video as i32;
+        let audio_type = privchat_protocol::message::ContentMessageType::Audio as i32;
+        if message_type == image_type || mime.starts_with("image/") {
             return "image";
         }
-        if message_type == 3 || mime.starts_with("video/") {
+        if message_type == video_type || mime.starts_with("video/") {
             return "video";
         }
-        if message_type == 8 || mime.starts_with("audio/") {
+        if message_type == audio_type || mime.starts_with("audio/") {
             return "audio";
         }
         let ext = filename
@@ -6913,7 +6954,7 @@ impl State {
         let part = reqwest::multipart::Part::bytes(data)
             .file_name(filename.to_string())
             .mime_str(mime_type)
-            .map_err(|e| Error::Transport(format!("build upload body failed: {e}")))?;
+            .map_err(|e| Error::Serialization(format!("invalid mime_type for upload part: {e}")))?;
         let form = reqwest::multipart::Form::new().part("file", part);
         let response = reqwest::Client::new()
             .post(upload_url)
@@ -7215,7 +7256,7 @@ impl State {
             .map_err(|e| Error::Storage(format!("write media meta failed: {e}")))?;
         }
 
-        let thumbnail_file_id = if let Some((thumb_path, thumb_mime, thumb_name)) = thumb_upload {
+        let uploaded_thumbnail = if let Some((thumb_path, thumb_mime, thumb_name)) = thumb_upload {
             let thumb_size = std::fs::metadata(&thumb_path)
                 .map(|m| m.len() as i64)
                 .map_err(|e| Error::Storage(format!("stat thumb file failed: {e}")))?;
@@ -7250,7 +7291,7 @@ impl State {
                 .await?;
             self.upload_callback(message.from_uid, &thumb_upload_token, &uploaded_thumb)
                 .await?;
-            Some(uploaded_thumb.file_id)
+            Some(uploaded_thumb)
         } else {
             None
         };
@@ -7285,20 +7326,45 @@ impl State {
         self.upload_callback(message.from_uid, &upload_token, &uploaded)
             .await?;
 
-        let attachment_content = if let Some(thumb_file_id) = thumbnail_file_id {
+        let uploaded_file_id = uploaded.file_id.parse::<u64>().map_err(|_| {
+            Error::Serialization(format!("upload response invalid numeric file_id: {}", uploaded.file_id))
+        })?;
+        let thumbnail_file_id_u64 = uploaded_thumbnail
+            .as_ref()
+            .map(|uploaded| {
+                uploaded.file_id.parse::<u64>().map_err(|_| {
+                    Error::Serialization(format!(
+                        "upload response invalid numeric thumbnail_file_id: {}",
+                        uploaded.file_id
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let attachment_content = if let Some(thumb_file_id) = thumbnail_file_id_u64 {
+            let thumbnail_url = uploaded_thumbnail
+                .as_ref()
+                .map(|v| v.file_url.clone())
+                .unwrap_or_default();
             serde_json::json!({
-                "file_id": uploaded.file_id,
+                "file_id": uploaded_file_id,
                 "thumbnail_file_id": thumb_file_id,
                 "filename": upload_filename,
                 "mime_type": mime_type,
                 "storage_source_id": uploaded.storage_source_id,
+                "file_size": uploaded.file_size,
+                "file_url": uploaded.file_url,
+                "thumbnail_url": thumbnail_url,
             })
         } else {
             serde_json::json!({
-                "file_id": uploaded.file_id,
+                "file_id": uploaded_file_id,
                 "filename": upload_filename,
                 "mime_type": mime_type,
                 "storage_source_id": uploaded.storage_source_id,
+                "file_size": uploaded.file_size,
+                "file_url": uploaded.file_url,
+                "thumbnail_url": uploaded.thumbnail_url,
             })
         };
         let content = serde_json::to_string(&attachment_content)
