@@ -146,7 +146,7 @@ privchat-sdk/
 |--------|-------------|
 | `upsert_message_reaction()` | Message reactions |
 | `record_mention()` / `get_unread_mention_count()` | @mentions |
-| `subscribe_presence()` / `fetch_presence()` | Presence status |
+| `batch_get_presence()` / `get_presence()` | Presence status |
 | `send_typing()` | Typing indicators |
 | `rpc_call(route, body_json)` | Generic RPC calls |
 

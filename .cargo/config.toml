@@ -1,0 +1,6 @@
+[env]
+# Ensure OpenSSL is compiled with the correct iOS deployment target,
+# matching the project's minimum iOS version (14.1).
+# Without this, openssl-sys picks up the latest Xcode SDK version (e.g. 26.x)
+# which uses ___chkstk_darwin, causing undefined symbol linker errors.
+IPHONEOS_DEPLOYMENT_TARGET = "14.1"

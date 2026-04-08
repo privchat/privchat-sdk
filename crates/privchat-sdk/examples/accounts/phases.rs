@@ -288,7 +288,7 @@ impl TestPhases {
                             metrics.rpc_calls += 1;
                             let history_ok = history.messages.first().is_some_and(|m| {
                                 (m.content == "hello friend" || m.content.contains("hello friend"))
-                                    && !m.timestamp.is_empty()
+                                    && m.timestamp > 0
                             });
                             if history_ok {
                                 metrics.rpc_successes += 1;
@@ -1560,29 +1560,15 @@ impl TestPhases {
         let bob_id = manager.user_id("bob")?;
         let alice_sdk = manager.sdk("alice")?;
 
-        let subscribed = alice_sdk.subscribe_presence(vec![bob_id]).await?;
-        metrics.rpc_calls += 1;
-        if !subscribed.is_empty() {
-            metrics.rpc_successes += 1;
-        } else {
-            metrics
-                .errors
-                .push("subscribe_presence returned empty".to_string());
-        }
-
-        let fetched = alice_sdk.fetch_presence(vec![bob_id]).await?;
+        let fetched = alice_sdk.batch_get_presence(vec![bob_id]).await?;
         metrics.rpc_calls += 1;
         if !fetched.is_empty() {
             metrics.rpc_successes += 1;
         } else {
             metrics
                 .errors
-                .push("fetch_presence returned empty".to_string());
+                .push("batch_get_presence returned empty".to_string());
         }
-
-        alice_sdk.unsubscribe_presence(vec![bob_id]).await?;
-        metrics.rpc_calls += 1;
-        metrics.rpc_successes += 1;
 
         Ok(PhaseResult {
             phase_name: "online-presence".to_string(),
@@ -1933,28 +1919,121 @@ impl TestPhases {
         let mut metrics = PhaseMetrics::default();
 
         let alice_sdk = manager.sdk("alice")?;
+        let bob_sdk = manager.sdk("bob")?;
         let bob_id = manager.user_id("bob")?;
         let charlie_id = manager.user_id("charlie")?;
+        let channel_id = manager
+            .cached_direct_channel("alice", "bob")
+            .or_else(|| manager.cached_group_channel("alice_bob_friend_channel"))
+            .ok_or_else(|| boxed_err("missing alice-bob channel for presence"))?;
 
-        let subscribed = alice_sdk
-            .subscribe_presence(vec![bob_id, charlie_id])
+        let fetched = alice_sdk
+            .batch_get_presence(vec![bob_id, charlie_id])
             .await?;
-        metrics.rpc_calls += 1;
-        if subscribed.len() >= 2 {
-            metrics.rpc_successes += 1;
-        } else {
-            metrics
-                .errors
-                .push("presence subscribe size < 2".to_string());
-        }
-
-        let fetched = alice_sdk.fetch_presence(vec![bob_id, charlie_id]).await?;
         metrics.rpc_calls += 1;
         if fetched.len() >= 2 {
             metrics.rpc_successes += 1;
         } else {
-            metrics.errors.push("presence fetch size < 2".to_string());
+            metrics
+                .errors
+                .push("presence batch_get size < 2".to_string());
         }
+
+        alice_sdk.subscribe_channel(channel_id, 0, None).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        let mut alice_events = alice_sdk.subscribe_events();
+        while alice_events.try_recv().is_ok() {}
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut notified_snapshot_matches_query = false;
+
+        bob_sdk.disconnect().await?;
+        let mut bob_needs_reconnect = true;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        let received_notification = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match alice_events.recv().await {
+                    Ok(privchat_sdk::SdkEvent::SubscriptionMessageReceived {
+                        channel_id: cid,
+                        topic,
+                        payload,
+                        ..
+                    }) if cid == channel_id && topic.as_deref() == Some("presence_changed") => {
+                        let notification =
+                            serde_json::from_slice::<
+                                privchat_protocol::presence::PresenceChangedNotification,
+                            >(&payload)
+                            .map_err(|e| {
+                                boxed_err(format!("decode presence_changed payload failed: {e}"))
+                            })?;
+                        break Ok(notification);
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        break Err(boxed_err(format!(
+                            "presence event stream closed before presence_changed: {e}"
+                        )));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| boxed_err("timed out waiting for presence_changed"))??;
+
+        let received_presence_changed = true;
+
+        if received_notification.user_id != bob_id {
+            metrics.errors.push(format!(
+                "presence_changed user mismatch expected={} actual={}",
+                bob_id, received_notification.user_id
+            ));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+
+        let fetched_after_disconnect = alice_sdk.batch_get_presence(vec![bob_id]).await?;
+        metrics.rpc_calls += 1;
+        if let Some(current) = fetched_after_disconnect.first() {
+            if current.user_id == received_notification.snapshot.user_id
+                && current.is_online == received_notification.snapshot.is_online
+                && current.last_seen_at == received_notification.snapshot.last_seen_at
+                && current.device_count == received_notification.snapshot.device_count
+            {
+                notified_snapshot_matches_query = true;
+                metrics.rpc_successes += 1;
+            } else {
+                metrics.errors.push(format!(
+                    "presence_changed snapshot mismatch query snapshot: notified(user={}, version={}, online={}, devices={}) query(user={}, online={}, devices={})",
+                    received_notification.snapshot.user_id,
+                    received_notification.snapshot.version,
+                    received_notification.snapshot.is_online,
+                    received_notification.snapshot.device_count,
+                    current.user_id,
+                    current.is_online,
+                    current.device_count
+                ));
+            }
+        } else {
+            metrics
+                .errors
+                .push("batch_get_presence after disconnect returned empty".to_string());
+        }
+
+        if let Err(e) = reconnect_account(manager, "bob").await {
+            metrics
+                .errors
+                .push(format!("reconnect bob after presence test failed: {e}"));
+        } else {
+            bob_needs_reconnect = false;
+            metrics.rpc_successes += 1;
+        }
+
+        let _ = alice_sdk.unsubscribe_channel(channel_id, 0).await;
 
         let state = alice_sdk.connection_state().await?;
         metrics.rpc_calls += 1;
@@ -1966,17 +2045,21 @@ impl TestPhases {
                 .push(format!("unexpected connection state: {state:?}"));
         }
 
-        alice_sdk
-            .unsubscribe_presence(vec![bob_id, charlie_id])
-            .await?;
-        metrics.rpc_calls += 1;
-        metrics.rpc_successes += 1;
+        if bob_needs_reconnect {
+            let _ = reconnect_account(manager, "bob").await;
+        }
 
         Ok(PhaseResult {
             phase_name: "presence-system".to_string(),
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
-            details: format!("subscribed={} fetched={}", subscribed.len(), fetched.len()),
+            details: format!(
+                "fetched={} channel={} presence_changed={} snapshot_match={}",
+                fetched.len(),
+                channel_id,
+                received_presence_changed,
+                notified_snapshot_matches_query
+            ),
             metrics,
         })
     }

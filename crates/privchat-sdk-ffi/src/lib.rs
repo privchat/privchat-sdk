@@ -1196,9 +1196,9 @@ pub struct ChannelSyncState {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PresenceStatus {
     pub user_id: u64,
-    pub status: String,
-    pub last_seen: i64,
-    pub online_devices: Vec<String>,
+    pub is_online: bool,
+    pub last_seen_at: i64,
+    pub device_count: u32,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -2170,9 +2170,9 @@ fn map_file_queue_ref(r: SdkFileQueueRef) -> FileQueueRef {
 fn map_presence_status(v: SdkPresenceStatus) -> PresenceStatus {
     PresenceStatus {
         user_id: v.user_id,
-        status: v.status,
-        last_seen: v.last_seen,
-        online_devices: v.online_devices,
+        is_online: v.is_online,
+        last_seen_at: v.last_seen_at,
+        device_count: v.device_count,
     }
 }
 
@@ -3430,25 +3430,6 @@ impl PrivchatClient {
         Ok(count as u64)
     }
 
-    pub async fn subscribe_presence(
-        &self,
-        user_ids: Vec<u64>,
-    ) -> Result<Vec<PresenceStatus>, PrivchatFfiError> {
-        let out = self
-            .inner
-            .subscribe_presence(user_ids)
-            .await
-            .map_err(PrivchatFfiError::from)?;
-        Ok(out.into_iter().map(map_presence_status).collect())
-    }
-
-    pub async fn unsubscribe_presence(&self, user_ids: Vec<u64>) -> Result<(), PrivchatFfiError> {
-        self.inner
-            .unsubscribe_presence(user_ids)
-            .await
-            .map_err(PrivchatFfiError::from)
-    }
-
     /// 订阅频道事件（进入聊天页面时调用，接收 typing / presence 等状态事件）
     /// channel_type: 0=Private, 1=Group, 2=Room
     /// token: 可选，Room 类型订阅时传入业务 API 签发的 ticket（JWT）
@@ -3477,30 +3458,23 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
-    pub async fn fetch_presence(
+    pub async fn batch_get_presence(
         &self,
         user_ids: Vec<u64>,
     ) -> Result<Vec<PresenceStatus>, PrivchatFfiError> {
         let out = self
             .inner
-            .fetch_presence(user_ids)
+            .batch_get_presence(user_ids)
             .await
             .map_err(PrivchatFfiError::from)?;
         Ok(out.into_iter().map(map_presence_status).collect())
-    }
-
-    pub async fn batch_get_presence(
-        &self,
-        user_ids: Vec<u64>,
-    ) -> Result<Vec<PresenceStatus>, PrivchatFfiError> {
-        self.fetch_presence(user_ids).await
     }
 
     pub async fn get_presence(
         &self,
         user_id: u64,
     ) -> Result<Option<PresenceStatus>, PrivchatFfiError> {
-        let mut out = self.fetch_presence(vec![user_id]).await?;
+        let mut out = self.batch_get_presence(vec![user_id]).await?;
         Ok(out.pop())
     }
 
@@ -6703,12 +6677,9 @@ impl PrivchatClient {
                 total: 0,
             });
         }
-        let statuses = self.fetch_presence(user_ids).await?;
+        let statuses = self.batch_get_presence(user_ids).await?;
         let total = statuses.len() as u64;
-        let online = statuses
-            .iter()
-            .filter(|s| s.status.eq_ignore_ascii_case("online"))
-            .count() as u64;
+        let online = statuses.iter().filter(|s| s.is_online).count() as u64;
         let offline = total.saturating_sub(online);
         Ok(PresenceStatsView {
             online,

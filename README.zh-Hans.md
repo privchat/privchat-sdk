@@ -144,7 +144,7 @@ privchat-sdk/
 |------|------|
 | `upsert_message_reaction()` | 消息表情回应 |
 | `record_mention()` / `get_unread_mention_count()` | @提醒 |
-| `subscribe_presence()` / `fetch_presence()` | 在线状态 |
+| `batch_get_presence()` / `get_presence()` | 在线状态 |
 | `send_typing()` | 输入状态指示 |
 | `rpc_call(route, body_json)` | 通用 RPC 调用 |
 

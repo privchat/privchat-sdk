@@ -1374,7 +1374,8 @@ struct FriendApplyCompat {
     user_id: u64,
     username: String,
     status: String,
-    added_at: String,
+    #[serde(deserialize_with = "deserialize_u64_from_string_or_number")]
+    added_at: u64,
     message: Option<String>,
 }
 

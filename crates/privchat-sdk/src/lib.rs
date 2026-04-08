@@ -29,9 +29,8 @@ use msgtrans::transport::TransportOptions;
 use msgtrans::ClientEvent;
 use privchat_protocol::message::MessagePayloadEnvelope;
 use privchat_protocol::presence::{
-    GetOnlineStatusRequest, GetOnlineStatusResponse, OnlineStatusInfo, SubscribePresenceRequest,
-    SubscribePresenceResponse, TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
-    UnsubscribePresenceRequest,
+    PresenceBatchStatusRequest, PresenceBatchStatusResponse,
+    TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
 };
 use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
 use privchat_protocol::rpc::file::upload::{
@@ -705,9 +704,9 @@ pub struct FileQueueRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresenceStatus {
     pub user_id: u64,
-    pub status: String,
-    pub last_seen: i64,
-    pub online_devices: Vec<String>,
+    pub is_online: bool,
+    pub last_seen_at: i64,
+    pub device_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -730,19 +729,6 @@ impl TypingActionType {
             TypingActionType::UploadingFile => ProtoTypingActionType::UploadingFile,
             TypingActionType::ChoosingSticker => ProtoTypingActionType::ChoosingSticker,
         }
-    }
-}
-
-fn map_presence_status(value: OnlineStatusInfo) -> PresenceStatus {
-    PresenceStatus {
-        user_id: value.user_id,
-        status: value.status.as_str().to_string(),
-        last_seen: value.last_seen,
-        online_devices: value
-            .online_devices
-            .into_iter()
-            .map(|d| d.as_str().to_string())
-            .collect(),
     }
 }
 
@@ -1296,15 +1282,7 @@ enum Command {
     SyncAllChannels {
         resp: oneshot::Sender<Result<usize>>,
     },
-    SubscribePresence {
-        user_ids: Vec<u64>,
-        resp: oneshot::Sender<Result<Vec<PresenceStatus>>>,
-    },
-    UnsubscribePresence {
-        user_ids: Vec<u64>,
-        resp: oneshot::Sender<Result<()>>,
-    },
-    FetchPresence {
+    BatchGetPresence {
         user_ids: Vec<u64>,
         resp: oneshot::Sender<Result<Vec<PresenceStatus>>>,
     },
@@ -6382,113 +6360,46 @@ impl State {
         Ok(total)
     }
 
-    async fn subscribe_presence(&mut self, user_ids: Vec<u64>) -> Result<Vec<PresenceStatus>> {
+    async fn batch_get_presence(&mut self, user_ids: Vec<u64>) -> Result<Vec<PresenceStatus>> {
         if user_ids.is_empty() {
             return Ok(Vec::new());
         }
         let timeout = self.timeout();
-        let req = SubscribePresenceRequest { user_ids };
-        let request = RpcRequest {
-            route: routes::presence::SUBSCRIBE.to_string(),
-            body: serde_json::to_value(req).map_err(|e| {
-                Error::Serialization(format!("encode subscribe_presence body: {e}"))
-            })?,
-        };
-        let payload = encode_message(&request)
-            .map_err(|e| Error::Serialization(format!("encode subscribe_presence rpc: {e}")))?;
-        let raw = self
-            .request_bytes(
-                Bytes::from(payload),
-                MessageType::RpcRequest as u8,
-                timeout,
-                "rpc subscribe_presence",
-            )
-            .await?;
-        let rpc_resp: RpcResponse = decode_message(&raw)
-            .map_err(|e| Error::Serialization(format!("decode subscribe_presence rpc: {e}")))?;
-        if rpc_resp.code != 0 {
-            return Err(Error::Auth(rpc_resp.message));
-        }
-        let body = rpc_resp
-            .data
-            .ok_or_else(|| Error::Serialization("empty subscribe_presence data".into()))?;
-        let response: SubscribePresenceResponse = serde_json::from_value(body).map_err(|e| {
-            Error::Serialization(format!("decode subscribe_presence response: {e}"))
-        })?;
-        let mut out: Vec<PresenceStatus> = response
-            .initial_statuses
-            .into_values()
-            .map(map_presence_status)
-            .collect();
-        out.sort_by_key(|v| v.user_id);
-        Ok(out)
-    }
-
-    async fn unsubscribe_presence(&mut self, user_ids: Vec<u64>) -> Result<()> {
-        if user_ids.is_empty() {
-            return Ok(());
-        }
-        let timeout = self.timeout();
-        let req = UnsubscribePresenceRequest { user_ids };
-        let request = RpcRequest {
-            route: routes::presence::UNSUBSCRIBE.to_string(),
-            body: serde_json::to_value(req).map_err(|e| {
-                Error::Serialization(format!("encode unsubscribe_presence body: {e}"))
-            })?,
-        };
-        let payload = encode_message(&request)
-            .map_err(|e| Error::Serialization(format!("encode unsubscribe_presence rpc: {e}")))?;
-        let raw = self
-            .request_bytes(
-                Bytes::from(payload),
-                MessageType::RpcRequest as u8,
-                timeout,
-                "rpc unsubscribe_presence",
-            )
-            .await?;
-        let rpc_resp: RpcResponse = decode_message(&raw)
-            .map_err(|e| Error::Serialization(format!("decode unsubscribe_presence rpc: {e}")))?;
-        if rpc_resp.code != 0 {
-            return Err(Error::Auth(rpc_resp.message));
-        }
-        Ok(())
-    }
-
-    async fn fetch_presence(&mut self, user_ids: Vec<u64>) -> Result<Vec<PresenceStatus>> {
-        if user_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let timeout = self.timeout();
-        let req = GetOnlineStatusRequest { user_ids };
+        let req = PresenceBatchStatusRequest { user_ids };
         let request = RpcRequest {
             route: routes::presence::STATUS_GET.to_string(),
             body: serde_json::to_value(req)
-                .map_err(|e| Error::Serialization(format!("encode fetch_presence body: {e}")))?,
+                .map_err(|e| Error::Serialization(format!("encode batch_get_presence body: {e}")))?,
         };
         let payload = encode_message(&request)
-            .map_err(|e| Error::Serialization(format!("encode fetch_presence rpc: {e}")))?;
+            .map_err(|e| Error::Serialization(format!("encode batch_get_presence rpc: {e}")))?;
         let raw = self
             .request_bytes(
                 Bytes::from(payload),
                 MessageType::RpcRequest as u8,
                 timeout,
-                "rpc fetch_presence",
+                "rpc batch_get_presence",
             )
             .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
-            .map_err(|e| Error::Serialization(format!("decode fetch_presence rpc: {e}")))?;
+            .map_err(|e| Error::Serialization(format!("decode batch_get_presence rpc: {e}")))?;
         if rpc_resp.code != 0 {
             return Err(Error::Auth(rpc_resp.message));
         }
         let body = rpc_resp
             .data
-            .ok_or_else(|| Error::Serialization("empty fetch_presence data".into()))?;
-        let response: GetOnlineStatusResponse = serde_json::from_value(body)
-            .map_err(|e| Error::Serialization(format!("decode fetch_presence response: {e}")))?;
+            .ok_or_else(|| Error::Serialization("empty batch_get_presence data".into()))?;
+        let response: PresenceBatchStatusResponse = serde_json::from_value(body)
+            .map_err(|e| Error::Serialization(format!("decode batch_get_presence response: {e}")))?;
         let mut out: Vec<PresenceStatus> = response
-            .statuses
-            .into_values()
-            .map(map_presence_status)
+            .items
+            .into_iter()
+            .map(|snapshot| PresenceStatus {
+                user_id: snapshot.user_id,
+                is_online: snapshot.is_online,
+                last_seen_at: snapshot.last_seen_at,
+                device_count: snapshot.device_count,
+            })
             .collect();
         out.sort_by_key(|v| v.user_id);
         Ok(out)
@@ -8142,51 +8053,17 @@ impl PrivchatSdk {
                             let _ = resp.send(result);
                         }
                     }
-                    Command::SubscribePresence { user_ids, resp } => {
+                    Command::BatchGetPresence { user_ids, resp } => {
                         let result = match state.session_state.can(Action::Authenticate) {
                             Ok(_) => match timeout(
                                 Duration::from_secs(15),
-                                state.subscribe_presence(user_ids),
+                                state.batch_get_presence(user_ids),
                             )
                             .await
                             {
                                 Ok(r) => r,
                                 Err(_) => {
-                                    Err(Error::Transport("subscribe_presence timeout".to_string()))
-                                }
-                            },
-                            Err(e) => Err(e),
-                        };
-                        let _ = resp.send(result);
-                    }
-                    Command::UnsubscribePresence { user_ids, resp } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => match timeout(
-                                Duration::from_secs(15),
-                                state.unsubscribe_presence(user_ids),
-                            )
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(_) => Err(Error::Transport(
-                                    "unsubscribe_presence timeout".to_string(),
-                                )),
-                            },
-                            Err(e) => Err(e),
-                        };
-                        let _ = resp.send(result);
-                    }
-                    Command::FetchPresence { user_ids, resp } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => match timeout(
-                                Duration::from_secs(15),
-                                state.fetch_presence(user_ids),
-                            )
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    Err(Error::Transport("fetch_presence timeout".to_string()))
+                                    Err(Error::Transport("batch_get_presence timeout".to_string()))
                                 }
                             },
                             Err(e) => Err(e),
@@ -9832,11 +9709,11 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn subscribe_presence(&self, user_ids: Vec<u64>) -> Result<Vec<PresenceStatus>> {
+    pub async fn batch_get_presence(&self, user_ids: Vec<u64>) -> Result<Vec<PresenceStatus>> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(Command::SubscribePresence {
+            .send(Command::BatchGetPresence {
                 user_ids,
                 resp: resp_tx,
             })
@@ -9845,30 +9722,9 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn unsubscribe_presence(&self, user_ids: Vec<u64>) -> Result<()> {
-        self.ensure_running()?;
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(Command::UnsubscribePresence {
-                user_ids,
-                resp: resp_tx,
-            })
-            .await
-            .map_err(|_| self.actor_channel_error())?;
-        resp_rx.await.map_err(|_| self.actor_channel_error())?
-    }
-
-    pub async fn fetch_presence(&self, user_ids: Vec<u64>) -> Result<Vec<PresenceStatus>> {
-        self.ensure_running()?;
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(Command::FetchPresence {
-                user_ids,
-                resp: resp_tx,
-            })
-            .await
-            .map_err(|_| self.actor_channel_error())?;
-        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    pub async fn get_presence(&self, user_id: u64) -> Result<Option<PresenceStatus>> {
+        let mut out = self.batch_get_presence(vec![user_id]).await?;
+        Ok(out.pop())
     }
 
     pub async fn send_typing(
@@ -11742,6 +11598,64 @@ mod tests {
         assert!(
             members.is_empty(),
             "group member tombstone should remove local member"
+        );
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn friend_tombstone_removes_local_friend() {
+        let (mut state, dir) = new_seeded_state("friend-tombstone").await;
+
+        state
+            .storage
+            .upsert_user(UpsertUserInput {
+                user_id: 20001,
+                username: Some("bob".to_string()),
+                nickname: Some("Bob".to_string()),
+                alias: Some("B".to_string()),
+                avatar: "avatar://bob".to_string(),
+                user_type: 0,
+                is_deleted: false,
+                channel_id: String::new(),
+                version: 9,
+                updated_at: 900,
+            })
+            .await
+            .expect("seed friend user");
+        state
+            .storage
+            .upsert_friend(UpsertFriendInput {
+                user_id: 20001,
+                tags: Some("work".to_string()),
+                is_pinned: false,
+                created_at: 800,
+                version: 10,
+                updated_at: 900,
+            })
+            .await
+            .expect("seed friend row");
+
+        let deleted = SyncEntityItem {
+            entity_id: "20001".to_string(),
+            version: 11,
+            deleted: true,
+            payload: None,
+        };
+        state
+            .apply_sync_entities("friend", None, &[deleted], false)
+            .await
+            .expect("apply friend tombstone");
+
+        let friends = state
+            .storage
+            .list_friends(20, 0)
+            .await
+            .expect("list friends after tombstone");
+        assert!(
+            friends.is_empty(),
+            "friend tombstone should remove local friend row"
         );
 
         state.storage.shutdown();
