@@ -29,7 +29,7 @@ use msgtrans::transport::TransportOptions;
 use msgtrans::ClientEvent;
 use privchat_protocol::message::MessagePayloadEnvelope;
 use privchat_protocol::presence::{
-    PresenceBatchStatusRequest, PresenceBatchStatusResponse,
+    PresenceBatchStatusRequest, PresenceBatchStatusResponse, PresenceChangedNotification,
     TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
 };
 use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
@@ -707,6 +707,7 @@ pub struct PresenceStatus {
     pub is_online: bool,
     pub last_seen_at: i64,
     pub device_count: u32,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1728,9 +1729,63 @@ struct State {
     cache_hit_count: u64,
     cache_miss_count: u64,
     pending_prelogin_inbound_frames: Vec<(u8, Vec<u8>)>,
+    presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
 }
 
 impl State {
+    fn clear_presence_cache(&self) {
+        if let Ok(mut locked) = self.presence_cache.lock() {
+            locked.clear();
+        }
+    }
+
+    fn update_presence_cache(&self, items: &[PresenceStatus]) {
+        if let Ok(mut locked) = self.presence_cache.lock() {
+            for item in items {
+                match locked.get(&item.user_id) {
+                    Some(existing) if existing.version >= item.version => {}
+                    _ => {
+                        locked.insert(item.user_id, item.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_presence_changed_payload(&self, payload: &[u8]) {
+        let Ok(notification) = serde_json::from_slice::<PresenceChangedNotification>(payload) else {
+            return;
+        };
+        let snapshot = notification.snapshot;
+        self.update_presence_cache(&[PresenceStatus {
+            user_id: snapshot.user_id,
+            is_online: snapshot.is_online,
+            last_seen_at: snapshot.last_seen_at,
+            device_count: snapshot.device_count,
+            version: snapshot.version,
+        }]);
+    }
+
+    fn cache_presence_response(
+        &self,
+        response: PresenceBatchStatusResponse,
+    ) -> Vec<PresenceStatus> {
+        let mut out: Vec<PresenceStatus> = response
+            .items
+            .into_iter()
+            .map(|snapshot| PresenceStatus {
+                user_id: snapshot.user_id,
+                is_online: snapshot.is_online,
+                last_seen_at: snapshot.last_seen_at,
+                device_count: snapshot.device_count,
+                version: snapshot.version,
+            })
+            .collect();
+        out.sort_by_key(|v| v.user_id);
+        self.update_presence_cache(&out);
+        out
+    }
+
     fn sync_version_key(entity_type: &str, scope: Option<&str>) -> String {
         let scope_part = scope.unwrap_or("*");
         format!("__sync_version__:{entity_type}:{scope_part}")
@@ -5980,6 +6035,9 @@ impl State {
                             req.payload.len()
                         );
                     }
+                    if req.topic.as_deref() == Some("presence_changed") {
+                        self.apply_presence_changed_payload(&req.payload);
+                    }
                     self.pending_events
                         .push(SdkEvent::SubscriptionMessageReceived {
                             channel_id: req.channel_id,
@@ -6391,18 +6449,7 @@ impl State {
             .ok_or_else(|| Error::Serialization("empty batch_get_presence data".into()))?;
         let response: PresenceBatchStatusResponse = serde_json::from_value(body)
             .map_err(|e| Error::Serialization(format!("decode batch_get_presence response: {e}")))?;
-        let mut out: Vec<PresenceStatus> = response
-            .items
-            .into_iter()
-            .map(|snapshot| PresenceStatus {
-                user_id: snapshot.user_id,
-                is_online: snapshot.is_online,
-                last_seen_at: snapshot.last_seen_at,
-                device_count: snapshot.device_count,
-            })
-            .collect();
-        out.sort_by_key(|v| v.user_id);
-        Ok(out)
+        Ok(self.cache_presence_response(response))
     }
 
     async fn send_typing(
@@ -7418,6 +7465,7 @@ pub struct PrivchatSdk {
     supervised_sync_running: Arc<AtomicBool>,
     startup_error: Arc<StdMutex<Option<Error>>>,
     snowflake: Arc<snowflake_me::Snowflake>,
+    presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
 }
 
 impl PrivchatSdk {
@@ -7463,6 +7511,8 @@ impl PrivchatSdk {
         let task_registry = TaskRegistry::new();
         let startup_error = Arc::new(StdMutex::new(None));
         let actor_startup_error = startup_error.clone();
+        let presence_cache = Arc::new(StdMutex::new(HashMap::new()));
+        let actor_presence_cache = presence_cache.clone();
         let machine_id: u16 = (std::process::id() as u16) & 0x1f;
         let data_center_id: u16 = (chrono::Utc::now().timestamp_millis() as u16) & 0x1f;
         let snowflake = snowflake_me::Snowflake::builder()
@@ -7538,6 +7588,7 @@ impl PrivchatSdk {
                 cache_hit_count: 0,
                 cache_miss_count: 0,
                 pending_prelogin_inbound_frames: Vec::new(),
+                presence_cache: actor_presence_cache,
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut health_tick = interval(Duration::from_secs(15));
@@ -7670,6 +7721,7 @@ impl PrivchatSdk {
                         let from_state = state.session_state.as_connection_state();
                         let result = state.disconnect().await;
                         if result.is_ok() && state.session_state != SessionState::Shutdown {
+                            state.clear_presence_cache();
                             state.session_state = SessionState::New;
                             emit_sequenced_event(
                                 &actor_event_tx,
@@ -9271,6 +9323,7 @@ impl PrivchatSdk {
                         let from_state = state.session_state.as_connection_state();
                         state.should_auto_reconnect = false;
                         state.bootstrap_completed = false;
+                        state.clear_presence_cache();
                         state.session_state = SessionState::Connected;
                         let result = match state.current_uid.clone() {
                             Some(uid) => {
@@ -9312,6 +9365,7 @@ impl PrivchatSdk {
                         if let Ok(next_state) = state.session_state.can(Action::Shutdown) {
                             state.session_state = next_state;
                         }
+                        state.clear_presence_cache();
                         emit_sequenced_event(
                             &actor_event_tx,
                             &actor_event_history,
@@ -9366,6 +9420,7 @@ impl PrivchatSdk {
             supervised_sync_running: Arc::new(AtomicBool::new(false)),
             startup_error,
             snowflake,
+            presence_cache,
         }
     }
 
@@ -9413,7 +9468,11 @@ impl PrivchatSdk {
             .send(Command::Disconnect { resp: resp_tx })
             .await
             .map_err(|_| self.actor_channel_error())?;
-        resp_rx.await.map_err(|_| self.actor_channel_error())?
+        let out = resp_rx.await.map_err(|_| self.actor_channel_error())?;
+        if out.is_ok() {
+            self.clear_presence_cache();
+        }
+        out
     }
 
     pub async fn is_connected(&self) -> Result<bool> {
@@ -9725,6 +9784,35 @@ impl PrivchatSdk {
     pub async fn get_presence(&self, user_id: u64) -> Result<Option<PresenceStatus>> {
         let mut out = self.batch_get_presence(vec![user_id]).await?;
         Ok(out.pop())
+    }
+
+    pub fn batch_get_cached_presence(&self, user_ids: Vec<u64>) -> Vec<PresenceStatus> {
+        let mut out = self
+            .presence_cache
+            .lock()
+            .ok()
+            .map(|locked| {
+                user_ids
+                    .iter()
+                    .filter_map(|user_id| locked.get(user_id).cloned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.sort_by_key(|v| v.user_id);
+        out
+    }
+
+    pub fn get_cached_presence(&self, user_id: u64) -> Option<PresenceStatus> {
+        self.presence_cache
+            .lock()
+            .ok()
+            .and_then(|locked| locked.get(&user_id).cloned())
+    }
+
+    pub fn clear_presence_cache(&self) {
+        if let Ok(mut locked) = self.presence_cache.lock() {
+            locked.clear();
+        }
     }
 
     pub async fn send_typing(
@@ -10968,19 +11056,23 @@ mod tests {
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
         group_settings_key, Action, ConnectionState, Error, ErrorCode, LoginResult,
-        MessageCachePolicy, NetworkHint, PrivchatConfig, PrivchatSdk, ResumeEscalationScope,
-        ResumeFailureClass, ResumeFailureTarget, SdkEvent, SessionState, State, UpsertChannelInput,
-        UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput, UpsertMessageReactionInput,
-        UpsertRemoteMessageInput, UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
+        MessageCachePolicy, NetworkHint, PresenceStatus, PrivchatConfig, PrivchatSdk,
+        ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, SessionState,
+        State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
+        UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertRemoteMessageInput,
+        UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
     };
     use crate::local_store::LocalStore;
     use crate::receive_pipeline::ReceivePipeline;
     use crate::storage_actor::StorageHandle;
+    use privchat_protocol::presence::{
+        PresenceBatchStatusResponse, PresenceChangedNotification, PresenceSnapshot,
+    };
     use privchat_protocol::rpc::sync::SyncEntityItem;
     use privchat_protocol::PushMessageRequest;
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(name: &str) -> PathBuf {
@@ -11085,6 +11177,7 @@ mod tests {
             cache_hit_count: 0,
             cache_miss_count: 0,
             pending_prelogin_inbound_frames: Vec::new(),
+            presence_cache: Arc::new(StdMutex::new(HashMap::new())),
         };
         (state, dir)
     }
@@ -11657,6 +11750,115 @@ mod tests {
             friends.is_empty(),
             "friend tombstone should remove local friend row"
         );
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_get_presence_response_populates_rust_presence_cache() {
+        let (state, dir) = new_seeded_state("presence-cache-response").await;
+
+        let out = state.cache_presence_response(PresenceBatchStatusResponse {
+            items: vec![
+                PresenceSnapshot {
+                    user_id: 20002,
+                    is_online: false,
+                    last_seen_at: 1_710_000_002,
+                    device_count: 0,
+                    version: 3,
+                },
+                PresenceSnapshot {
+                    user_id: 20001,
+                    is_online: true,
+                    last_seen_at: 1_710_000_001,
+                    device_count: 2,
+                    version: 7,
+                },
+            ],
+            denied_user_ids: vec![20003],
+        });
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].user_id, 20001);
+        assert_eq!(out[1].user_id, 20002);
+
+        let cached = state
+            .presence_cache
+            .lock()
+            .expect("presence cache")
+            .clone();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached.get(&20001).map(|v| v.version), Some(7));
+        assert_eq!(cached.get(&20002).map(|v| v.version), Some(3));
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn presence_changed_updates_rust_presence_cache_without_regressing_version() {
+        let (state, dir) = new_seeded_state("presence-cache-event").await;
+
+        state.update_presence_cache(&[PresenceStatus {
+            user_id: 20001,
+            is_online: false,
+            last_seen_at: 1_710_000_000,
+            device_count: 0,
+            version: 4,
+        }]);
+
+        let newer = PresenceChangedNotification {
+            user_id: 20001,
+            version: 6,
+            snapshot: PresenceSnapshot {
+                user_id: 20001,
+                is_online: true,
+                last_seen_at: 1_710_000_010,
+                device_count: 1,
+                version: 6,
+            },
+        };
+        state.apply_presence_changed_payload(
+            &serde_json::to_vec(&newer).expect("encode presence_changed newer"),
+        );
+
+        let after_newer = state
+            .presence_cache
+            .lock()
+            .expect("presence cache after newer")
+            .get(&20001)
+            .cloned()
+            .expect("cached presence after newer");
+        assert_eq!(after_newer.version, 6);
+        assert!(after_newer.is_online);
+        assert_eq!(after_newer.device_count, 1);
+
+        let older = PresenceChangedNotification {
+            user_id: 20001,
+            version: 5,
+            snapshot: PresenceSnapshot {
+                user_id: 20001,
+                is_online: false,
+                last_seen_at: 1_710_000_020,
+                device_count: 0,
+                version: 5,
+            },
+        };
+        state.apply_presence_changed_payload(
+            &serde_json::to_vec(&older).expect("encode presence_changed older"),
+        );
+
+        let after_older = state
+            .presence_cache
+            .lock()
+            .expect("presence cache after older")
+            .get(&20001)
+            .cloned()
+            .expect("cached presence after older");
+        assert_eq!(after_older.version, 6);
+        assert!(after_older.is_online);
+        assert_eq!(after_older.device_count, 1);
 
         state.storage.shutdown();
         let _ = std::fs::remove_dir_all(dir);

@@ -34,12 +34,13 @@ use privchat_protocol::rpc::{
     ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse, ChannelPinRequest,
     ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse, DevicePushStatusRequest,
     DevicePushStatusResponse, DevicePushUpdateRequest, DevicePushUpdateResponse,
-    FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
-    FileUploadCallbackResponse, FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest,
-    FriendApplyResponse, FriendCheckRequest, FriendCheckResponse, FriendPendingRequest,
-    FriendPendingResponse, FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest,
-    FriendRemoveResponse, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
-    GetDifferenceResponse, GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
+    FileGetUrlRequest, FileGetUrlResponse, FileRequestUploadTokenRequest,
+    FileRequestUploadTokenResponse, FileUploadCallbackRequest, FileUploadCallbackResponse,
+    FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse,
+    FriendCheckRequest, FriendCheckResponse, FriendPendingRequest, FriendPendingResponse,
+    FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest, FriendRemoveResponse,
+    GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest, GetDifferenceResponse,
+    GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
     GroupApprovalHandleRequest, GroupApprovalHandleResponse, GroupApprovalListRequest,
     GroupApprovalListResponse, GroupCreateRequest, GroupCreateResponse, GroupInfoRequest,
     GroupInfoResponse, GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberLeaveRequest,
@@ -1199,6 +1200,7 @@ pub struct PresenceStatus {
     pub is_online: bool,
     pub last_seen_at: i64,
     pub device_count: u32,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -2173,6 +2175,7 @@ fn map_presence_status(v: SdkPresenceStatus) -> PresenceStatus {
         is_online: v.is_online,
         last_seen_at: v.last_seen_at,
         device_count: v.device_count,
+        version: v.version,
     }
 }
 
@@ -3467,18 +3470,21 @@ impl PrivchatClient {
             .batch_get_presence(user_ids)
             .await
             .map_err(PrivchatFfiError::from)?;
-        Ok(out.into_iter().map(map_presence_status).collect())
+        Ok(out
+            .into_iter()
+            .map(map_presence_status)
+            .collect())
     }
 
     pub async fn get_presence(
         &self,
         user_id: u64,
     ) -> Result<Option<PresenceStatus>, PrivchatFfiError> {
-        let mut out = self.batch_get_presence(vec![user_id]).await?;
-        Ok(out.pop())
+        Ok(self.inner.get_cached_presence(user_id).map(map_presence_status))
     }
 
     pub async fn clear_presence_cache(&self) -> Result<(), PrivchatFfiError> {
+        self.inner.clear_presence_cache();
         Ok(())
     }
 
@@ -6936,10 +6942,7 @@ impl PrivchatClient {
         source_path: String,
         target_path: String,
     ) -> Result<String, PrivchatFfiError> {
-        let data = std::fs::read(&source_path).map_err(|e| PrivchatFfiError::SdkError {
-            code: privchat_protocol::ErrorCode::InternalError as u32,
-            detail: format!("read source attachment failed: {e}"),
-        })?;
+        let data = self.resolve_attachment_bytes(&source_path).await?;
         if let Some(parent) = std::path::Path::new(&target_path).parent() {
             std::fs::create_dir_all(parent).map_err(|e| PrivchatFfiError::SdkError {
                 code: privchat_protocol::ErrorCode::InternalError as u32,
@@ -7011,6 +7014,66 @@ impl PrivchatClient {
 
     pub async fn remove_video_process_hook(&self) -> Result<(), PrivchatFfiError> {
         self.set_video_process_hook(None).await
+    }
+
+    async fn resolve_attachment_bytes(
+        &self,
+        source_path: &str,
+    ) -> Result<Vec<u8>, PrivchatFfiError> {
+        let source = source_path.trim();
+        if source.is_empty() {
+            return Err(PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InvalidParams as u32,
+                detail: "attachment source is empty".to_string(),
+            });
+        }
+
+        let path = std::path::Path::new(source);
+        if path.exists() {
+            return std::fs::read(path).map_err(|e| PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InternalError as u32,
+                detail: format!("read local attachment failed: {e}"),
+            });
+        }
+
+        let download_url = if source.starts_with("http://") || source.starts_with("https://") {
+            source.to_string()
+        } else if let Ok(file_id) = source.parse::<u64>() {
+            let req = FileGetUrlRequest {
+                file_id,
+                user_id: 0,
+            };
+            let resp: FileGetUrlResponse =
+                rpc_call_typed(&self.inner, routes::file::GET_URL, &req).await?;
+            resp.file_url
+        } else {
+            return Err(PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InvalidParams as u32,
+                detail: format!("invalid attachment source: {source}"),
+            });
+        };
+
+        let response = reqwest::Client::new()
+            .get(&download_url)
+            .send()
+            .await
+            .map_err(|e| PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::NetworkError as u32,
+                detail: format!("download attachment request failed: {e}"),
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::NetworkError as u32,
+                detail: format!("download attachment failed: status={status} body={body}"),
+            });
+        }
+        let bytes = response.bytes().await.map_err(|e| PrivchatFfiError::SdkError {
+            code: privchat_protocol::ErrorCode::NetworkError as u32,
+            detail: format!("read attachment bytes failed: {e}"),
+        })?;
+        Ok(bytes.to_vec())
     }
 
     pub fn to_client_endpoint(&self) -> Option<String> {

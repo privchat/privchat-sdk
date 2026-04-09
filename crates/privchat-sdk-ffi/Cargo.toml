@@ -18,6 +18,7 @@ serde_json.workspace = true
 uniffi.workspace = true
 privchat-protocol.workspace = true
 tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 privchat-sdk = { path = "../privchat-sdk" }
 
 [build-dependencies]
