@@ -6605,17 +6605,25 @@ impl State {
                 .is_some()
             {
                 // Backward compatibility: attachment callers may still pass raw metadata json.
-                envelope.content = content_json
-                    .get("filename")
+                let file_type = content_json
+                    .get("file_type")
                     .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        std::path::Path::new(&message.content)
-                            .file_name()
-                            .and_then(|v| v.to_str())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| "attachment".to_string())
-                    });
+                    .or_else(|| {
+                        content_json
+                            .get("mime_type")
+                            .and_then(|v| v.as_str())
+                            .and_then(|mime| {
+                                if mime.starts_with("image/") {
+                                    Some("image")
+                                } else if mime.starts_with("video/") {
+                                    Some("video")
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+                    .unwrap_or("file");
+                envelope.content = Self::attachment_placeholder_text(file_type).to_string();
                 envelope.metadata = Some(content_json);
             }
         }
@@ -6763,6 +6771,14 @@ impl State {
             "mp4" | "mov" | "mkv" | "avi" | "webm" => "video",
             "mp3" | "wav" | "aac" | "m4a" | "ogg" => "audio",
             _ => "file",
+        }
+    }
+
+    fn attachment_placeholder_text(file_type: &str) -> &'static str {
+        match file_type {
+            "image" => "[图片]",
+            "video" => "[视频]",
+            _ => "[文件]",
         }
     }
 
@@ -7261,7 +7277,7 @@ impl State {
                 upload_filename.clone(),
                 upload_payload.len() as i64,
                 mime_type.clone(),
-                file_type,
+                file_type.clone(),
             )
             .await?;
         let upload_token = token
@@ -7306,6 +7322,7 @@ impl State {
                 .map(|v| v.file_url.clone())
                 .unwrap_or_default();
             serde_json::json!({
+                "file_type": file_type,
                 "file_id": uploaded_file_id,
                 "thumbnail_file_id": thumb_file_id,
                 "filename": upload_filename,
@@ -7317,6 +7334,7 @@ impl State {
             })
         } else {
             serde_json::json!({
+                "file_type": file_type,
                 "file_id": uploaded_file_id,
                 "filename": upload_filename,
                 "mime_type": mime_type,
@@ -11583,6 +11601,15 @@ mod tests {
         assert!(State::should_apply_entity_version(Some(5), 5));
         assert!(State::should_apply_entity_version(Some(5), 6));
         assert!(!State::should_apply_entity_version(Some(5), 4));
+    }
+
+    #[test]
+    fn attachment_placeholder_text_is_protocol_aligned() {
+        assert_eq!(State::attachment_placeholder_text("image"), "[图片]");
+        assert_eq!(State::attachment_placeholder_text("video"), "[视频]");
+        assert_eq!(State::attachment_placeholder_text("file"), "[文件]");
+        assert_eq!(State::attachment_placeholder_text("audio"), "[文件]");
+        assert_eq!(State::attachment_placeholder_text("unknown"), "[文件]");
     }
 
     #[tokio::test(flavor = "current_thread")]
