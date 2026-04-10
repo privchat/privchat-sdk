@@ -34,7 +34,7 @@ use privchat_protocol::presence::{
 };
 use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
 use privchat_protocol::rpc::file::upload::{
-    FileRequestUploadTokenRequest,
+    FileRequestUploadTokenRequest, FileRequestUploadTokenResponse,
 };
 use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
 use privchat_protocol::rpc::contact::friend::FriendPendingResponse;
@@ -539,15 +539,6 @@ struct UploadedFileInfo {
     width: Option<u32>,
     height: Option<u32>,
     mime_type: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct UploadTokenCompatResponse {
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(default)]
-    upload_token: Option<String>,
-    upload_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6893,7 +6884,7 @@ impl State {
         file_size: i64,
         mime_type: String,
         file_type: String,
-    ) -> Result<UploadTokenCompatResponse> {
+    ) -> Result<FileRequestUploadTokenResponse> {
         let payload = FileRequestUploadTokenRequest {
             user_id,
             filename: Some(filename),
@@ -6902,17 +6893,17 @@ impl State {
             file_type,
             business_type: "message".to_string(),
         };
-        let response: UploadTokenCompatResponse = self
+        let response: FileRequestUploadTokenResponse = self
             .rpc_call_typed(routes::file::REQUEST_UPLOAD_TOKEN, &payload)
             .await?;
-        if response
-            .token
-            .as_deref()
-            .or(response.upload_token.as_deref())
-            .is_none()
-        {
+        if response.token.trim().is_empty() {
             return Err(Error::Serialization(
-                "decode file/request_upload_token response: missing token/upload_token".to_string(),
+                "decode file/request_upload_token response: missing token".to_string(),
+            ));
+        }
+        if response.upload_url.trim().is_empty() {
+            return Err(Error::Serialization(
+                "decode file/request_upload_token response: missing upload_url".to_string(),
             ));
         }
         Ok(response)
@@ -7003,11 +6994,11 @@ impl State {
     async fn upload_callback(
         &mut self,
         user_id: u64,
-        upload_token: &str,
+        token: &str,
         uploaded: &UploadedFileInfo,
     ) -> Result<()> {
         let payload = serde_json::json!({
-            "upload_token": upload_token,
+            "token": token,
             "file_id": uploaded.file_id,
             "file_url": uploaded.file_url,
             "thumbnail_url": uploaded.thumbnail_url,
@@ -7244,27 +7235,18 @@ impl State {
                     "image".to_string(),
                 )
                 .await?;
-            let thumb_upload_token = thumb_token
-                .token
-                .clone()
-                .or(thumb_token.upload_token.clone())
-                .ok_or_else(|| {
-                    Error::Serialization(
-                        "file/request_upload_token response missing token/upload_token".to_string(),
-                    )
-                })?;
             let thumb_bytes = std::fs::read(&thumb_path)
                 .map_err(|e| Error::Storage(format!("read thumb file failed: {e}")))?;
             let uploaded_thumb = self
                 .upload_file_bytes(
                     &thumb_token.upload_url,
-                    &thumb_upload_token,
+                    &thumb_token.token,
                     &thumb_name,
                     &thumb_mime,
                     thumb_bytes,
                 )
                 .await?;
-            self.upload_callback(message.from_uid, &thumb_upload_token, &uploaded_thumb)
+            self.upload_callback(message.from_uid, &thumb_token.token, &uploaded_thumb)
                 .await?;
             Some(uploaded_thumb)
         } else {
@@ -7280,25 +7262,16 @@ impl State {
                 file_type.clone(),
             )
             .await?;
-        let upload_token = token
-            .token
-            .clone()
-            .or(token.upload_token.clone())
-            .ok_or_else(|| {
-                Error::Serialization(
-                    "file/request_upload_token response missing token/upload_token".to_string(),
-                )
-            })?;
         let uploaded = self
             .upload_file_bytes(
                 &token.upload_url,
-                &upload_token,
+                &token.token,
                 &upload_filename,
                 &mime_type,
                 upload_payload,
             )
             .await?;
-        self.upload_callback(message.from_uid, &upload_token, &uploaded)
+        self.upload_callback(message.from_uid, &token.token, &uploaded)
             .await?;
 
         let uploaded_file_id = uploaded.file_id.parse::<u64>().map_err(|_| {

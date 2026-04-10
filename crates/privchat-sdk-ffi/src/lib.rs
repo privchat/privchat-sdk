@@ -3320,17 +3320,6 @@ impl PrivchatClient {
         30
     }
 
-    pub fn file_api_base_url(&self) -> String {
-        let cfg = self.config();
-        cfg.endpoints
-            .first()
-            .map(|ep| {
-                let scheme = if ep.use_tls { "https" } else { "http" };
-                format!("{scheme}://{}:{}", ep.host, ep.port)
-            })
-            .unwrap_or_default()
-    }
-
     pub fn image_send_max_edge(&self) -> u32 {
         4096
     }

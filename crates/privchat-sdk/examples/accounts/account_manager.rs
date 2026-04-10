@@ -1387,7 +1387,6 @@ struct BlacklistCheckCompat {
 
 #[derive(Debug, Deserialize)]
 struct FileRequestUploadTokenCompat {
-    #[serde(alias = "upload_token")]
     token: String,
     upload_url: String,
     file_id: Option<String>,
