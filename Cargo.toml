@@ -33,3 +33,9 @@ rand = "0.8"
 msgtrans = { version = "1.0.6", path = "../msgtrans" }
 privchat-protocol = { version = "0.1", path = "../privchat-protocol" }
 uniffi = { version = "0.31.0", features = ["cli"] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

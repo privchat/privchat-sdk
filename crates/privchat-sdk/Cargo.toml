@@ -26,7 +26,7 @@ hex.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
 rand.workspace = true
-snowflake_me = { version = "0.5.0", features = ["ip-fallback"] }
+snowflake_me = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
