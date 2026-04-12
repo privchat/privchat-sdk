@@ -3054,7 +3054,10 @@ impl State {
 
         match notification_type.as_str() {
             // 已读游标同步通知：走 channel_read_cursor 实体
-            "self_read_pts_updated" | "peer_read_pts_updated" | "user_read_pts" => {
+            "self_read_pts_updated"
+            | "peer_read_pts_updated"
+            | "user_read_pts"
+            | "channel_read_cursor_updated" => {
                 let channel_id =
                     Self::json_field_u64(&payload_json, &["metadata", "channel_id"]).unwrap_or(0);
                 let read_pts =
@@ -3066,17 +3069,25 @@ impl State {
                     Self::json_field_u64(&payload_json, &["metadata", "channel_type"]).unwrap_or(1);
                 let reader_id =
                     Self::json_field_u64(&payload_json, &["metadata", "reader_id"]).unwrap_or(0);
+                let updated_at = Self::json_field_u64(&payload_json, &["metadata", "updated_at"])
+                    .unwrap_or(u64::from(push.timestamp) * 1000);
+                // read cursor 事件在服务器侧当前可能携带 message_seq=0，这里必须给一个单调版本，
+                // 否则会被本地投影当作旧版本丢弃，导致多端已读不一致。
+                let version = u64::from(push.message_seq)
+                    .max(updated_at)
+                    .max(read_pts)
+                    .max(1);
                 let payload = serde_json::json!({
                     "channel_id": channel_id,
                     "channel_type": channel_type as i32,
                     "type": channel_type as i32,
                     "reader_id": reader_id,
                     "last_read_pts": read_pts,
-                    "updated_at": i64::from(push.timestamp),
+                    "updated_at": i64::try_from(updated_at).unwrap_or(i64::MAX),
                 });
                 Some(SyncEntityItem {
                     entity_id: format!("{}:{}", channel_id, reader_id),
-                    version: u64::from(push.message_seq),
+                    version,
                     deleted: false,
                     payload: Some(payload),
                 })
@@ -3922,6 +3933,22 @@ impl State {
                     // the authoritative count is a local projection from message timeline + read cursor.
                     // For realtime push messages, bump_unread_on_incoming is true.
                     let from_self = current_user_id.map(|v| v == from_uid).unwrap_or(false);
+                    let should_bump_unread =
+                        bump_unread_on_incoming && !from_self && upserted.inserted_new;
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.unread] message apply: channel_id={} channel_type={} message_id={} server_message_id={} from_uid={} from_self={} inserted_new={} bump_unread_on_incoming={} should_bump_unread={}",
+                            channel_id,
+                            channel_type,
+                            message_id,
+                            server_message_id,
+                            from_uid,
+                            from_self,
+                            upserted.inserted_new,
+                            bump_unread_on_incoming,
+                            should_bump_unread
+                        );
+                    }
                     let _ = self
                         .update_channel_last_message(
                             channel_id,
@@ -3930,7 +3957,7 @@ impl State {
                             timestamp,
                             message_id,
                             Some(from_uid),
-                            bump_unread_on_incoming && !from_self && upserted.inserted_new,
+                            should_bump_unread,
                         )
                         .await;
                     emitted.push(SdkEvent::SyncEntityChanged {
@@ -4307,10 +4334,41 @@ impl State {
                     let reader_id = read_cursor.reader_id.unwrap_or(current_uid);
                     let read_pts = read_cursor.last_read_pts.unwrap_or(0);
                     if reader_id == current_uid && read_pts > 0 {
+                        let unread_before = self
+                            .storage
+                            .get_channel_unread_count(channel_id, channel_type)
+                            .await
+                            .ok();
                         let _ = self
                             .storage
                             .project_channel_read_cursor(channel_id, channel_type, read_pts)
                             .await;
+                        let unread_after = self
+                            .storage
+                            .get_channel_unread_count(channel_id, channel_type)
+                            .await
+                            .ok();
+                        if inbound_logs_enabled() {
+                            eprintln!(
+                                "[SDK.unread] read_cursor apply: channel_id={} channel_type={} reader_id={} current_uid={} read_pts={} unread_before={:?} unread_after={:?}",
+                                channel_id,
+                                channel_type,
+                                reader_id,
+                                current_uid,
+                                read_pts,
+                                unread_before,
+                                unread_after
+                            );
+                        }
+                    } else if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.unread] read_cursor skip: channel_id={} channel_type={} reader_id={} current_uid={} read_pts={}",
+                            channel_id,
+                            channel_type,
+                            reader_id,
+                            current_uid,
+                            read_pts
+                        );
                     }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "channel_read_cursor".to_string(),
@@ -6773,6 +6831,185 @@ impl State {
         }
     }
 
+    fn is_formatted_preview(content: &str) -> bool {
+        matches!(
+            content,
+            s if s.starts_with("[图片]")
+                || s.starts_with("[视频]")
+                || s.starts_with("[语音]")
+                || s.starts_with("[文件]")
+                || s.starts_with("[位置]")
+                || s.starts_with("[红包]")
+                || s.starts_with("[名片]")
+                || s.starts_with("[表情]")
+        )
+    }
+
+    fn preview_type_from_json(value: &serde_json::Value) -> Option<String> {
+        Self::json_get_string(value, &["type"])
+            .or_else(|| Self::json_get_string(value, &["content", "type"]))
+            .or_else(|| Self::json_get_string(value, &["metadata", "type"]))
+            .map(|v| v.to_ascii_lowercase())
+    }
+
+    fn preview_text_from_json(value: &serde_json::Value) -> Option<String> {
+        Self::json_get_string(value, &["content"])
+            .or_else(|| Self::json_get_string(value, &["text"]))
+            .or_else(|| Self::json_get_string(value, &["body"]))
+            .or_else(|| Self::json_get_string(value, &["content", "text"]))
+            .or_else(|| Self::json_get_string(value, &["content", "body"]))
+            .or_else(|| Self::json_get_string(value, &["tip"]))
+    }
+
+    fn preview_duration_from_json(value: &serde_json::Value) -> Option<i64> {
+        Self::json_get_i64(value, &["duration"])
+            .or_else(|| Self::json_get_i64(value, &["content", "duration"]))
+            .or_else(|| Self::json_get_i64(value, &["metadata", "duration"]))
+    }
+
+    fn infer_preview_kind(
+        message_type: Option<i32>,
+        content_json: Option<&serde_json::Value>,
+        extra_json: Option<&serde_json::Value>,
+    ) -> &'static str {
+        let image_type = i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(-1);
+        let file_type = i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(-1);
+        let voice_type = i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(-1);
+        let video_type = i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(-1);
+        let system_type = i32::try_from(ContentMessageType::System.as_u32()).unwrap_or(-1);
+        let audio_type = i32::try_from(ContentMessageType::Audio.as_u32()).unwrap_or(-1);
+        let location_type = i32::try_from(ContentMessageType::Location.as_u32()).unwrap_or(-1);
+        let contact_type = i32::try_from(ContentMessageType::ContactCard.as_u32()).unwrap_or(-1);
+        let sticker_type = i32::try_from(ContentMessageType::Sticker.as_u32()).unwrap_or(-1);
+
+        match message_type {
+            Some(v) if v == image_type => return "image",
+            Some(v) if v == file_type => {
+                let mime = content_json
+                    .and_then(|value| Self::json_get_string(value, &["mime_type"]))
+                    .or_else(|| extra_json.and_then(|value| Self::json_get_string(value, &["mime_type"])))
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                return if mime.starts_with("image/") {
+                    "image"
+                } else if mime.starts_with("video/") {
+                    "video"
+                } else if mime.starts_with("audio/") {
+                    "voice"
+                } else {
+                    "file"
+                };
+            }
+            Some(v) if v == voice_type || v == audio_type => return "voice",
+            Some(v) if v == video_type => return "video",
+            Some(v) if v == system_type => return "system",
+            Some(v) if v == location_type => return "location",
+            Some(v) if v == contact_type => return "contact_card",
+            Some(v) if v == sticker_type => return "sticker",
+            _ => {}
+        }
+
+        let detected = content_json
+            .and_then(Self::preview_type_from_json)
+            .or_else(|| extra_json.and_then(Self::preview_type_from_json));
+        match detected.as_deref() {
+            Some("image") => "image",
+            Some("video") => "video",
+            Some("voice") | Some("audio") => "voice",
+            Some("file") => "file",
+            Some("location") => "location",
+            Some("contact_card") | Some("contactcard") | Some("card") => "contact_card",
+            Some("red_packet") | Some("redpacket") | Some("hongbao") => "red_packet",
+            Some("sticker") | Some("emoji") => "sticker",
+            Some("system") | Some("tip") => "system",
+            Some("revoked") => "revoked",
+            _ => {
+                let revoked = content_json
+                    .and_then(|value| Self::json_get_bool(value, &["revoked"]))
+                    .or_else(|| extra_json.and_then(|value| Self::json_get_bool(value, &["revoked"])))
+                    .unwrap_or(false);
+                if revoked { "revoked" } else { "text" }
+            }
+        }
+    }
+
+    fn format_conversation_preview(
+        message_type: Option<i32>,
+        content: &str,
+        extra: Option<&str>,
+    ) -> String {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if Self::is_formatted_preview(trimmed) {
+            return trimmed.to_string();
+        }
+
+        let content_json = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+        let extra_json = extra
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+        let preview_kind =
+            Self::infer_preview_kind(message_type, content_json.as_ref(), extra_json.as_ref());
+
+        match preview_kind {
+            "image" => "[图片]".to_string(),
+            "video" => "[视频]".to_string(),
+            "voice" => {
+                let duration = content_json
+                    .as_ref()
+                    .and_then(Self::preview_duration_from_json)
+                    .or_else(|| extra_json.as_ref().and_then(Self::preview_duration_from_json))
+                    .unwrap_or_default();
+                if duration > 0 {
+                    format!("[语音]{duration}\"")
+                } else {
+                    "[语音]".to_string()
+                }
+            }
+            "file" => "[文件]".to_string(),
+            "location" => "[位置]".to_string(),
+            "contact_card" => "[名片]".to_string(),
+            "red_packet" => "[红包]".to_string(),
+            "sticker" => "[表情]".to_string(),
+            "system" => content_json
+                .as_ref()
+                .and_then(Self::preview_text_from_json)
+                .or_else(|| extra_json.as_ref().and_then(Self::preview_text_from_json))
+                .unwrap_or_else(|| trimmed.to_string()),
+            "revoked" => "撤回了一条消息".to_string(),
+            _ => content_json
+                .as_ref()
+                .and_then(Self::preview_text_from_json)
+                .or_else(|| extra_json.as_ref().and_then(Self::preview_text_from_json))
+                .unwrap_or_else(|| trimmed.to_string()),
+        }
+    }
+
+    async fn materialize_channel_preview(&self, mut channel: StoredChannel) -> StoredChannel {
+        let preview = if channel.last_local_message_id > 0 {
+            match self.storage.get_message_by_id(channel.last_local_message_id).await {
+                Ok(Some(message))
+                    if message.channel_id == channel.channel_id
+                        && message.channel_type == channel.channel_type =>
+                {
+                    Self::format_conversation_preview(
+                        Some(message.message_type),
+                        &message.content,
+                        Some(&message.extra),
+                    )
+                }
+                _ => Self::format_conversation_preview(None, &channel.last_msg_content, None),
+            }
+        } else {
+            Self::format_conversation_preview(None, &channel.last_msg_content, None)
+        };
+        channel.last_msg_content = preview;
+        channel
+    }
+
     fn guess_mime_type(filename: &str) -> &'static str {
         let ext = filename
             .rsplit('.')
@@ -7376,6 +7613,7 @@ impl State {
         bump_unread: bool,
     ) -> Result<()> {
         let existing = self.storage.get_channel_by_id(channel_id).await?;
+        let unread_before = existing.as_ref().map(|c| c.unread_count).unwrap_or(0);
         let (channel_name, channel_remark, avatar, top, mute, unread_count) =
             if let Some(c) = existing {
                 (
@@ -7414,6 +7652,18 @@ impl State {
                     if bump_unread { 1 } else { 0 },
                 )
             };
+        if inbound_logs_enabled() {
+            eprintln!(
+                "[SDK.unread] update_channel_last_message: channel_id={} channel_type={} bump_unread={} unread_before={} unread_after={} message_id={} from_uid={:?}",
+                channel_id,
+                channel_type,
+                bump_unread,
+                unread_before,
+                unread_count,
+                message_id,
+                from_uid
+            );
+        }
         let existing_version = self
             .storage
             .get_channel_by_id(channel_id)
@@ -8579,7 +8829,11 @@ impl PrivchatSdk {
                     }
                     Command::GetChannelById { channel_id, resp } => {
                         let result = match state.current_uid_required() {
-                            Ok(_) => state.storage.get_channel_by_id(channel_id).await,
+                            Ok(_) => match state.storage.get_channel_by_id(channel_id).await {
+                                Ok(Some(channel)) => Ok(Some(state.materialize_channel_preview(channel).await)),
+                                Ok(None) => Ok(None),
+                                Err(e) => Err(e),
+                            },
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -8590,7 +8844,16 @@ impl PrivchatSdk {
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
-                            Ok(_) => state.storage.list_channels(limit, offset).await,
+                            Ok(_) => match state.storage.list_channels(limit, offset).await {
+                                Ok(channels) => {
+                                    let mut formatted = Vec::with_capacity(channels.len());
+                                    for channel in channels {
+                                        formatted.push(state.materialize_channel_preview(channel).await);
+                                    }
+                                    Ok(formatted)
+                                }
+                                Err(e) => Err(e),
+                            },
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -11046,7 +11309,7 @@ impl PrivchatSdk {
 mod tests {
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
-        group_settings_key, Action, ConnectionState, Error, ErrorCode, LoginResult,
+        group_settings_key, Action, ConnectionState, ContentMessageType, Error, ErrorCode, LoginResult,
         MessageCachePolicy, NetworkHint, PresenceStatus, PrivchatConfig, PrivchatSdk,
         ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, SessionState,
         State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
@@ -11583,6 +11846,30 @@ mod tests {
         assert_eq!(State::attachment_placeholder_text("file"), "[文件]");
         assert_eq!(State::attachment_placeholder_text("audio"), "[文件]");
         assert_eq!(State::attachment_placeholder_text("unknown"), "[文件]");
+    }
+
+    #[test]
+    fn conversation_preview_is_rendered_in_sdk_layer() {
+        assert_eq!(
+            State::format_conversation_preview(
+                Some(i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(0)),
+                "{\"type\":\"voice\",\"duration\":3}",
+                Some("{}"),
+            ),
+            "[语音]3\""
+        );
+        assert_eq!(
+            State::format_conversation_preview(
+                Some(i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0)),
+                "{\"content\":\"hello\"}",
+                Some("{}"),
+            ),
+            "hello"
+        );
+        assert_eq!(
+            State::format_conversation_preview(None, "{\"type\":\"contact_card\"}", None),
+            "[名片]"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12751,10 +13038,7 @@ mod tests {
             .expect("sdk get channel")
             .expect("channel exists");
         assert_eq!(channel.last_msg_timestamp, messages[0].created_at);
-        assert_eq!(
-            channel.last_msg_content,
-            "{\"content\":\"materialized-message\"}"
-        );
+        assert_eq!(channel.last_msg_content, "[图片]");
         assert_eq!(channel.last_local_message_id, inserted.message_id);
 
         let channels = sdk.list_channels(20, 0).await.expect("sdk list channels");
@@ -12763,10 +13047,7 @@ mod tests {
             .find(|row| row.channel_id == 97002)
             .expect("listed channel exists");
         assert_eq!(listed.last_msg_timestamp, messages[0].created_at);
-        assert_eq!(
-            listed.last_msg_content,
-            "{\"content\":\"materialized-message\"}"
-        );
+        assert_eq!(listed.last_msg_content, "[图片]");
         assert_eq!(listed.last_local_message_id, inserted.message_id);
 
         assert_eq!(messages[0].message_id, inserted.message_id);

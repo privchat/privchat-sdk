@@ -1841,6 +1841,20 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("resolve channel unread exact count: {e}")))?;
         let exact_unread = exact_unread.max(0);
 
+        // Guard against regressed/non-monotonic message pts from inbound push:
+        // in that case exact_unread may be computed as 0 while channel.unread_count
+        // has just been bumped by realtime ingress, causing badge to "flash then disappear".
+        //
+        // We only suppress this specific self-heal path when:
+        // - keep_pts has already reached max_pts (read cursor appears up-to-date),
+        // - exact_unread is 0,
+        // - but channel currently carries unread > 0.
+        //
+        // This keeps unread stable until a real read projection clears it.
+        if keep_pts >= max_pts && exact_unread == 0 && channel.unread_count.max(0) > 0 {
+            return Ok(channel.unread_count.max(0));
+        }
+
         if exact_unread != channel.unread_count.max(0) {
             conn.execute(
                 "UPDATE channel
