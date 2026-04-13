@@ -33,18 +33,17 @@ use privchat_protocol::presence::{
     TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
 };
 use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
+use privchat_protocol::rpc::contact::friend::FriendPendingResponse;
 use privchat_protocol::rpc::file::upload::{
     FileRequestUploadTokenRequest, FileRequestUploadTokenResponse,
 };
 use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
-use privchat_protocol::rpc::contact::friend::FriendPendingResponse;
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
     ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload,
     ChannelSyncPayload, FriendSyncPayload, GetChannelPtsRequest, GetChannelPtsResponse,
-    GetDifferenceRequest, GetDifferenceResponse,
-    GroupMemberSyncPayload, GroupSyncPayload, MessageStatusSyncPayload, MessageSyncPayload,
-    SyncEntityItem,
+    GetDifferenceRequest, GetDifferenceResponse, GroupMemberSyncPayload, GroupSyncPayload,
+    MessageStatusSyncPayload, MessageSyncPayload, SyncEntityItem,
 };
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
@@ -1746,7 +1745,8 @@ impl State {
     }
 
     fn apply_presence_changed_payload(&self, payload: &[u8]) {
-        let Ok(notification) = serde_json::from_slice::<PresenceChangedNotification>(payload) else {
+        let Ok(notification) = serde_json::from_slice::<PresenceChangedNotification>(payload)
+        else {
             return;
         };
         let snapshot = notification.snapshot;
@@ -1849,9 +1849,7 @@ impl State {
         pts: u64,
     ) -> Result<()> {
         let key = Self::resume_channel_pts_key(channel_id, channel_type);
-        self.storage
-            .kv_put(key, pts.to_string().into_bytes())
-            .await
+        self.storage.kv_put(key, pts.to_string().into_bytes()).await
     }
 
     #[cfg(test)]
@@ -3874,10 +3872,9 @@ impl State {
                     let searchable_word = message_sync.searchable_word.unwrap_or_default();
                     let extra = message_sync.extra.unwrap_or_default();
                     if item.deleted {
-                        let revoker = content
-                            .parse::<serde_json::Value>()
-                            .ok()
-                            .and_then(|value| Self::json_get_u64(&value, &["revoked_by", "revoker"]));
+                        let revoker = content.parse::<serde_json::Value>().ok().and_then(|value| {
+                            Self::json_get_u64(&value, &["revoked_by", "revoker"])
+                        });
                         match self
                             .storage
                             .set_message_revoke_by_server_message_id(
@@ -5629,7 +5626,10 @@ impl State {
         channel_type: i32,
     ) -> Result<usize> {
         let scope = Some(format!("{channel_type}:{channel_id}"));
-        let mut last_pts = self.storage.max_message_pts(channel_id, channel_type).await?;
+        let mut last_pts = self
+            .storage
+            .max_message_pts(channel_id, channel_type)
+            .await?;
         if let Some(cursor_pts) = self.load_resume_channel_pts(channel_id, channel_type).await {
             last_pts = last_pts.max(cursor_pts);
         }
@@ -6488,8 +6488,9 @@ impl State {
         let req = PresenceBatchStatusRequest { user_ids };
         let request = RpcRequest {
             route: routes::presence::STATUS_GET.to_string(),
-            body: serde_json::to_value(req)
-                .map_err(|e| Error::Serialization(format!("encode batch_get_presence body: {e}")))?,
+            body: serde_json::to_value(req).map_err(|e| {
+                Error::Serialization(format!("encode batch_get_presence body: {e}"))
+            })?,
         };
         let payload = encode_message(&request)
             .map_err(|e| Error::Serialization(format!("encode batch_get_presence rpc: {e}")))?;
@@ -6509,8 +6510,9 @@ impl State {
         let body = rpc_resp
             .data
             .ok_or_else(|| Error::Serialization("empty batch_get_presence data".into()))?;
-        let response: PresenceBatchStatusResponse = serde_json::from_value(body)
-            .map_err(|e| Error::Serialization(format!("decode batch_get_presence response: {e}")))?;
+        let response: PresenceBatchStatusResponse = serde_json::from_value(body).map_err(|e| {
+            Error::Serialization(format!("decode batch_get_presence response: {e}"))
+        })?;
         Ok(self.cache_presence_response(response))
     }
 
@@ -6691,7 +6693,7 @@ impl State {
         }
 
         let payload = serde_json::to_vec(&envelope)
-        .map_err(|e| Error::Serialization(format!("encode send payload: {e}")))?;
+            .map_err(|e| Error::Serialization(format!("encode send payload: {e}")))?;
 
         Ok(privchat_protocol::protocol::SendMessageRequest {
             setting: privchat_protocol::protocol::MessageSetting {
@@ -6848,7 +6850,9 @@ impl State {
             Some(v) if v == file_type => {
                 let mime = content_json
                     .and_then(|value| Self::json_get_string(value, &["mime_type"]))
-                    .or_else(|| extra_json.and_then(|value| Self::json_get_string(value, &["mime_type"])))
+                    .or_else(|| {
+                        extra_json.and_then(|value| Self::json_get_string(value, &["mime_type"]))
+                    })
                     .unwrap_or_default()
                     .to_ascii_lowercase();
                 return if mime.starts_with("image/") {
@@ -6887,9 +6891,15 @@ impl State {
             _ => {
                 let revoked = content_json
                     .and_then(|value| Self::json_get_bool(value, &["revoked"]))
-                    .or_else(|| extra_json.and_then(|value| Self::json_get_bool(value, &["revoked"])))
+                    .or_else(|| {
+                        extra_json.and_then(|value| Self::json_get_bool(value, &["revoked"]))
+                    })
                     .unwrap_or(false);
-                if revoked { "revoked" } else { "text" }
+                if revoked {
+                    "revoked"
+                } else {
+                    "text"
+                }
             }
         }
     }
@@ -6922,7 +6932,11 @@ impl State {
                 let duration = content_json
                     .as_ref()
                     .and_then(Self::preview_duration_from_json)
-                    .or_else(|| extra_json.as_ref().and_then(Self::preview_duration_from_json))
+                    .or_else(|| {
+                        extra_json
+                            .as_ref()
+                            .and_then(Self::preview_duration_from_json)
+                    })
                     .unwrap_or_default();
                 if duration > 0 {
                     format!("[语音]{duration}\"")
@@ -6951,7 +6965,11 @@ impl State {
 
     async fn materialize_channel_preview(&self, mut channel: StoredChannel) -> StoredChannel {
         let preview = if channel.last_local_message_id > 0 {
-            match self.storage.get_message_by_id(channel.last_local_message_id).await {
+            match self
+                .storage
+                .get_message_by_id(channel.last_local_message_id)
+                .await
+            {
                 Ok(Some(message))
                     if message.channel_id == channel.channel_id
                         && message.channel_type == channel.channel_type =>
@@ -7473,7 +7491,10 @@ impl State {
             .await?;
 
         let uploaded_file_id = uploaded.file_id.parse::<u64>().map_err(|_| {
-            Error::Serialization(format!("upload response invalid numeric file_id: {}", uploaded.file_id))
+            Error::Serialization(format!(
+                "upload response invalid numeric file_id: {}",
+                uploaded.file_id
+            ))
         })?;
         let thumbnail_file_id_u64 = uploaded_thumbnail
             .as_ref()
@@ -7668,6 +7689,7 @@ pub struct PrivchatSdk {
     startup_error: Arc<StdMutex<Option<Error>>>,
     snowflake: Arc<snowflake_me::Snowflake>,
     presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
+    typing_throttle: Arc<StdMutex<HashMap<(u64, bool, u8), std::time::Instant>>>,
 }
 
 impl PrivchatSdk {
@@ -9636,6 +9658,7 @@ impl PrivchatSdk {
             startup_error,
             snowflake,
             presence_cache,
+            typing_throttle: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -10038,6 +10061,20 @@ impl PrivchatSdk {
         action_type: TypingActionType,
     ) -> Result<()> {
         self.ensure_running()?;
+
+        // 1 秒节流：如果同一频道在 1 秒内已经上报过相同状态，则直接跳过
+        let key = (channel_id, is_typing, action_type.clone() as u8);
+        let now = std::time::Instant::now();
+        {
+            let mut locked = self.typing_throttle.lock().unwrap();
+            if let Some(last_sent) = locked.get(&key) {
+                if now.duration_since(*last_sent).as_millis() < 1000 {
+                    return Ok(());
+                }
+            }
+            locked.insert(key, now);
+        }
+
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::SendTyping {
@@ -11270,12 +11307,12 @@ impl PrivchatSdk {
 mod tests {
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
-        group_settings_key, Action, ConnectionState, ContentMessageType, Error, ErrorCode, LoginResult,
-        MessageCachePolicy, NetworkHint, PresenceStatus, PrivchatConfig, PrivchatSdk,
+        group_settings_key, Action, ConnectionState, ContentMessageType, Error, ErrorCode,
+        LoginResult, MessageCachePolicy, NetworkHint, PresenceStatus, PrivchatConfig, PrivchatSdk,
         ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, SessionState,
-        State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
-        UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertRemoteMessageInput,
-        UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
+        State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput,
+        UpsertMessageReactionInput, UpsertRemoteMessageInput, UpsertUserInput,
+        NETWORK_DISCONNECTED_MESSAGE,
     };
     use crate::local_store::LocalStore;
     use crate::receive_pipeline::ReceivePipeline;
@@ -11393,6 +11430,7 @@ mod tests {
             cache_miss_count: 0,
             pending_prelogin_inbound_frames: Vec::new(),
             presence_cache: Arc::new(StdMutex::new(HashMap::new())),
+            typing_throttle: Arc::new(StdMutex::new(HashMap::new())),
         };
         (state, dir)
     }
@@ -12031,11 +12069,7 @@ mod tests {
         assert_eq!(out[0].user_id, 20001);
         assert_eq!(out[1].user_id, 20002);
 
-        let cached = state
-            .presence_cache
-            .lock()
-            .expect("presence cache")
-            .clone();
+        let cached = state.presence_cache.lock().expect("presence cache").clone();
         assert_eq!(cached.len(), 2);
         assert_eq!(cached.get(&20001).map(|v| v.version), Some(7));
         assert_eq!(cached.get(&20002).map(|v| v.version), Some(3));
