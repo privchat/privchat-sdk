@@ -190,6 +190,12 @@ enum StorageCmd {
         revoker: Option<u64>,
         resp: oneshot::Sender<Result<()>>,
     },
+    SetMessageRevokeByServerMessageId {
+        server_message_id: u64,
+        revoked: bool,
+        revoker: Option<u64>,
+        resp: oneshot::Sender<Result<Option<StoredMessage>>>,
+    },
     EditMessage {
         message_id: u64,
         content: String,
@@ -827,6 +833,24 @@ impl StorageHandle {
         self.tx
             .send(StorageCmd::SetMessageRevoke {
                 message_id,
+                revoked,
+                revoker,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn set_message_revoke_by_server_message_id(
+        &self,
+        server_message_id: u64,
+        revoked: bool,
+        revoker: Option<u64>,
+    ) -> Result<Option<StoredMessage>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::SetMessageRevokeByServerMessageId {
+                server_message_id,
                 revoked,
                 revoker,
                 resp: resp_tx,
@@ -1663,6 +1687,19 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         } => {
             with_uid!(resp, |uid| store
                 .set_message_revoke(&uid, message_id, revoked, revoker));
+        }
+        StorageCmd::SetMessageRevokeByServerMessageId {
+            server_message_id,
+            revoked,
+            revoker,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.set_message_revoke_by_server_message_id(
+                &uid,
+                server_message_id,
+                revoked,
+                revoker
+            ));
         }
         StorageCmd::EditMessage {
             message_id,

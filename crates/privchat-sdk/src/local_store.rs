@@ -1320,9 +1320,12 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(
             "SELECT
-                id, server_message_id, channel_id, channel_type, from_uid, type,
-                content, status, created_at, updated_at, extra, local_message_id
-             FROM message WHERE id = ?1 LIMIT 1",
+                m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
+                m.content, m.status, m.created_at, m.updated_at, m.extra, m.local_message_id,
+                COALESCE(me.revoke, 0), me.revoker
+             FROM message m
+             LEFT JOIN message_extra me ON me.message_id = m.id
+             WHERE m.id = ?1 LIMIT 1",
             params![message_id as i64],
             |row| {
                 Ok(StoredMessage {
@@ -1341,6 +1344,8 @@ impl LocalStore {
                     created_at: row.get::<_, i64>(8)?,
                     updated_at: row.get::<_, i64>(9)?,
                     extra: row.get::<_, String>(10)?,
+                    revoked: row.get::<_, i32>(12)? != 0,
+                    revoked_by: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
                 })
             },
         )
@@ -1367,6 +1372,60 @@ impl LocalStore {
         .map_err(|e| Error::Storage(format!("get message id by server_message_id: {e}")))
     }
 
+    pub fn set_message_revoke_by_server_message_id(
+        &self,
+        uid: &str,
+        server_message_id: u64,
+        revoked: bool,
+        revoker: Option<u64>,
+    ) -> Result<Option<StoredMessage>> {
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let updated = if revoked {
+            conn.execute(
+                "UPDATE message
+                 SET type = 0, content = ?1, searchable_word = ?1, updated_at = ?2
+                 WHERE server_message_id = ?3",
+                params!["消息已撤回", now_ms, server_message_id as i64],
+            )
+            .map_err(|e| Error::Storage(format!("update revoked message by server id: {e}")))?
+        } else {
+            0
+        };
+        if updated == 0 {
+            return Ok(None);
+        }
+        let (message_id, channel_id, channel_type): (i64, i64, i32) = conn
+            .query_row(
+                "SELECT id, channel_id, channel_type
+                 FROM message
+                 WHERE server_message_id = ?1
+                 LIMIT 1",
+                params![server_message_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| Error::Storage(format!("query revoked message by server id: {e}")))?;
+        conn.execute(
+            "INSERT INTO message_extra (
+                message_id, channel_id, channel_type, revoke, revoker, extra_version
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(message_id) DO UPDATE SET
+                revoke=excluded.revoke,
+                revoker=excluded.revoker,
+                extra_version=MAX(message_extra.extra_version, excluded.extra_version)",
+            params![
+                message_id,
+                channel_id,
+                channel_type,
+                if revoked { 1 } else { 0 },
+                revoker.map(|v| v as i64),
+                now_ms,
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("set message revoke by server id: {e}")))?;
+        self.get_message_by_id(uid, message_id as u64)
+    }
+
     pub fn list_messages(
         &self,
         uid: &str,
@@ -1379,11 +1438,13 @@ impl LocalStore {
         let mut stmt = conn
             .prepare(
                 "SELECT
-                    id, server_message_id, channel_id, channel_type, from_uid, type,
-                    content, status, created_at, updated_at, extra, local_message_id
-                 FROM message
-                 WHERE channel_id = ?1 AND channel_type = ?2
-                 ORDER BY id DESC
+                    m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
+                    m.content, m.status, m.created_at, m.updated_at, m.extra, m.local_message_id,
+                    COALESCE(me.revoke, 0), me.revoker
+                 FROM message m
+                 LEFT JOIN message_extra me ON me.message_id = m.id
+                 WHERE m.channel_id = ?1 AND m.channel_type = ?2
+                 ORDER BY m.id DESC
                  LIMIT ?3 OFFSET ?4",
             )
             .map_err(|e| Error::Storage(format!("prepare list messages: {e}")))?;
@@ -1407,6 +1468,8 @@ impl LocalStore {
                         created_at: row.get::<_, i64>(8)?,
                         updated_at: row.get::<_, i64>(9)?,
                         extra: row.get::<_, String>(10)?,
+                        revoked: row.get::<_, i32>(12)? != 0,
+                        revoked_by: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
                     })
                 },
             )
@@ -2928,6 +2991,22 @@ impl LocalStore {
             ],
         )
         .map_err(|e| Error::Storage(format!("set message revoke: {e}")))?;
+        if revoked {
+            let updated = conn
+                .execute(
+                    "UPDATE message
+                     SET type = 0, content = ?1, searchable_word = ?1, updated_at = ?2
+                     WHERE id = ?3",
+                    params!["消息已撤回", now_ms, message_id as i64],
+                )
+                .map_err(|e| Error::Storage(format!("update revoked message row: {e}")))?;
+            if updated == 0 {
+                return Err(Error::Storage(format!(
+                    "set message revoke failed: message.id={} not found",
+                    message_id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -3724,6 +3803,16 @@ mod tests {
         assert_eq!(sent.message_id, message_id);
         assert_eq!(sent.server_message_id, Some(900001));
         assert_eq!(sent.status, 2);
+
+        let revoked = store
+            .set_message_revoke_by_server_message_id(uid, 900001, true, Some(30001))
+            .expect("revoke by server message id")
+            .expect("message exists");
+        assert_eq!(revoked.message_id, message_id);
+        assert_eq!(revoked.message_type, 0);
+        assert_eq!(revoked.content, "消息已撤回");
+        assert!(revoked.revoked);
+        assert_eq!(revoked.revoked_by, Some(30001));
     }
 
     #[test]
@@ -5017,6 +5106,14 @@ mod tests {
         store
             .set_message_revoke(uid, message_id, true, Some(30001))
             .expect("set revoke");
+        let revoked_row = store
+            .get_message_by_id(uid, message_id)
+            .expect("get revoked message")
+            .expect("message exists");
+        assert_eq!(revoked_row.message_type, 0);
+        assert_eq!(revoked_row.content, "消息已撤回");
+        assert!(revoked_row.revoked);
+        assert_eq!(revoked_row.revoked_by, Some(30001));
         store
             .edit_message(uid, message_id, "after-edit", 123)
             .expect("edit message");

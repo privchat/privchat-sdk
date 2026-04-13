@@ -774,6 +774,8 @@ pub struct StoredMessage {
     pub created_at: i64,
     pub updated_at: i64,
     pub extra: String,
+    pub revoked: bool,
+    pub revoked_by: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3005,8 +3007,9 @@ impl State {
     }
 
     fn push_message_to_sync_item(push: PushMessageRequest) -> SyncEntityItem {
+        let deleted = push.deleted;
         let (content, extra) = Self::payload_bytes_to_message_content_and_extra(&push.payload);
-        Self::build_message_sync_item(
+        let mut item = Self::build_message_sync_item(
             push.server_message_id,
             push.local_message_id,
             push.channel_id,
@@ -3026,7 +3029,10 @@ impl State {
             Some(i64::from(push.stream_flag)),
             Some(push.msg_key),
             Some(i64::from(push.expire)),
-        )
+        );
+        // 透传 deleted 标志：deleted=true 时 SDK 走 set_message_revoke 路径
+        item.deleted = deleted;
+        item
     }
 
     fn json_field_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
@@ -3868,45 +3874,54 @@ impl State {
                     let searchable_word = message_sync.searchable_word.unwrap_or_default();
                     let extra = message_sync.extra.unwrap_or_default();
                     if item.deleted {
-                        if channel_id > 0 {
-                            let upserted = self
-                                .storage
-                                .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                        let revoker = content
+                            .parse::<serde_json::Value>()
+                            .ok()
+                            .and_then(|value| Self::json_get_u64(&value, &["revoked_by", "revoker"]));
+                        match self
+                            .storage
+                            .set_message_revoke_by_server_message_id(
+                                server_message_id,
+                                true,
+                                revoker,
+                            )
+                            .await?
+                        {
+                            Some(revoked_message) => {
+                                eprintln!(
+                                    "[SDK.revoke] applied server_message_id={} local_message_id={} channel_id={} channel_type={} revoker={:?}",
                                     server_message_id,
-                                    local_message_id,
-                                    channel_id,
-                                    channel_type,
-                                    timestamp,
-                                    from_uid,
-                                    message_type,
-                                    content: content.clone(),
-                                    status,
-                                    pts,
-                                    setting,
-                                    order_seq,
-                                    searchable_word: searchable_word.clone(),
-                                    extra: extra.clone(),
-                                })
-                                .await?;
-                            let local_id = upserted.message_id;
-                            let _ = self.storage.set_message_revoke(local_id, true, None).await;
+                                    revoked_message.message_id,
+                                    revoked_message.channel_id,
+                                    revoked_message.channel_type,
+                                    revoker
+                                );
+                                emitted.push(SdkEvent::TimelineUpdated {
+                                    channel_id: revoked_message.channel_id,
+                                    channel_type: revoked_message.channel_type,
+                                    message_id: revoked_message.message_id,
+                                    reason: "sync_entity_deleted".to_string(),
+                                });
+                            }
+                            None => {
+                                eprintln!(
+                                    "[SDK.revoke] existing message not found server_message_id={} channel_id={} channel_type={}",
+                                    server_message_id, channel_id, channel_type
+                                );
+                            }
                         }
                         emitted.push(SdkEvent::SyncEntityChanged {
                             entity_type: "message".to_string(),
                             entity_id: item.entity_id.clone(),
                             deleted: true,
                         });
-                        if channel_id > 0 {
-                            emitted.push(SdkEvent::TimelineUpdated {
-                                channel_id,
-                                channel_type,
-                                message_id: server_message_id,
-                                reason: "sync_entity_deleted".to_string(),
-                            });
-                        }
                         continue;
                     }
                     if channel_id == 0 {
+                        eprintln!(
+                            "[SDK.message] skip sync item without channel server_message_id={} deleted=false",
+                            server_message_id
+                        );
                         continue;
                     }
                     let upserted = self
@@ -4575,6 +4590,10 @@ impl State {
                         processed += 1;
                         continue;
                     }
+                    eprintln!(
+                        "[SDK.actor] normal queue send failed: message_id={} error={}",
+                        message_id, e
+                    );
                     let _ = self.storage.update_message_status(message_id, 3).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "normal".to_string(),
@@ -4588,18 +4607,15 @@ impl State {
                             status: 3,
                             server_message_id: None,
                         });
-                    if Self::is_permanent_send_rejection(&e) {
-                        let _ = self.storage.normal_queue_ack(vec![message_id]).await;
-                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
-                            kind: "normal".to_string(),
-                            action: "failed_drop".to_string(),
-                            message_id: Some(message_id),
-                            queue_index: None,
-                        });
-                        processed += 1;
-                        continue;
-                    }
-                    return Err(e);
+                    let _ = self.storage.normal_queue_ack(vec![message_id]).await;
+                    self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                        kind: "normal".to_string(),
+                        action: "failed_drop".to_string(),
+                        message_id: Some(message_id),
+                        queue_index: None,
+                    });
+                    processed += 1;
+                    continue;
                 }
             }
         }
@@ -4702,36 +4718,31 @@ impl State {
                         "[SDK.actor] file queue send failed: queue_index={} message_id={} error={}",
                         queue_index, message_id, e
                     );
-                    if Self::is_permanent_send_rejection(&e) {
-                        let _ = self.storage.update_message_status(message_id, 3).await;
-                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
-                            kind: "file".to_string(),
-                            action: "failed".to_string(),
-                            message_id: Some(message_id),
-                            queue_index: Some(queue_index),
+                    let _ = self.storage.update_message_status(message_id, 3).await;
+                    self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                        kind: "file".to_string(),
+                        action: "failed".to_string(),
+                        message_id: Some(message_id),
+                        queue_index: Some(queue_index),
+                    });
+                    self.pending_events
+                        .push(SdkEvent::MessageSendStatusChanged {
+                            message_id,
+                            status: 3,
+                            server_message_id: None,
                         });
-                        self.pending_events
-                            .push(SdkEvent::MessageSendStatusChanged {
-                                message_id,
-                                status: 3,
-                                server_message_id: None,
-                            });
-                        let _ = self
-                            .storage
-                            .file_queue_ack(queue_index, vec![message_id])
-                            .await;
-                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
-                            kind: "file".to_string(),
-                            action: "failed_drop".to_string(),
-                            message_id: Some(message_id),
-                            queue_index: Some(queue_index),
-                        });
-                        processed += 1;
-                        continue;
-                    }
-                    // Transient failures (timeout/transport hiccup) should stay queued.
-                    // Do not mark failed or ack-drop; let next drain retry.
-                    return Err(e);
+                    let _ = self
+                        .storage
+                        .file_queue_ack(queue_index, vec![message_id])
+                        .await;
+                    self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                        kind: "file".to_string(),
+                        action: "failed_drop".to_string(),
+                        message_id: Some(message_id),
+                        queue_index: Some(queue_index),
+                    });
+                    processed += 1;
+                    continue;
                 }
             }
         }
@@ -6030,6 +6041,8 @@ impl State {
                 if let Some(status_item) = Self::push_message_to_status_sync_item(&req) {
                     read_cursor_items.push(status_item);
                 } else {
+                    // deleted=true 时 push_message_to_sync_item 会透传给 SyncEntityItem.deleted，
+                    // 进而触发 "message" 实体处理里的 set_message_revoke 路径
                     message_items.push(Self::push_message_to_sync_item(req));
                 }
             }
@@ -6743,58 +6756,6 @@ impl State {
             ));
         }
         Ok(resp)
-    }
-
-    fn transport_reason_code(err: &Error) -> Option<u32> {
-        let Error::Transport(message) = err else {
-            return None;
-        };
-        let marker = "reason_code=";
-        let start = message.find(marker)? + marker.len();
-        let digits: String = message[start..]
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect();
-        if digits.is_empty() {
-            return None;
-        }
-        digits.parse::<u32>().ok()
-    }
-
-    fn is_permanent_send_rejection(err: &Error) -> bool {
-        if matches!(
-            err,
-            Error::Auth(_) | Error::Serialization(_) | Error::InvalidState(_)
-        ) {
-            return true;
-        }
-        if let Error::Storage(message) = err {
-            let lower = message.to_ascii_lowercase();
-            // File/image pre-processing failures are deterministic and will block the queue forever
-            // if we keep retrying the same head item.
-            if lower.contains("decode image failed")
-                || lower.contains("not recognized as an image format")
-                || lower.contains("mime")
-                || lower.contains("invalid image")
-            {
-                return true;
-            }
-        }
-        if let Error::Transport(message) = err {
-            if message.contains("upload failed: status=400")
-                || message.contains("upload failed: status=401")
-                || message.contains("upload failed: status=403")
-                || message.contains("upload failed: status=404")
-                || message.contains("upload failed: status=413")
-            {
-                return true;
-            }
-        }
-        let Some(reason_code) = Self::transport_reason_code(err) else {
-            return false;
-        };
-        // 业务层的 2xxxx 错误通常是内容/权限校验失败，重试不会成功。
-        (20_000..30_000).contains(&reason_code)
     }
 
     fn guess_file_type(message_type: i32, filename: &str, mime: &str) -> &'static str {

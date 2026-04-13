@@ -1239,6 +1239,8 @@ pub struct StoredMessage {
     pub created_at: i64,
     pub updated_at: i64,
     pub extra: String,
+    pub revoked: bool,
+    pub revoked_by: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2246,6 +2248,8 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
         created_at: v.created_at,
         updated_at: v.updated_at,
         extra: v.extra,
+        revoked: v.revoked,
+        revoked_by: v.revoked_by,
     }
 }
 
