@@ -33,17 +33,17 @@ use privchat_protocol::rpc::{
     ChannelContentPublishRequest, ChannelContentPublishResponse, ChannelHideRequest,
     ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse, ChannelPinRequest,
     ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse, DevicePushStatusRequest,
-    DevicePushStatusResponse, DevicePushUpdateRequest, DevicePushUpdateResponse,
-    FileGetUrlRequest, FileGetUrlResponse, FileRequestUploadTokenRequest,
-    FileRequestUploadTokenResponse, FileUploadCallbackRequest, FileUploadCallbackResponse,
-    FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse,
-    FriendCheckRequest, FriendCheckResponse, FriendPendingRequest, FriendPendingResponse,
-    FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest, FriendRemoveResponse,
-    GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest, GetDifferenceResponse,
-    GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
-    GroupApprovalHandleRequest, GroupApprovalHandleResponse, GroupApprovalListRequest,
-    GroupApprovalListResponse, GroupCreateRequest, GroupCreateResponse, GroupInfoRequest,
-    GroupInfoResponse, GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberLeaveRequest,
+    DevicePushStatusResponse, DevicePushUpdateRequest, DevicePushUpdateResponse, FileGetUrlRequest,
+    FileGetUrlResponse, FileRequestUploadTokenRequest, FileRequestUploadTokenResponse,
+    FileUploadCallbackRequest, FileUploadCallbackResponse, FriendAcceptRequest,
+    FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse, FriendCheckRequest,
+    FriendCheckResponse, FriendPendingRequest, FriendPendingResponse, FriendRejectRequest,
+    FriendRejectResponse, FriendRemoveRequest, FriendRemoveResponse, GetChannelPtsRequest,
+    GetChannelPtsResponse, GetDifferenceRequest, GetDifferenceResponse,
+    GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse, GroupApprovalHandleRequest,
+    GroupApprovalHandleResponse, GroupApprovalListRequest, GroupApprovalListResponse,
+    GroupCreateRequest, GroupCreateResponse, GroupInfoRequest, GroupInfoResponse,
+    GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberLeaveRequest,
     GroupMemberLeaveResponse, GroupMemberListRequest, GroupMemberListResponse,
     GroupMemberMuteRequest, GroupMemberMuteResponse, GroupMemberRemoveRequest,
     GroupMemberRemoveResponse, GroupMemberUnmuteRequest, GroupMemberUnmuteResponse,
@@ -3463,17 +3463,17 @@ impl PrivchatClient {
             .batch_get_presence(user_ids)
             .await
             .map_err(PrivchatFfiError::from)?;
-        Ok(out
-            .into_iter()
-            .map(map_presence_status)
-            .collect())
+        Ok(out.into_iter().map(map_presence_status).collect())
     }
 
     pub async fn get_presence(
         &self,
         user_id: u64,
     ) -> Result<Option<PresenceStatus>, PrivchatFfiError> {
-        Ok(self.inner.get_cached_presence(user_id).map(map_presence_status))
+        Ok(self
+            .inner
+            .get_cached_presence(user_id)
+            .map(map_presence_status))
     }
 
     pub async fn clear_presence_cache(&self) -> Result<(), PrivchatFfiError> {
@@ -6959,15 +6959,42 @@ impl PrivchatClient {
         self.download_attachment_to_path(source_path, target).await
     }
 
-    pub async fn download_attachment_to_message_dir(
+    /// 获取附件下载目标目录 (Canonical 路径)
+    /// 参数必须传入 message 表的主键和创建时间，禁止使用业务脏字段
+    pub fn get_attachment_target_dir(
         &self,
-        source_path: String,
-        message_id: u64,
-        file_name: String,
+        uid: u64,
+        message_id: i64,
+        created_at_ms: i64,
     ) -> Result<String, PrivchatFfiError> {
-        let base = self.assets_dir().await?;
-        let target = format!("{base}/messages/{message_id}/{file_name}");
-        self.download_attachment_to_path(source_path, target).await
+        let data_dir = self.config.lock().unwrap().data_dir.clone();
+        let root = std::path::Path::new(&data_dir);
+        privchat_sdk::media_store::ensure_attachment_dir(root, uid, message_id, created_at_ms)
+            .map(|p| p.to_string_lossy().to_string())
+            .map_err(|e| PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InternalError as u32,
+                detail: format!("ensure attachment dir failed: {e}"),
+            })
+    }
+
+    /// 解析本地已存在的附件路径 (含 Legacy 兼容)
+    pub fn resolve_attachment_path(
+        &self,
+        uid: u64,
+        message_id: i64,
+        created_at_ms: i64,
+        filename: Option<String>,
+    ) -> Option<String> {
+        let data_dir = self.config.lock().unwrap().data_dir.clone();
+        let root = std::path::Path::new(&data_dir);
+        privchat_sdk::media_store::resolve_attachment_path(
+            root,
+            uid,
+            message_id,
+            created_at_ms,
+            filename.as_deref(),
+        )
+        .map(|p| p.to_string_lossy().to_string())
     }
 
     pub async fn set_video_process_hook(
@@ -7062,10 +7089,13 @@ impl PrivchatClient {
                 detail: format!("download attachment failed: status={status} body={body}"),
             });
         }
-        let bytes = response.bytes().await.map_err(|e| PrivchatFfiError::SdkError {
-            code: privchat_protocol::ErrorCode::NetworkError as u32,
-            detail: format!("read attachment bytes failed: {e}"),
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::NetworkError as u32,
+                detail: format!("read attachment bytes failed: {e}"),
+            })?;
         Ok(bytes.to_vec())
     }
 

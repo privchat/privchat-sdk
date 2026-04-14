@@ -60,6 +60,7 @@ use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
 pub mod error_codes;
 mod local_store;
+pub mod media_store;
 mod receive_pipeline;
 mod runtime;
 mod storage_actor;
@@ -7017,13 +7018,6 @@ impl State {
         }
     }
 
-    fn yyyymm_from_timestamp_ms(ts_ms: i64) -> String {
-        chrono::DateTime::from_timestamp_millis(ts_ms)
-            .unwrap_or_else(chrono::Utc::now)
-            .format("%Y%m")
-            .to_string()
-    }
-
     fn yyyymmdd_from_timestamp_ms(ts_ms: i64) -> String {
         chrono::DateTime::from_timestamp_millis(ts_ms)
             .unwrap_or_else(chrono::Utc::now)
@@ -7257,15 +7251,14 @@ impl State {
             .unwrap_or_else(|| format!("file-{}.bin", message.message_id));
 
         let storage_paths = self.storage.get_storage_paths().await?;
-        let yyyymm = Self::yyyymm_from_timestamp_ms(message.created_at);
+        let user_root = PathBuf::from(&storage_paths.user_root);
+        let files_dir = media_store::get_message_dir(
+            &user_root,
+            message.message_id as i64,
+            message.created_at,
+        );
         let yyyymmdd = Self::yyyymmdd_from_timestamp_ms(message.created_at);
-        let files_dir = PathBuf::from(&storage_paths.user_root)
-            .join("files")
-            .join(yyyymm)
-            .join(message.message_id.to_string());
-        let tmp_dir = PathBuf::from(&storage_paths.user_root)
-            .join("tmp")
-            .join(yyyymmdd);
+        let tmp_dir = user_root.join("tmp").join(yyyymmdd);
         std::fs::create_dir_all(&files_dir)
             .map_err(|e| Error::Storage(format!("create files dir failed: {e}")))?;
         std::fs::create_dir_all(&tmp_dir)
