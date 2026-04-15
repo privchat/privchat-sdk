@@ -17,6 +17,7 @@
 
 #![allow(clippy::new_without_default)]
 
+use privchat_protocol::rpc::account::user::DetailSourceType;
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::{
     AccountPrivacyGetRequest, AccountPrivacyGetResponse, AccountPrivacyUpdateRequest,
@@ -4726,8 +4727,8 @@ impl PrivchatClient {
             routes::account_user::DETAIL,
             &AccountUserDetailRequest {
                 target_user_id: user_id,
-                source: "profile".to_string(),
-                source_id: "ffi".to_string(),
+                source: DetailSourceType::Friend.as_str().to_string(),
+                source_id: user_id.to_string(),
                 user_id: 0,
             },
         )
