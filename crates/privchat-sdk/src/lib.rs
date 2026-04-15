@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -724,7 +724,7 @@ impl TypingActionType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NewMessage {
     pub channel_id: u64,
     pub channel_type: i32,
@@ -734,9 +734,15 @@ pub struct NewMessage {
     pub searchable_word: String,
     pub setting: i32,
     pub extra: String,
+    /// 媒体 MIME 类型，纯文本消息为 None
+    pub mime_type: Option<String>,
+    /// 主附件文件是否已在本地就绪（发送时为 true）
+    pub media_downloaded: bool,
+    /// 缩略图状态：0=missing, 1=ready, 2=failed
+    pub thumb_status: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpsertRemoteMessageInput {
     pub server_message_id: u64,
     pub local_message_id: u64,
@@ -752,6 +758,8 @@ pub struct UpsertRemoteMessageInput {
     pub order_seq: i64,
     pub searchable_word: String,
     pub extra: String,
+    /// 媒体 MIME 类型（从 content/extra 中提取）
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -776,6 +784,12 @@ pub struct StoredMessage {
     pub extra: String,
     pub revoked: bool,
     pub revoked_by: Option<u64>,
+    /// 媒体 MIME 类型（如 image/jpeg），纯文本为 None
+    pub mime_type: Option<String>,
+    /// 主附件文件是否已下载到本地 canonical 目录
+    pub media_downloaded: bool,
+    /// 缩略图状态：0=missing, 1=ready, 2=failed
+    pub thumb_status: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1402,6 +1416,16 @@ enum Command {
     UpdateMessageStatus {
         message_id: u64,
         status: i32,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    UpdateThumbStatus {
+        message_id: u64,
+        thumb_status: i32,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    UpdateMediaDownloaded {
+        message_id: u64,
+        downloaded: bool,
         resp: oneshot::Sender<Result<()>>,
     },
     SetMessageRevoke {
@@ -3922,6 +3946,7 @@ impl State {
                         );
                         continue;
                     }
+                    let mime_type = Self::extract_mime_type_from_json(&content, &extra);
                     let upserted = self
                         .storage
                         .upsert_remote_message_with_result(UpsertRemoteMessageInput {
@@ -3939,6 +3964,7 @@ impl State {
                             order_seq,
                             searchable_word,
                             extra,
+                            mime_type,
                         })
                         .await?;
                     let message_id = upserted.message_id;
@@ -3973,6 +3999,26 @@ impl State {
                             should_bump_unread,
                         )
                         .await;
+
+                    // Auto-download thumbnail for incoming image/video messages
+                    let is_image_or_video = message_type
+                        == i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(1)
+                        || message_type
+                            == i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(4);
+                    if is_image_or_video && !from_self && upserted.inserted_new {
+                        if let Ok(paths) = self.storage.get_storage_paths().await {
+                            let user_root = PathBuf::from(&paths.user_root);
+                            let storage = self.storage.clone();
+                            Self::spawn_auto_download_thumbnail(
+                                &content,
+                                &user_root,
+                                message_id,
+                                timestamp,
+                                storage,
+                            );
+                        }
+                    }
+
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "message".to_string(),
                         entity_id: item.entity_id.clone(),
@@ -4461,12 +4507,13 @@ impl State {
         if self.current_uid.is_none() {
             return Ok(());
         }
-        let today = chrono::Utc::now().format("%Y%m%d").to_string();
+        let today = chrono::Utc::now().format("%Y%m").to_string();
         if self.last_tmp_cleanup_day.as_deref() == Some(today.as_str()) {
             return Ok(());
         }
         let paths = self.storage.get_storage_paths().await?;
-        let tmp_root = PathBuf::from(paths.user_root).join("tmp");
+        let user_root = PathBuf::from(&paths.user_root);
+        let tmp_root = user_root.join("files").join("tmp");
         if tmp_root.exists() {
             for entry in std::fs::read_dir(&tmp_root)
                 .map_err(|e| Error::Storage(format!("read tmp root failed: {e}")))?
@@ -4481,10 +4528,15 @@ impl State {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if name.len() == 8 && name.chars().all(|c| c.is_ascii_digit()) && name < today {
+                if name.len() == 6 && name.chars().all(|c| c.is_ascii_digit()) && name < today {
                     let _ = std::fs::remove_dir_all(&path);
                 }
             }
+        }
+        // Also clean up legacy {user_root}/tmp/ directory
+        let legacy_tmp_root = user_root.join("tmp");
+        if legacy_tmp_root.exists() {
+            let _ = std::fs::remove_dir_all(&legacy_tmp_root);
         }
         self.last_tmp_cleanup_day = Some(today);
         Ok(())
@@ -4625,6 +4677,11 @@ impl State {
         if items.is_empty() {
             return Ok(0);
         }
+        eprintln!(
+            "[SDK.actor] drain_file_queue_once: queue_index={} items={}",
+            queue_index,
+            items.len()
+        );
         let mut processed = 0usize;
         for (message_id, payload) in items {
             let msg = match self.storage.get_message_by_id(message_id).await? {
@@ -4645,6 +4702,12 @@ impl State {
                 }
             };
             let local_message_id = self.ensure_local_message_id(message_id).await?;
+            eprintln!(
+                "[SDK.actor] drain_file_queue_once: processing message_id={} payload_len={} created_at={}",
+                message_id,
+                payload.len(),
+                msg.created_at
+            );
             match self
                 .process_outbound_file(&msg, local_message_id, payload)
                 .await
@@ -4719,7 +4782,7 @@ impl State {
                     let _ = self.storage.update_message_status(message_id, 3).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
-                        action: "failed".to_string(),
+                        action: format!("failed:{}", e),
                         message_id: Some(message_id),
                         queue_index: Some(queue_index),
                     });
@@ -5585,6 +5648,7 @@ impl State {
                 "file" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
                 _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
             };
+            let mime_type = Self::extract_mime_type_from_json(&item.content, "");
             let message_id = self
                 .storage
                 .upsert_remote_message_with_result(UpsertRemoteMessageInput {
@@ -5602,6 +5666,7 @@ impl State {
                     order_seq: 0,
                     searchable_word: String::new(),
                     extra: String::new(),
+                    mime_type,
                 })
                 .await?
                 .message_id;
@@ -6339,6 +6404,7 @@ impl State {
                     "file" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
                     _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
                 };
+                let mime_type = Self::extract_mime_type_from_json(&item.content, "");
                 let message_id = self
                     .storage
                     .upsert_remote_message_with_result(UpsertRemoteMessageInput {
@@ -6356,6 +6422,7 @@ impl State {
                         order_seq: 0,
                         searchable_word: String::new(),
                         extra: String::new(),
+                        mime_type,
                     })
                     .await?
                     .message_id;
@@ -6761,6 +6828,119 @@ impl State {
         Ok(resp)
     }
 
+    /// Extract mime_type from content or extra JSON.
+    /// Tries content first, then extra. Looks for "mime_type" key in metadata or flat format.
+    fn extract_mime_type_from_json(content: &str, extra: &str) -> Option<String> {
+        for src in [content, extra] {
+            if src.is_empty() {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(src) {
+                // Envelope: {"metadata":{"mime_type":"image/jpeg"}}
+                if let Some(mime) = json
+                    .get("metadata")
+                    .and_then(|m| m.get("mime_type"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(mime.to_string());
+                }
+                // Flat: {"mime_type":"image/jpeg"}
+                if let Some(mime) = json
+                    .get("mime_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(mime.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract thumbnail_url from message content JSON (supports envelope and flat formats).
+    fn extract_thumbnail_url(content: &str) -> Option<String> {
+        let json: serde_json::Value = serde_json::from_str(content).ok()?;
+        // Envelope format: {"content":"...","metadata":{"thumbnail_url":"..."}}
+        if let Some(url) = json
+            .get("metadata")
+            .and_then(|m| m.get("thumbnail_url"))
+            .and_then(|v| v.as_str())
+        {
+            if !url.is_empty() {
+                return Some(url.to_string());
+            }
+        }
+        // Flat format: {"thumbnail_url":"..."}
+        if let Some(url) = json.get("thumbnail_url").and_then(|v| v.as_str()) {
+            if !url.is_empty() {
+                return Some(url.to_string());
+            }
+        }
+        None
+    }
+
+    /// Spawn a background task to download a thumbnail for an incoming message.
+    fn spawn_auto_download_thumbnail(
+        content: &str,
+        user_root: &Path,
+        message_id: u64,
+        created_at_ms: i64,
+        storage: crate::storage_actor::StorageHandle,
+    ) {
+        let thumb_url = match Self::extract_thumbnail_url(content) {
+            Some(url) if url.starts_with("http") => url,
+            _ => return,
+        };
+        let dir = media_store::get_message_dir(user_root, message_id as i64, created_at_ms);
+        let thumb_path = dir.join(media_store::THUMB_FILENAME);
+        if thumb_path.exists() {
+            // File already on disk — just ensure DB is consistent
+            let _ = tokio::spawn(async move {
+                let _ = storage.update_thumb_status(message_id, 1).await;
+            });
+            return;
+        }
+        tokio::spawn(async move {
+            match Self::do_download_thumbnail(&thumb_url, &dir, &thumb_path).await {
+                Ok(()) => {
+                    if let Err(e) = storage.update_thumb_status(message_id, 1).await {
+                        eprintln!("[SDK.thumb] update thumb_status=1 failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[SDK.thumb] auto-download failed message_id={} url={}: {}",
+                        message_id, thumb_url, e
+                    );
+                    if let Err(e2) = storage.update_thumb_status(message_id, 2).await {
+                        eprintln!("[SDK.thumb] update thumb_status=2 failed: {e2}");
+                    }
+                }
+            }
+        });
+    }
+
+    async fn do_download_thumbnail(
+        url: &str,
+        dir: &Path,
+        thumb_path: &Path,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let resp = reqwest::Client::new().get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()).into());
+        }
+        let bytes = resp.bytes().await?;
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(thumb_path, &bytes)?;
+        eprintln!(
+            "[SDK.thumb] auto-download ok: {} ({} bytes)",
+            thumb_path.display(),
+            bytes.len()
+        );
+        Ok(())
+    }
+
     fn guess_file_type(message_type: i32, filename: &str, mime: &str) -> &'static str {
         let image_type = privchat_protocol::message::ContentMessageType::Image as i32;
         let video_type = privchat_protocol::message::ContentMessageType::Video as i32;
@@ -6792,6 +6972,22 @@ impl State {
             "image" => "[图片]",
             "video" => "[视频]",
             _ => "[文件]",
+        }
+    }
+
+    fn default_mime_for_message_type(message_type: i32) -> &'static str {
+        use privchat_protocol::message::ContentMessageType;
+        let image_type = ContentMessageType::Image as i32;
+        let video_type = ContentMessageType::Video as i32;
+        let audio_type = ContentMessageType::Audio as i32;
+        if message_type == image_type {
+            "image/jpeg"
+        } else if message_type == video_type {
+            "video/mp4"
+        } else if message_type == audio_type {
+            "audio/mp4"
+        } else {
+            "application/octet-stream"
         }
     }
 
@@ -7018,13 +7214,6 @@ impl State {
         }
     }
 
-    fn yyyymmdd_from_timestamp_ms(ts_ms: i64) -> String {
-        chrono::DateTime::from_timestamp_millis(ts_ms)
-            .unwrap_or_else(chrono::Utc::now)
-            .format("%Y%m%d")
-            .to_string()
-    }
-
     fn transparent_png_1x1() -> &'static [u8] {
         &[
             0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
@@ -7041,7 +7230,6 @@ impl State {
         max_edge: u32,
         quality: u8,
     ) -> Result<(u32, u32, u64)> {
-        use image::codecs::jpeg::JpegEncoder;
         let reader = image::ImageReader::open(source_path)
             .map_err(|e| Error::Storage(format!("open image failed: {e}")))?;
         let img = reader
@@ -7058,9 +7246,8 @@ impl State {
             (nw, nh)
         };
         let thumb = img.resize_exact(tw, th, image::imageops::FilterType::Triangle);
-        // JPEG does not support RGBA pixel format on this encoder path.
-        // Convert to RGB explicitly to avoid "Rgba8 not supported" failures.
-        let rgb = thumb.to_rgb8();
+        // WebP supports RGBA, so preserve alpha channel for PNG/WebP sources.
+        let rgba = thumb.to_rgba8();
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::Storage(format!("create thumb dir failed: {e}")))?;
@@ -7068,15 +7255,16 @@ impl State {
         let file = std::fs::File::create(output_path)
             .map_err(|e| Error::Storage(format!("create thumb failed: {e}")))?;
         let mut writer = std::io::BufWriter::new(file);
-        let mut encoder = JpegEncoder::new_with_quality(&mut writer, quality);
+        let _ = quality; // lossless WebP; quality unused but kept for API compat
+        let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut writer);
         encoder
             .encode(
-                rgb.as_raw(),
+                rgba.as_raw(),
                 thumb.width(),
                 thumb.height(),
-                image::ExtendedColorType::Rgb8,
+                image::ExtendedColorType::Rgba8,
             )
-            .map_err(|e| Error::Storage(format!("encode thumb failed: {e}")))?;
+            .map_err(|e| Error::Storage(format!("encode thumb webp failed: {e}")))?;
         writer
             .flush()
             .map_err(|e| Error::Storage(format!("flush thumb failed: {e}")))?;
@@ -7243,12 +7431,29 @@ impl State {
                 "attachment payload is empty".to_string(),
             ));
         }
-        let filename = std::path::Path::new(&message.content)
+        // Extract original filename from content (before server overwrites it)
+        let original_filename = std::path::Path::new(&message.content)
             .file_name()
             .and_then(|v| v.to_str())
             .map(|s| s.to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("file-{}.bin", message.message_id));
+            .filter(|s| !s.is_empty() && !s.starts_with('['));
+
+        // Determine MIME from original filename (best effort)
+        let mime_type = original_filename
+            .as_deref()
+            .map(|n| Self::guess_mime_type(n).to_string())
+            .unwrap_or_else(|| {
+                Self::default_mime_for_message_type(message.message_type).to_string()
+            });
+
+        // Canonical payload filename: payload.{ext} (Spec §7.5 v2)
+        let filename = media_store::payload_filename_with_fallback(
+            &mime_type,
+            original_filename.as_deref(),
+        );
+
+        let file_type =
+            Self::guess_file_type(message.message_type, &filename, &mime_type).to_string();
 
         let storage_paths = self.storage.get_storage_paths().await?;
         let user_root = PathBuf::from(&storage_paths.user_root);
@@ -7257,24 +7462,20 @@ impl State {
             message.message_id as i64,
             message.created_at,
         );
-        let yyyymmdd = Self::yyyymmdd_from_timestamp_ms(message.created_at);
-        let tmp_dir = user_root.join("tmp").join(yyyymmdd);
+        let yyyymm = media_store::yyyymm_from_ms(message.created_at);
+        let tmp_dir = user_root.join("files").join("tmp").join(&yyyymm);
         std::fs::create_dir_all(&files_dir)
             .map_err(|e| Error::Storage(format!("create files dir failed: {e}")))?;
         std::fs::create_dir_all(&tmp_dir)
             .map_err(|e| Error::Storage(format!("create tmp dir failed: {e}")))?;
 
         let body_path = files_dir.join(&filename);
-        let meta_path = files_dir.join("meta.json");
+        let meta_path = files_dir.join(media_store::META_FILENAME);
         std::fs::write(&body_path, &payload)
             .map_err(|e| Error::Storage(format!("write body file failed: {e}")))?;
         let mut upload_payload = payload;
         let mut upload_filename = filename.clone();
         let mut body_size = upload_payload.len() as u64;
-
-        let mime_type = Self::guess_mime_type(&filename).to_string();
-        let file_type =
-            Self::guess_file_type(message.message_type, &filename, &mime_type).to_string();
 
         let mut source_width = None;
         let mut source_height = None;
@@ -7286,17 +7487,23 @@ impl State {
                     source_height = Some(img.height());
                 }
             }
-            let thumb_path = tmp_dir.join(format!("{}_thumb.jpg", message.message_id));
+            let thumb_path = tmp_dir.join(format!("{}_thumb.webp", message.message_id));
             let (w, h, size) =
-                Self::generate_image_thumbnail_sync(&body_path, &thumb_path, 90, 85)?;
+                Self::generate_image_thumbnail_sync(&body_path, &thumb_path, 320, 85)?;
+            // Copy thumbnail to canonical directory so it survives app restart
+            let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
+            std::fs::copy(&thumb_path, &canonical_thumb)
+                .map_err(|e| Error::Storage(format!("copy thumb to canonical dir failed: {e}")))?;
+            // Mark thumb_status=1 (ready) for the sender's own message
+            let _ = self.storage.update_thumb_status(message.message_id, 1).await;
             thumb_upload = Some((
                 thumb_path,
-                "image/jpeg".to_string(),
-                format!("{}_thumb.jpg", message.message_id),
+                "image/webp".to_string(),
+                format!("{}_thumb.webp", message.message_id),
             ));
             let meta = MediaMeta {
                 source: MediaSourceMeta {
-                    original_filename: filename.clone(),
+                    original_filename: original_filename.clone().unwrap_or_default(),
                     mime: mime_type.clone(),
                     width: source_width,
                     height: source_height,
@@ -7306,7 +7513,7 @@ impl State {
                     width: Some(w),
                     height: Some(h),
                     file_size: Some(size),
-                    mime: Some("image/jpeg".to_string()),
+                    mime: Some("image/webp".to_string()),
                 }),
                 processing: Some(MediaProcessingMeta {
                     strategy: Some("client_preprocess".to_string()),
@@ -7355,6 +7562,10 @@ impl State {
                 .map_err(|e| Error::Storage(format!("video thumbnail hook failed: {e}")))?;
                 if ok && hook_thumb_path.exists() {
                     hook_used = true;
+                    // Copy video thumbnail to canonical directory
+                    let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
+                    let _ = std::fs::copy(&hook_thumb_path, &canonical_thumb);
+                    let _ = self.storage.update_thumb_status(message.message_id, 1).await;
                     thumb_upload = Some((
                         hook_thumb_path.clone(),
                         "image/jpeg".to_string(),
@@ -7385,7 +7596,7 @@ impl State {
             };
             let meta = MediaMeta {
                 source: MediaSourceMeta {
-                    original_filename: upload_filename.clone(),
+                    original_filename: original_filename.clone().unwrap_or_default(),
                     mime: mime_type.clone(),
                     width: None,
                     height: None,
@@ -7411,7 +7622,7 @@ impl State {
         } else {
             let meta = MediaMeta {
                 source: MediaSourceMeta {
-                    original_filename: upload_filename.clone(),
+                    original_filename: original_filename.clone().unwrap_or_default(),
                     mime: mime_type.clone(),
                     width: None,
                     height: None,
@@ -7431,10 +7642,19 @@ impl State {
             .map_err(|e| Error::Storage(format!("write media meta failed: {e}")))?;
         }
 
+        eprintln!(
+            "[SDK.actor] process_outbound_file: message_id={} file_type={} mime={} body_size={} has_thumb={}",
+            message.message_id, file_type, mime_type, body_size, thumb_upload.is_some()
+        );
+
         let uploaded_thumbnail = if let Some((thumb_path, thumb_mime, thumb_name)) = thumb_upload {
             let thumb_size = std::fs::metadata(&thumb_path)
                 .map(|m| m.len() as i64)
                 .map_err(|e| Error::Storage(format!("stat thumb file failed: {e}")))?;
+            eprintln!(
+                "[SDK.actor] process_outbound_file: uploading thumbnail size={}",
+                thumb_size
+            );
             let thumb_token = self
                 .request_upload_token(
                     message.from_uid,
@@ -7462,6 +7682,10 @@ impl State {
             None
         };
 
+        eprintln!(
+            "[SDK.actor] process_outbound_file: requesting upload token for main file size={}",
+            upload_payload.len()
+        );
         let token = self
             .request_upload_token(
                 message.from_uid,
@@ -7471,6 +7695,10 @@ impl State {
                 file_type.clone(),
             )
             .await?;
+        eprintln!(
+            "[SDK.actor] process_outbound_file: uploading main file to {}",
+            token.upload_url
+        );
         let uploaded = self
             .upload_file_bytes(
                 &token.upload_url,
@@ -7480,6 +7708,7 @@ impl State {
                 upload_payload,
             )
             .await?;
+        eprintln!("[SDK.actor] process_outbound_file: upload callback");
         self.upload_callback(message.from_uid, &token.token, &uploaded)
             .await?;
 
@@ -8928,6 +9157,28 @@ impl PrivchatSdk {
                                 },
                             );
                         }
+                        let _ = resp.send(result);
+                    }
+                    Command::UpdateThumbStatus {
+                        message_id,
+                        thumb_status,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => state.storage.update_thumb_status(message_id, thumb_status).await,
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
+                    Command::UpdateMediaDownloaded {
+                        message_id,
+                        downloaded,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => state.storage.update_media_downloaded(message_id, downloaded).await,
+                            Err(e) => Err(e),
+                        };
                         let _ = resp.send(result);
                     }
                     Command::SetMessageRevoke {
@@ -10553,6 +10804,34 @@ impl PrivchatSdk {
             .send(Command::UpdateMessageStatus {
                 message_id,
                 status,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn update_thumb_status(&self, message_id: u64, thumb_status: i32) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::UpdateThumbStatus {
+                message_id,
+                thumb_status,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn update_media_downloaded(&self, message_id: u64, downloaded: bool) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::UpdateMediaDownloaded {
+                message_id,
+                downloaded,
                 resp: resp_tx,
             })
             .await
@@ -12277,6 +12556,7 @@ mod tests {
                 order_seq: 20,
                 searchable_word: "hello".to_string(),
                 extra: "{}".to_string(),
+                mime_type: None,
             })
             .await
             .expect("seed remote message");
@@ -12398,6 +12678,7 @@ mod tests {
                 order_seq: 10,
                 searchable_word: "m1".to_string(),
                 extra: "{}".to_string(),
+                mime_type: None,
             })
             .await
             .expect("seed m1");
@@ -12418,6 +12699,7 @@ mod tests {
                 order_seq: 20,
                 searchable_word: "m2".to_string(),
                 extra: "{}".to_string(),
+                mime_type: None,
             })
             .await
             .expect("seed m2");
@@ -12438,6 +12720,7 @@ mod tests {
                 order_seq: 30,
                 searchable_word: "m3".to_string(),
                 extra: "{}".to_string(),
+                mime_type: None,
             })
             .await
             .expect("seed m3");
@@ -12544,6 +12827,7 @@ mod tests {
                     order_seq: pts,
                     searchable_word: format!("m{pts}"),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 })
                 .await
                 .expect("seed message");
@@ -12645,6 +12929,7 @@ mod tests {
                     order_seq: pts,
                     searchable_word: format!("m{pts}"),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 })
                 .await
                 .expect("seed message");
@@ -12816,6 +13101,7 @@ mod tests {
                 order_seq: 10,
                 searchable_word: "peer".to_string(),
                 extra: "{}".to_string(),
+                mime_type: None,
             })
             .await
             .expect("seed peer message");
@@ -12836,6 +13122,7 @@ mod tests {
                 order_seq: 20,
                 searchable_word: "self".to_string(),
                 extra: "{}".to_string(),
+                mime_type: None,
             })
             .await
             .expect("seed self message");
@@ -13009,6 +13296,7 @@ mod tests {
                     order_seq: 33,
                     searchable_word: "materialized message".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("seed materialized message");
@@ -13289,6 +13577,7 @@ mod tests {
                     order_seq: 10,
                     searchable_word: "cursor message 1".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("seed message one");
@@ -13310,6 +13599,7 @@ mod tests {
                     order_seq: 20,
                     searchable_word: "cursor message 2".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("seed message two");
@@ -13408,6 +13698,7 @@ mod tests {
                     order_seq: 30,
                     searchable_word: "revoke target".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("seed message");
@@ -13490,6 +13781,7 @@ mod tests {
                     order_seq: 40,
                     searchable_word: "reaction target".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("seed message");

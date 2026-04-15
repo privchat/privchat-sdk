@@ -950,8 +950,9 @@ impl LocalStore {
         conn.execute(
             "INSERT INTO message (
                 server_message_id, channel_id, channel_type, from_uid, type, content,
-                status, created_at, updated_at, searchable_word, local_message_id, setting, extra
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                status, created_at, updated_at, searchable_word, local_message_id, setting, extra,
+                mime_type, media_downloaded, thumb_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 Option::<i64>::None,
                 input.channel_id as i64,
@@ -965,7 +966,10 @@ impl LocalStore {
                 input.searchable_word,
                 local_message_id as i64,
                 input.setting,
-                input.extra
+                input.extra,
+                input.mime_type,
+                input.media_downloaded as i32,
+                input.thumb_status,
             ],
         )
         .map_err(|e| Error::Storage(format!("insert message: {e}")))?;
@@ -1016,7 +1020,8 @@ impl LocalStore {
                  SET channel_id = ?1, channel_type = ?2, timestamp = ?3, from_uid = ?4,
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
-                     server_message_id = ?15
+                     server_message_id = ?15,
+                     mime_type = COALESCE(?17, mime_type)
                  WHERE id = ?16",
                 params![
                     input.channel_id as i64,
@@ -1035,6 +1040,7 @@ impl LocalStore {
                     input.order_seq,
                     input.server_message_id as i64,
                     row_id,
+                    input.mime_type,
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
@@ -1092,8 +1098,8 @@ impl LocalStore {
             "INSERT INTO message (
                 server_message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
                 content, status, created_at, updated_at, searchable_word, local_message_id,
-                setting, order_seq, extra
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
+                setting, order_seq, extra, mime_type
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 input.server_message_id as i64,
                 input.pts,
@@ -1110,6 +1116,7 @@ impl LocalStore {
                 input.setting,
                 input.order_seq,
                 input.extra,
+                input.mime_type,
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
@@ -1215,7 +1222,8 @@ impl LocalStore {
                  SET channel_id = ?1, channel_type = ?2, timestamp = ?3, from_uid = ?4,
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
-                     server_message_id = ?15
+                     server_message_id = ?15,
+                     mime_type = COALESCE(?17, mime_type)
                  WHERE id = ?16",
                 params![
                     input.channel_id as i64,
@@ -1234,6 +1242,7 @@ impl LocalStore {
                     input.order_seq,
                     input.server_message_id as i64,
                     row_id,
+                    input.mime_type,
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
@@ -1289,8 +1298,8 @@ impl LocalStore {
             "INSERT INTO message (
                 server_message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
                 content, status, created_at, updated_at, searchable_word, local_message_id,
-                setting, order_seq, extra
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
+                setting, order_seq, extra, mime_type
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 input.server_message_id as i64,
                 input.pts,
@@ -1307,6 +1316,7 @@ impl LocalStore {
                 input.setting,
                 input.order_seq,
                 input.extra,
+                input.mime_type,
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
@@ -1322,7 +1332,8 @@ impl LocalStore {
             "SELECT
                 m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
                 m.content, m.status, m.created_at, m.updated_at, m.extra, m.local_message_id,
-                COALESCE(me.revoke, 0), me.revoker
+                COALESCE(me.revoke, 0), me.revoker,
+                m.mime_type, m.media_downloaded, m.thumb_status
              FROM message m
              LEFT JOIN message_extra me ON me.message_id = m.id
              WHERE m.id = ?1 LIMIT 1",
@@ -1346,6 +1357,9 @@ impl LocalStore {
                     extra: row.get::<_, String>(10)?,
                     revoked: row.get::<_, i32>(12)? != 0,
                     revoked_by: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                    mime_type: row.get::<_, Option<String>>(14)?,
+                    media_downloaded: row.get::<_, i32>(15).unwrap_or(0) != 0,
+                    thumb_status: row.get::<_, i32>(16).unwrap_or(0),
                 })
             },
         )
@@ -1440,7 +1454,8 @@ impl LocalStore {
                 "SELECT
                     m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
                     m.content, m.status, m.created_at, m.updated_at, m.extra, m.local_message_id,
-                    COALESCE(me.revoke, 0), me.revoker
+                    COALESCE(me.revoke, 0), me.revoker,
+                    m.mime_type, m.media_downloaded, m.thumb_status
                  FROM message m
                  LEFT JOIN message_extra me ON me.message_id = m.id
                  WHERE m.channel_id = ?1 AND m.channel_type = ?2
@@ -1470,6 +1485,9 @@ impl LocalStore {
                         extra: row.get::<_, String>(10)?,
                         revoked: row.get::<_, i32>(12)? != 0,
                         revoked_by: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                        mime_type: row.get::<_, Option<String>>(14)?,
+                        media_downloaded: row.get::<_, i32>(15).unwrap_or(0) != 0,
+                        thumb_status: row.get::<_, i32>(16).unwrap_or(0),
                     })
                 },
             )
@@ -1480,6 +1498,38 @@ impl LocalStore {
             out.push(row.map_err(|e| Error::Storage(format!("decode list messages row: {e}")))?);
         }
         Ok(out)
+    }
+
+    /// 更新消息的缩略图状态：0=missing, 1=ready, 2=failed
+    pub fn update_thumb_status(
+        &self,
+        uid: &str,
+        message_id: u64,
+        thumb_status: i32,
+    ) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        conn.execute(
+            "UPDATE message SET thumb_status = ?1, updated_at = ?3 WHERE id = ?2",
+            params![thumb_status, message_id as i64, chrono::Utc::now().timestamp_millis()],
+        )
+        .map_err(|e| Error::Storage(format!("update thumb_status: {e}")))?;
+        Ok(())
+    }
+
+    /// 更新消息的主文件下载状态
+    pub fn update_media_downloaded(
+        &self,
+        uid: &str,
+        message_id: u64,
+        downloaded: bool,
+    ) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        conn.execute(
+            "UPDATE message SET media_downloaded = ?1, updated_at = ?3 WHERE id = ?2",
+            params![downloaded as i32, message_id as i64, chrono::Utc::now().timestamp_millis()],
+        )
+        .map_err(|e| Error::Storage(format!("update media_downloaded: {e}")))?;
+        Ok(())
     }
 
     pub fn max_message_pts(&self, uid: &str, channel_id: u64, channel_type: i32) -> Result<u64> {

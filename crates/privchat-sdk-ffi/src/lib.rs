@@ -1223,6 +1223,9 @@ pub struct NewMessage {
     pub searchable_word: String,
     pub setting: i32,
     pub extra: String,
+    pub mime_type: Option<String>,
+    pub media_downloaded: bool,
+    pub thumb_status: i32,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1241,6 +1244,9 @@ pub struct StoredMessage {
     pub extra: String,
     pub revoked: bool,
     pub revoked_by: Option<u64>,
+    pub mime_type: Option<String>,
+    pub media_downloaded: bool,
+    pub thumb_status: i32,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2202,6 +2208,9 @@ fn map_new_message(v: NewMessage) -> SdkNewMessage {
         searchable_word: v.searchable_word,
         setting: v.setting,
         extra: v.extra,
+        mime_type: v.mime_type,
+        media_downloaded: v.media_downloaded,
+        thumb_status: v.thumb_status,
     }
 }
 
@@ -2250,6 +2259,9 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
         extra: v.extra,
         revoked: v.revoked,
         revoked_by: v.revoked_by,
+        mime_type: v.mime_type,
+        media_downloaded: v.media_downloaded,
+        thumb_status: v.thumb_status,
     }
 }
 
@@ -5731,6 +5743,9 @@ impl PrivchatClient {
             searchable_word: String::new(),
             setting: 0,
             extra: String::new(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
         });
         let message_id = self
             .inner
@@ -5765,6 +5780,9 @@ impl PrivchatClient {
             searchable_word: String::new(),
             setting: 0,
             extra: String::new(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
         })
         .await
     }
@@ -6009,6 +6027,28 @@ impl PrivchatClient {
     ) -> Result<(), PrivchatFfiError> {
         self.inner
             .update_message_status(message_id, status)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn update_thumb_status(
+        &self,
+        message_id: u64,
+        thumb_status: i32,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .update_thumb_status(message_id, thumb_status)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn update_media_downloaded(
+        &self,
+        message_id: u64,
+        downloaded: bool,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .update_media_downloaded(message_id, downloaded)
             .await
             .map_err(PrivchatFfiError::from)
     }
@@ -6995,6 +7035,44 @@ impl PrivchatClient {
             filename.as_deref(),
         )
         .map(|p| p.to_string_lossy().to_string())
+    }
+
+    /// 查找本地缩略图路径：{user_root}/files/{yyyymm}/{message_id}/thumb.webp
+    pub fn resolve_thumbnail_path(
+        &self,
+        uid: u64,
+        message_id: i64,
+        created_at_ms: i64,
+    ) -> Option<String> {
+        let data_dir = self.config.lock().unwrap().data_dir.clone();
+        let root = std::path::Path::new(&data_dir);
+        let dir = privchat_sdk::media_store::get_canonical_message_dir(
+            root, uid, message_id, created_at_ms,
+        );
+        let thumb = dir.join(privchat_sdk::media_store::THUMB_FILENAME);
+        if thumb.exists() {
+            return Some(thumb.to_string_lossy().to_string());
+        }
+        // Legacy: check for {id}_thumb.webp or {id}_thumb.jpg in same dir
+        for ext in &["webp", "jpg"] {
+            let legacy = dir.join(format!("{}_thumb.{}", message_id, ext));
+            if legacy.exists() {
+                return Some(legacy.to_string_lossy().to_string());
+            }
+        }
+        // Also try legacy dir without yyyymm
+        let legacy_dir = root
+            .join("users")
+            .join(uid.to_string())
+            .join("files")
+            .join(message_id.to_string());
+        if legacy_dir != dir && legacy_dir.exists() {
+            let thumb = legacy_dir.join(privchat_sdk::media_store::THUMB_FILENAME);
+            if thumb.exists() {
+                return Some(thumb.to_string_lossy().to_string());
+            }
+        }
+        None
     }
 
     pub async fn set_video_process_hook(

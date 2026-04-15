@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Derive yyyymm from a message's created_at timestamp (milliseconds).
-fn yyyymm(created_at_ms: i64) -> String {
+pub fn yyyymm_from_ms(created_at_ms: i64) -> String {
     DateTime::from_timestamp_millis(created_at_ms)
         .unwrap_or_else(Utc::now)
         .format("%Y%m")
@@ -17,7 +17,7 @@ fn yyyymm(created_at_ms: i64) -> String {
 pub fn get_message_dir(user_root: &Path, message_id: i64, created_at_ms: i64) -> PathBuf {
     user_root
         .join("files")
-        .join(yyyymm(created_at_ms))
+        .join(yyyymm_from_ms(created_at_ms))
         .join(message_id.to_string())
 }
 
@@ -90,6 +90,94 @@ pub fn resolve_attachment_path(
     }
 
     None
+}
+
+// ============================================================
+// Canonical file naming (Spec §7.5 v2)
+// ============================================================
+
+/// The fixed base name for the primary attachment file.
+pub const PAYLOAD_BASENAME: &str = "payload";
+
+/// The fixed thumbnail filename (static WebP).
+pub const THUMB_FILENAME: &str = "thumb.webp";
+
+/// The metadata filename.
+pub const META_FILENAME: &str = "meta.json";
+
+/// Normalize a MIME type string and return the canonical file extension (without dot).
+///
+/// Priority: known MIME mapping > fallback to "bin".
+pub fn ext_from_mime(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().trim() {
+        // Image
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        "image/bmp" | "image/x-bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        "image/tiff" => "tiff",
+        // Video
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/x-matroska" => "mkv",
+        "video/webm" => "webm",
+        "video/x-msvideo" => "avi",
+        "video/3gpp" => "3gp",
+        // Audio
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "audio/x-m4a" => "m4a",
+        "audio/aac" => "aac",
+        "audio/ogg" | "audio/vorbis" => "ogg",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/flac" => "flac",
+        "audio/opus" => "opus",
+        "audio/amr" => "amr",
+        // Document
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
+        "application/x-rar-compressed" | "application/vnd.rar" => "rar",
+        "application/x-7z-compressed" => "7z",
+        "text/plain" => "txt",
+        // Fallback
+        _ => "bin",
+    }
+}
+
+/// Build the canonical payload filename: `payload.{ext}`.
+pub fn payload_filename(mime: &str) -> String {
+    format!("{}.{}", PAYLOAD_BASENAME, ext_from_mime(mime))
+}
+
+/// Try to extract an extension from an original filename as a weak fallback.
+/// Returns `None` if the extension is empty, suspicious, or too long.
+pub fn ext_from_original_filename(filename: &str) -> Option<&str> {
+    let ext = filename.rsplit('.').next()?;
+    if ext.is_empty() || ext.len() > 10 || ext.contains('/') || ext.contains('\\') {
+        return None;
+    }
+    Some(ext)
+}
+
+/// Build payload filename with fallback chain:
+/// 1. Known MIME → extension
+/// 2. Original filename extension (weak)
+/// 3. `.bin`
+pub fn payload_filename_with_fallback(mime: &str, original_filename: Option<&str>) -> String {
+    let ext = ext_from_mime(mime);
+    if ext != "bin" {
+        return format!("{}.{}", PAYLOAD_BASENAME, ext);
+    }
+    // MIME was unknown/octet-stream, try original filename
+    if let Some(name) = original_filename {
+        if let Some(orig_ext) = ext_from_original_filename(name) {
+            return format!("{}.{}", PAYLOAD_BASENAME, orig_ext.to_ascii_lowercase());
+        }
+    }
+    format!("{}.bin", PAYLOAD_BASENAME)
 }
 
 /// Helper: Find the "primary" file in a directory.

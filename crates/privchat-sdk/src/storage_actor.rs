@@ -184,6 +184,16 @@ enum StorageCmd {
         status: i32,
         resp: oneshot::Sender<Result<()>>,
     },
+    UpdateThumbStatus {
+        message_id: u64,
+        thumb_status: i32,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    UpdateMediaDownloaded {
+        message_id: u64,
+        downloaded: bool,
+        resp: oneshot::Sender<Result<()>>,
+    },
     SetMessageRevoke {
         message_id: u64,
         revoked: bool,
@@ -817,6 +827,30 @@ impl StorageHandle {
             .send(StorageCmd::UpdateMessageStatus {
                 message_id,
                 status,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn update_thumb_status(&self, message_id: u64, thumb_status: i32) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UpdateThumbStatus {
+                message_id,
+                thumb_status,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn update_media_downloaded(&self, message_id: u64, downloaded: bool) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UpdateMediaDownloaded {
+                message_id,
+                downloaded,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1678,6 +1712,22 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         } => {
             with_uid!(resp, |uid| store
                 .update_message_status(&uid, message_id, status));
+        }
+        StorageCmd::UpdateThumbStatus {
+            message_id,
+            thumb_status,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .update_thumb_status(&uid, message_id, thumb_status));
+        }
+        StorageCmd::UpdateMediaDownloaded {
+            message_id,
+            downloaded,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .update_media_downloaded(&uid, message_id, downloaded));
         }
         StorageCmd::SetMessageRevoke {
             message_id,

@@ -28,5 +28,5 @@ hkdf.workspace = true
 rand.workspace = true
 snowflake_me = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 libc = "0.2"
