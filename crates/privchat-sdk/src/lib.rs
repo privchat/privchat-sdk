@@ -1747,6 +1747,10 @@ struct State {
     cache_miss_count: u64,
     pending_prelogin_inbound_frames: Vec<(u8, Vec<u8>)>,
     presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
+    event_tx: Option<broadcast::Sender<SdkEvent>>,
+    event_history: Option<Arc<StdMutex<VecDeque<SequencedSdkEvent>>>>,
+    event_seq: Option<Arc<AtomicU64>>,
+    event_history_limit: usize,
 }
 
 impl State {
@@ -3947,6 +3951,7 @@ impl State {
                         continue;
                     }
                     let mime_type = Self::extract_mime_type_from_json(&content, &extra);
+                    let extra_for_thumb = extra.clone();
                     let upserted = self
                         .storage
                         .upsert_remote_message_with_result(UpsertRemoteMessageInput {
@@ -4005,16 +4010,27 @@ impl State {
                         == i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(1)
                         || message_type
                             == i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(4);
-                    if is_image_or_video && !from_self && upserted.inserted_new {
+                    if is_image_or_video && !from_self {
                         if let Ok(paths) = self.storage.get_storage_paths().await {
                             let user_root = PathBuf::from(&paths.user_root);
                             let storage = self.storage.clone();
+                            // DB stores created_at as now_ms (millis), so use
+                            // the same unit for the download path to match
+                            // resolveThumbnailPath which reads DB created_at.
+                            let created_at_ms = chrono::Utc::now().timestamp_millis();
+                            // thumbnail_url lives in `extra`, not `content`
                             Self::spawn_auto_download_thumbnail(
-                                &content,
+                                &extra_for_thumb,
                                 &user_root,
                                 message_id,
-                                timestamp,
+                                created_at_ms,
+                                channel_id,
+                                channel_type,
                                 storage,
+                                self.event_tx.clone(),
+                                self.event_history.clone(),
+                                self.event_seq.clone(),
+                                self.event_history_limit,
                             );
                         }
                     }
@@ -6886,7 +6902,13 @@ impl State {
         user_root: &Path,
         message_id: u64,
         created_at_ms: i64,
+        channel_id: u64,
+        channel_type: i32,
         storage: crate::storage_actor::StorageHandle,
+        event_tx: Option<broadcast::Sender<SdkEvent>>,
+        event_history: Option<Arc<StdMutex<VecDeque<SequencedSdkEvent>>>>,
+        event_seq: Option<Arc<AtomicU64>>,
+        event_history_limit: usize,
     ) {
         let thumb_url = match Self::extract_thumbnail_url(content) {
             Some(url) if url.starts_with("http") => url,
@@ -6906,6 +6928,20 @@ impl State {
                 Ok(()) => {
                     if let Err(e) = storage.update_thumb_status(message_id, 1).await {
                         eprintln!("[SDK.thumb] update thumb_status=1 failed: {e}");
+                    }
+                    // Notify clients that the thumbnail is ready so they can refresh
+                    let event = SdkEvent::TimelineUpdated {
+                        channel_id,
+                        channel_type,
+                        message_id,
+                        reason: "thumbnail_ready".to_string(),
+                    };
+                    if let (Some(tx), Some(history), Some(seq)) =
+                        (&event_tx, &event_history, &event_seq)
+                    {
+                        emit_sequenced_event(tx, history, seq, event_history_limit, event);
+                    } else if let Some(tx) = &event_tx {
+                        let _ = tx.send(event);
                     }
                 }
                 Err(e) => {
@@ -8035,6 +8071,10 @@ impl PrivchatSdk {
                 cache_miss_count: 0,
                 pending_prelogin_inbound_frames: Vec::new(),
                 presence_cache: actor_presence_cache,
+                event_tx: Some(actor_event_tx.clone()),
+                event_history: Some(actor_event_history.clone()),
+                event_seq: Some(actor_event_seq.clone()),
+                event_history_limit: event_history_limit,
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut health_tick = interval(Duration::from_secs(15));
@@ -9002,6 +9042,34 @@ impl PrivchatSdk {
                                 .map(|snapshot| snapshot.messages),
                             Err(e) => Err(e),
                         };
+                        // Trigger thumbnail downloads for image/video messages missing thumbnails
+                        if let Ok(ref messages) = result {
+                            if let Ok(paths) = state.storage.get_storage_paths().await {
+                                let user_root = PathBuf::from(&paths.user_root);
+                                let image_type = i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(1);
+                                let video_type = i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(4);
+                                for msg in messages {
+                                    if (msg.message_type == image_type || msg.message_type == video_type)
+                                        && msg.thumb_status == 0
+                                    {
+                                        // thumbnail_url lives in `extra`, not `content`
+                                        State::spawn_auto_download_thumbnail(
+                                            &msg.extra,
+                                            &user_root,
+                                            msg.message_id,
+                                            msg.created_at,
+                                            channel_id,
+                                            channel_type,
+                                            state.storage.clone(),
+                                            state.event_tx.clone(),
+                                            state.event_history.clone(),
+                                            state.event_seq.clone(),
+                                            state.event_history_limit,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let _ = resp.send(result);
                     }
                     Command::QueryTimelineSnapshot {
@@ -11702,7 +11770,10 @@ mod tests {
             cache_miss_count: 0,
             pending_prelogin_inbound_frames: Vec::new(),
             presence_cache: Arc::new(StdMutex::new(HashMap::new())),
-            typing_throttle: Arc::new(StdMutex::new(HashMap::new())),
+            event_tx: None,
+            event_history: None,
+            event_seq: None,
+            event_history_limit: 0,
         };
         (state, dir)
     }
