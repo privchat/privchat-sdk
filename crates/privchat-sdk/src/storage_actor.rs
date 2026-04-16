@@ -227,6 +227,22 @@ enum StorageCmd {
         last_read_pts: u64,
         resp: oneshot::Sender<Result<()>>,
     },
+    MarkMessageDelivered {
+        server_message_id: u64,
+        delivered_at: u64,
+        resp: oneshot::Sender<Result<bool>>,
+    },
+    SavePeerReadPts {
+        channel_id: u64,
+        channel_type: i32,
+        peer_read_pts: u64,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    GetPeerReadPts {
+        channel_id: u64,
+        channel_type: i32,
+        resp: oneshot::Sender<Result<Option<u64>>>,
+    },
     GetChannelUnreadCount {
         channel_id: u64,
         channel_type: i32,
@@ -941,6 +957,56 @@ impl StorageHandle {
                 channel_id,
                 channel_type,
                 last_read_pts,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn mark_message_delivered(
+        &self,
+        server_message_id: u64,
+        delivered_at: u64,
+    ) -> Result<bool> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::MarkMessageDelivered {
+                server_message_id,
+                delivered_at,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn save_peer_read_pts(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        peer_read_pts: u64,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::SavePeerReadPts {
+                channel_id,
+                channel_type,
+                peer_read_pts,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn get_peer_read_pts(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<Option<u64>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::GetPeerReadPts {
+                channel_id,
+                channel_type,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1782,6 +1848,41 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 channel_id,
                 channel_type,
                 last_read_pts
+            ));
+        }
+        StorageCmd::MarkMessageDelivered {
+            server_message_id,
+            delivered_at,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.mark_message_delivered(
+                &uid,
+                server_message_id,
+                delivered_at
+            ));
+        }
+        StorageCmd::SavePeerReadPts {
+            channel_id,
+            channel_type,
+            peer_read_pts,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.save_peer_read_pts(
+                &uid,
+                channel_id,
+                channel_type,
+                peer_read_pts
+            ));
+        }
+        StorageCmd::GetPeerReadPts {
+            channel_id,
+            channel_type,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.get_peer_read_pts(
+                &uid,
+                channel_id,
+                channel_type
             ));
         }
         StorageCmd::GetChannelUnreadCount {

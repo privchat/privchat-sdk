@@ -426,6 +426,18 @@ pub enum SdkEvent {
         server_message_id: Option<u64>,
         timestamp: u64,
     },
+    PeerReadPtsAdvanced {
+        channel_id: u64,
+        channel_type: i32,
+        reader_id: u64,
+        read_pts: u64,
+    },
+    MessageDelivered {
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+        delivered_at: u64,
+    },
     ShutdownStarted,
     ShutdownCompleted,
 }
@@ -643,15 +655,28 @@ async fn start_inbound_task(
                 Ok(ClientEvent::MessageReceived(context)) => {
                     if inbound_logs_enabled() {
                         eprintln!(
-                            "[SDK.inbound] message received biz_type={} len={}",
+                            "[SDK.inbound] message received biz_type={} len={} is_request={}",
                             context.biz_type,
-                            context.data.len()
+                            context.data.len(),
+                            context.is_request()
                         );
+                    }
+                    let biz_type = context.biz_type;
+                    let data = context.data.clone();
+                    // 对 Request 类型的包回复 ACK（PushMessageResponse）
+                    if context.is_request() {
+                        let ack = PushMessageResponse {
+                            succeed: true,
+                            message: None,
+                        };
+                        if let Ok(ack_bytes) = encode_message(&ack) {
+                            context.respond(ack_bytes);
+                        }
                     }
                     if actor_tx
                         .send(Command::InboundFrame {
-                            biz_type: context.biz_type,
-                            data: context.data.clone(),
+                            biz_type,
+                            data,
                         })
                         .await
                         .is_err()
@@ -790,6 +815,10 @@ pub struct StoredMessage {
     pub media_downloaded: bool,
     /// 缩略图状态：0=missing, 1=ready, 2=failed
     pub thumb_status: i32,
+    /// 是否已送达对端（from message_extra.delivered）
+    pub delivered: bool,
+    /// per-channel 消息序号（用于 read cursor 投影: pts <= peer_read_pts）
+    pub pts: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,6 +915,7 @@ pub struct StoredChannelExtra {
     pub draft: String,
     pub draft_updated_at: u64,
     pub version: i64,
+    pub peer_read_pts: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -904,6 +934,8 @@ pub struct StoredMessageExtra {
     pub edited_at: i32,
     pub need_upload: bool,
     pub is_pinned: bool,
+    pub delivered: bool,
+    pub delivered_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1454,6 +1486,11 @@ enum Command {
         channel_type: i32,
         last_read_pts: u64,
         resp: oneshot::Sender<Result<()>>,
+    },
+    GetPeerReadPts {
+        channel_id: u64,
+        channel_type: i32,
+        resp: oneshot::Sender<Result<Option<u64>>>,
     },
     GetChannelUnreadCount {
         channel_id: u64,
@@ -3129,6 +3166,34 @@ impl State {
         }
     }
 
+    /// Extract a delivery receipt from a push notification, if applicable.
+    fn push_message_to_delivery_receipt(
+        push: &PushMessageRequest,
+    ) -> Option<(u64, i32, u64, u64)> {
+        let payload_json: serde_json::Value = serde_json::from_slice(&push.payload).ok()?;
+        let notification_type =
+            Self::json_field_string(&payload_json, &["metadata", "notification_type"])?;
+        if notification_type != "message_receipt_updated" {
+            return None;
+        }
+        let receipt_type = Self::json_field_string(&payload_json, &["receipt_type"])?;
+        if receipt_type != "delivered" {
+            return None;
+        }
+        let channel_id =
+            Self::json_field_u64(&payload_json, &["metadata", "channel_id"]).unwrap_or(0);
+        let channel_type =
+            Self::json_field_u64(&payload_json, &["metadata", "channel_type"]).unwrap_or(1) as i32;
+        let server_message_id =
+            Self::json_field_u64(&payload_json, &["server_message_id"]).unwrap_or(0);
+        let delivered_at =
+            Self::json_field_u64(&payload_json, &["delivered_at"]).unwrap_or(0);
+        if server_message_id == 0 {
+            return None;
+        }
+        Some((channel_id, channel_type, server_message_id, delivered_at))
+    }
+
     fn send_message_to_sync_item(
         req: SendMessageRequest,
         channel_type: u8,
@@ -4433,6 +4498,23 @@ impl State {
                                 read_pts,
                                 unread_before,
                                 unread_after
+                            );
+                        }
+                    } else if read_pts > 0 {
+                        let _ = self
+                            .storage
+                            .save_peer_read_pts(channel_id, channel_type, read_pts)
+                            .await;
+                        emitted.push(SdkEvent::PeerReadPtsAdvanced {
+                            channel_id,
+                            channel_type,
+                            reader_id,
+                            read_pts,
+                        });
+                        if inbound_logs_enabled() {
+                            eprintln!(
+                                "[SDK.read] peer_read_pts_advanced: channel_id={} channel_type={} reader_id={} read_pts={}",
+                                channel_id, channel_type, reader_id, read_pts
                             );
                         }
                     } else if inbound_logs_enabled() {
@@ -6082,6 +6164,8 @@ impl State {
         }
         let mut message_items = Vec::new();
         let mut read_cursor_items = Vec::new();
+        // (channel_id, channel_type, server_message_id, delivered_at)
+        let mut delivery_receipts: Vec<(u64, i32, u64, u64)> = Vec::new();
         match message_type {
             MessageType::SendMessageRequest => {
                 let req: SendMessageRequest = decode_message(&data).map_err(|e| {
@@ -6122,6 +6206,8 @@ impl State {
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
                 if let Some(status_item) = Self::push_message_to_status_sync_item(&req) {
                     read_cursor_items.push(status_item);
+                } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&req) {
+                    delivery_receipts.push(receipt);
                 } else {
                     // deleted=true 时 push_message_to_sync_item 会透传给 SyncEntityItem.deleted，
                     // 进而触发 "message" 实体处理里的 set_message_revoke 路径
@@ -6134,6 +6220,8 @@ impl State {
                 for push in req.messages {
                     if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
                         read_cursor_items.push(status_item);
+                    } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
+                        delivery_receipts.push(receipt);
                     } else {
                         message_items.push(Self::push_message_to_sync_item(push));
                     }
@@ -6152,6 +6240,8 @@ impl State {
                     }
                     if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
                         read_cursor_items.push(status_item);
+                    } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
+                        delivery_receipts.push(receipt);
                     } else {
                         message_items.push(Self::push_message_to_sync_item(push));
                     }
@@ -6165,6 +6255,8 @@ impl State {
                     for push in batch.messages {
                         if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
                             read_cursor_items.push(status_item);
+                        } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
+                            delivery_receipts.push(receipt);
                         } else {
                             message_items.push(Self::push_message_to_sync_item(push));
                         }
@@ -6218,6 +6310,28 @@ impl State {
                     read_cursor_items,
                 )
                 .await?;
+        }
+        // Process delivery receipts: persist + emit events
+        for (channel_id, channel_type, server_message_id, delivered_at) in delivery_receipts {
+            let was_new = self
+                .storage
+                .mark_message_delivered(server_message_id, delivered_at)
+                .await
+                .unwrap_or(false);
+            if was_new {
+                self.pending_events.push(SdkEvent::MessageDelivered {
+                    channel_id,
+                    channel_type,
+                    server_message_id,
+                    delivered_at,
+                });
+                if inbound_logs_enabled() {
+                    eprintln!(
+                        "[SDK.delivered] message_delivered: channel_id={} server_message_id={} delivered_at={}",
+                        channel_id, server_message_id, delivered_at
+                    );
+                }
+            }
         }
         Ok(applied)
     }
@@ -9406,6 +9520,22 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::GetPeerReadPts {
+                        channel_id,
+                        channel_type,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => {
+                                state
+                                    .storage
+                                    .get_peer_read_pts(channel_id, channel_type)
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::GetChannelUnreadCount {
                         channel_id,
                         channel_type,
@@ -10987,6 +11117,25 @@ impl PrivchatSdk {
                 channel_id,
                 channel_type,
                 last_read_pts,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// Get the locally persisted peer read pts for cold start.
+    pub async fn get_peer_read_pts(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<Option<u64>> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::GetPeerReadPts {
+                channel_id,
+                channel_type,
                 resp: resp_tx,
             })
             .await

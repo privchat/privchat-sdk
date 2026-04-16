@@ -1333,7 +1333,9 @@ impl LocalStore {
                 m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
                 m.content, m.status, m.created_at, m.updated_at, m.extra, m.local_message_id,
                 COALESCE(me.revoke, 0), me.revoker,
-                m.mime_type, m.media_downloaded, m.thumb_status
+                m.mime_type, m.media_downloaded, m.thumb_status,
+                COALESCE(me.delivered, 0),
+                m.pts
              FROM message m
              LEFT JOIN message_extra me ON me.message_id = m.id
              WHERE m.id = ?1 LIMIT 1",
@@ -1360,6 +1362,8 @@ impl LocalStore {
                     mime_type: row.get::<_, Option<String>>(14)?,
                     media_downloaded: row.get::<_, i32>(15).unwrap_or(0) != 0,
                     thumb_status: row.get::<_, i32>(16).unwrap_or(0),
+                    delivered: row.get::<_, i32>(17).unwrap_or(0) != 0,
+                    pts: row.get::<_, Option<i64>>(18)?.filter(|&v| v > 0).map(|v| v as u64),
                 })
             },
         )
@@ -1455,7 +1459,9 @@ impl LocalStore {
                     m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
                     m.content, m.status, m.created_at, m.updated_at, m.extra, m.local_message_id,
                     COALESCE(me.revoke, 0), me.revoker,
-                    m.mime_type, m.media_downloaded, m.thumb_status
+                    m.mime_type, m.media_downloaded, m.thumb_status,
+                    COALESCE(me.delivered, 0),
+                    m.pts
                  FROM message m
                  LEFT JOIN message_extra me ON me.message_id = m.id
                  WHERE m.channel_id = ?1 AND m.channel_type = ?2
@@ -1488,6 +1494,8 @@ impl LocalStore {
                         mime_type: row.get::<_, Option<String>>(14)?,
                         media_downloaded: row.get::<_, i32>(15).unwrap_or(0) != 0,
                         thumb_status: row.get::<_, i32>(16).unwrap_or(0),
+                        delivered: row.get::<_, i32>(17).unwrap_or(0) != 0,
+                        pts: row.get::<_, Option<i64>>(18)?.filter(|&v| v > 0).map(|v| v as u64),
                     })
                 },
             )
@@ -2030,7 +2038,7 @@ impl LocalStore {
         conn.query_row(
             "SELECT
                 channel_id, channel_type, browse_to, keep_pts, keep_offset_y,
-                draft, draft_updated_at, version
+                draft, draft_updated_at, version, peer_read_pts
              FROM channel_extra
              WHERE channel_id = ?1 AND channel_type = ?2
              LIMIT 1",
@@ -2045,11 +2053,53 @@ impl LocalStore {
                     draft: row.get::<_, String>(5)?,
                     draft_updated_at: row.get::<_, i64>(6)? as u64,
                     version: row.get::<_, i64>(7)?,
+                    peer_read_pts: row.get::<_, i64>(8)? as u64,
                 })
             },
         )
         .optional()
         .map_err(|e| Error::Storage(format!("get channel_extra: {e}")))
+    }
+
+    /// Persist peer read pts (monotonic max) into channel_extra.
+    pub fn save_peer_read_pts(
+        &self,
+        uid: &str,
+        channel_id: u64,
+        channel_type: i32,
+        peer_read_pts: u64,
+    ) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        conn.execute(
+            "INSERT INTO channel_extra (channel_id, channel_type, peer_read_pts)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(channel_id, channel_type) DO UPDATE SET
+                peer_read_pts = MAX(channel_extra.peer_read_pts, excluded.peer_read_pts)",
+            params![channel_id as i64, channel_type, peer_read_pts as i64],
+        )
+        .map_err(|e| Error::Storage(format!("save_peer_read_pts: {e}")))?;
+        Ok(())
+    }
+
+    /// Get peer read pts for a channel (cold start query).
+    pub fn get_peer_read_pts(
+        &self,
+        uid: &str,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<Option<u64>> {
+        let conn = self.conn_for_user(uid)?;
+        let pts: Option<i64> = conn
+            .query_row(
+                "SELECT peer_read_pts FROM channel_extra
+                 WHERE channel_id = ?1 AND channel_type = ?2
+                 LIMIT 1",
+                params![channel_id as i64, channel_type],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("get_peer_read_pts: {e}")))?;
+        Ok(pts.filter(|&v| v > 0).map(|v| v as u64))
     }
 
     pub fn upsert_user(&self, uid: &str, input: &UpsertUserInput) -> Result<()> {
@@ -3146,7 +3196,8 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(
             "SELECT message_id, channel_id, channel_type, readed, readed_count, unread_count, revoke,
-                    revoker, extra_version, is_mutual_deleted, content_edit, edited_at, need_upload, is_pinned
+                    revoker, extra_version, is_mutual_deleted, content_edit, edited_at, need_upload, is_pinned,
+                    delivered, delivered_at
              FROM message_extra WHERE message_id = ?1",
             params![message_id as i64],
             |row| {
@@ -3165,11 +3216,51 @@ impl LocalStore {
                     edited_at: row.get::<_, i32>(11)?,
                     need_upload: row.get::<_, i16>(12)? != 0,
                     is_pinned: row.get::<_, i32>(13)? != 0,
+                    delivered: row.get::<_, i32>(14)? != 0,
+                    delivered_at: row.get::<_, i64>(15)? as u64,
                 })
             },
         )
         .optional()
         .map_err(|e| Error::Storage(format!("get message extra: {e}")))
+    }
+
+    /// Mark a message as delivered (only upgrades 0→1, never downgrades).
+    /// Returns true if the row was actually updated (first receipt).
+    pub fn mark_message_delivered(
+        &self,
+        uid: &str,
+        server_message_id: u64,
+        delivered_at: u64,
+    ) -> Result<bool> {
+        let conn = self.conn_for_user(uid)?;
+        // Resolve local message_id from server_message_id
+        let message_row: Option<(i64, i64, i32)> = conn
+            .query_row(
+                "SELECT id, channel_id, channel_type FROM message WHERE server_message_id = ?1 LIMIT 1",
+                params![server_message_id as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("mark_delivered lookup: {e}")))?;
+        let Some((message_id, channel_id, channel_type)) = message_row else {
+            return Ok(false);
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let updated = conn
+            .execute(
+                "INSERT INTO message_extra (
+                    message_id, channel_id, channel_type, delivered, delivered_at, extra_version
+                 ) VALUES (?1, ?2, ?3, 1, ?4, ?5)
+                 ON CONFLICT(message_id) DO UPDATE SET
+                    delivered = 1,
+                    delivered_at = excluded.delivered_at,
+                    extra_version = excluded.extra_version
+                 WHERE message_extra.delivered = 0",
+                params![message_id, channel_id, channel_type, delivered_at as i64, now_ms],
+            )
+            .map_err(|e| Error::Storage(format!("mark_delivered upsert: {e}")))?;
+        Ok(updated > 0)
     }
 
     /// 基于 read cursor 精确投影本地读状态：

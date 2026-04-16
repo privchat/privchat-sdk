@@ -586,6 +586,7 @@ impl MultiAccountManager {
                 channel_id,
                 read_pts,
                 last_read_message_id: None,
+                client_visible_pts: None,
             },
         )
         .await

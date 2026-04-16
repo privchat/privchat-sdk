@@ -1109,6 +1109,18 @@ pub enum SdkEvent {
         server_message_id: Option<u64>,
         timestamp: u64,
     },
+    PeerReadPtsAdvanced {
+        channel_id: u64,
+        channel_type: i32,
+        reader_id: u64,
+        read_pts: u64,
+    },
+    MessageDelivered {
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+        delivered_at: u64,
+    },
     ShutdownStarted,
     ShutdownCompleted,
 }
@@ -1248,6 +1260,8 @@ pub struct StoredMessage {
     pub mime_type: Option<String>,
     pub media_downloaded: bool,
     pub thumb_status: i32,
+    pub delivered: bool,
+    pub pts: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1320,6 +1334,8 @@ pub struct StoredMessageExtra {
     pub edited_at: i32,
     pub need_upload: bool,
     pub is_pinned: bool,
+    pub delivered: bool,
+    pub delivered_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1922,6 +1938,28 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             server_message_id,
             timestamp,
         },
+        privchat_sdk::SdkEvent::PeerReadPtsAdvanced {
+            channel_id,
+            channel_type,
+            reader_id,
+            read_pts,
+        } => SdkEvent::PeerReadPtsAdvanced {
+            channel_id,
+            channel_type,
+            reader_id,
+            read_pts,
+        },
+        privchat_sdk::SdkEvent::MessageDelivered {
+            channel_id,
+            channel_type,
+            server_message_id,
+            delivered_at,
+        } => SdkEvent::MessageDelivered {
+            channel_id,
+            channel_type,
+            server_message_id,
+            delivered_at,
+        },
         privchat_sdk::SdkEvent::ShutdownStarted => SdkEvent::ShutdownStarted,
         privchat_sdk::SdkEvent::ShutdownCompleted => SdkEvent::ShutdownCompleted,
     }
@@ -2127,6 +2165,30 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "server_message_id": server_message_id,
             "timestamp": timestamp
         }),
+        SdkEvent::PeerReadPtsAdvanced {
+            channel_id,
+            channel_type,
+            reader_id,
+            read_pts,
+        } => json!({
+            "type": "peer_read_pts_advanced",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "reader_id": reader_id,
+            "read_pts": read_pts
+        }),
+        SdkEvent::MessageDelivered {
+            channel_id,
+            channel_type,
+            server_message_id,
+            delivered_at,
+        } => json!({
+            "type": "message_delivered",
+            "channel_id": channel_id,
+            "channel_type": channel_type,
+            "server_message_id": server_message_id,
+            "delivered_at": delivered_at
+        }),
         SdkEvent::ShutdownStarted => json!({ "type": "shutdown_started" }),
         SdkEvent::ShutdownCompleted => json!({ "type": "shutdown_completed" }),
     }
@@ -2263,6 +2325,8 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
         mime_type: v.mime_type,
         media_downloaded: v.media_downloaded,
         thumb_status: v.thumb_status,
+        delivered: v.delivered,
+        pts: v.pts,
     }
 }
 
@@ -2312,6 +2376,8 @@ fn map_stored_message_extra(v: SdkStoredMessageExtra) -> StoredMessageExtra {
         edited_at: v.edited_at,
         need_upload: v.need_upload,
         is_pinned: v.is_pinned,
+        delivered: v.delivered,
+        delivered_at: v.delivered_at,
     }
 }
 
@@ -4019,6 +4085,7 @@ impl PrivchatClient {
                 channel_id,
                 read_pts,
                 last_read_message_id: None,
+                client_visible_pts: None,
             },
         )
         .await?;
@@ -6008,6 +6075,17 @@ impl PrivchatClient {
             .await
             .map_err(PrivchatFfiError::from)?;
         Ok(out.map(map_stored_channel_extra))
+    }
+
+    pub async fn get_peer_read_pts(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<Option<u64>, PrivchatFfiError> {
+        self.inner
+            .get_peer_read_pts(channel_id, channel_type)
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn mark_message_sent(
