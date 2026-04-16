@@ -2137,6 +2137,20 @@ impl LocalStore {
         Ok(())
     }
 
+    pub fn update_user_alias(&self, uid: &str, user_id: u64, alias: Option<String>) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        conn.execute(
+            "UPDATE user SET alias = ?2, updated_at = ?3 WHERE user_id = ?1",
+            params![
+                user_id as i64,
+                alias,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("update_user_alias: {e}")))?;
+        Ok(())
+    }
+
     pub fn get_user_by_id(&self, uid: &str, user_id: u64) -> Result<Option<StoredUser>> {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(

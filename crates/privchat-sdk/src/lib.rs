@@ -1505,6 +1505,11 @@ enum Command {
         input: UpsertUserInput,
         resp: oneshot::Sender<Result<()>>,
     },
+    UpdateUserAlias {
+        user_id: u64,
+        alias: Option<String>,
+        resp: oneshot::Sender<Result<()>>,
+    },
     GetUserById {
         user_id: u64,
         resp: oneshot::Sender<Result<Option<StoredUser>>>,
@@ -9574,6 +9579,13 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::UpdateUserAlias { user_id, alias, resp } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => state.storage.update_user_alias(user_id, alias).await,
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::GetUserById { user_id, resp } => {
                         let result = match state.current_uid_required() {
                             Ok(_) => state.storage.get_user_by_id(user_id).await,
@@ -11187,6 +11199,20 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    pub async fn update_user_alias(&self, user_id: u64, alias: Option<String>) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::UpdateUserAlias {
+                user_id,
+                alias,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
     pub async fn get_user_by_id(&self, user_id: u64) -> Result<Option<StoredUser>> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -11624,7 +11650,7 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    async fn kv_put_local(&self, key: String, value: Vec<u8>) -> Result<()> {
+    pub async fn kv_put_local(&self, key: String, value: Vec<u8>) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -11638,7 +11664,7 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    async fn kv_get_local(&self, key: String) -> Result<Option<Vec<u8>>> {
+    pub async fn kv_get_local(&self, key: String) -> Result<Option<Vec<u8>>> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx

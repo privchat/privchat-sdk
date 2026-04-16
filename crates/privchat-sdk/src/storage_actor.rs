@@ -261,6 +261,11 @@ enum StorageCmd {
         input: UpsertUserInput,
         resp: oneshot::Sender<Result<()>>,
     },
+    UpdateUserAlias {
+        user_id: u64,
+        alias: Option<String>,
+        resp: oneshot::Sender<Result<()>>,
+    },
     GetUserById {
         user_id: u64,
         resp: oneshot::Sender<Result<Option<StoredUser>>>,
@@ -1061,6 +1066,18 @@ impl StorageHandle {
         self.tx
             .send(StorageCmd::UpsertUser {
                 input,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn update_user_alias(&self, user_id: u64, alias: Option<String>) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UpdateUserAlias {
+                user_id,
+                alias,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1916,6 +1933,9 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::UpsertUser { input, resp } => {
             with_uid!(resp, |uid| store.upsert_user(&uid, &input));
+        }
+        StorageCmd::UpdateUserAlias { user_id, alias, resp } => {
+            with_uid!(resp, |uid| store.update_user_alias(&uid, user_id, alias));
         }
         StorageCmd::GetUserById { user_id, resp } => {
             with_uid!(resp, |uid| store.get_user_by_id(&uid, user_id));
