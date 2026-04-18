@@ -3963,6 +3963,19 @@ impl PrivchatClient {
         Ok(resp)
     }
 
+    /// 设置用户备注（本地）
+    pub async fn update_user_alias(
+        &self,
+        user_id: u64,
+        alias: Option<String>,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .update_user_alias(user_id, alias)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(())
+    }
+
     pub async fn add_to_blacklist(&self, blocked_user_id: u64) -> Result<bool, PrivchatFfiError> {
         let user_id = self.require_current_user_id().await?;
         let resp: BlacklistAddResponse = rpc_call_typed(
