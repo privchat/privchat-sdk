@@ -1279,6 +1279,7 @@ dependencies = [
  "serde_json",
  "sharded-slab",
  "slab",
+ "socket2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",

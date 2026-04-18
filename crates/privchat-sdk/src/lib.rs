@@ -892,6 +892,9 @@ pub struct StoredChannel {
     pub last_msg_content: String,
     pub version: i64,
     pub updated_at: i64,
+    /// DM 会话的对端用户 ID。仅 channel_type==1 时有值，其余为 None。
+    /// 派生自 channel_member 表（排除当前用户后的唯一成员）。
+    pub peer_user_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

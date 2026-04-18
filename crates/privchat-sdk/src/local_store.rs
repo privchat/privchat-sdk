@@ -1717,7 +1717,16 @@ impl LocalStore {
                     ''
                 ) AS resolved_last_msg_content,
                 c.version,
-                c.updated_at
+                c.updated_at,
+                CASE WHEN c.channel_type = 1 THEN (
+                    SELECT cm.member_uid
+                    FROM channel_member cm
+                    WHERE cm.channel_id = c.channel_id
+                      AND cm.channel_type = c.channel_type
+                      AND cm.member_uid != ?2
+                    ORDER BY cm.role ASC, cm.member_uid ASC
+                    LIMIT 1
+                ) ELSE NULL END AS peer_user_id
              FROM channel c
              WHERE c.channel_id = ?1
              LIMIT 1",
@@ -1737,6 +1746,7 @@ impl LocalStore {
                     last_msg_content: row.get::<_, String>(10)?,
                     version: row.get::<_, i64>(11)?,
                     updated_at: row.get::<_, i64>(12)?,
+                    peer_user_id: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
                 })
             },
         )
@@ -1873,7 +1883,16 @@ impl LocalStore {
                         ''
                     ) AS resolved_last_msg_content,
                     c.version,
-                    c.updated_at
+                    c.updated_at,
+                    CASE WHEN c.channel_type = 1 THEN (
+                        SELECT cm.member_uid
+                        FROM channel_member cm
+                        WHERE cm.channel_id = c.channel_id
+                          AND cm.channel_type = c.channel_type
+                          AND cm.member_uid != ?3
+                        ORDER BY cm.role ASC, cm.member_uid ASC
+                        LIMIT 1
+                    ) ELSE NULL END AS peer_user_id
                  FROM channel c
                  ORDER BY c.top DESC, resolved_last_msg_timestamp DESC, c.channel_id DESC
                  LIMIT ?1 OFFSET ?2",
@@ -1895,6 +1914,7 @@ impl LocalStore {
                     last_msg_content: row.get::<_, String>(10)?,
                     version: row.get::<_, i64>(11)?,
                     updated_at: row.get::<_, i64>(12)?,
+                    peer_user_id: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
                 })
             })
             .map_err(|e| Error::Storage(format!("query list channels: {e}")))?;

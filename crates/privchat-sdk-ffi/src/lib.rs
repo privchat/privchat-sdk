@@ -1293,6 +1293,7 @@ pub struct StoredChannel {
     pub last_local_message_id: u64,
     pub last_msg_content: String,
     pub updated_at: i64,
+    pub peer_user_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2344,6 +2345,7 @@ fn map_stored_channel(v: SdkStoredChannel) -> StoredChannel {
         last_local_message_id: v.last_local_message_id,
         last_msg_content: v.last_msg_content,
         updated_at: v.updated_at,
+        peer_user_id: v.peer_user_id,
     }
 }
 
