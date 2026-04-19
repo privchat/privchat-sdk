@@ -3680,6 +3680,191 @@ impl TestPhases {
             metrics,
         })
     }
+
+    /// Phase 35 - 验证 admin 撤回副作用闭环（P0 收敛后）
+    ///
+    /// 覆盖 `ADMIN_PATH_CONVERGENCE_AUDIT §1.1` 的全部 6 项副作用：
+    /// - DB 撤回标记（admin 响应里的 `revoked_at` > 0）
+    /// - 推送撤回事件（alice/bob 本地 `StoredMessage.revoked == true`，这是最关键的用户可见信号）
+    /// - 离线队列清理、缓存同步、PTS commit 等间接通过"在线端收到撤回"来兜底
+    ///
+    /// 若 admin 路径回退到 `message_repository.revoke_message(id, 0)` 单步写法，
+    /// 客户端不会收到撤回事件，本 phase 必然失败——作为回归锚点。
+    pub async fn phase35_admin_revoke_online(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let admin_port = std::env::var("PRIVCHAT_ADMIN_API_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(9090);
+        let service_key = std::env::var("SERVICE_MASTER_KEY")
+            .unwrap_or_else(|_| "your_service_master_key_here".to_string());
+        let admin_base = format!("http://{}:{}", host, admin_port);
+
+        let client = reqwest::Client::new();
+
+        let channel_id = require_group_channel(manager, "main_group")?;
+        let charlie_uid = manager.user_id("charlie")?;
+
+        // 1) 通过 admin 发一条种子消息，拿到一个确切可控的 message_id
+        let probe = format!("admin-revoke-seed-{}", now_millis());
+        let send_resp = client
+            .post(format!("{}/api/admin/messages/send", admin_base))
+            .header("X-Service-Key", &service_key)
+            .json(&serde_json::json!({
+                "channel_id": channel_id,
+                "sender_id": charlie_uid,
+                "content": probe,
+                "message_type": "text",
+            }))
+            .send()
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.messages_sent += 1;
+        if !send_resp.status().is_success() {
+            let status = send_resp.status();
+            let body = send_resp.text().await.unwrap_or_default();
+            metrics
+                .errors
+                .push(format!("admin seed send failed: {status} {body}"));
+            return Ok(phase_fail(
+                "admin-revoke-online",
+                start.elapsed(),
+                "seed admin send_message returned non-2xx",
+                metrics,
+            ));
+        }
+        metrics.rpc_successes += 1;
+
+        // 2) 等待 fanout 到 SDK 端并刷一下本地视图
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        for key in ["alice", "bob"] {
+            if let Err(e) = manager.refresh_local_views(key).await {
+                metrics
+                    .errors
+                    .push(format!("refresh_local_views({key}) pre-revoke failed: {e}"));
+            }
+        }
+
+        // 3) 在 alice 本地定位 server_message_id
+        let alice_msgs = manager
+            .list_local_messages("alice", channel_id, GROUP_SYNC_CHANNEL_TYPE as i32, 20)
+            .await?;
+        metrics.rpc_calls += 1;
+        let seed = alice_msgs
+            .iter()
+            .find(|m| m.from_uid == charlie_uid && m.content.contains(&probe))
+            .cloned();
+        let seed = match seed {
+            Some(s) => s,
+            None => {
+                metrics
+                    .errors
+                    .push(format!("alice 未收到 admin 种子消息，probe={probe}"));
+                return Ok(phase_fail(
+                    "admin-revoke-online",
+                    start.elapsed(),
+                    "seed message did not arrive at alice before revoke",
+                    metrics,
+                ));
+            }
+        };
+        let server_message_id = seed
+            .server_message_id
+            .unwrap_or(seed.message_id);
+        metrics.rpc_successes += 1;
+
+        // 4) admin 撤回这条消息
+        let revoke_resp = client
+            .post(format!(
+                "{}/api/admin/messages/{}/revoke",
+                admin_base, server_message_id
+            ))
+            .header("X-Service-Key", &service_key)
+            .json(&serde_json::json!({"reason": "phase35 audit"}))
+            .send()
+            .await?;
+        metrics.rpc_calls += 1;
+        if !revoke_resp.status().is_success() {
+            let status = revoke_resp.status();
+            let body = revoke_resp.text().await.unwrap_or_default();
+            metrics
+                .errors
+                .push(format!("admin revoke failed: {status} {body}"));
+            return Ok(phase_fail(
+                "admin-revoke-online",
+                start.elapsed(),
+                "admin revoke returned non-2xx",
+                metrics,
+            ));
+        }
+        let revoke_body: serde_json::Value = revoke_resp.json().await?;
+        metrics.rpc_successes += 1;
+
+        let resp_channel_id = revoke_body
+            .get("channel_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if resp_channel_id != channel_id {
+            metrics.errors.push(format!(
+                "admin revoke response channel_id mismatch: expected {channel_id}, got {resp_channel_id}"
+            ));
+        }
+        let resp_revoked_at = revoke_body
+            .get("revoked_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if resp_revoked_at <= 0 {
+            metrics
+                .errors
+                .push("admin revoke response missing revoked_at".to_string());
+        }
+
+        // 5) 等待撤回事件经 ConnectionManager 推到 SDK 并落库
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        for key in ["alice", "bob"] {
+            if let Err(e) = manager.refresh_local_views(key).await {
+                metrics
+                    .errors
+                    .push(format!("refresh_local_views({key}) post-revoke failed: {e}"));
+            }
+        }
+
+        // 6) 验证 alice/bob 本地的消息已 revoked=true —— 这是 admin 路径以前缺失的用户可见副作用
+        for key in ["alice", "bob"] {
+            let msgs = manager
+                .list_local_messages(key, channel_id, GROUP_SYNC_CHANNEL_TYPE as i32, 30)
+                .await?;
+            metrics.rpc_calls += 1;
+            let entry = msgs.iter().find(|m| {
+                m.server_message_id == Some(server_message_id) || m.message_id == server_message_id
+            });
+            match entry {
+                Some(m) if m.revoked => metrics.rpc_successes += 1,
+                Some(m) => metrics.errors.push(format!(
+                    "{key} 本地消息未标记 revoked: message_id={}, revoked={}",
+                    m.message_id, m.revoked
+                )),
+                None => metrics.errors.push(format!(
+                    "{key} 本地找不到被撤回的消息 server_message_id={server_message_id}"
+                )),
+            }
+        }
+
+        Ok(PhaseResult {
+            phase_name: "admin-revoke-online".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: format!(
+                "admin revoke server_message_id={server_message_id} → alice/bob 本地 revoked=true"
+            ),
+            metrics,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
