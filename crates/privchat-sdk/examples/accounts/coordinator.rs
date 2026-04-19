@@ -100,6 +100,8 @@ impl TestCoordinator {
             .await;
         self.run_phase(TestPhases::phase33_unread_resume_strict(manager).await)
             .await;
+        self.run_phase(TestPhases::phase34_admin_push_online(manager).await)
+            .await;
         Ok(())
     }
 

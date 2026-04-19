@@ -1068,6 +1068,8 @@ impl MultiAccountManager {
             file_id: resp
                 .file_id
                 .unwrap_or_else(|| "unknown-file-id".to_string()),
+            expires_at: None,
+            max_size: None,
         })
     }
 
@@ -1261,6 +1263,33 @@ impl MultiAccountManager {
         let _ = sdk.disconnect().await;
         sdk.shutdown().await;
         Ok(ok)
+    }
+
+    /// 在被同设备替换 / 服务端踢下线后，把 manager 持有的主 SDK 重新 connect+login+authenticate 回来，
+    /// 供后续 phase 继续用原 Arc<PrivchatSdk>。
+    pub async fn restore_primary_session(&mut self, key: &str) -> BoxResult<()> {
+        let account = self
+            .accounts
+            .get_mut(key)
+            .ok_or_else(|| boxed_err(format!("account not found: {key}")))?;
+        let sdk = account.sdk.clone();
+        let cfg = account.cfg.clone();
+
+        if !sdk.is_connected().await.unwrap_or(false) {
+            sdk.connect().await?;
+        }
+        let login = sdk
+            .login(
+                cfg.username.clone(),
+                cfg.password.clone(),
+                cfg.device_id.clone(),
+            )
+            .await?;
+        sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
+            .await?;
+        sdk.run_bootstrap_sync().await?;
+        account.cfg.token = login.token;
+        Ok(())
     }
 
     pub async fn verify_login_notice_persisted(

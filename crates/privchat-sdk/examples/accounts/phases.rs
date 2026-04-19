@@ -2128,6 +2128,17 @@ impl TestPhases {
             ));
         }
 
+        // 同设备 replace 后主 SDK 的 transport 已被服务端踢断，
+        // 否则后续所有 phase 会以 "authenticate requires connect and login first" 连锁失败。
+        if let Err(e) = manager.restore_primary_session("alice").await {
+            metrics
+                .errors
+                .push(format!("restore_primary_session(alice) failed: {e}"));
+        } else {
+            metrics.rpc_calls += 1;
+            metrics.rpc_successes += 1;
+        }
+
         Ok(PhaseResult {
             phase_name: "login-test".to_string(),
             success: metrics.errors.is_empty(),
@@ -2908,6 +2919,7 @@ impl TestPhases {
                 searchable_word: marker.clone(),
                 setting: 0,
                 extra: String::new(),
+                ..Default::default()
             })
             .await?;
         metrics.messages_sent += 1;
@@ -3519,6 +3531,209 @@ impl TestPhases {
             metrics,
         })
     }
+
+    /// Phase 34: admin 推送与 RPC 推送共享同一投递入口（CONNECTION_LIFECYCLE_SPEC §8.8）
+    ///
+    /// 1. 快照 /metrics（投递计数器 before）
+    /// 2. 通过 admin API `POST /api/admin/messages/send` 让 charlie 向 main_group 发消息
+    /// 3. 等待 fanout，刷新 alice/bob 本地视图，断言两人都收到文本
+    /// 4. 快照 /metrics after，断言 delta：
+    ///    - attempt_total  ≥ 2（至少覆盖 alice + bob 两个 user 粒度投递）
+    ///    - success_sessions_total ≥ 2（两人在线）
+    ///    - zero_success_total Δ == 0（无 user 维度 0 成功）
+    ///    - offline_enqueue_total Δ == 0（在线用户不得落离线）
+    pub async fn phase34_admin_push_online(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let admin_port = std::env::var("PRIVCHAT_ADMIN_API_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(9090);
+        let metrics_port = std::env::var("PRIVCHAT_METRICS_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(9083);
+        let service_key = std::env::var("SERVICE_MASTER_KEY")
+            .unwrap_or_else(|_| "your_service_master_key_here".to_string());
+        let admin_base = format!("http://{}:{}", host, admin_port);
+        let metrics_url = format!("http://{}:{}/metrics", host, metrics_port);
+
+        let client = reqwest::Client::new();
+
+        let channel_id = require_group_channel(manager, "main_group")?;
+        let charlie_uid = manager.user_id("charlie")?;
+
+        // 为了让 delta 只覆盖本次 admin push，先刷一轮 metrics
+        let before = fetch_delivery_metrics(&client, &metrics_url).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        let probe = format!("admin-push-{}", now_millis());
+        let resp = client
+            .post(format!("{}/api/admin/messages/send", admin_base))
+            .header("X-Service-Key", &service_key)
+            .json(&serde_json::json!({
+                "channel_id": channel_id,
+                "sender_id": charlie_uid,
+                "content": probe,
+                "message_type": "text",
+            }))
+            .send()
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.messages_sent += 1;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            metrics
+                .errors
+                .push(format!("admin send_message failed: {status} {body}"));
+            return Ok(phase_fail(
+                "admin-push-online",
+                start.elapsed(),
+                "admin send_message returned non-2xx",
+                metrics,
+            ));
+        }
+        metrics.rpc_successes += 1;
+
+        // fanout 真正到达 SDK 需要经过 server 落库 + transport.send + SDK ack，1.5s 足够
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        for key in ["alice", "bob"] {
+            if let Err(e) = manager.refresh_local_views(key).await {
+                metrics
+                    .errors
+                    .push(format!("refresh_local_views({key}) failed: {e}"));
+            } else {
+                metrics.rpc_calls += 1;
+                metrics.rpc_successes += 1;
+            }
+        }
+
+        for key in ["alice", "bob"] {
+            let msgs = manager
+                .list_local_messages(key, channel_id, GROUP_SYNC_CHANNEL_TYPE as i32, 10)
+                .await?;
+            metrics.rpc_calls += 1;
+            let hit = msgs
+                .iter()
+                .any(|m| m.from_uid == charlie_uid && m.content.contains(&probe));
+            if hit {
+                metrics.rpc_successes += 1;
+            } else {
+                let brief = msgs
+                    .iter()
+                    .take(4)
+                    .map(|m| {
+                        format!("id={} from={} content={}", m.message_id, m.from_uid, m.content)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                metrics.errors.push(format!(
+                    "{key} did not receive admin-push probe={probe} latest=[{brief}]"
+                ));
+            }
+        }
+
+        let after = fetch_delivery_metrics(&client, &metrics_url).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        let d_attempt = after.attempt.saturating_sub(before.attempt);
+        let d_success = after.success_sessions.saturating_sub(before.success_sessions);
+        let d_zero = after.zero_success.saturating_sub(before.zero_success);
+        let d_offline = after.offline_enqueue.saturating_sub(before.offline_enqueue);
+
+        if d_attempt < 2 {
+            metrics.errors.push(format!(
+                "expected delivery_attempt_total Δ ≥ 2 (alice+bob), got {d_attempt}"
+            ));
+        }
+        if d_success < 2 {
+            metrics.errors.push(format!(
+                "expected delivery_success_sessions_total Δ ≥ 2 (both online), got {d_success}"
+            ));
+        }
+        if d_zero != 0 {
+            metrics.errors.push(format!(
+                "expected delivery_zero_success_total Δ == 0, got {d_zero}"
+            ));
+        }
+        if d_offline != 0 {
+            metrics.errors.push(format!(
+                "expected offline_enqueue_total Δ == 0 (both recipients online), got {d_offline}"
+            ));
+        }
+
+        Ok(PhaseResult {
+            phase_name: "admin-push-online".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: format!(
+                "admin /messages/send → main_group: attempt Δ={d_attempt} success Δ={d_success} zero Δ={d_zero} offline Δ={d_offline}"
+            ),
+            metrics,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DeliveryMetricsSnapshot {
+    attempt: u64,
+    success_sessions: u64,
+    zero_success: u64,
+    offline_enqueue: u64,
+}
+
+async fn fetch_delivery_metrics(
+    client: &reqwest::Client,
+    url: &str,
+) -> BoxResult<DeliveryMetricsSnapshot> {
+    let resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        return Err(boxed_err(format!(
+            "metrics endpoint returned {}",
+            resp.status()
+        )));
+    }
+    let body = resp.text().await?;
+    Ok(parse_delivery_metrics(&body))
+}
+
+fn parse_delivery_metrics(body: &str) -> DeliveryMetricsSnapshot {
+    let mut snap = DeliveryMetricsSnapshot::default();
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // 目标计数器均为无 label 的 counter，行形如：`name value` 或 `name{...} value`
+        let (name_part, value_part) = match trimmed.rsplit_once(' ') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let name = name_part.split('{').next().unwrap_or(name_part).trim();
+        let value: u64 = value_part
+            .trim()
+            .split('.')
+            .next()
+            .unwrap_or(value_part)
+            .parse()
+            .unwrap_or(0);
+        match name {
+            "privchat_delivery_attempt_total" => snap.attempt += value,
+            "privchat_delivery_success_sessions_total" => snap.success_sessions += value,
+            "privchat_delivery_zero_success_total" => snap.zero_success += value,
+            "privchat_offline_enqueue_total" => snap.offline_enqueue += value,
+            _ => {}
+        }
+    }
+    snap
 }
 
 // --- Admin API response types for phase31 ---
