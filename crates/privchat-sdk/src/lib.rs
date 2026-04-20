@@ -1490,6 +1490,19 @@ enum Command {
         revoker: Option<u64>,
         resp: oneshot::Sender<Result<()>>,
     },
+    DeleteMessageLocal {
+        message_id: u64,
+        resp: oneshot::Sender<Result<Option<StoredMessage>>>,
+    },
+    SetChannelHidden {
+        channel_id: u64,
+        hidden: bool,
+        resp: oneshot::Sender<Result<bool>>,
+    },
+    DeleteChannelLocal {
+        channel_id: u64,
+        resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
+    },
     EditMessage {
         message_id: u64,
         content: String,
@@ -9536,6 +9549,50 @@ impl PrivchatSdk {
                         }
                         let _ = resp.send(result);
                     }
+                    Command::DeleteMessageLocal { message_id, resp } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => state.storage.delete_message_local(message_id).await,
+                            Err(e) => Err(e),
+                        };
+                        if let Ok(Some(stored)) = &result {
+                            state.invalidate_channel_cache_with_reason(
+                                stored.channel_id,
+                                stored.channel_type,
+                                "delete_message_local",
+                            );
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::TimelineUpdated {
+                                    channel_id: stored.channel_id,
+                                    channel_type: stored.channel_type,
+                                    message_id,
+                                    reason: "delete_local".to_string(),
+                                },
+                            );
+                        }
+                        let _ = resp.send(result);
+                    }
+                    Command::SetChannelHidden {
+                        channel_id,
+                        hidden,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => state.storage.set_channel_hidden(channel_id, hidden).await,
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
+                    Command::DeleteChannelLocal { channel_id, resp } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => state.storage.delete_channel_local(channel_id).await,
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::EditMessage {
                         message_id,
                         content,
@@ -11202,6 +11259,51 @@ impl PrivchatSdk {
                 message_id,
                 revoked,
                 revoker,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn delete_message_local(
+        &self,
+        message_id: u64,
+    ) -> Result<Option<StoredMessage>> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::DeleteMessageLocal {
+                message_id,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 设置本地 channel 隐藏标记（不触达服务端）。返回 true 表示命中行被更新。
+    pub async fn set_channel_hidden(&self, channel_id: u64, hidden: bool) -> Result<bool> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetChannelHidden {
+                channel_id,
+                hidden,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 本地删除 channel：隐藏 + 清空所有相关消息。不触达服务端；附件文件由调用方清理。
+    pub async fn delete_channel_local(&self, channel_id: u64) -> Result<Vec<StoredMessage>> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::DeleteChannelLocal {
+                channel_id,
                 resp: resp_tx,
             })
             .await

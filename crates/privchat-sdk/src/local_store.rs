@@ -1577,7 +1577,12 @@ impl LocalStore {
                 last_local_message_id=excluded.last_local_message_id,
                 last_msg_content=excluded.last_msg_content,
                 version=excluded.version,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                is_deleted=CASE
+                    WHEN excluded.last_msg_timestamp > IFNULL(channel.last_msg_timestamp, 0)
+                    THEN 0
+                    ELSE channel.is_deleted
+                END
              WHERE excluded.version >= channel.version",
             params![
                 input.channel_id as i64,
@@ -1736,6 +1741,7 @@ impl LocalStore {
                 ) ELSE NULL END AS peer_user_id
              FROM channel c
              WHERE c.channel_id = ?1
+               AND COALESCE(c.is_deleted, 0) = 0
              LIMIT 1",
             params![channel_id as i64, uid_i64],
             |row| {
@@ -1908,6 +1914,7 @@ impl LocalStore {
                         END
                     ) ELSE NULL END AS peer_user_id
                  FROM channel c
+                 WHERE COALESCE(c.is_deleted, 0) = 0
                  ORDER BY c.top DESC, resolved_last_msg_timestamp DESC, c.channel_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
@@ -1941,6 +1948,110 @@ impl LocalStore {
             out.push(channel);
         }
         Ok(out)
+    }
+
+    /// 设置本地 channel 隐藏标记。纯本地操作，不触达服务端。
+    /// hidden=true 对应 is_deleted=1（主页列表不再显示）；hidden=false 取消隐藏。
+    /// 返回值：true 表示命中行被更新，false 表示 channel 不存在。
+    pub fn set_channel_hidden(&self, uid: &str, channel_id: u64, hidden: bool) -> Result<bool> {
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let affected = conn
+            .execute(
+                "UPDATE channel SET is_deleted = ?1, updated_at = ?2 WHERE channel_id = ?3",
+                params![if hidden { 1 } else { 0 }, now_ms, channel_id as i64],
+            )
+            .map_err(|e| Error::Storage(format!("set_channel_hidden: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    /// 本地删除 channel：标记隐藏 + 清除所有相关消息及其附属表。
+    /// 不触达服务端；附件文件清理由调用方（FFI 层）负责。
+    /// 返回被删除的消息列表（包含 created_at / message_id，用于定位 canonical 附件目录）。
+    pub fn delete_channel_local(
+        &self,
+        uid: &str,
+        channel_id: u64,
+    ) -> Result<Vec<StoredMessage>> {
+        let messages = {
+            let conn = self.conn_for_user(uid)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, created_at FROM message WHERE channel_id = ?1",
+                )
+                .map_err(|e| Error::Storage(format!("prepare list channel messages: {e}")))?;
+            let rows = stmt
+                .query_map(params![channel_id as i64], |row| {
+                    Ok(StoredMessage {
+                        message_id: row.get::<_, i64>(0)? as u64,
+                        server_message_id: None,
+                        local_message_id: None,
+                        channel_id,
+                        channel_type: 0,
+                        from_uid: 0,
+                        message_type: 0,
+                        content: String::new(),
+                        status: 0,
+                        created_at: row.get::<_, i64>(1)?,
+                        updated_at: 0,
+                        extra: String::new(),
+                        revoked: false,
+                        revoked_by: None,
+                        mime_type: None,
+                        media_downloaded: false,
+                        thumb_status: 0,
+                        delivered: false,
+                        pts: None,
+                    })
+                })
+                .map_err(|e| Error::Storage(format!("query channel messages: {e}")))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(
+                    row.map_err(|e| Error::Storage(format!("decode channel message: {e}")))?,
+                );
+            }
+            out
+        };
+
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("delete_channel_local begin tx: {e}")))?;
+        tx.execute(
+            "UPDATE channel SET is_deleted = 1, updated_at = ?1 WHERE channel_id = ?2",
+            params![now_ms, channel_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_channel_local mark: {e}")))?;
+        tx.execute(
+            "DELETE FROM message_extra WHERE channel_id = ?1",
+            params![channel_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_channel_local message_extra: {e}")))?;
+        tx.execute(
+            "DELETE FROM message_reaction WHERE channel_id = ?1",
+            params![channel_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_channel_local message_reaction: {e}")))?;
+        tx.execute(
+            "DELETE FROM mention WHERE channel_id = ?1",
+            params![channel_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_channel_local mention: {e}")))?;
+        tx.execute(
+            "DELETE FROM reminder WHERE channel_id = ?1",
+            params![channel_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_channel_local reminder: {e}")))?;
+        tx.execute(
+            "DELETE FROM message WHERE channel_id = ?1",
+            params![channel_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_channel_local message: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("delete_channel_local commit: {e}")))?;
+        Ok(messages)
     }
 
     fn resolve_channel_unread_on_read(
@@ -3156,6 +3267,52 @@ impl LocalStore {
             }
         }
         Ok(())
+    }
+
+    /// 本地删除消息：删掉 message 及其附属表（message_extra / message_reaction / mention / reminder）。
+    /// 不会触达服务端；附件文件清理由调用方（FFI 层）负责。
+    /// 返回被删除消息的 StoredMessage（用于上层 emit event 与附件 dir 定位）；找不到返回 None。
+    pub fn delete_message_local(
+        &self,
+        uid: &str,
+        message_id: u64,
+    ) -> Result<Option<StoredMessage>> {
+        let existing = self.get_message_by_id(uid, message_id)?;
+        let Some(stored) = existing else {
+            return Ok(None);
+        };
+        let mut conn = self.conn_for_user(uid)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("delete_message_local begin tx: {e}")))?;
+        tx.execute(
+            "DELETE FROM message WHERE id = ?1",
+            params![message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_message_local message: {e}")))?;
+        tx.execute(
+            "DELETE FROM message_extra WHERE message_id = ?1",
+            params![message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_message_local message_extra: {e}")))?;
+        tx.execute(
+            "DELETE FROM message_reaction WHERE message_id = ?1",
+            params![message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_message_local message_reaction: {e}")))?;
+        tx.execute(
+            "DELETE FROM mention WHERE message_id = ?1",
+            params![message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_message_local mention: {e}")))?;
+        tx.execute(
+            "DELETE FROM reminder WHERE message_id = ?1",
+            params![message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("delete_message_local reminder: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("delete_message_local commit: {e}")))?;
+        Ok(Some(stored))
     }
 
     pub fn edit_message(

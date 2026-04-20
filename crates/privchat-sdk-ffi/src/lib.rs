@@ -4160,6 +4160,145 @@ impl PrivchatClient {
         self.recall_message(server_message_id, channel_id).await
     }
 
+    /// 本地删除消息：删 DB 行 + 清附件目录。不触达服务端。
+    /// 返回 true 表示确实删到了行；false 表示消息不存在（幂等）。
+    pub async fn delete_message_local(
+        &self,
+        message_id: u64,
+    ) -> Result<bool, PrivchatFfiError> {
+        let stored = self
+            .inner
+            .delete_message_local(message_id)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        let Some(stored) = stored else {
+            return Ok(false);
+        };
+        if let Ok(uid) = self.require_current_user_id().await {
+            let data_dir = self.config.lock().unwrap().data_dir.clone();
+            let root = std::path::Path::new(&data_dir);
+            let canonical = privchat_sdk::media_store::get_canonical_message_dir(
+                root,
+                uid,
+                stored.message_id as i64,
+                stored.created_at,
+            );
+            let _ = std::fs::remove_dir_all(&canonical);
+            let legacy = root
+                .join("users")
+                .join(uid.to_string())
+                .join("files")
+                .join(stored.message_id.to_string());
+            if legacy != canonical {
+                let _ = std::fs::remove_dir_all(&legacy);
+            }
+        }
+        Ok(true)
+    }
+
+    /// 把指定本地消息转发到目标频道。
+    ///
+    /// 内部做两件事：
+    /// 1. 克隆源消息的 `content / message_type / mime_type / extra`，用当前登录用户作为 `from_uid`，
+    ///    通过 `enqueue_local_message` 创建新本地行并加入出站队列（走正常发送链路）。
+    /// 2. 若源消息带附件（`mime_type` 非空），则把源消息目录下的所有文件整体复制到新消息目录，
+    ///    并把 `media_downloaded` 置为 true，让 UI 立即看到本地缩略图 / 文件。
+    ///
+    /// 调用方负责限制不可转发的类型（比如 VOICE / 撤回消息）——SDK 会拒绝撤回消息但不做类型过滤。
+    /// 可选的 note 文本由调用方自行追加 `send_message` 调用，本接口不负责。
+    ///
+    /// 返回新消息的 `message_id`（本地 rowid）。
+    pub async fn forward_message(
+        &self,
+        src_message_id: u64,
+        target_channel_id: u64,
+        target_channel_type: i32,
+    ) -> Result<u64, PrivchatFfiError> {
+        let src = self
+            .inner
+            .get_message_by_id(src_message_id)
+            .await
+            .map_err(PrivchatFfiError::from)?
+            .ok_or_else(|| PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
+                detail: format!("source message not found: {}", src_message_id),
+            })?;
+
+        if src.revoked {
+            return Err(PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
+                detail: "cannot forward a revoked message".to_string(),
+            });
+        }
+
+        let from_uid = self.require_current_user_id().await?;
+
+        let input = NewMessage {
+            channel_id: target_channel_id,
+            channel_type: target_channel_type,
+            from_uid,
+            message_type: src.message_type,
+            content: src.content.clone(),
+            searchable_word: String::new(),
+            setting: 0,
+            extra: src.extra.clone(),
+            mime_type: src.mime_type.clone(),
+            media_downloaded: false,
+            thumb_status: src.thumb_status,
+        };
+        let new_message_id = self.enqueue_local_message(input).await?;
+
+        // 复制附件文件（若有）。任意一步失败都不回滚已创建的消息，仅让 UI 缺少本地缓存。
+        if src.mime_type.is_some() {
+            let data_dir = self.config.lock().unwrap().data_dir.clone();
+            let root = std::path::Path::new(&data_dir);
+            let src_dir = privchat_sdk::media_store::get_canonical_message_dir(
+                root,
+                from_uid,
+                src.message_id as i64,
+                src.created_at,
+            );
+            let new_created_at = self
+                .inner
+                .get_message_by_id(new_message_id)
+                .await
+                .map_err(PrivchatFfiError::from)?
+                .map(|m| m.created_at)
+                .unwrap_or(src.created_at);
+            if let Ok(dst_dir) = privchat_sdk::media_store::ensure_attachment_dir(
+                root,
+                from_uid,
+                new_message_id as i64,
+                new_created_at,
+            ) {
+                let mut copied_any = false;
+                if src_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+                        for entry in entries.flatten() {
+                            let src_path = entry.path();
+                            if src_path.is_file() {
+                                if let Some(name) = src_path.file_name() {
+                                    let dst_path = dst_dir.join(name);
+                                    if std::fs::copy(&src_path, &dst_path).is_ok() {
+                                        copied_any = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if copied_any {
+                    let _ = self
+                        .inner
+                        .update_media_downloaded(new_message_id, true)
+                        .await;
+                }
+            }
+        }
+
+        Ok(new_message_id)
+    }
+
     pub async fn add_reaction(
         &self,
         server_message_id: u64,
@@ -4380,6 +4519,55 @@ impl PrivchatClient {
         )
         .await?;
         Ok(resp)
+    }
+
+    /// 设置本地 channel 隐藏标记（不触达服务端）。
+    /// 隐藏后会话列表不再显示该 channel，收到新消息时自动取消隐藏。
+    pub async fn set_channel_hidden_local(
+        &self,
+        channel_id: u64,
+        hidden: bool,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .set_channel_hidden(channel_id, hidden)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(())
+    }
+
+    /// 本地删除 channel：标记隐藏 + 清空所有关联消息与附件文件。不触达服务端。
+    /// 返回 true 表示 channel 原本存在；false 表示 channel 不存在或没有消息（幂等）。
+    pub async fn delete_channel_local(
+        &self,
+        channel_id: u64,
+    ) -> Result<bool, PrivchatFfiError> {
+        let messages = self
+            .inner
+            .delete_channel_local(channel_id)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        if let Ok(uid) = self.require_current_user_id().await {
+            let data_dir = self.config.lock().unwrap().data_dir.clone();
+            let root = std::path::Path::new(&data_dir);
+            for stored in &messages {
+                let canonical = privchat_sdk::media_store::get_canonical_message_dir(
+                    root,
+                    uid,
+                    stored.message_id as i64,
+                    stored.created_at,
+                );
+                let _ = std::fs::remove_dir_all(&canonical);
+                let legacy = root
+                    .join("users")
+                    .join(uid.to_string())
+                    .join("files")
+                    .join(stored.message_id.to_string());
+                if legacy != canonical {
+                    let _ = std::fs::remove_dir_all(&legacy);
+                }
+            }
+        }
+        Ok(!messages.is_empty())
     }
 
     pub async fn mute_channel(

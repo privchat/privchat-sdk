@@ -200,6 +200,19 @@ enum StorageCmd {
         revoker: Option<u64>,
         resp: oneshot::Sender<Result<()>>,
     },
+    DeleteMessageLocal {
+        message_id: u64,
+        resp: oneshot::Sender<Result<Option<StoredMessage>>>,
+    },
+    SetChannelHidden {
+        channel_id: u64,
+        hidden: bool,
+        resp: oneshot::Sender<Result<bool>>,
+    },
+    DeleteChannelLocal {
+        channel_id: u64,
+        resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
+    },
     SetMessageRevokeByServerMessageId {
         server_message_id: u64,
         revoked: bool,
@@ -890,6 +903,43 @@ impl StorageHandle {
                 message_id,
                 revoked,
                 revoker,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn delete_message_local(
+        &self,
+        message_id: u64,
+    ) -> Result<Option<StoredMessage>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::DeleteMessageLocal {
+                message_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn set_channel_hidden(&self, channel_id: u64, hidden: bool) -> Result<bool> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::SetChannelHidden {
+                channel_id,
+                hidden,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn delete_channel_local(&self, channel_id: u64) -> Result<Vec<StoredMessage>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::DeleteChannelLocal {
+                channel_id,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1820,6 +1870,19 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         } => {
             with_uid!(resp, |uid| store
                 .set_message_revoke(&uid, message_id, revoked, revoker));
+        }
+        StorageCmd::DeleteMessageLocal { message_id, resp } => {
+            with_uid!(resp, |uid| store.delete_message_local(&uid, message_id));
+        }
+        StorageCmd::SetChannelHidden {
+            channel_id,
+            hidden,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.set_channel_hidden(&uid, channel_id, hidden));
+        }
+        StorageCmd::DeleteChannelLocal { channel_id, resp } => {
+            with_uid!(resp, |uid| store.delete_channel_local(&uid, channel_id));
         }
         StorageCmd::SetMessageRevokeByServerMessageId {
             server_message_id,
