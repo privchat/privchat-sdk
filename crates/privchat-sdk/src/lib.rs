@@ -540,6 +540,23 @@ pub type VideoProcessHook = Arc<
         + Sync,
 >;
 
+/// 网址预览抓取结果（应用层实现）：URL → 标题 / 描述 / 本地缩略图文件路径。
+/// 任一字段可缺省；缩略图字段若存在，SDK 随后会将该本地文件作为普通图片上传得到 `file_id`。
+#[derive(Debug, Clone, Default)]
+pub struct LinkPreviewResult {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// 本地缩略图路径；SDK 负责后续上传并填入 `LinkMetadata.thumbnail_file_id`。
+    pub thumbnail_path: Option<std::path::PathBuf>,
+}
+
+/// 网址预览回调（应用层实现）。类比 [`VideoProcessHook`]：SDK 传入 URL，由宿主 App 抓取
+/// 网页 meta 和 og:image，写入本地临时路径后返回结果；宿主未注册时 SDK 不会发起抓取，
+/// `LinkMetadata` 各可选字段保持 `None`（客户端 UI 兜底空白预览）。
+pub type LinkPreviewHook = Arc<
+    dyn Fn(&str) -> std::result::Result<LinkPreviewResult, String> + Send + Sync,
+>;
+
 #[derive(Debug, Clone)]
 struct UploadedFileInfo {
     file_id: String,
@@ -1294,6 +1311,10 @@ enum Command {
         hook: Option<VideoProcessHook>,
         resp: oneshot::Sender<Result<()>>,
     },
+    SetLinkPreviewHook {
+        hook: Option<LinkPreviewHook>,
+        resp: oneshot::Sender<Result<()>>,
+    },
     Register {
         username: String,
         password: String,
@@ -1780,6 +1801,7 @@ struct State {
     last_sync_dropped_duplicates: usize,
     last_sync_entity_events: Vec<SdkEvent>,
     video_process_hook: Option<VideoProcessHook>,
+    link_preview_hook: Option<LinkPreviewHook>,
     last_tmp_cleanup_day: Option<String>,
     pending_events: Vec<SdkEvent>,
     message_cache_policy: MessageCachePolicy,
@@ -2886,11 +2908,12 @@ impl State {
             "voice" => ContentMessageType::Voice,
             "video" => ContentMessageType::Video,
             "system" => ContentMessageType::System,
-            "audio" => ContentMessageType::Audio,
+            "audio" => ContentMessageType::File,
             "location" => ContentMessageType::Location,
             "contact_card" | "contactcard" | "card" => ContentMessageType::ContactCard,
             "sticker" => ContentMessageType::Sticker,
             "forward" => ContentMessageType::Forward,
+            "link" | "url" => ContentMessageType::Link,
             _ => ContentMessageType::Text,
         };
         i32::try_from(normalized.as_u32()).unwrap_or(0)
@@ -5749,9 +5772,10 @@ impl State {
             let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
             let message_type = match item.message_type.as_str() {
                 "image" => i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(0),
-                "audio" => i32::try_from(ContentMessageType::Audio.as_u32()).unwrap_or(0),
+                "voice" => i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(0),
                 "video" => i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(0),
-                "file" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
+                // 注：普通音频文件（mp3/wav/...）作为 File 消息发送，不再有独立 Audio 类型
+                "file" | "audio" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
                 _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
             };
             let mime_type = Self::extract_mime_type_from_json(&item.content, "");
@@ -6537,9 +6561,9 @@ impl State {
                 let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
                 let message_type = match item.message_type.as_str() {
                     "image" => i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(0),
-                    "audio" => i32::try_from(ContentMessageType::Audio.as_u32()).unwrap_or(0),
+                    "voice" => i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(0),
                     "video" => i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(0),
-                    "file" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
+                    "file" | "audio" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
                     _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
                 };
                 let mime_type = Self::extract_mime_type_from_json(&item.content, "");
@@ -6893,7 +6917,8 @@ impl State {
                             })
                     })
                     .unwrap_or("file");
-                envelope.content = Self::attachment_placeholder_text(file_type).to_string();
+                envelope.content =
+                    Self::attachment_placeholder_text(message.message_type, file_type).to_string();
                 envelope.metadata = Some(content_json);
             }
         }
@@ -7099,18 +7124,29 @@ impl State {
         Ok(())
     }
 
+    /// 存储层 / 上传层使用的文件分类字符串，严格对齐服务端 `FileType`：
+    /// `"image"` / `"video"` / `"voice"` / `"file"`。
+    ///
+    /// 规则：发送入口（`message_type`）决定分类，MIME 不反推消息类型。
+    /// Voice 消息直接返回 `"voice"`，服务端据此走独立的尺寸限额与 /voices/ 存储目录。
     fn guess_file_type(message_type: i32, filename: &str, mime: &str) -> &'static str {
         let image_type = privchat_protocol::message::ContentMessageType::Image as i32;
         let video_type = privchat_protocol::message::ContentMessageType::Video as i32;
-        let audio_type = privchat_protocol::message::ContentMessageType::Audio as i32;
-        if message_type == image_type || mime.starts_with("image/") {
+        let voice_type = privchat_protocol::message::ContentMessageType::Voice as i32;
+        if message_type == image_type {
             return "image";
         }
-        if message_type == video_type || mime.starts_with("video/") {
+        if message_type == video_type {
             return "video";
         }
-        if message_type == audio_type || mime.starts_with("audio/") {
-            return "audio";
+        if message_type == voice_type {
+            return "voice";
+        }
+        if mime.starts_with("image/") {
+            return "image";
+        }
+        if mime.starts_with("video/") {
+            return "video";
         }
         let ext = filename
             .rsplit('.')
@@ -7120,12 +7156,30 @@ impl State {
         match ext.as_str() {
             "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" => "image",
             "mp4" | "mov" | "mkv" | "avi" | "webm" => "video",
-            "mp3" | "wav" | "aac" | "m4a" | "ogg" => "audio",
             _ => "file",
         }
     }
 
-    fn attachment_placeholder_text(file_type: &str) -> &'static str {
+    /// 附件消息的会话预览文案。
+    ///
+    /// 分层：
+    /// 1. 第一层看 `message_type`（Voice / Image / Video 各自独立类型）——
+    ///    协议级类型是真理，一旦匹配就返回固定文案，不受 file_type 影响。
+    /// 2. 第二层（File 消息）才按存储层 `file_type`（"image"/"video"/"file"）细分。
+    ///
+    /// 与「发送入口决定消息类型，MIME 不反推」原则一致：只有 File 消息才允许
+    /// 靠 MIME 推回 `[图片]`/`[视频]` 这种预览文案。
+    fn attachment_placeholder_text(message_type: i32, file_type: &str) -> &'static str {
+        use privchat_protocol::message::ContentMessageType;
+        if message_type == ContentMessageType::Voice as i32 {
+            return "[语音]";
+        }
+        if message_type == ContentMessageType::Image as i32 {
+            return "[图片]";
+        }
+        if message_type == ContentMessageType::Video as i32 {
+            return "[视频]";
+        }
         match file_type {
             "image" => "[图片]",
             "video" => "[视频]",
@@ -7137,15 +7191,72 @@ impl State {
         use privchat_protocol::message::ContentMessageType;
         let image_type = ContentMessageType::Image as i32;
         let video_type = ContentMessageType::Video as i32;
-        let audio_type = ContentMessageType::Audio as i32;
+        let voice_type = ContentMessageType::Voice as i32;
         if message_type == image_type {
             "image/jpeg"
         } else if message_type == video_type {
             "video/mp4"
-        } else if message_type == audio_type {
+        } else if message_type == voice_type {
             "audio/mp4"
         } else {
             "application/octet-stream"
+        }
+    }
+
+    /// 从 extra JSON 中按优先级读 u64：先找顶层 `key`，再找 `metadata.key`。
+    fn pick_u64_from_extra(extra: &str, key: &str) -> Option<u64> {
+        let value = serde_json::from_str::<serde_json::Value>(extra).ok()?;
+        value
+            .get(key)
+            .or_else(|| value.get("metadata").and_then(|m| m.get(key)))
+            .and_then(|v| v.as_u64())
+    }
+
+    /// 语音消息：协议要求 `VoiceMetadata.duration` 必填。
+    ///
+    /// 上传完成后 SDK 会用 attachment_content 重写 message.content，如果不把发送侧
+    /// 采样的时长搬进去，接收端 VoiceMetadata 解析就会拿到 duration=0。录制不足 1 秒
+    /// 时兜底为 1，与客户端约定保持一致。
+    fn merge_voice_metadata(extra: &str, attachment_content: &mut serde_json::Value) {
+        let duration_secs = Self::pick_u64_from_extra(extra, "duration")
+            .map(|v| v.min(u32::MAX as u64) as u32)
+            .unwrap_or(1);
+        if let Some(obj) = attachment_content.as_object_mut() {
+            obj.insert(
+                "duration".to_string(),
+                serde_json::Value::from(duration_secs),
+            );
+        }
+    }
+
+    /// 视频消息：协议 `VideoMetadata` 要求 duration / width / height 必填，缩略图三件套可选。
+    ///
+    /// 与语音不同，视频的 UI（气泡比例、首帧渲染）依赖完整的尺寸信息，因此独立成函数处理，
+    /// 避免和语音的单字段逻辑混用。未抽帧的视频允许缺省 thumbnail_*，由客户端播放器自行处理。
+    fn merge_video_metadata(extra: &str, attachment_content: &mut serde_json::Value) {
+        let Some(obj) = attachment_content.as_object_mut() else {
+            return;
+        };
+        let insert_u32 = |obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, v: u64| {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::from(v.min(u32::MAX as u64) as u32),
+            );
+        };
+        if let Some(duration) = Self::pick_u64_from_extra(extra, "duration") {
+            insert_u32(obj, "duration", duration);
+        }
+        if let Some(width) = Self::pick_u64_from_extra(extra, "width") {
+            insert_u32(obj, "width", width);
+        }
+        if let Some(height) = Self::pick_u64_from_extra(extra, "height") {
+            insert_u32(obj, "height", height);
+        }
+        if let Some(tw) = Self::pick_u64_from_extra(extra, "thumbnail_width") {
+            insert_u32(obj, "thumbnail_width", tw);
+        }
+        if let Some(th) = Self::pick_u64_from_extra(extra, "thumbnail_height") {
+            insert_u32(obj, "thumbnail_height", th);
         }
     }
 
@@ -7195,7 +7306,6 @@ impl State {
         let voice_type = i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(-1);
         let video_type = i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(-1);
         let system_type = i32::try_from(ContentMessageType::System.as_u32()).unwrap_or(-1);
-        let audio_type = i32::try_from(ContentMessageType::Audio.as_u32()).unwrap_or(-1);
         let location_type = i32::try_from(ContentMessageType::Location.as_u32()).unwrap_or(-1);
         let contact_type = i32::try_from(ContentMessageType::ContactCard.as_u32()).unwrap_or(-1);
         let sticker_type = i32::try_from(ContentMessageType::Sticker.as_u32()).unwrap_or(-1);
@@ -7220,7 +7330,7 @@ impl State {
                     "file"
                 };
             }
-            Some(v) if v == voice_type || v == audio_type => return "voice",
+            Some(v) if v == voice_type => return "voice",
             Some(v) if v == video_type => return "video",
             Some(v) if v == system_type => return "system",
             Some(v) if v == location_type => return "location",
@@ -7888,7 +7998,7 @@ impl State {
             })
             .transpose()?;
 
-        let attachment_content = if let Some(thumb_file_id) = thumbnail_file_id_u64 {
+        let mut attachment_content = if let Some(thumb_file_id) = thumbnail_file_id_u64 {
             let thumbnail_url = uploaded_thumbnail
                 .as_ref()
                 .map(|v| v.file_url.clone())
@@ -7916,6 +8026,14 @@ impl State {
                 "thumbnail_url": uploaded.thumbnail_url,
             })
         };
+
+        // 按消息类型独立合并 metadata：Voice 与 Video 的协议形态不同，不共用逻辑。
+        let msg_type = message.message_type;
+        if msg_type == (privchat_protocol::message::ContentMessageType::Voice as i32) {
+            Self::merge_voice_metadata(&message.extra, &mut attachment_content);
+        } else if msg_type == (privchat_protocol::message::ContentMessageType::Video as i32) {
+            Self::merge_video_metadata(&message.extra, &mut attachment_content);
+        }
         let content = serde_json::to_string(&attachment_content)
             .map_err(|e| Error::Serialization(format!("encode attachment content: {e}")))?;
         let req =
@@ -8181,6 +8299,7 @@ impl PrivchatSdk {
                 last_sync_dropped_duplicates: 0,
                 last_sync_entity_events: Vec::new(),
                 video_process_hook: None,
+                link_preview_hook: None,
                 last_tmp_cleanup_day: None,
                 pending_events: Vec::new(),
                 message_cache_policy: MessageCachePolicy::default(),
@@ -8472,6 +8591,10 @@ impl PrivchatSdk {
                     }
                     Command::SetVideoProcessHook { hook, resp } => {
                         state.video_process_hook = hook;
+                        let _ = resp.send(Ok(()));
+                    }
+                    Command::SetLinkPreviewHook { hook, resp } => {
+                        state.link_preview_hook = hook;
                         let _ = resp.send(Ok(()));
                     }
                     Command::Login {
@@ -10345,6 +10468,20 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    /// 注册 / 清除网址预览回调。未注册时发送 Link 消息仅带 URL，客户端显示空白缩略图。
+    pub async fn set_link_preview_hook(&self, hook: Option<LinkPreviewHook>) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetLinkPreviewHook {
+                hook,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
     pub async fn login(
         &self,
         username: String,
@@ -11936,6 +12073,7 @@ mod tests {
             last_sync_dropped_duplicates: 0,
             last_sync_entity_events: Vec::new(),
             video_process_hook: None,
+            link_preview_hook: None,
             last_tmp_cleanup_day: None,
             pending_events: Vec::new(),
             message_cache_policy: MessageCachePolicy::default(),
@@ -12361,11 +12499,22 @@ mod tests {
 
     #[test]
     fn attachment_placeholder_text_is_protocol_aligned() {
-        assert_eq!(State::attachment_placeholder_text("image"), "[图片]");
-        assert_eq!(State::attachment_placeholder_text("video"), "[视频]");
-        assert_eq!(State::attachment_placeholder_text("file"), "[文件]");
-        assert_eq!(State::attachment_placeholder_text("audio"), "[文件]");
-        assert_eq!(State::attachment_placeholder_text("unknown"), "[文件]");
+        use privchat_protocol::message::ContentMessageType;
+        let voice = ContentMessageType::Voice as i32;
+        let image = ContentMessageType::Image as i32;
+        let video = ContentMessageType::Video as i32;
+        let file = ContentMessageType::File as i32;
+
+        // 第一分层：message_type 独立类型直接决定文案，file_type 无法覆盖。
+        assert_eq!(State::attachment_placeholder_text(voice, "file"), "[语音]");
+        assert_eq!(State::attachment_placeholder_text(image, ""), "[图片]");
+        assert_eq!(State::attachment_placeholder_text(video, ""), "[视频]");
+
+        // 第二分层：File 消息才按 file_type 细分。
+        assert_eq!(State::attachment_placeholder_text(file, "image"), "[图片]");
+        assert_eq!(State::attachment_placeholder_text(file, "video"), "[视频]");
+        assert_eq!(State::attachment_placeholder_text(file, "file"), "[文件]");
+        assert_eq!(State::attachment_placeholder_text(file, "unknown"), "[文件]");
     }
 
     #[test]
