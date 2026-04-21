@@ -1009,6 +1009,15 @@ pub enum ResumeEscalationScope {
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
+pub enum MediaDownloadState {
+    Idle,
+    Downloading { bytes: u64, total: Option<u64> },
+    Paused { bytes: u64, total: Option<u64> },
+    Done { path: String },
+    Failed { code: u32, message: String },
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum SdkEvent {
     ConnectionStateChanged {
         from: ConnectionState,
@@ -1120,6 +1129,10 @@ pub enum SdkEvent {
         channel_type: i32,
         server_message_id: u64,
         delivered_at: u64,
+    },
+    MediaDownloadStateChanged {
+        message_id: u64,
+        state: MediaDownloadState,
     },
     ShutdownStarted,
     ShutdownCompleted,
@@ -1961,10 +1974,33 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             server_message_id,
             delivered_at,
         },
+        privchat_sdk::SdkEvent::MediaDownloadStateChanged { message_id, state } => {
+            SdkEvent::MediaDownloadStateChanged {
+                message_id,
+                state: map_media_download_state(state),
+            }
+        }
         privchat_sdk::SdkEvent::ShutdownStarted => SdkEvent::ShutdownStarted,
         privchat_sdk::SdkEvent::ShutdownCompleted => SdkEvent::ShutdownCompleted,
     }
 }
+
+fn map_media_download_state(v: privchat_sdk::MediaDownloadState) -> MediaDownloadState {
+    match v {
+        privchat_sdk::MediaDownloadState::Idle => MediaDownloadState::Idle,
+        privchat_sdk::MediaDownloadState::Downloading { bytes, total } => {
+            MediaDownloadState::Downloading { bytes, total }
+        }
+        privchat_sdk::MediaDownloadState::Paused { bytes, total } => {
+            MediaDownloadState::Paused { bytes, total }
+        }
+        privchat_sdk::MediaDownloadState::Done { path } => MediaDownloadState::Done { path },
+        privchat_sdk::MediaDownloadState::Failed { code, message } => {
+            MediaDownloadState::Failed { code, message }
+        }
+    }
+}
+
 
 fn map_sequenced_sdk_event(v: SdkSequencedSdkEvent) -> SequencedSdkEvent {
     SequencedSdkEvent {
@@ -2190,8 +2226,39 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "server_message_id": server_message_id,
             "delivered_at": delivered_at
         }),
+        SdkEvent::MediaDownloadStateChanged { message_id, state } => json!({
+            "type": "media_download_state_changed",
+            "message_id": message_id,
+            "state": media_download_state_to_json(state)
+        }),
         SdkEvent::ShutdownStarted => json!({ "type": "shutdown_started" }),
         SdkEvent::ShutdownCompleted => json!({ "type": "shutdown_completed" }),
+    }
+}
+
+fn media_download_state_to_json(state: &MediaDownloadState) -> serde_json::Value {
+    use serde_json::json;
+    match state {
+        MediaDownloadState::Idle => json!({ "kind": "idle" }),
+        MediaDownloadState::Downloading { bytes, total } => json!({
+            "kind": "downloading",
+            "bytes": bytes,
+            "total": total
+        }),
+        MediaDownloadState::Paused { bytes, total } => json!({
+            "kind": "paused",
+            "bytes": bytes,
+            "total": total
+        }),
+        MediaDownloadState::Done { path } => json!({
+            "kind": "done",
+            "path": path
+        }),
+        MediaDownloadState::Failed { code, message } => json!({
+            "kind": "failed",
+            "code": code,
+            "message": message
+        }),
     }
 }
 
@@ -7297,6 +7364,40 @@ impl PrivchatClient {
                 code: privchat_protocol::ErrorCode::InternalError as u32,
                 detail: format!("ensure attachment dir failed: {e}"),
             })
+    }
+
+    /// Start a streaming Telegram-style download for a message's primary attachment.
+    /// Delegates to [`PrivchatSdk::start_message_media_download`] — the core SDK owns
+    /// the state machine, so the Rust iced UI and the FFI Kotlin/iOS layer share it.
+    pub async fn start_message_media_download(
+        &self,
+        message_id: u64,
+        download_url: String,
+        mime: String,
+        filename_hint: Option<String>,
+        created_at_ms: i64,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .start_message_media_download(message_id, download_url, mime, filename_hint, created_at_ms)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn pause_message_media_download(&self, message_id: u64) {
+        self.inner.pause_message_media_download(message_id).await;
+    }
+
+    pub async fn resume_message_media_download(&self, message_id: u64) {
+        self.inner.resume_message_media_download(message_id).await;
+    }
+
+    pub async fn cancel_message_media_download(&self, message_id: u64) {
+        self.inner.cancel_message_media_download(message_id).await;
+    }
+
+    pub async fn get_media_download_state(&self, message_id: u64) -> MediaDownloadState {
+        let state = self.inner.get_media_download_state(message_id).await;
+        map_media_download_state(state)
     }
 
     /// 解析本地已存在的附件路径 (含 Legacy 兼容)

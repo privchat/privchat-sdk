@@ -60,6 +60,7 @@ use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
 pub mod error_codes;
 mod local_store;
+pub mod media_download;
 pub mod media_store;
 mod receive_pipeline;
 mod runtime;
@@ -326,6 +327,15 @@ impl NetworkHint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MediaDownloadState {
+    Idle,
+    Downloading { bytes: u64, total: Option<u64> },
+    Paused { bytes: u64, total: Option<u64> },
+    Done { path: String },
+    Failed { code: u32, message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SdkEvent {
     ConnectionStateChanged {
         from: ConnectionState,
@@ -437,6 +447,10 @@ pub enum SdkEvent {
         channel_type: i32,
         server_message_id: u64,
         delivered_at: u64,
+    },
+    MediaDownloadStateChanged {
+        message_id: u64,
+        state: MediaDownloadState,
     },
     ShutdownStarted,
     ShutdownCompleted,
@@ -8201,6 +8215,8 @@ pub struct PrivchatSdk {
     snowflake: Arc<snowflake_me::Snowflake>,
     presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
     typing_throttle: Arc<StdMutex<HashMap<(u64, bool, u8), std::time::Instant>>>,
+    data_dir: Arc<String>,
+    download_manager: media_download::DownloadManager,
 }
 
 impl PrivchatSdk {
@@ -8234,6 +8250,7 @@ impl PrivchatSdk {
 
     pub fn with_runtime(config: PrivchatConfig, runtime_provider: RuntimeProvider) -> Self {
         let configured_data_dir = config.data_dir.clone();
+        let data_dir_for_self = configured_data_dir.clone();
         let (tx, mut rx) = mpsc::channel::<Command>(64);
         let actor_cmd_tx = tx.clone();
         let (event_tx, _) = broadcast::channel::<SdkEvent>(256);
@@ -10296,6 +10313,8 @@ impl PrivchatSdk {
             snowflake,
             presence_cache,
             typing_throttle: Arc::new(StdMutex::new(HashMap::new())),
+            data_dir: Arc::new(data_dir_for_self),
+            download_manager: media_download::DownloadManager::new(),
         }
     }
 
@@ -10372,6 +10391,79 @@ impl PrivchatSdk {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<SdkEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Publish an event through the sequenced event bus.
+    /// Used by auxiliary tasks (media download, etc.) that live outside the actor loop
+    /// but need to emit on the same broadcast+history channel that consumers subscribe to.
+    pub fn emit_event(&self, event: SdkEvent) {
+        emit_sequenced_event(
+            &self.event_tx,
+            &self.event_history,
+            &self.event_seq,
+            self.event_history_limit,
+            event,
+        );
+    }
+
+    /// Configured data directory (may be empty if the caller relied on the default).
+    pub fn data_dir(&self) -> &str {
+        self.data_dir.as_str()
+    }
+
+    /// Start a Telegram-style streaming download for `message_id`.
+    ///
+    /// Resolves the canonical target directory via [`media_store`] and dispatches
+    /// to the embedded [`DownloadManager`](media_download::DownloadManager).
+    /// Emits [`SdkEvent::MediaDownloadStateChanged`] at ~5Hz plus on transitions.
+    pub async fn start_message_media_download(
+        &self,
+        message_id: u64,
+        download_url: String,
+        mime: String,
+        filename_hint: Option<String>,
+        created_at_ms: i64,
+    ) -> Result<()> {
+        let snapshot = self.session_snapshot().await?.ok_or_else(|| {
+            Error::InvalidState("session is empty; login/authenticate required".to_string())
+        })?;
+        let uid = snapshot.user_id;
+        let root = std::path::Path::new(self.data_dir.as_str());
+        let target_dir = media_store::ensure_attachment_dir(
+            root,
+            uid,
+            message_id as i64,
+            created_at_ms,
+        )
+        .map_err(|e| Error::Storage(format!("ensure attachment dir failed: {e}")))?;
+        let payload_filename =
+            media_store::payload_filename_with_fallback(&mime, filename_hint.as_deref());
+        self.download_manager
+            .start(
+                self.clone(),
+                message_id,
+                download_url,
+                target_dir,
+                payload_filename,
+            )
+            .await
+            .map_err(Error::InvalidState)
+    }
+
+    pub async fn pause_message_media_download(&self, message_id: u64) {
+        self.download_manager.pause(self, message_id).await;
+    }
+
+    pub async fn resume_message_media_download(&self, message_id: u64) {
+        self.download_manager.resume(self, message_id).await;
+    }
+
+    pub async fn cancel_message_media_download(&self, message_id: u64) {
+        self.download_manager.cancel(self, message_id).await;
+    }
+
+    pub async fn get_media_download_state(&self, message_id: u64) -> MediaDownloadState {
+        self.download_manager.get_state(message_id).await
     }
 
     pub fn last_event_sequence_id(&self) -> u64 {
