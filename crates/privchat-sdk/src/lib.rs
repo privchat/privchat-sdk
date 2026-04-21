@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use msgtrans::protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig};
@@ -1822,6 +1822,8 @@ struct State {
     storage: StorageHandle,
     current_uid: Option<String>,
     should_auto_reconnect: bool,
+    reconnect_attempt: u32,
+    next_reconnect_at: Option<Instant>,
     network_hint: NetworkHint,
     receive_pipeline: ReceivePipeline,
     last_sync_queued: usize,
@@ -2001,10 +2003,47 @@ impl State {
                 let from = self.session_state.as_connection_state();
                 self.session_state = SessionState::New;
                 self.transport = None;
+                // Transport went away — if the caller still wants auto-reconnect,
+                // arm an immediate retry (backoff will stretch out on repeated failure).
+                if self.should_auto_reconnect {
+                    self.reconnect_attempt = 0;
+                    self.next_reconnect_at = Some(Instant::now());
+                }
                 Some((from, self.session_state.as_connection_state()))
             }
             _ => None,
         }
+    }
+
+    fn reset_reconnect_backoff(&mut self) {
+        self.reconnect_attempt = 0;
+        self.next_reconnect_at = None;
+    }
+
+    /// Compute the next retry deadline using 1s/2s/4s/8s/16s/30s capped backoff,
+    /// and advance the attempt counter.
+    fn schedule_next_reconnect(&mut self) {
+        let secs: u64 = match self.reconnect_attempt {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            4 => 16,
+            _ => 30,
+        };
+        self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+        self.next_reconnect_at = Some(Instant::now() + Duration::from_secs(secs));
+        eprintln!(
+            "[SDK.actor] auto_reconnect_scheduled attempt={} delay_secs={}",
+            self.reconnect_attempt, secs
+        );
+    }
+
+    /// Arm the reconnect driver to fire right now and reset the attempt counter
+    /// (used e.g. on network recovery).
+    fn mark_reconnect_ready_now(&mut self) {
+        self.reconnect_attempt = 0;
+        self.next_reconnect_at = Some(Instant::now());
     }
 
     fn network_disconnected_error(&self) -> Error {
@@ -8323,6 +8362,8 @@ impl PrivchatSdk {
                 storage: storage.clone(),
                 current_uid,
                 should_auto_reconnect: false,
+                reconnect_attempt: 0,
+                next_reconnect_at: None,
                 network_hint: NetworkHint::Unknown,
                 receive_pipeline: ReceivePipeline::default(),
                 last_sync_queued: 0,
@@ -8351,15 +8392,40 @@ impl PrivchatSdk {
             let mut health_tick = interval(Duration::from_secs(15));
             health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
+                // Backoff driver: fires when `next_reconnect_at` is due. When no retry
+                // is armed we pin a `pending()` so this arm is inert but keeps its type
+                // inside `select!`.
+                let retry_deadline = if state.should_auto_reconnect
+                    && state.session_state == SessionState::New
+                    && state.network_hint.is_online()
+                {
+                    state.next_reconnect_at
+                } else {
+                    None
+                };
+                let retry_sleep = async move {
+                    match retry_deadline {
+                        Some(at) => {
+                            let now = Instant::now();
+                            let dur = at.saturating_duration_since(now);
+                            sleep(dur).await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::pin!(retry_sleep);
+
                 tokio::select! {
                     _ = health_tick.tick() => {
-                        if state.session_state == SessionState::Shutdown || !state.should_auto_reconnect {
+                        if state.session_state == SessionState::Shutdown {
                             continue;
                         }
                         if !state.network_hint.is_online() {
                             continue;
                         }
 
+                        // Probe live connections for silent drops (NAT/proxy timeouts).
+                        // apply_transport_health will arm the reconnect driver on loss.
                         if matches!(
                             state.session_state,
                             SessionState::Connected | SessionState::LoggedIn | SessionState::Authenticated
@@ -8379,37 +8445,6 @@ impl PrivchatSdk {
                             }
                         }
 
-                        if state.session_state == SessionState::New && state.should_auto_reconnect {
-                            let from = state.session_state.as_connection_state();
-                            match state.try_auto_reconnect().await {
-                                Ok(next) => {
-                                    state.session_state = next;
-                                    start_inbound_task(&state, actor_cmd_tx.clone(), &mut inbound_task)
-                                        .await;
-                                    if state.session_state == SessionState::Authenticated
-                                        && state.bootstrap_completed
-                                    {
-                                        if let Err(err) = state.run_resume_sync().await {
-                                            eprintln!("[SDK.actor] resume sync failed after reconnect: {err}");
-                                        }
-                                    }
-                                    emit_sequenced_event(
-                                        &actor_event_tx,
-                                        &actor_event_history,
-                                        &actor_event_seq,
-                                        event_history_limit,
-                                        SdkEvent::ConnectionStateChanged {
-                                            from,
-                                            to: state.session_state.as_connection_state(),
-                                        },
-                                    );
-                                }
-                                Err(_) => {
-                                    // keep New and retry on next tick
-                                }
-                            }
-                        }
-
                         let _ = state.cleanup_tmp_dirs_if_needed().await;
 
                         if state.should_process_outbound_queue() {
@@ -8425,6 +8460,50 @@ impl PrivchatSdk {
                             );
                         }
                     }
+                    _ = &mut retry_sleep => {
+                        // Retry driver: the deadline fired. Guard again because state
+                        // may have changed between pin and wake.
+                        if state.session_state != SessionState::New
+                            || !state.should_auto_reconnect
+                            || !state.network_hint.is_online()
+                        {
+                            state.next_reconnect_at = None;
+                            continue;
+                        }
+                        let attempt_n = state.reconnect_attempt.saturating_add(1);
+                        eprintln!("[SDK.actor] auto_reconnect_attempt #{attempt_n}");
+                        let from = state.session_state.as_connection_state();
+                        match state.try_auto_reconnect().await {
+                            Ok(next) => {
+                                state.session_state = next;
+                                state.reset_reconnect_backoff();
+                                eprintln!("[SDK.actor] auto_reconnect_result ok attempt=#{attempt_n}");
+                                start_inbound_task(&state, actor_cmd_tx.clone(), &mut inbound_task)
+                                    .await;
+                                if state.session_state == SessionState::Authenticated
+                                    && state.bootstrap_completed
+                                {
+                                    if let Err(err) = state.run_resume_sync().await {
+                                        eprintln!("[SDK.actor] resume sync failed after reconnect: {err}");
+                                    }
+                                }
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::ConnectionStateChanged {
+                                        from,
+                                        to: state.session_state.as_connection_state(),
+                                    },
+                                );
+                            }
+                            Err(_) => {
+                                eprintln!("[SDK.actor] auto_reconnect_result fail attempt=#{attempt_n}");
+                                state.schedule_next_reconnect();
+                            }
+                        }
+                    }
                     cmd = rx.recv() => {
                         let Some(cmd) = cmd else { break; };
                         match cmd {
@@ -8435,6 +8514,10 @@ impl PrivchatSdk {
                         if !state.network_hint.is_online() {
                             let _ = resp.send(Err(state.network_disconnected_error()));
                         } else {
+                            // A user-driven Connect expresses the intent to stay online —
+                            // enable auto-reconnect up-front so retry fires even if this
+                            // first attempt fails (e.g. server temporarily down).
+                            state.should_auto_reconnect = true;
                             let from_state = state.session_state.as_connection_state();
                             let result = match state.session_state.can(Action::Connect) {
                                 Ok(next_state) => {
@@ -8452,7 +8535,7 @@ impl PrivchatSdk {
                                 Err(e) => Err(e),
                             };
                             if result.is_ok() {
-                                state.should_auto_reconnect = true;
+                                state.reset_reconnect_backoff();
                                 start_inbound_task(&state, actor_cmd_tx.clone(), &mut inbound_task)
                                     .await;
                                 emit_sequenced_event(
@@ -8465,6 +8548,10 @@ impl PrivchatSdk {
                                         to: state.session_state.as_connection_state(),
                                     },
                                 );
+                            } else {
+                                // First attempt failed — schedule a backoff retry so we
+                                // don't leave the client silently unconnected.
+                                state.schedule_next_reconnect();
                             }
                             let _ = resp.send(result);
                         }
@@ -8474,6 +8561,7 @@ impl PrivchatSdk {
                             eprintln!("[SDK.actor] loop: cmd disconnect");
                         }
                         state.should_auto_reconnect = false;
+                        state.reset_reconnect_backoff();
                         stop_inbound_task(&mut inbound_task).await;
                         let from_state = state.session_state.as_connection_state();
                         let result = state.disconnect().await;
@@ -8559,32 +8647,11 @@ impl PrivchatSdk {
                                 );
                             }
                         } else if matches!(old_hint, NetworkHint::Offline) && state.should_auto_reconnect {
-                            // Trigger reconnect sooner on network recovery.
-                            if state.session_state == SessionState::New {
-                                let from = state.session_state.as_connection_state();
-                                if let Ok(next) = state.try_auto_reconnect().await {
-                                    state.session_state = next;
-                                    start_inbound_task(&state, actor_cmd_tx.clone(), &mut inbound_task)
-                                        .await;
-                                    if state.session_state == SessionState::Authenticated
-                                        && state.bootstrap_completed
-                                    {
-                                        if let Err(err) = state.run_resume_sync().await {
-                                            eprintln!("[SDK.actor] resume sync failed after network recovery: {err}");
-                                        }
-                                    }
-                                    emit_sequenced_event(
-                                        &actor_event_tx,
-                                        &actor_event_history,
-                                        &actor_event_seq,
-                                        event_history_limit,
-                                        SdkEvent::ConnectionStateChanged {
-                                            from,
-                                            to: state.session_state.as_connection_state(),
-                                        },
-                                    );
-                                }
-                            }
+                            // Network just came back — reset backoff and let the retry
+                            // driver fire immediately. No inline retry here; the select!
+                            // arm will wake up on the zero-delay deadline.
+                            eprintln!("[SDK.actor] network_hint offline->online: reset backoff, arming immediate retry");
+                            state.mark_reconnect_ready_now();
                         }
                         let _ = resp.send(Ok(()));
                     }
@@ -9029,6 +9096,7 @@ impl PrivchatSdk {
                     }
                     Command::ClearLocalState { resp } => {
                         state.should_auto_reconnect = false;
+                        state.reset_reconnect_backoff();
                         let from_state = state.session_state.as_connection_state();
                         state.bootstrap_completed = false;
                         state.session_state = SessionState::Connected;
@@ -10213,6 +10281,7 @@ impl PrivchatSdk {
                     Command::WipeCurrentUserFull { resp } => {
                         let from_state = state.session_state.as_connection_state();
                         state.should_auto_reconnect = false;
+                        state.reset_reconnect_backoff();
                         state.bootstrap_completed = false;
                         state.clear_presence_cache();
                         state.session_state = SessionState::Connected;
@@ -10244,6 +10313,7 @@ impl PrivchatSdk {
                             eprintln!("[SDK.actor] loop: cmd shutdown");
                         }
                         state.should_auto_reconnect = false;
+                        state.reset_reconnect_backoff();
                         stop_inbound_task(&mut inbound_task).await;
                         emit_sequenced_event(
                             &actor_event_tx,
@@ -10464,6 +10534,10 @@ impl PrivchatSdk {
 
     pub async fn get_media_download_state(&self, message_id: u64) -> MediaDownloadState {
         self.download_manager.get_state(message_id).await
+    }
+
+    pub(crate) fn runtime_provider(&self) -> &RuntimeProvider {
+        &self._runtime_provider
     }
 
     pub fn last_event_sequence_id(&self) -> u64 {
@@ -12261,6 +12335,8 @@ mod tests {
             storage,
             current_uid: Some("10001".to_string()),
             should_auto_reconnect: false,
+            reconnect_attempt: 0,
+            next_reconnect_at: None,
             network_hint: NetworkHint::Unknown,
             receive_pipeline: ReceivePipeline::default(),
             last_sync_queued: 0,

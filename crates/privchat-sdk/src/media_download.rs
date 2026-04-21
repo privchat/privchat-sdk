@@ -93,7 +93,11 @@ impl DownloadManager {
         let notify_c = pause_notify.clone();
         let sdk_c = sdk.clone();
 
-        let task = tokio::spawn(async move {
+        // UniFFI's async bridge doesn't provide a Tokio runtime, so `tokio::spawn`
+        // would panic with "no reactor running". Dispatch onto the SDK's own
+        // multi-thread Tokio runtime so `tokio::time::sleep`, reqwest, etc. work
+        // inside `run_download`.
+        let task = sdk.runtime_provider().spawn(async move {
             run_download(
                 sdk_c,
                 manager,

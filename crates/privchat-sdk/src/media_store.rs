@@ -153,10 +153,16 @@ pub fn payload_filename(mime: &str) -> String {
 }
 
 /// Try to extract an extension from an original filename as a weak fallback.
-/// Returns `None` if the extension is empty, suspicious, or too long.
+/// Returns `None` if the extension is empty, non-ASCII, non-alphanumeric, or too long.
+/// Callers sometimes pass display text (e.g. localized labels like `[视频]`) instead of
+/// a real filename; rejecting anything that doesn't look like a sane ext keeps garbage
+/// out of the on-disk path.
 pub fn ext_from_original_filename(filename: &str) -> Option<&str> {
     let ext = filename.rsplit('.').next()?;
-    if ext.is_empty() || ext.len() > 10 || ext.contains('/') || ext.contains('\\') {
+    if ext.is_empty() || ext.len() > 10 {
+        return None;
+    }
+    if !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
     Some(ext)
@@ -181,13 +187,36 @@ pub fn payload_filename_with_fallback(mime: &str, original_filename: Option<&str
 }
 
 /// Helper: Find the "primary" file in a directory.
-/// Strategy: Ignore JSON. If one file, return it. If multiple, return the largest one.
+/// Strategy: Ignore thumb/meta/JSON. If one file, return it. If multiple, return the largest one.
 fn find_primary_file(dir: &Path) -> Option<PathBuf> {
     if let Ok(entries) = fs::read_dir(dir) {
         let mut candidates: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().map_or(true, |ext| ext != "json"))
+            .filter(|p| {
+                if !p.is_file() {
+                    return false;
+                }
+                if p.extension().map_or(false, |ext| ext == "json") {
+                    return false;
+                }
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == META_FILENAME {
+                    return false;
+                }
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                // Exclude thumbnails: thumb.*, {id}_thumb.*, {id}_thumb_v{n}.*
+                if stem == "thumb" || stem.ends_with("_thumb") {
+                    return false;
+                }
+                if let Some(idx) = stem.rfind("_thumb_v") {
+                    let suffix = &stem[idx + "_thumb_v".len()..];
+                    if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                        return false;
+                    }
+                }
+                true
+            })
             .collect();
 
         if candidates.is_empty() {
