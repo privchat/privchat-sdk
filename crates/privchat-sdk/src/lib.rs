@@ -452,6 +452,20 @@ pub enum SdkEvent {
         message_id: u64,
         state: MediaDownloadState,
     },
+    /// Plan 2 异步媒体作业请求。Rust 发起后挂起 oneshot，等待宿主通过
+    /// `PrivchatSdk::submit_media_job_result(job_id, result)` 回传。
+    /// 超时（`timeout_ms`）内未回传，走 `thumb_status=3` 兜底。
+    /// 当前支持 `job_kind = "video_thumbnail"`：宿主从 `source_path`
+    /// 抽取首帧写入 `output_path`（JPEG），SDK 再转 WebP。
+    MediaJobRequested {
+        job_id: String,
+        job_kind: String,
+        source_path: String,
+        output_path: String,
+        mime_type: String,
+        message_id: u64,
+        timeout_ms: u64,
+    },
     ShutdownStarted,
     ShutdownCompleted,
 }
@@ -553,6 +567,16 @@ pub type VideoProcessHook = Arc<
         + Send
         + Sync,
 >;
+
+/// Plan 2 媒体作业结果。Kotlin/iOS 宿主完成工作后，通过
+/// [`PrivchatSdk::submit_media_job_result`] 回传。`ok=true` 时 `output_path`
+/// 必须指向已写入的文件（由发布方保证路径存在）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaJobResult {
+    pub ok: bool,
+    pub output_path: Option<String>,
+    pub error: Option<String>,
+}
 
 /// 网址预览抓取结果（应用层实现）：URL → 标题 / 描述 / 本地缩略图文件路径。
 /// 任一字段可缺省；缩略图字段若存在，SDK 随后会将该本地文件作为普通图片上传得到 `file_id`。
@@ -1265,6 +1289,15 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether the failure is transient — queued work should stay in queue
+    /// and retry once network/auth recovers, instead of being marked failed.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Error::Auth(_) | Error::NotConnected | Error::Transport(_)
+        )
+    }
+
     pub fn sdk_code(&self) -> u32 {
         match self {
             Error::Transport(_) => error_codes::TRANSPORT_FAILURE,
@@ -1497,6 +1530,20 @@ enum Command {
         message_id: u64,
         downloaded: bool,
         resp: oneshot::Sender<Result<()>>,
+    },
+    FinalizeLocalAttachment {
+        message_id: u64,
+        content: String,
+        thumb_status: i32,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    /// INSERT a local outbound attachment row WITHOUT emitting any event.
+    /// Caller must follow up with `FinalizeLocalAttachment` once files are written,
+    /// which is the single event the UI observes for this message.
+    CreateLocalAttachmentPlaceholder {
+        input: NewMessage,
+        local_message_id: Option<u64>,
+        resp: oneshot::Sender<Result<u64>>,
     },
     SetMessageRevoke {
         message_id: u64,
@@ -1847,6 +1894,10 @@ struct State {
     event_history: Option<Arc<StdMutex<VecDeque<SequencedSdkEvent>>>>,
     event_seq: Option<Arc<AtomicU64>>,
     event_history_limit: usize,
+    /// Plan 2 共享作业表：Rust 发起 `MediaJobRequested` 时插入 oneshot sender，
+    /// 宿主通过 `PrivchatSdk::submit_media_job_result` 直接（不经 actor cmd）
+    /// 取出并触发。
+    pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>>,
 }
 
 impl State {
@@ -4835,6 +4886,19 @@ impl State {
                         processed += 1;
                         continue;
                     }
+                    if e.is_retryable() {
+                        eprintln!(
+                            "[SDK.actor] normal queue send deferred (retryable): message_id={} error={}",
+                            message_id, e
+                        );
+                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                            kind: "normal".to_string(),
+                            action: format!("deferred:{}", e),
+                            message_id: Some(message_id),
+                            queue_index: None,
+                        });
+                        break;
+                    }
                     eprintln!(
                         "[SDK.actor] normal queue send failed: message_id={} error={}",
                         message_id, e
@@ -4969,6 +5033,22 @@ impl State {
                             });
                         processed += 1;
                         continue;
+                    }
+                    if e.is_retryable() {
+                        // Transient failure (auth/network): keep the item in the queue
+                        // and stop draining — next connection / auth / enqueue trigger
+                        // will retry. Don't ack, don't mark the message failed.
+                        eprintln!(
+                            "[SDK.actor] file queue send deferred (retryable): queue_index={} message_id={} error={}",
+                            queue_index, message_id, e
+                        );
+                        self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                            kind: "file".to_string(),
+                            action: format!("deferred:{}", e),
+                            message_id: Some(message_id),
+                            queue_index: Some(queue_index),
+                        });
+                        break;
                     }
                     eprintln!(
                         "[SDK.actor] file queue send failed: queue_index={} message_id={} error={}",
@@ -7125,12 +7205,20 @@ impl State {
     ) {
         let thumb_url = match Self::extract_thumbnail_url(content) {
             Some(url) if url.starts_with("http") => url,
-            _ => return,
+            _ => {
+                // Protocol-level "no thumbnail" — mark thumb_status=3 so UI
+                // renders a type-derived static placeholder instead of a loader.
+                tokio::spawn(async move {
+                    let _ = storage.update_thumb_status(message_id, 3).await;
+                });
+                return;
+            }
         };
         let dir = media_store::get_message_dir(user_root, message_id as i64, created_at_ms);
-        let thumb_path = dir.join(media_store::THUMB_FILENAME);
-        if thumb_path.exists() {
-            // File already on disk — just ensure DB is consistent
+        let thumb_path = dir.join(Self::thumb_filename_for_url(&thumb_url));
+        let webp_path = dir.join(media_store::THUMB_FILENAME);
+        let png_path = dir.join(media_store::THUMB_PNG_FILENAME);
+        if thumb_path.exists() || webp_path.exists() || png_path.exists() {
             let _ = tokio::spawn(async move {
                 let _ = storage.update_thumb_status(message_id, 1).await;
             });
@@ -7168,6 +7256,22 @@ impl State {
                 }
             }
         });
+    }
+
+    /// Pick canonical thumbnail filename based on the remote URL extension,
+    /// so the file name on disk matches the actual bytes (webp vs png).
+    fn thumb_filename_for_url(url: &str) -> &'static str {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        let ext = path
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit('.').next())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match ext.as_str() {
+            "png" => media_store::THUMB_PNG_FILENAME,
+            _ => media_store::THUMB_FILENAME,
+        }
     }
 
     async fn do_download_thumbnail(
@@ -7548,16 +7652,6 @@ impl State {
         }
     }
 
-    fn transparent_png_1x1() -> &'static [u8] {
-        &[
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-        ]
-    }
-
     fn generate_image_thumbnail_sync(
         source_path: &std::path::Path,
         output_path: &std::path::Path,
@@ -7796,12 +7890,8 @@ impl State {
             message.message_id as i64,
             message.created_at,
         );
-        let yyyymm = media_store::yyyymm_from_ms(message.created_at);
-        let tmp_dir = user_root.join("files").join("tmp").join(&yyyymm);
         std::fs::create_dir_all(&files_dir)
             .map_err(|e| Error::Storage(format!("create files dir failed: {e}")))?;
-        std::fs::create_dir_all(&tmp_dir)
-            .map_err(|e| Error::Storage(format!("create tmp dir failed: {e}")))?;
 
         let body_path = files_dir.join(&filename);
         let meta_path = files_dir.join(media_store::META_FILENAME);
@@ -7821,19 +7911,14 @@ impl State {
                     source_height = Some(img.height());
                 }
             }
-            let thumb_path = tmp_dir.join(format!("{}_thumb.webp", message.message_id));
-            let (w, h, size) =
-                Self::generate_image_thumbnail_sync(&body_path, &thumb_path, 320, 85)?;
-            // Copy thumbnail to canonical directory so it survives app restart
             let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
-            std::fs::copy(&thumb_path, &canonical_thumb)
-                .map_err(|e| Error::Storage(format!("copy thumb to canonical dir failed: {e}")))?;
-            // Mark thumb_status=1 (ready) for the sender's own message
+            let (w, h, size) =
+                Self::generate_image_thumbnail_sync(&body_path, &canonical_thumb, 320, 85)?;
             let _ = self.storage.update_thumb_status(message.message_id, 1).await;
             thumb_upload = Some((
-                thumb_path,
+                canonical_thumb,
                 "image/webp".to_string(),
-                format!("{}_thumb.webp", message.message_id),
+                media_store::THUMB_FILENAME.to_string(),
             ));
             let meta = MediaMeta {
                 source: MediaSourceMeta {
@@ -7862,21 +7947,17 @@ impl State {
             .map_err(|e| Error::Storage(format!("write media meta failed: {e}")))?;
         } else if file_type == "video" {
             if let Some(hook) = self.video_process_hook.as_ref() {
-                let ext = std::path::Path::new(&filename)
-                    .extension()
-                    .and_then(|v| v.to_str())
-                    .unwrap_or("mp4");
-                let compressed_path =
-                    tmp_dir.join(format!("{}_compressed.{ext}", message.message_id));
+                // Hook writes compressed output in place to `payload.{ext}`.
+                // On failure the implementation must leave the file untouched.
                 let compressed_ok = hook(
                     MediaProcessOp::Compress,
                     &body_path,
                     &meta_path,
-                    &compressed_path,
+                    &body_path,
                 )
                 .map_err(|e| Error::Storage(format!("video compress hook failed: {e}")))?;
-                if compressed_ok && compressed_path.exists() {
-                    upload_payload = std::fs::read(&compressed_path).map_err(|e| {
+                if compressed_ok {
+                    upload_payload = std::fs::read(&body_path).map_err(|e| {
                         Error::Storage(format!("read compressed video failed: {e}"))
                     })?;
                     body_size = upload_payload.len() as u64;
@@ -7884,39 +7965,161 @@ impl State {
                 }
             }
 
-            let hook_thumb_path = tmp_dir.join(format!("{}_thumb.jpg", message.message_id));
+            let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
+            let thumb_scratch = files_dir.join("thumb.src.jpg");
             let mut hook_used = false;
-            if let Some(hook) = self.video_process_hook.as_ref() {
-                let ok = hook(
-                    MediaProcessOp::Thumbnail,
-                    &body_path,
-                    &meta_path,
-                    &hook_thumb_path,
+            // Host (Kotlin/iOS) may have pre-generated thumb.webp during the send-prep
+            // loading modal. If present, trust it: set thumb_status=1 and skip both the
+            // sync hook and Plan 2 async path.
+            if canonical_thumb.exists()
+                && std::fs::metadata(&canonical_thumb).map(|m| m.len() > 0).unwrap_or(false)
+            {
+                hook_used = true;
+                let _ = self.storage.update_thumb_status(message.message_id, 1).await;
+                thumb_upload = Some((
+                    canonical_thumb.clone(),
+                    "image/webp".to_string(),
+                    media_store::THUMB_FILENAME.to_string(),
+                ));
+            }
+            if !hook_used {
+                if let Some(hook) = self.video_process_hook.as_ref() {
+                    // Hook outputs JPEG; Rust re-encodes to canonical WebP (Spec §FILE_STORAGE).
+                    let ok = hook(
+                        MediaProcessOp::Thumbnail,
+                        &body_path,
+                        &meta_path,
+                        &thumb_scratch,
+                    )
+                    .map_err(|e| Error::Storage(format!("video thumbnail hook failed: {e}")))?;
+                    if ok && thumb_scratch.exists() {
+                        match Self::generate_image_thumbnail_sync(
+                            &thumb_scratch,
+                            &canonical_thumb,
+                            320,
+                            85,
+                        ) {
+                            Ok(_) => {
+                                hook_used = true;
+                                let _ = self.storage.update_thumb_status(message.message_id, 1).await;
+                                thumb_upload = Some((
+                                    canonical_thumb.clone(),
+                                    "image/webp".to_string(),
+                                    media_store::THUMB_FILENAME.to_string(),
+                                ));
+                            }
+                            Err(e) => {
+                                eprintln!("[SDK.video] re-encode thumbnail to webp failed: {e}");
+                            }
+                        }
+                        let _ = std::fs::remove_file(&thumb_scratch);
+                    }
+                }
+            }
+            // Plan 2: no sync hook registered → issue an async media job to the host
+            // (Kotlin/iOS) and block on a oneshot. `submit_media_job_result` bypasses
+            // the actor command channel because the actor is blocked here.
+            if !hook_used && self.event_tx.is_some() {
+                const VIDEO_THUMBNAIL_TIMEOUT_MS: u64 = 8_000;
+                let job_id = self
+                    .snowflake
+                    .next_id()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|_| {
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string()
+                    });
+                let (job_tx, job_rx) = oneshot::channel::<MediaJobResult>();
+                {
+                    let mut locked = self
+                        .pending_media_jobs
+                        .lock()
+                        .expect("pending_media_jobs poisoned");
+                    locked.insert(job_id.clone(), job_tx);
+                }
+                let event = SdkEvent::MediaJobRequested {
+                    job_id: job_id.clone(),
+                    job_kind: "video_thumbnail".to_string(),
+                    source_path: body_path.display().to_string(),
+                    output_path: thumb_scratch.display().to_string(),
+                    mime_type: mime_type.clone(),
+                    message_id: message.message_id,
+                    timeout_ms: VIDEO_THUMBNAIL_TIMEOUT_MS,
+                };
+                if let (Some(tx), Some(history), Some(seq)) = (
+                    self.event_tx.as_ref(),
+                    self.event_history.as_ref(),
+                    self.event_seq.as_ref(),
+                ) {
+                    emit_sequenced_event(tx, history, seq, self.event_history_limit, event);
+                }
+                let wait = tokio::time::timeout(
+                    Duration::from_millis(VIDEO_THUMBNAIL_TIMEOUT_MS),
+                    job_rx,
                 )
-                .map_err(|e| Error::Storage(format!("video thumbnail hook failed: {e}")))?;
-                if ok && hook_thumb_path.exists() {
-                    hook_used = true;
-                    // Copy video thumbnail to canonical directory
-                    let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
-                    let _ = std::fs::copy(&hook_thumb_path, &canonical_thumb);
-                    let _ = self.storage.update_thumb_status(message.message_id, 1).await;
-                    thumb_upload = Some((
-                        hook_thumb_path.clone(),
-                        "image/jpeg".to_string(),
-                        format!("{}_thumb.jpg", message.message_id),
-                    ));
+                .await;
+                // Clear the entry on any exit path — host may submit after timeout.
+                if let Ok(mut locked) = self.pending_media_jobs.lock() {
+                    locked.remove(&job_id);
+                }
+                match wait {
+                    Ok(Ok(result)) if result.ok => {
+                        let out = result
+                            .output_path
+                            .as_deref()
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| thumb_scratch.clone());
+                        if out.exists() {
+                            match Self::generate_image_thumbnail_sync(
+                                &out,
+                                &canonical_thumb,
+                                320,
+                                85,
+                            ) {
+                                Ok(_) => {
+                                    hook_used = true;
+                                    let _ = self
+                                        .storage
+                                        .update_thumb_status(message.message_id, 1)
+                                        .await;
+                                    thumb_upload = Some((
+                                        canonical_thumb.clone(),
+                                        "image/webp".to_string(),
+                                        media_store::THUMB_FILENAME.to_string(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[SDK.video] plan2 re-encode thumbnail to webp failed: {e}"
+                                    );
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "[SDK.video] plan2 host reported ok but {} missing",
+                                out.display()
+                            );
+                        }
+                        let _ = std::fs::remove_file(&thumb_scratch);
+                    }
+                    Ok(Ok(result)) => {
+                        eprintln!(
+                            "[SDK.video] plan2 host failed job {job_id}: {}",
+                            result.error.unwrap_or_else(|| "unknown".to_string())
+                        );
+                    }
+                    Ok(Err(_)) => {
+                        eprintln!("[SDK.video] plan2 job {job_id} sender dropped");
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[SDK.video] plan2 job {job_id} timed out after {}ms",
+                            VIDEO_THUMBNAIL_TIMEOUT_MS
+                        );
+                    }
                 }
             }
             if !hook_used {
-                let thumb_path = tmp_dir.join(format!("{}_thumb.png", message.message_id));
-                std::fs::write(&thumb_path, Self::transparent_png_1x1()).map_err(|e| {
-                    Error::Storage(format!("write video placeholder thumb failed: {e}"))
-                })?;
-                thumb_upload = Some((
-                    thumb_path,
-                    "image/png".to_string(),
-                    format!("{}_thumb.png", message.message_id),
-                ));
+                let _ = self.storage.update_thumb_status(message.message_id, 3).await;
             }
 
             let (thumb_w, thumb_h, thumb_size, thumb_mime) = match thumb_upload.as_ref() {
@@ -7936,12 +8139,16 @@ impl State {
                     height: None,
                     file_size: Some(body_size),
                 },
-                thumbnail: Some(MediaThumbnailMeta {
-                    width: thumb_w,
-                    height: thumb_h,
-                    file_size: thumb_size,
-                    mime: thumb_mime,
-                }),
+                thumbnail: if thumb_upload.is_some() {
+                    Some(MediaThumbnailMeta {
+                        width: thumb_w,
+                        height: thumb_h,
+                        file_size: thumb_size,
+                        mime: thumb_mime,
+                    })
+                } else {
+                    None
+                },
                 processing: Some(MediaProcessingMeta {
                     strategy: Some("client_preprocess".to_string()),
                     created_at: Some(chrono::Utc::now().timestamp()),
@@ -8256,6 +8463,7 @@ pub struct PrivchatSdk {
     typing_throttle: Arc<StdMutex<HashMap<(u64, bool, u8), std::time::Instant>>>,
     data_dir: Arc<String>,
     download_manager: media_download::DownloadManager,
+    pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>>,
 }
 
 impl PrivchatSdk {
@@ -8304,6 +8512,10 @@ impl PrivchatSdk {
         let actor_startup_error = startup_error.clone();
         let presence_cache = Arc::new(StdMutex::new(HashMap::new()));
         let actor_presence_cache = presence_cache.clone();
+        let pending_media_jobs: Arc<
+            StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>,
+        > = Arc::new(StdMutex::new(HashMap::new()));
+        let actor_pending_media_jobs = pending_media_jobs.clone();
         let machine_id: u16 = (std::process::id() as u16) & 0x1f;
         let data_center_id: u16 = (chrono::Utc::now().timestamp_millis() as u16) & 0x1f;
         let snowflake = snowflake_me::Snowflake::builder()
@@ -8387,6 +8599,7 @@ impl PrivchatSdk {
                 event_history: Some(actor_event_history.clone()),
                 event_seq: Some(actor_event_seq.clone()),
                 event_history_limit: event_history_limit,
+                pending_media_jobs: actor_pending_media_jobs,
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut health_tick = interval(Duration::from_secs(15));
@@ -9592,6 +9805,68 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::CreateLocalAttachmentPlaceholder { input, local_message_id, resp } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => {
+                                let lid = match local_message_id {
+                                    Some(id) => Ok(id),
+                                    None => state.next_local_message_id(),
+                                };
+                                match lid {
+                                    Ok(local_message_id) => {
+                                        state
+                                            .storage
+                                            .create_local_message(local_message_id, input)
+                                            .await
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            },
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
+                    Command::FinalizeLocalAttachment {
+                        message_id,
+                        content,
+                        thumb_status,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => {
+                                state
+                                    .storage
+                                    .finalize_local_attachment(message_id, content, thumb_status)
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        match result {
+                            Ok((channel_id, channel_type)) => {
+                                state.invalidate_channel_cache_with_reason(
+                                    channel_id,
+                                    channel_type,
+                                    "finalize_local_attachment",
+                                );
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::TimelineUpdated {
+                                        channel_id,
+                                        channel_type,
+                                        message_id,
+                                        reason: "outbound_prep_complete".to_string(),
+                                    },
+                                );
+                                let _ = resp.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                            }
+                        }
+                    }
                     Command::SetMessageRevoke {
                         message_id,
                         revoked,
@@ -10385,6 +10660,7 @@ impl PrivchatSdk {
             typing_throttle: Arc::new(StdMutex::new(HashMap::new())),
             data_dir: Arc::new(data_dir_for_self),
             download_manager: media_download::DownloadManager::new(),
+            pending_media_jobs,
         }
     }
 
@@ -10689,6 +10965,29 @@ impl PrivchatSdk {
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// Plan 2 媒体作业回传。宿主（Kotlin/iOS）收到 `SdkEvent::MediaJobRequested`
+    /// 处理完成后调用此接口。直接操作共享 `pending_media_jobs` 表、不经 actor
+    /// 命令通道——此时 actor 正阻塞在同一 oneshot rx 上。
+    ///
+    /// 已过期（超时被 actor 丢弃）或 `job_id` 未知时返回 `Err`。
+    pub fn submit_media_job_result(&self, job_id: String, result: MediaJobResult) -> Result<()> {
+        let sender = {
+            let mut locked = self
+                .pending_media_jobs
+                .lock()
+                .expect("pending_media_jobs poisoned");
+            locked.remove(&job_id)
+        };
+        match sender {
+            Some(tx) => tx
+                .send(result)
+                .map_err(|_| Error::InvalidState(format!("media job {job_id} receiver dropped"))),
+            None => Err(Error::InvalidState(format!(
+                "media job {job_id} not pending (expired or unknown)"
+            ))),
+        }
     }
 
     /// 注册 / 清除网址预览回调。未注册时发送 Link 消息仅带 URL，客户端显示空白缩略图。
@@ -11405,6 +11704,49 @@ impl PrivchatSdk {
             .send(Command::UpdateMediaDownloaded {
                 message_id,
                 downloaded,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 本地发送附件的占位 INSERT：拿 DB 自增 id，但不 emit 任何事件。
+    /// 调用方必须在文件写盘后调用 `finalize_local_attachment`，由 finalize 负责 emit，
+    /// 这样 UI 只会看到一次完整态的气泡，不会有"空内容 → 有内容"的闪动。
+    pub async fn create_local_attachment_placeholder(
+        &self,
+        input: NewMessage,
+        local_message_id: Option<u64>,
+    ) -> Result<u64> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::CreateLocalAttachmentPlaceholder {
+                input,
+                local_message_id,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 本地发送附件：文件写盘完毕后调用，一次性写回 content / thumb_status /
+    /// media_downloaded，并 emit TimelineUpdated 让 UI 刷新气泡。
+    pub async fn finalize_local_attachment(
+        &self,
+        message_id: u64,
+        content: String,
+        thumb_status: i32,
+    ) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::FinalizeLocalAttachment {
+                message_id,
+                content,
+                thumb_status,
                 resp: resp_tx,
             })
             .await
@@ -12360,6 +12702,7 @@ mod tests {
             event_history: None,
             event_seq: None,
             event_history_limit: 0,
+            pending_media_jobs: Arc::new(StdMutex::new(HashMap::new())),
         };
         (state, dir)
     }

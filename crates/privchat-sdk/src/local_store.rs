@@ -1540,6 +1540,35 @@ impl LocalStore {
         Ok(())
     }
 
+    /// 本地发送附件准备完毕：一次性把 content / thumb_status / media_downloaded 写回。
+    /// 调用方已经按 `id` 把文件落到规范目录，拿到这个 ack 之后就可以让 UI 刷新气泡。
+    pub fn finalize_local_attachment(
+        &self,
+        uid: &str,
+        message_id: u64,
+        content: &str,
+        thumb_status: i32,
+    ) -> Result<(u64, i32)> {
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE message
+                SET content = ?1,
+                    thumb_status = ?2,
+                    media_downloaded = 1,
+                    updated_at = ?3
+              WHERE id = ?4",
+            params![content, thumb_status, now_ms, message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("finalize local attachment: {e}")))?;
+        conn.query_row(
+            "SELECT channel_id, channel_type FROM message WHERE id = ?1",
+            params![message_id as i64],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i32>(1)?)),
+        )
+        .map_err(|e| Error::Storage(format!("lookup finalized message channel: {e}")))
+    }
+
     pub fn max_message_pts(&self, uid: &str, channel_id: u64, channel_type: i32) -> Result<u64> {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(

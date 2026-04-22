@@ -102,6 +102,10 @@ pub const PAYLOAD_BASENAME: &str = "payload";
 /// The fixed thumbnail filename (static WebP).
 pub const THUMB_FILENAME: &str = "thumb.webp";
 
+/// Fallback thumbnail filename used when the placeholder is a raw PNG
+/// (hook unregistered or hook failed). Filename matches the bytes.
+pub const THUMB_PNG_FILENAME: &str = "thumb.png";
+
 /// The metadata filename.
 pub const META_FILENAME: &str = "meta.json";
 

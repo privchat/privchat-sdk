@@ -1134,8 +1134,24 @@ pub enum SdkEvent {
         message_id: u64,
         state: MediaDownloadState,
     },
+    MediaJobRequested {
+        job_id: String,
+        job_kind: String,
+        source_path: String,
+        output_path: String,
+        mime_type: String,
+        message_id: u64,
+        timeout_ms: u64,
+    },
     ShutdownStarted,
     ShutdownCompleted,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MediaJobResult {
+    pub ok: bool,
+    pub output_path: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1980,6 +1996,23 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
                 state: map_media_download_state(state),
             }
         }
+        privchat_sdk::SdkEvent::MediaJobRequested {
+            job_id,
+            job_kind,
+            source_path,
+            output_path,
+            mime_type,
+            message_id,
+            timeout_ms,
+        } => SdkEvent::MediaJobRequested {
+            job_id,
+            job_kind,
+            source_path,
+            output_path,
+            mime_type,
+            message_id,
+            timeout_ms,
+        },
         privchat_sdk::SdkEvent::ShutdownStarted => SdkEvent::ShutdownStarted,
         privchat_sdk::SdkEvent::ShutdownCompleted => SdkEvent::ShutdownCompleted,
     }
@@ -2230,6 +2263,24 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "type": "media_download_state_changed",
             "message_id": message_id,
             "state": media_download_state_to_json(state)
+        }),
+        SdkEvent::MediaJobRequested {
+            job_id,
+            job_kind,
+            source_path,
+            output_path,
+            mime_type,
+            message_id,
+            timeout_ms,
+        } => json!({
+            "type": "media_job_requested",
+            "job_id": job_id,
+            "job_kind": job_kind,
+            "source_path": source_path,
+            "output_path": output_path,
+            "mime_type": mime_type,
+            "message_id": message_id,
+            "timeout_ms": timeout_ms
         }),
         SdkEvent::ShutdownStarted => json!({ "type": "shutdown_started" }),
         SdkEvent::ShutdownCompleted => json!({ "type": "shutdown_completed" }),
@@ -6246,6 +6297,17 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
+    pub async fn create_local_message_with_id(
+        &self,
+        input: NewMessage,
+        local_message_id: Option<u64>,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.inner
+            .create_local_message_with_id(map_new_message(input), local_message_id)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn get_message_by_id(
         &self,
         message_id: u64,
@@ -6398,6 +6460,29 @@ impl PrivchatClient {
     ) -> Result<(), PrivchatFfiError> {
         self.inner
             .update_media_downloaded(message_id, downloaded)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn finalize_local_attachment(
+        &self,
+        message_id: u64,
+        content: String,
+        thumb_status: i32,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .finalize_local_attachment(message_id, content, thumb_status)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn create_local_attachment_placeholder(
+        &self,
+        input: NewMessage,
+        local_message_id: Option<u64>,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.inner
+            .create_local_attachment_placeholder(map_new_message(input), local_message_id)
             .await
             .map_err(PrivchatFfiError::from)
     }
@@ -7432,9 +7517,14 @@ impl PrivchatClient {
         let dir = privchat_sdk::media_store::get_canonical_message_dir(
             root, uid, message_id, created_at_ms,
         );
-        let thumb = dir.join(privchat_sdk::media_store::THUMB_FILENAME);
-        if thumb.exists() {
-            return Some(thumb.to_string_lossy().to_string());
+        for name in &[
+            privchat_sdk::media_store::THUMB_FILENAME,
+            privchat_sdk::media_store::THUMB_PNG_FILENAME,
+        ] {
+            let thumb = dir.join(name);
+            if thumb.exists() {
+                return Some(thumb.to_string_lossy().to_string());
+            }
         }
         // Legacy: check for {id}_thumb.webp or {id}_thumb.jpg in same dir
         for ext in &["webp", "jpg"] {
@@ -7450,9 +7540,14 @@ impl PrivchatClient {
             .join("files")
             .join(message_id.to_string());
         if legacy_dir != dir && legacy_dir.exists() {
-            let thumb = legacy_dir.join(privchat_sdk::media_store::THUMB_FILENAME);
-            if thumb.exists() {
-                return Some(thumb.to_string_lossy().to_string());
+            for name in &[
+                privchat_sdk::media_store::THUMB_FILENAME,
+                privchat_sdk::media_store::THUMB_PNG_FILENAME,
+            ] {
+                let thumb = legacy_dir.join(name);
+                if thumb.exists() {
+                    return Some(thumb.to_string_lossy().to_string());
+                }
             }
         }
         None
@@ -7495,6 +7590,22 @@ impl PrivchatClient {
 
     pub async fn remove_video_process_hook(&self) -> Result<(), PrivchatFfiError> {
         self.set_video_process_hook(None).await
+    }
+
+    /// Plan 2：宿主处理完 `SdkEvent::MediaJobRequested` 后回传结果。
+    pub fn submit_media_job_result(
+        &self,
+        job_id: String,
+        result: MediaJobResult,
+    ) -> Result<(), PrivchatFfiError> {
+        let inner = privchat_sdk::MediaJobResult {
+            ok: result.ok,
+            output_path: result.output_path,
+            error: result.error,
+        };
+        self.inner
+            .submit_media_job_result(job_id, inner)
+            .map_err(PrivchatFfiError::from)
     }
 
     async fn resolve_attachment_bytes(
