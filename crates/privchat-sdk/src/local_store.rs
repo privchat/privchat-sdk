@@ -640,6 +640,95 @@ impl LocalStore {
         Ok(())
     }
 
+    /// 原子更新 access token；不动 refresh_token / device_id。
+    /// `expires_at = None` 表示保持原值不变（Command::Authenticate 外部 token 流程用不到新的过期时间）。
+    pub fn update_access_token(
+        &self,
+        uid: &str,
+        access_token: &str,
+        expires_at: Option<u64>,
+    ) -> Result<()> {
+        let master_key = self.load_master_key(uid)?;
+        let blob = self.encrypt_user_blob(uid, "access_token", &master_key, access_token.as_bytes())?;
+        let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
+        let mut batch = sled::Batch::default();
+        batch.insert(K_ACCESS_TOKEN_ALG, TOKEN_ALG.as_bytes());
+        batch.insert(K_ACCESS_TOKEN_ENC, blob.ciphertext);
+        batch.insert(K_ACCESS_TOKEN_NONCE, blob.nonce);
+        if let Some(exp) = expires_at {
+            batch.insert(
+                K_TOKEN_EXPIRE_AT,
+                i64_to_be_bytes(i64::try_from(exp).unwrap_or(i64::MAX)).to_vec(),
+            );
+        }
+        auth.apply_batch(batch)
+            .map_err(|e| Error::Storage(format!("apply access token batch: {e}")))?;
+        Ok(())
+    }
+
+    /// 原子更新 refresh token：Some → 替换；None → 保留旧值（B1 non-rotation 语义）。
+    /// 注意：这里 None 表示「不动」，不是清空。如果要清空请用 clear_session。
+    pub fn update_refresh_token(&self, uid: &str, refresh_token: Option<&str>) -> Result<()> {
+        let Some(token) = refresh_token else {
+            return Ok(());
+        };
+        let master_key = self.load_master_key(uid)?;
+        let blob = self.encrypt_user_blob(uid, "refresh_token", &master_key, token.as_bytes())?;
+        let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
+        let mut batch = sled::Batch::default();
+        batch.insert(K_REFRESH_TOKEN_ALG, TOKEN_ALG.as_bytes());
+        batch.insert(K_REFRESH_TOKEN_ENC, blob.ciphertext);
+        batch.insert(K_REFRESH_TOKEN_NONCE, blob.nonce);
+        auth.apply_batch(batch)
+            .map_err(|e| Error::Storage(format!("apply refresh token batch: {e}")))?;
+        Ok(())
+    }
+
+    /// 读取当前 access_token（只读，不做 legacy session 迁移；Ok(None) 表示未登录）。
+    pub fn load_access_token(&self, uid: &str) -> Result<Option<String>> {
+        let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
+        let enc = auth
+            .get(K_ACCESS_TOKEN_ENC)
+            .map_err(|e| Error::Storage(format!("load access token: {e}")))?;
+        let nonce = auth
+            .get(K_ACCESS_TOKEN_NONCE)
+            .map_err(|e| Error::Storage(format!("load access token nonce: {e}")))?;
+        let (Some(enc), Some(nonce)) = (enc, nonce) else {
+            return Ok(None);
+        };
+        let master_key = self.load_master_key(uid)?;
+        let plain = self.decrypt_user_blob(
+            uid,
+            "access_token",
+            &master_key,
+            enc.as_ref(),
+            nonce.as_ref(),
+        )?;
+        let token = String::from_utf8(plain)
+            .map_err(|e| Error::Storage(format!("decode access token utf8: {e}")))?;
+        Ok(Some(token))
+    }
+
+    /// 读取 refresh token（用于 refresh RPC）。无值返回 Ok(None)。
+    pub fn load_refresh_token(&self, uid: &str) -> Result<Option<String>> {
+        let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
+        let enc = auth
+            .get(K_REFRESH_TOKEN_ENC)
+            .map_err(|e| Error::Storage(format!("load refresh token: {e}")))?;
+        let nonce = auth
+            .get(K_REFRESH_TOKEN_NONCE)
+            .map_err(|e| Error::Storage(format!("load refresh token nonce: {e}")))?;
+        let (Some(enc), Some(nonce)) = (enc, nonce) else {
+            return Ok(None);
+        };
+        let master_key = self.load_master_key(uid)?;
+        let plain =
+            self.decrypt_user_blob(uid, "refresh_token", &master_key, enc.as_ref(), nonce.as_ref())?;
+        let token = String::from_utf8(plain)
+            .map_err(|e| Error::Storage(format!("decode refresh token utf8: {e}")))?;
+        Ok(Some(token))
+    }
+
     fn k_acct_last_login(uid: &str) -> String {
         format!("acct/{uid}/last_login_at")
     }
@@ -4154,6 +4243,9 @@ mod tests {
             searchable_word: "hello".to_string(),
             setting: 0,
             extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
         };
 
         let message_id = store
@@ -4203,6 +4295,9 @@ mod tests {
             searchable_word: "hello".to_string(),
             setting: 0,
             extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
         };
 
         let local_id = store
@@ -4227,6 +4322,7 @@ mod tests {
                     pts: 1,
                     order_seq: 1,
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("upsert remote row")
@@ -4268,6 +4364,7 @@ mod tests {
                     order_seq: 100,
                     searchable_word: "first".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("upsert first")
@@ -4297,6 +4394,7 @@ mod tests {
                     order_seq: 101,
                     searchable_word: "updated".to_string(),
                     extra: "{\"k\":1}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("upsert second")
@@ -4333,6 +4431,9 @@ mod tests {
                     searchable_word: "pending".to_string(),
                     setting: 0,
                     extra: "{}".to_string(),
+                    mime_type: None,
+                    media_downloaded: false,
+                    thumb_status: 0,
                 },
                 local_message_id,
             )
@@ -4356,6 +4457,7 @@ mod tests {
                     order_seq: 100,
                     searchable_word: "pending".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("merge self echo")
@@ -4384,6 +4486,7 @@ mod tests {
                     order_seq: 101,
                     searchable_word: "other".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert self message from another device")
@@ -4435,6 +4538,7 @@ mod tests {
                     order_seq: 300,
                     searchable_word: "newer".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert newer")
@@ -4458,6 +4562,7 @@ mod tests {
                     order_seq: 200,
                     searchable_word: "older".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("replay older")
@@ -4485,6 +4590,9 @@ mod tests {
             searchable_word: "hello".to_string(),
             setting: 0,
             extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
         };
         let m1 = store
             .create_local_message(uid, &input, 0)
@@ -4532,6 +4640,7 @@ mod tests {
                     pts: 100,
                     order_seq: 100,
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert message 1");
@@ -4553,6 +4662,7 @@ mod tests {
                     pts: 101,
                     order_seq: 101,
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert self message");
@@ -4655,6 +4765,7 @@ mod tests {
                     pts: 10,
                     order_seq: 10,
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert m1")
@@ -4677,6 +4788,7 @@ mod tests {
                     pts: 20,
                     order_seq: 20,
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert m2")
@@ -4699,6 +4811,7 @@ mod tests {
                     pts: 30,
                     order_seq: 30,
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert m3")
@@ -4721,6 +4834,7 @@ mod tests {
                     pts: 40,
                     order_seq: 40,
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert self")
@@ -4896,6 +5010,7 @@ mod tests {
                     searchable_word: "self-message".to_string(),
                     setting: 0,
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert self message");
@@ -5012,6 +5127,7 @@ mod tests {
                     order_seq: 12,
                     searchable_word: "fresh local message".to_string(),
                     extra: "{}".to_string(),
+                    mime_type: None,
                 },
             )
             .expect("insert local materialized message");
@@ -5436,6 +5552,9 @@ mod tests {
             searchable_word: "local-id".to_string(),
             setting: 0,
             extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
         };
         let message_id = store
             .create_local_message(uid, &input, 0)
@@ -5473,6 +5592,9 @@ mod tests {
             searchable_word: "before-edit".to_string(),
             setting: 0,
             extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
         };
         let message_id = store
             .create_local_message(uid, &input, 0)

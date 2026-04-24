@@ -50,6 +50,25 @@ enum StorageCmd {
         uid: String,
         resp: oneshot::Sender<Result<()>>,
     },
+    UpdateAccessToken {
+        uid: String,
+        access_token: String,
+        expires_at: Option<u64>,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    UpdateRefreshToken {
+        uid: String,
+        refresh_token: Option<String>,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    LoadRefreshToken {
+        uid: String,
+        resp: oneshot::Sender<Result<Option<String>>>,
+    },
+    LoadAccessToken {
+        uid: String,
+        resp: oneshot::Sender<Result<Option<String>>>,
+    },
     LoadCurrentUid {
         resp: oneshot::Sender<Result<Option<String>>>,
     },
@@ -502,6 +521,56 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ClearSession { uid, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn update_access_token(
+        &self,
+        uid: String,
+        access_token: String,
+        expires_at: Option<u64>,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UpdateAccessToken {
+                uid,
+                access_token,
+                expires_at,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn update_refresh_token(
+        &self,
+        uid: String,
+        refresh_token: Option<String>,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UpdateRefreshToken {
+                uid,
+                refresh_token,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn load_refresh_token(&self, uid: String) -> Result<Option<String>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::LoadRefreshToken { uid, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn load_access_token(&self, uid: String) -> Result<Option<String>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::LoadAccessToken { uid, resp: resp_tx })
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
@@ -1669,6 +1738,27 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::ClearSession { uid, resp } => {
             let _ = resp.send(store.clear_session(&uid));
+        }
+        StorageCmd::UpdateAccessToken {
+            uid,
+            access_token,
+            expires_at,
+            resp,
+        } => {
+            let _ = resp.send(store.update_access_token(&uid, &access_token, expires_at));
+        }
+        StorageCmd::UpdateRefreshToken {
+            uid,
+            refresh_token,
+            resp,
+        } => {
+            let _ = resp.send(store.update_refresh_token(&uid, refresh_token.as_deref()));
+        }
+        StorageCmd::LoadRefreshToken { uid, resp } => {
+            let _ = resp.send(store.load_refresh_token(&uid));
+        }
+        StorageCmd::LoadAccessToken { uid, resp } => {
+            let _ = resp.send(store.load_access_token(&uid));
         }
         StorageCmd::LoadCurrentUid { resp } => {
             let _ = resp.send(store.load_current_uid());

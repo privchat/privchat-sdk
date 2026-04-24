@@ -32,7 +32,9 @@ use privchat_protocol::presence::{
     PresenceBatchStatusRequest, PresenceBatchStatusResponse, PresenceChangedNotification,
     TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
 };
-use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
+use privchat_protocol::rpc::auth::{
+    AuthLoginRequest, AuthRefreshRequest, AuthRefreshResponse, AuthResponse, UserRegisterRequest,
+};
 use privchat_protocol::rpc::contact::friend::FriendPendingResponse;
 use privchat_protocol::rpc::file::upload::{
     FileRequestUploadTokenRequest, FileRequestUploadTokenResponse,
@@ -308,6 +310,10 @@ pub enum ConnectionState {
     Connected,
     LoggedIn,
     Authenticated,
+    /// 服务端判定本次登录态不可自愈（token 过期/撤销/设备不匹配等）。
+    /// SDK 已断开 transport 并禁用自动重连；UI 必须清本地 token 重新登录
+    /// 才能回到 New。本字段从 `ForcedLogout` 事件派生，debug/metrics 可直接读。
+    Terminated,
     Shutdown,
 }
 
@@ -333,6 +339,31 @@ pub enum MediaDownloadState {
     Paused { bytes: u64, total: Option<u64> },
     Done { path: String },
     Failed { code: u32, message: String },
+}
+
+/// `SdkEvent::ForcedLogout` 触发来源。
+/// 前端可据此决定提示语 / 是否清理本地登录态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForcedLogoutSource {
+    /// CONNECT 阶段服务端判定 Terminal（token 过期、设备被踢等）。
+    ConnectAuth,
+    /// 认证后 RPC 调用侧判定 Terminal（e.g. 10000-段 auth-required）。
+    RpcAuth,
+    /// 手动 `authenticate()` 调用拿到 Terminal 错——当前不走自动重连路径，
+    /// 但语义一致，统一走这里给 UI 一个出口。
+    Manual,
+}
+
+/// 最近一次 ForcedLogout 的原因快照，供 debug / metrics / 冷启动诊断使用。
+/// `connect()` 成功后清空；同一次生命周期内只保留最后一次。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalReason {
+    /// `privchat_protocol::ErrorCode` 对应的 u32 码；未携带时为 0。
+    pub code: u32,
+    pub message: String,
+    pub source: ForcedLogoutSource,
+    /// UTC 毫秒时间戳。
+    pub at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -465,6 +496,29 @@ pub enum SdkEvent {
         mime_type: String,
         message_id: u64,
         timeout_ms: u64,
+    },
+    /// Access token 已由 SDK 自动续期成功（Phase B1）。
+    ///
+    /// 不携带 token 内容——token 是敏感凭证，不通过 broadcast 事件扩散。
+    /// 如果宿主需要读取新 access_token（例如拿去调其它业务 HTTP），
+    /// 请调用 `PrivchatSdk::get_current_access_token()` 主动拉取当前权威值。
+    ///
+    /// 宿主**可以**忽略此事件——SDK 内部已原子替换 token 并继续连接，
+    /// 订阅仅用于调试 / metrics / 刷新 UI 上的"会话有效期"显示。
+    TokenRefreshed {
+        /// 新 access_token 的过期时间（Unix 毫秒，服务端下发）。
+        expires_at: u64,
+    },
+    /// 服务端/协议栈判定本次登录态不可自愈（token 过期/撤销、设备不匹配等）。
+    /// SDK 已停止自动重连并断开当前 session，宿主收到该事件后应：
+    /// 1) 清理本地登录态（token / user_id / device_id）；
+    /// 2) 跳回登录页，避免冷启动继续用过期 token。
+    /// 同一次生命周期内 SDK 保证只发一次，由 `State::auth_terminal_fired` 幂等闸门保证。
+    ForcedLogout {
+        /// `privchat_protocol::ErrorCode` 对应的 u32 码；未携带时为 0。
+        code: u32,
+        message: String,
+        source: ForcedLogoutSource,
     },
     ShutdownStarted,
     ShutdownCompleted,
@@ -679,6 +733,82 @@ async fn stop_inbound_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+/// 把一次 Terminal 认证错误收敛成一次 ForcedLogout 事件。
+///
+/// 调用方必须把 `err` 判定为 `is_auth_terminal()` 后再进来；
+/// 本函数只负责 side-effect 编排，不做分类。
+///
+/// 严格顺序：
+/// 1. 幂等闸门 (`auth_terminal_fired`) —— 只触发一次；
+/// 2. 停掉 inbound 任务并 bump `inbound_epoch`，丢弃 mpsc 里任何遗留帧；
+/// 3. 断开 transport（失败不阻塞流程，继续清状态）；
+/// 4. 切 `session_state = Terminated` / 关自动重连 / 清 next_reconnect_at / 重置 backoff；
+/// 5. 记录 `last_terminal_reason`，方便 debug / 冷启动诊断；
+/// 6. emit `SdkEvent::ForcedLogout`——发给 UI 的唯一出口事件。
+///
+/// 我们不在这里再发 `ConnectionStateChanged { to: Terminated }`：
+/// ForcedLogout 本身就是比 Disconnected 更强的 UI 信号；Terminated 状态可通过
+/// `connection_state()` 随时读到，避免 UI 写两套跳转逻辑。
+async fn trigger_forced_logout(
+    state: &mut State,
+    inbound_task: &mut Option<tokio::task::JoinHandle<()>>,
+    actor_event_tx: &broadcast::Sender<SdkEvent>,
+    actor_event_history: &StdMutex<VecDeque<SequencedSdkEvent>>,
+    actor_event_seq: &AtomicU64,
+    event_history_limit: usize,
+    err: &Error,
+    source: ForcedLogoutSource,
+) {
+    if state.auth_terminal_fired {
+        return;
+    }
+    state.auth_terminal_fired = true;
+
+    let code = err.auth_error_code().unwrap_or(0);
+    let message = match err {
+        Error::Auth(msg) => msg.clone(),
+        _ => err.to_string(),
+    };
+
+    eprintln!(
+        "[SDK.actor] forced_logout source={:?} code={} msg={}",
+        source, code, message
+    );
+
+    stop_inbound_task(inbound_task).await;
+    // 即便 abort 了任务，mpsc 里可能还有已发送的 InboundFrame；bump epoch 让
+    // actor loop 下个 tick 比对时丢弃。
+    state.inbound_epoch = state.inbound_epoch.wrapping_add(1);
+
+    if let Err(e) = state.disconnect().await {
+        eprintln!("[SDK.actor] forced_logout disconnect failed: {e}");
+    }
+
+    state.session_state = SessionState::Terminated;
+    state.should_auto_reconnect = false;
+    state.next_reconnect_at = None;
+    state.reset_reconnect_backoff();
+
+    state.last_terminal_reason = Some(TerminalReason {
+        code,
+        message: message.clone(),
+        source,
+        at_ms: chrono::Utc::now().timestamp_millis(),
+    });
+
+    emit_sequenced_event(
+        actor_event_tx,
+        actor_event_history,
+        actor_event_seq,
+        event_history_limit,
+        SdkEvent::ForcedLogout {
+            code,
+            message,
+            source,
+        },
+    );
+}
+
 fn inbound_logs_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("PRIVCHAT_INBOUND_LOG").ok().as_deref() == Some("1"))
@@ -695,11 +825,15 @@ fn actor_logs_enabled() -> bool {
 }
 
 async fn start_inbound_task(
-    state: &State,
+    state: &mut State,
     actor_tx: mpsc::Sender<Command>,
     task: &mut Option<tokio::task::JoinHandle<()>>,
 ) {
     stop_inbound_task(task).await;
+    // 新 inbound 任务 = 新 epoch。任何 stop_inbound_task 之后遗留在 mpsc 队列里的
+    // 旧帧都会被 actor loop 按 epoch 比对丢弃。
+    state.inbound_epoch = state.inbound_epoch.wrapping_add(1);
+    let epoch = state.inbound_epoch;
     let Some(transport) = state.transport.as_ref() else {
         return;
     };
@@ -730,6 +864,7 @@ async fn start_inbound_task(
                     }
                     if actor_tx
                         .send(Command::InboundFrame {
+                            epoch,
                             biz_type,
                             data,
                         })
@@ -741,7 +876,7 @@ async fn start_inbound_task(
                 }
                 Ok(ClientEvent::Disconnected { .. }) => {
                     eprintln!("[SDK.inbound] transport disconnected");
-                    let _ = actor_tx.send(Command::InboundDisconnected).await;
+                    let _ = actor_tx.send(Command::InboundDisconnected { epoch }).await;
                     break;
                 }
                 Ok(_) => {}
@@ -1286,16 +1421,103 @@ pub enum Error {
     Shutdown,
     #[error("invalid state: {0}")]
     InvalidState(String),
+    #[error("server error: reason_code={code} message={message}")]
+    Server { code: u32, message: String },
+}
+
+/// 认证错误分层语义（spec: TOKEN_REFRESH_SPEC §2.1）。
+/// - Terminal → 必须停止一切自动重连，UI 侧强制登出。
+/// - Transient → 网络抖动/服务端瞬时拒绝，交给 reconnect 自愈。
+/// - Recoverable → access token 已过期但 refresh token 仍有效，应走无感续期流程。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthErrorKind {
+    Transient,
+    Recoverable,
+    Terminal,
+}
+
+/// 服务端 AuthorizationResponse.error_code 数字码 → Terminal/Recoverable/Transient 映射。
+/// 未知码保守归 Transient，避免误封锁；显式 Terminal 的都是已明确无法自愈的状态。
+///
+/// 对应 `privchat_protocol::ErrorCode` Authentication 段（10000–10099）：
+/// - 10001 InvalidToken / 10003 TokenRevoked / 10004 PermissionDenied /
+///   10005 SessionExpired / 10006 SessionNotFound / 10007 UserBanned /
+///   10008 IpNotAllowed / 10009 RefreshTokenExpired / 10010 RefreshTokenRevoked
+///   → Terminal
+/// - 10002 TokenExpired（语义：access token 过期，refresh 可救）→ **Recoverable**
+/// - 10000 AuthRequired（RPC 侧信号：缺 / 旧 access token）→ **Recoverable**，
+///   调用方在拿到 Recoverable 后应先走 refresh；refresh 若失败再升级为 Terminal。
+pub fn classify_auth_error_code(code: u32) -> AuthErrorKind {
+    match code {
+        10000   // AuthRequired（RPC 侧）：视为 access token 已失效，尝试 refresh
+        | 10002 // TokenExpired：access token 过期，尝试 refresh
+            => AuthErrorKind::Recoverable,
+        10001  // InvalidToken
+        | 10003 // TokenRevoked
+        | 10004 // PermissionDenied
+        | 10005 // SessionExpired
+        | 10006 // SessionNotFound
+        | 10007 // UserBanned
+        | 10008 // IpNotAllowed
+        | 10009 // RefreshTokenExpired
+        | 10010 // RefreshTokenRevoked
+            => AuthErrorKind::Terminal,
+        _ => AuthErrorKind::Transient,
+    }
+}
+
+/// 从 `Error::Auth` message 里解出前缀 `[<code>] ...` 的数字码。
+/// SDK 约定所有 auth 失败的 message 都以 `[<code>] msg` 形式编码（code 为十进制 u32），
+/// 这样可以保持 `Error::Auth(String)` 结构不变、不破坏 FFI/ABI。
+fn parse_auth_error_code(message: &str) -> Option<u32> {
+    let rest = message.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    rest[..end].parse::<u32>().ok()
 }
 
 impl Error {
+    /// 若本错误是 `Error::Auth`，根据 message 前缀的错误码分层；否则返回 None。
+    pub fn auth_kind(&self) -> Option<AuthErrorKind> {
+        match self {
+            Error::Auth(msg) => Some(
+                parse_auth_error_code(msg)
+                    .map(classify_auth_error_code)
+                    .unwrap_or(AuthErrorKind::Transient),
+            ),
+            _ => None,
+        }
+    }
+
+    /// 是否为 Terminal 认证错误（token 过期/撤销等）——调用方用于决定是否停止重连。
+    pub fn is_auth_terminal(&self) -> bool {
+        matches!(self.auth_kind(), Some(AuthErrorKind::Terminal))
+    }
+
+    /// 从 `Error::Auth` message 里提取原始服务端错误码；没有前缀则返回 None。
+    pub fn auth_error_code(&self) -> Option<u32> {
+        match self {
+            Error::Auth(msg) => parse_auth_error_code(msg),
+            _ => None,
+        }
+    }
+
     /// Whether the failure is transient — queued work should stay in queue
     /// and retry once network/auth recovers, instead of being marked failed.
+    ///
+    /// 规则：
+    /// - 传输层/连接断开 → 可重试（等网络恢复即可）
+    /// - 鉴权错误 → 不可重试，交给 reconnect + re-authenticate 通道处理；
+    ///   原地重试只会把请求反复丢到未授权会话上
+    /// - 服务端业务错误（reason_code != 0）→ 仅白名单里的瞬时码可重试，其余视为永久失败
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Error::Auth(_) | Error::NotConnected | Error::Transport(_)
-        )
+        match self {
+            // Auth 错误不可重试：服务端已明确拒绝（token 过期/session 未建立/挤下线），
+            // 盲目重试只会把同样的请求反复丢到未授权会话上，造成「一直发送中」。
+            // 恢复路径应走 reconnect + re-authenticate，而非让 drain loop 原地重试。
+            Error::NotConnected | Error::Transport(_) => true,
+            Error::Server { code, .. } => is_retryable_server_code(*code),
+            _ => false,
+        }
     }
 
     pub fn sdk_code(&self) -> u32 {
@@ -1308,6 +1530,7 @@ impl Error {
             Error::ActorClosed => error_codes::ACTOR_CLOSED,
             Error::Shutdown => error_codes::SHUTDOWN,
             Error::InvalidState(_) => error_codes::INVALID_STATE,
+            Error::Server { code, .. } => *code,
         }
     }
 
@@ -1321,8 +1544,27 @@ impl Error {
             Error::ActorClosed => ErrorCode::SystemBusy as u32,
             Error::Shutdown => ErrorCode::ServiceUnavailable as u32,
             Error::InvalidState(_) => ErrorCode::OperationNotAllowed as u32,
+            Error::Server { code, .. } => *code,
         }
     }
+}
+
+/// 服务端业务错误码是否可重试（仅瞬时类）。
+/// 其余业务码都视为永久失败 —— 例如 MessageNotFound/InvalidParams/PermissionDenied
+/// 之类的用户态错误，重试只会反复失败，应当出队并标记 failed。
+fn is_retryable_server_code(code: u32) -> bool {
+    matches!(
+        code,
+        x if x == ErrorCode::SystemBusy as u32
+            || x == ErrorCode::ServiceUnavailable as u32
+            || x == ErrorCode::Timeout as u32
+            || x == ErrorCode::Maintenance as u32
+            || x == ErrorCode::DatabaseError as u32
+            || x == ErrorCode::CacheError as u32
+            || x == ErrorCode::NetworkError as u32
+            || x == ErrorCode::RateLimitExceeded as u32
+            || x == ErrorCode::ConcurrentLimitExceeded as u32
+    )
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -1342,6 +1584,15 @@ enum Command {
     GetConnectionState {
         resp: oneshot::Sender<Result<ConnectionState>>,
     },
+    /// 读取最近一次 Terminal 认证错误快照（`None` = 当前没有未清的 ForcedLogout 记录）。
+    GetLastTerminalReason {
+        resp: oneshot::Sender<Result<Option<TerminalReason>>>,
+    },
+    /// 读取当前 access_token（权威值；SDK 内部 refresh 后这里拿到的就是新 token）。
+    /// 未登录时返回 `Ok(None)`。
+    GetCurrentAccessToken {
+        resp: oneshot::Sender<Result<Option<String>>>,
+    },
     Ping {
         resp: oneshot::Sender<Result<()>>,
     },
@@ -1350,10 +1601,15 @@ enum Command {
         resp: oneshot::Sender<Result<()>>,
     },
     InboundFrame {
+        /// `State::inbound_epoch` snapshot taken when the inbound task was spawned;
+        /// actor drops frames whose epoch doesn't match current epoch.
+        epoch: u64,
         biz_type: u8,
         data: Vec<u8>,
     },
-    InboundDisconnected,
+    InboundDisconnected {
+        epoch: u64,
+    },
     SetVideoProcessHook {
         hook: Option<VideoProcessHook>,
         resp: oneshot::Sender<Result<()>>,
@@ -1777,6 +2033,10 @@ enum SessionState {
     Connected,
     LoggedIn,
     Authenticated,
+    /// ForcedLogout 后驻留的终止态：必须由调用方显式 `connect()`/`reset` 才能离开。
+    /// 阻止 auto-reconnect（因为 `session_state != SessionState::New`），
+    /// 同时让 `connection_state()` 直观反映"被强制登出"状态。
+    Terminated,
     Shutdown,
 }
 
@@ -1830,6 +2090,8 @@ impl SessionState {
             (SessionState::Connected, Action::Connect) => Ok(SessionState::Connected),
             (SessionState::LoggedIn, Action::Connect) => Ok(SessionState::Connected),
             (SessionState::Authenticated, Action::Connect) => Ok(SessionState::Connected),
+            // 用户重新登录时需要从 Terminated 走 Connect 出发（SDK 不会自动做）。
+            (SessionState::Terminated, Action::Connect) => Ok(SessionState::Connected),
 
             (SessionState::Connected, Action::Login) => Ok(SessionState::LoggedIn),
             (SessionState::LoggedIn, Action::Login) => Ok(SessionState::LoggedIn),
@@ -1837,12 +2099,18 @@ impl SessionState {
             (SessionState::New, Action::Login) => Err(Error::InvalidState(
                 "login requires connect first".to_string(),
             )),
+            (SessionState::Terminated, Action::Login) => Err(Error::InvalidState(
+                "login requires connect after forced logout".to_string(),
+            )),
 
             (SessionState::Connected, Action::Authenticate) => Ok(SessionState::Authenticated),
             (SessionState::LoggedIn, Action::Authenticate) => Ok(SessionState::Authenticated),
             (SessionState::Authenticated, Action::Authenticate) => Ok(SessionState::Authenticated),
             (SessionState::New, Action::Authenticate) => Err(Error::InvalidState(
                 "authenticate requires connect and login first".to_string(),
+            )),
+            (SessionState::Terminated, Action::Authenticate) => Err(Error::InvalidState(
+                "authenticate requires connect after forced logout".to_string(),
             )),
 
             (_, Action::Shutdown) => Ok(SessionState::Shutdown),
@@ -1855,6 +2123,7 @@ impl SessionState {
             SessionState::Connected => ConnectionState::Connected,
             SessionState::LoggedIn => ConnectionState::LoggedIn,
             SessionState::Authenticated => ConnectionState::Authenticated,
+            SessionState::Terminated => ConnectionState::Terminated,
             SessionState::Shutdown => ConnectionState::Shutdown,
         }
     }
@@ -1871,6 +2140,16 @@ struct State {
     should_auto_reconnect: bool,
     reconnect_attempt: u32,
     next_reconnect_at: Option<Instant>,
+    /// 一次性闸门：Terminal 级认证失败触发后置 true，防止 reconnect/Command 路径
+    /// 重复发 ForcedLogout 或重启 backoff。成功完成 authenticate / login 时重置。
+    auth_terminal_fired: bool,
+    /// 当前 inbound 会话 epoch。每次 `start_inbound_task` 或 `trigger_forced_logout`
+    /// 里显式 bump；actor loop 收到 `InboundFrame` / `InboundDisconnected` 时比对，
+    /// 丢弃上一 epoch 遗留在 mpsc 通道里的帧，做到"冻结旧 inbound"。
+    inbound_epoch: u64,
+    /// 最近一次 Terminal 认证失败的原因。`connect()` 成功后清空。
+    /// 供 debug / metrics / 冷启动诊断使用，不持久化。
+    last_terminal_reason: Option<TerminalReason>,
     network_hint: NetworkHint,
     receive_pipeline: ReceivePipeline,
     last_sync_queued: usize,
@@ -2129,6 +2408,13 @@ impl State {
                     || lowered.contains("channel resync")
                 {
                     ResumeFailureClass::ChannelResyncRequired
+                } else {
+                    ResumeFailureClass::FatalProtocolError
+                }
+            }
+            Error::Server { code, .. } => {
+                if is_retryable_server_code(*code) {
+                    ResumeFailureClass::RetryableTemporaryError
                 } else {
                     ResumeFailureClass::FatalProtocolError
                 }
@@ -4699,6 +4985,20 @@ impl State {
         Ok(uid)
     }
 
+    /// 需要服务端已完成鉴权（ConnAuth 通过）才能执行业务 RPC。
+    /// 之前的 `can(Action::Authenticate)` 是状态机的「可转移到 Authenticated 吗」检查，
+    /// 它在 Connected/LoggedIn 也返回 Ok，导致请求落到未授权会话上被服务端拒。
+    fn require_authenticated(&self) -> Result<()> {
+        match self.session_state {
+            SessionState::Authenticated => Ok(()),
+            SessionState::Shutdown => Err(Error::Shutdown),
+            _ => Err(Error::InvalidState(format!(
+                "operation requires authenticated session (current: {:?})",
+                self.session_state
+            ))),
+        }
+    }
+
     async fn resolve_target(host: &str, port: u16) -> Result<String> {
         let direct = format!("{host}:{port}");
         if direct.parse::<std::net::SocketAddr>().is_ok() {
@@ -4741,11 +5041,11 @@ impl State {
     }
 
     fn should_process_outbound_queue(&self) -> bool {
+        // 只有鉴权完成的 session 才能发业务 RPC；Connected/LoggedIn 都可能跑在
+        // 服务端未授权的通道上（例如重连刚握好 TCP、ConnAuth 还没回），那时 drain
+        // 只会触发 10000 Authentication required。
         self.network_hint.is_online()
-            && matches!(
-                self.session_state,
-                SessionState::Connected | SessionState::LoggedIn | SessionState::Authenticated
-            )
+            && self.session_state == SessionState::Authenticated
             && self.current_uid.is_some()
     }
 
@@ -5225,24 +5525,59 @@ impl State {
             "[SDK.actor] monitor: restoring session user_id={}",
             snapshot.user_id
         );
-        match timeout(
+        let user_id = snapshot.user_id;
+        let device_id = snapshot.device_id.clone();
+        let bootstrap_completed = snapshot.bootstrap_completed;
+        let first_attempt = timeout(
             Duration::from_secs(20),
-            self.authenticate(snapshot.user_id, snapshot.token, snapshot.device_id),
+            self.authenticate(user_id, snapshot.token, device_id.clone()),
         )
-        .await
-        {
-            Ok(Ok(())) => {
-                self.bootstrap_completed = snapshot.bootstrap_completed;
+        .await;
+        let auth_result = match first_attempt {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                // Recoverable（10000 AuthRequired / 10002 AccessTokenExpired）→ 走 refresh，
+                // 成功就用新 access_token 再握一次；refresh 或二次 authenticate 的错误
+                // 原样回滚出去，让外层按 Terminal / Transient 分别处理。
+                if matches!(e.auth_kind(), Some(AuthErrorKind::Recoverable)) {
+                    eprintln!(
+                        "[SDK.actor] monitor: access token recoverable ({e}); attempting refresh"
+                    );
+                    match self.refresh_access_token().await {
+                        Ok(new_access) => {
+                            eprintln!("[SDK.actor] monitor: refresh ok, retry authenticate");
+                            match timeout(
+                                Duration::from_secs(20),
+                                self.authenticate(user_id, new_access, device_id.clone()),
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => Err(Error::Transport(
+                                    "reconnect auth timeout after refresh".to_string(),
+                                )),
+                            }
+                        }
+                        Err(refresh_err) => Err(refresh_err),
+                    }
+                } else {
+                    Err(e)
+                }
+            }
+            Err(_) => Err(Error::Transport("reconnect auth timeout".to_string())),
+        };
+        match auth_result {
+            Ok(()) => {
+                self.bootstrap_completed = bootstrap_completed;
                 eprintln!("[SDK.actor] monitor: session restored");
                 Ok(SessionState::Authenticated)
             }
-            Ok(Err(e)) => {
-                eprintln!("[SDK.actor] monitor: restore auth failed: {e}");
-                Ok(SessionState::Connected)
-            }
-            Err(_) => {
-                eprintln!("[SDK.actor] monitor: restore auth timeout");
-                Ok(SessionState::Connected)
+            Err(e) => {
+                // 新 transport 还留着服务端会视为「未认证会话」，后续 RPC 会被 10000 拒绝。
+                // 主动释放，让监控循环走 backoff 再来一次完整握手。
+                eprintln!("[SDK.actor] monitor: restore auth failed: {e} (dropping transport)");
+                let _ = self.disconnect().await;
+                Err(e)
             }
         }
     }
@@ -5574,31 +5909,133 @@ impl State {
         let auth_resp: AuthorizationResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode auth response: {e}")))?;
         if !auth_resp.success {
-            return Err(Error::Auth(
-                auth_resp
-                    .error_message
-                    .unwrap_or_else(|| "authorization failed".to_string()),
-            ));
+            // 把服务端 error_code（u32）塞进 message 前缀 `[<code>] ...`，供上层 auth_kind() 解出。
+            // 0 表示未携带码，归 Transient。
+            let code = auth_resp.error_code.unwrap_or(0);
+            let message = auth_resp
+                .error_message
+                .unwrap_or_else(|| "authorization failed".to_string());
+            return Err(Error::Auth(format!("[{}] {}", code, message)));
         }
         let uid = user_id.to_string();
-        self.storage
-            .save_login(
-                uid.clone(),
-                LoginResult {
-                    user_id,
-                    token: token_for_persist,
-                    device_id: device_id_for_persist,
-                    refresh_token: None,
-                    expires_at: 0,
-                },
-            )
-            .await?;
+        // authenticate() 的职责只是用当前 access_token 握手；不应覆盖 login/register 写入的
+        // refresh_token 或过期时间。若该用户已有会话，只原子刷新 access_token；否则才走
+        // save_login（用于外部认证首次 handshake，无 refresh_token）。
+        let existing_session = self
+            .storage
+            .load_session(uid.clone())
+            .await
+            .ok()
+            .flatten();
+        if existing_session.is_some() {
+            self.storage
+                .update_access_token(uid.clone(), token_for_persist, None)
+                .await?;
+        } else {
+            self.storage
+                .save_login(
+                    uid.clone(),
+                    LoginResult {
+                        user_id,
+                        token: token_for_persist,
+                        device_id: device_id_for_persist,
+                        refresh_token: None,
+                        expires_at: 0,
+                    },
+                )
+                .await?;
+        }
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] authenticate: success");
         }
         Ok(())
+    }
+
+    /// Phase B1：access token 过期时调用 `account/auth/refresh` 续期。
+    ///
+    /// 成功后原子更新 access_token / expires_at（refresh_token 仅在服务端回传新值时替换，
+    /// 缺失则保留旧值，遵守 TOKEN_REFRESH_SPEC §5 的 non-rotation 契约），并返回新 access_token，
+    /// 供调用方立刻喂给 `authenticate()` 继续握手。
+    ///
+    /// 失败时：Error::Auth 带 10009/10010 → Terminal（由上层触发 ForcedLogout）；
+    /// 传输/5xx → 其它 Error::* → Transient（上层继续 backoff）。
+    async fn refresh_access_token(&mut self) -> Result<String> {
+        eprintln!("[metric] token_refresh_attempt");
+        let result = self.refresh_access_token_inner().await;
+        match &result {
+            Ok(_) => {}
+            Err(e) => {
+                let reason = match e {
+                    Error::Auth(_) => match e.auth_kind() {
+                        Some(AuthErrorKind::Terminal) => "auth_terminal",
+                        Some(AuthErrorKind::Recoverable) => "auth_recoverable",
+                        _ => "auth_transient",
+                    },
+                    Error::Transport(_) => "transport",
+                    Error::Server { .. } => "server",
+                    _ => "other",
+                };
+                eprintln!("[metric] token_refresh_failed reason={reason}");
+            }
+        }
+        result
+    }
+
+    async fn refresh_access_token_inner(&mut self) -> Result<String> {
+        let uid = self
+            .current_uid
+            .clone()
+            .ok_or_else(|| Error::InvalidState("no current uid; cannot refresh".to_string()))?;
+        let refresh_token = self
+            .storage
+            .load_refresh_token(uid.clone())
+            .await?
+            .ok_or_else(|| {
+                // 没有 refresh_token 就和「refresh 已撤销」等价——直接 Terminal
+                Error::Auth(format!("[{}] missing refresh token", 10010))
+            })?;
+        let session = self
+            .storage
+            .load_session(uid.clone())
+            .await?
+            .ok_or_else(|| Error::InvalidState("session missing; cannot refresh".to_string()))?;
+        let req = AuthRefreshRequest {
+            refresh_token,
+            device_id: session.device_id.clone(),
+        };
+        let resp: AuthRefreshResponse = self.rpc_call_typed(routes::auth::REFRESH, &req).await?;
+        self.storage
+            .update_access_token(uid.clone(), resp.access_token.clone(), Some(resp.expires_at))
+            .await?;
+        if resp.refresh_token.is_some() {
+            self.storage
+                .update_refresh_token(uid.clone(), resp.refresh_token.clone())
+                .await?;
+        }
+        self.storage.flush_user(uid).await?;
+        eprintln!(
+            "[metric] token_refresh_success rotated={} expires_at={}",
+            resp.refresh_token.is_some(),
+            resp.expires_at
+        );
+        if let (Some(tx), Some(history), Some(seq)) = (
+            self.event_tx.as_ref(),
+            self.event_history.as_ref(),
+            self.event_seq.as_ref(),
+        ) {
+            emit_sequenced_event(
+                tx,
+                history,
+                seq,
+                self.event_history_limit,
+                SdkEvent::TokenRefreshed {
+                    expires_at: resp.expires_at,
+                },
+            );
+        }
+        Ok(resp.access_token)
     }
 
     async fn sync_entities(&mut self, entity_type: String, scope: Option<String>) -> Result<usize> {
@@ -7124,10 +7561,10 @@ impl State {
         let resp: SendMessageResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode send response: {e}")))?;
         if resp.reason_code != 0 {
-            return Err(Error::Transport(format!(
-                "send message failed: reason_code={}",
-                resp.reason_code
-            )));
+            return Err(Error::Server {
+                code: resp.reason_code,
+                message: format!("send message failed: reason_code={}", resp.reason_code),
+            });
         }
         if resp.server_message_id == 0 {
             return Err(Error::Serialization(
@@ -8334,7 +8771,19 @@ impl State {
         let rpc_resp: RpcResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode rpc response: {e}")))?;
         if rpc_resp.code != 0 {
-            return Err(Error::Auth(rpc_resp.message));
+            // 认证段 (10000-10099) 单独归为 Error::Auth（非 retryable），
+            // 其它 code 交给 is_retryable_server_code 按段判定。
+            let code_u32 = rpc_resp.code as u32;
+            if (10000..10100).contains(&code_u32) {
+                return Err(Error::Auth(format!(
+                    "[{}] {}",
+                    rpc_resp.code, rpc_resp.message
+                )));
+            }
+            return Err(Error::Server {
+                code: code_u32,
+                message: rpc_resp.message,
+            });
         }
         Ok(rpc_resp.data.unwrap_or(serde_json::Value::Null))
     }
@@ -8488,6 +8937,7 @@ impl PrivchatSdk {
                 | SdkEvent::ResumeSyncCompleted { .. }
                 | SdkEvent::ResumeSyncFailed { .. }
                 | SdkEvent::ResumeSyncEscalated { .. }
+                | SdkEvent::ForcedLogout { .. }
         )
     }
 
@@ -8576,6 +9026,9 @@ impl PrivchatSdk {
                 should_auto_reconnect: false,
                 reconnect_attempt: 0,
                 next_reconnect_at: None,
+                auth_terminal_fired: false,
+                inbound_epoch: 0,
+                last_terminal_reason: None,
                 network_hint: NetworkHint::Unknown,
                 receive_pipeline: ReceivePipeline::default(),
                 last_sync_queued: 0,
@@ -8690,8 +9143,10 @@ impl PrivchatSdk {
                             Ok(next) => {
                                 state.session_state = next;
                                 state.reset_reconnect_backoff();
+                                // 握手 + 认证全通了，解除 Terminal 闸门，后续如果再过期还能再触发一次。
+                                state.auth_terminal_fired = false;
                                 eprintln!("[SDK.actor] auto_reconnect_result ok attempt=#{attempt_n}");
-                                start_inbound_task(&state, actor_cmd_tx.clone(), &mut inbound_task)
+                                start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
                                     .await;
                                 if state.session_state == SessionState::Authenticated
                                     && state.bootstrap_completed
@@ -8711,9 +9166,27 @@ impl PrivchatSdk {
                                     },
                                 );
                             }
-                            Err(_) => {
+                            Err(e) => {
                                 eprintln!("[SDK.actor] auto_reconnect_result fail attempt=#{attempt_n}");
-                                state.schedule_next_reconnect();
+                                if e.is_auth_terminal() {
+                                    // Terminal 认证错误（token 过期/撤销/设备不匹配等）由
+                                    // trigger_forced_logout 统一收口：停 inbound、断 transport、
+                                    // 清状态、发 ForcedLogout。继续自动重连只会把过期 token 反复
+                                    // 投给服务端打满日志。
+                                    trigger_forced_logout(
+                                        &mut state,
+                                        &mut inbound_task,
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        &e,
+                                        ForcedLogoutSource::ConnectAuth,
+                                    )
+                                    .await;
+                                } else {
+                                    state.schedule_next_reconnect();
+                                }
                             }
                         }
                     }
@@ -8749,7 +9222,12 @@ impl PrivchatSdk {
                             };
                             if result.is_ok() {
                                 state.reset_reconnect_backoff();
-                                start_inbound_task(&state, actor_cmd_tx.clone(), &mut inbound_task)
+                                // 用户主动 Connect 成功 = 新的登录回合。清 Terminal 闸门
+                                // 和上一轮 terminal reason，让后续 Authenticate 若再遇到
+                                // Terminal 错可以再次触发 ForcedLogout。
+                                state.auth_terminal_fired = false;
+                                state.last_terminal_reason = None;
+                                start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
                                     .await;
                                 emit_sequenced_event(
                                     &actor_event_tx,
@@ -8822,6 +9300,16 @@ impl PrivchatSdk {
                         }
                         let _ = resp.send(Ok(state.session_state.as_connection_state()));
                     }
+                    Command::GetCurrentAccessToken { resp } => {
+                        let token = match state.current_uid.clone() {
+                            Some(uid) => state.storage.load_access_token(uid).await,
+                            None => Ok(None),
+                        };
+                        let _ = resp.send(token);
+                    }
+                    Command::GetLastTerminalReason { resp } => {
+                        let _ = resp.send(Ok(state.last_terminal_reason.clone()));
+                    }
                     Command::Ping { resp } => {
                         let result = if state.probe_connection().await {
                             Ok(())
@@ -8868,7 +9356,12 @@ impl PrivchatSdk {
                         }
                         let _ = resp.send(Ok(()));
                     }
-                    Command::InboundFrame { biz_type, data } => {
+                    Command::InboundFrame { epoch, biz_type, data } => {
+                        // 丢弃旧 inbound 任务遗留的帧（例如 ForcedLogout 发生时已 stop，
+                        // 但 mpsc 通道里可能还有 pending 帧）。
+                        if epoch != state.inbound_epoch {
+                            continue;
+                        }
                         match state.handle_inbound_frame(biz_type, data).await {
                             Ok(applied) if applied > 0 => {
                                 for evt in state.last_sync_entity_events.clone() {
@@ -8887,7 +9380,10 @@ impl PrivchatSdk {
                             }
                         }
                     }
-                    Command::InboundDisconnected => {
+                    Command::InboundDisconnected { epoch } => {
+                        if epoch != state.inbound_epoch {
+                            continue;
+                        }
                         stop_inbound_task(&mut inbound_task).await;
                         if let Some((from, to)) = state.apply_transport_health(false) {
                             emit_sequenced_event(
@@ -9017,6 +9513,8 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
+                            // 新 token 生效，解除 Terminal 闸门。
+                            state.auth_terminal_fired = false;
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -9027,6 +9525,22 @@ impl PrivchatSdk {
                                     to: state.session_state.as_connection_state(),
                                 },
                             );
+                        } else if let Err(ref e) = result {
+                            // 手动 authenticate 拿到 Terminal 错：和 retry_sleep 分支同走 forced_logout，
+                            // UI 会收到 ForcedLogout 事件，走清 token + 回登录页流程。
+                            if e.is_auth_terminal() {
+                                trigger_forced_logout(
+                                    &mut state,
+                                    &mut inbound_task,
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    e,
+                                    ForcedLogoutSource::Manual,
+                                )
+                                .await;
+                            }
                         }
                         let _ = resp.send(result);
                     }
@@ -9090,8 +9604,8 @@ impl PrivchatSdk {
                         channel_type,
                         resp,
                     } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => match timeout(
+                        let result = match state.require_authenticated() {
+                            Ok(()) => match timeout(
                                 Duration::from_secs(30),
                                 state.sync_channel(channel_id, channel_type),
                             )
@@ -9120,8 +9634,8 @@ impl PrivchatSdk {
                         }
                     }
                     Command::SyncAllChannels { resp } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => {
+                        let result = match state.require_authenticated() {
+                            Ok(()) => {
                                 match timeout(Duration::from_secs(30), state.sync_all_channels())
                                     .await
                                 {
@@ -9147,8 +9661,8 @@ impl PrivchatSdk {
                         }
                     }
                     Command::BatchGetPresence { user_ids, resp } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => match timeout(
+                        let result = match state.require_authenticated() {
+                            Ok(()) => match timeout(
                                 Duration::from_secs(15),
                                 state.batch_get_presence(user_ids),
                             )
@@ -9170,8 +9684,8 @@ impl PrivchatSdk {
                         action_type,
                         resp,
                     } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => match timeout(
+                        let result = match state.require_authenticated() {
+                            Ok(()) => match timeout(
                                 Duration::from_secs(10),
                                 state.send_typing(channel_id, channel_type, is_typing, action_type),
                             )
@@ -9198,8 +9712,8 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::Subscribe { channel_id, channel_type, token, resp } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => match timeout(
+                        let result = match state.require_authenticated() {
+                            Ok(()) => match timeout(
                                 Duration::from_secs(10),
                                 state.subscribe_channel(channel_id, channel_type, token),
                             )
@@ -9213,8 +9727,8 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::Unsubscribe { channel_id, channel_type, resp } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => match timeout(
+                        let result = match state.require_authenticated() {
+                            Ok(()) => match timeout(
                                 Duration::from_secs(10),
                                 state.unsubscribe_channel(channel_id, channel_type),
                             )
@@ -9232,8 +9746,8 @@ impl PrivchatSdk {
                         body_json,
                         resp,
                     } => {
-                        let result = match state.session_state.can(Action::Authenticate) {
-                            Ok(_) => {
+                        let result = match state.require_authenticated() {
+                            Ok(()) => {
                                 let parsed_body = serde_json::from_str::<serde_json::Value>(
                                     &body_json,
                                 )
@@ -10730,6 +11244,35 @@ impl PrivchatSdk {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::GetConnectionState { resp: resp_tx })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 读取最近一次 Terminal 认证错误原因（ForcedLogout 快照）。
+    /// `Connect` 成功后清空，可用于宿主冷启动诊断 / debug UI。
+    pub async fn last_terminal_reason(&self) -> Result<Option<TerminalReason>> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::GetLastTerminalReason { resp: resp_tx })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 读取当前 access_token——SDK 内部 refresh 后拿到的就是最新权威值。
+    ///
+    /// 典型用法：宿主需要拿 access_token 调其它业务 HTTP API 时，**每次临用临取**，
+    /// 不要在宿主侧缓存；订阅 `SdkEvent::TokenRefreshed` 仅用于 UI 状态更新，
+    /// 真正要使用 token 时再调一次本方法，保证拿到的是最新值。
+    ///
+    /// 未登录时返回 `Ok(None)`。
+    pub async fn get_current_access_token(&self) -> Result<Option<String>> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::GetCurrentAccessToken { resp: resp_tx })
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
@@ -12679,6 +13222,9 @@ mod tests {
             should_auto_reconnect: false,
             reconnect_attempt: 0,
             next_reconnect_at: None,
+            auth_terminal_fired: false,
+            inbound_epoch: 0,
+            last_terminal_reason: None,
             network_hint: NetworkHint::Unknown,
             receive_pipeline: ReceivePipeline::default(),
             last_sync_queued: 0,

@@ -227,6 +227,9 @@ async fn main() {
             searchable_word: "hello".to_string(),
             setting: 0,
             extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
         })
         .await
     {
@@ -251,35 +254,11 @@ async fn main() {
         eprintln!("[basic] update_message_status failed: {e}");
         std::process::exit(12);
     }
-    if let Err(e) = client.set_message_read(message_id, 1, 1, false).await {
-        eprintln!("[basic] set_message_read(false) failed: {e}");
-        std::process::exit(24);
-    }
-    let unread = match client.get_channel_unread_count(1, 1).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[basic] get_channel_unread_count failed: {e}");
-            std::process::exit(25);
-        }
-    };
-    if unread <= 0 {
-        eprintln!("[basic] expected unread > 0 after set_message_read(false), got {unread}");
-        std::process::exit(26);
-    }
-    if let Err(e) = client.mark_channel_read(1, 1).await {
-        eprintln!("[basic] mark_channel_read failed: {e}");
-        std::process::exit(27);
-    }
-    let unread_after = match client.get_channel_unread_count(1, 1).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[basic] get_channel_unread_count(after) failed: {e}");
-            std::process::exit(28);
-        }
-    };
-    if unread_after != 0 {
-        eprintln!("[basic] expected unread_after=0, got {unread_after}");
-        std::process::exit(29);
+    // 注：原先的 set_message_read/mark_channel_read 已在 PTS 重构中下线，
+    // 只保留 get_channel_unread_count 的健康检查，避免 smoke 对已删 API 的依赖。
+    if let Err(e) = client.get_channel_unread_count(1, 1).await {
+        eprintln!("[basic] get_channel_unread_count failed: {e}");
+        std::process::exit(25);
     }
     let paths = match client.user_storage_paths().await {
         Ok(v) => v,

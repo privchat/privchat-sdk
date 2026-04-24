@@ -80,6 +80,7 @@ use privchat_sdk::{
     StoredGroupMember as SdkStoredGroupMember, StoredMessage as SdkStoredMessage,
     StoredMessageExtra as SdkStoredMessageExtra, StoredMessageReaction as SdkStoredMessageReaction,
     StoredReminder as SdkStoredReminder, StoredUser as SdkStoredUser,
+    TerminalReason as SdkTerminalReason,
     TransportProtocol as SdkProtocol, TypingActionType as SdkTypingActionType,
     UnreadMentionCount as SdkUnreadMentionCount, UpsertBlacklistInput as SdkUpsertBlacklistInput,
     UpsertChannelExtraInput as SdkUpsertChannelExtraInput,
@@ -643,6 +644,31 @@ pub struct SendMessageOptionsInput {
     pub options_json: Option<String>,
 }
 
+/// Kotlin 侧 `buildJsonObject` 写入的 options JSON 字段。
+/// ULong 经 Kotlin 的 `JsonPrimitive(toString())` 包装为字符串，所以这里两种都要兼容。
+#[derive(Debug, Default, serde::Deserialize)]
+struct SendMessageOptionsPayload {
+    #[serde(default)]
+    in_reply_to_message_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_list")]
+    mentions: Vec<u64>,
+}
+
+fn deserialize_u64_list<'de, D>(deserializer: D) -> Result<Vec<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let raw = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?.unwrap_or_default();
+    raw.into_iter()
+        .map(|v| match v {
+            serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| D::Error::custom("mentions: not a u64")),
+            serde_json::Value::String(s) => s.parse::<u64>().map_err(D::Error::custom),
+            _ => Err(D::Error::custom("mentions: expected number or string")),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GroupInfoView {
     pub group_id: u64,
@@ -979,6 +1005,9 @@ pub enum ConnectionState {
     Connected,
     LoggedIn,
     Authenticated,
+    /// 服务端判定本次登录态不可自愈（token 过期/撤销/设备不匹配）。
+    /// SDK 已断开并停止自动重连；UI 必须重新登录才能回到 New。
+    Terminated,
     Shutdown,
 }
 
@@ -1015,6 +1044,22 @@ pub enum MediaDownloadState {
     Paused { bytes: u64, total: Option<u64> },
     Done { path: String },
     Failed { code: u32, message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ForcedLogoutSource {
+    ConnectAuth,
+    RpcAuth,
+    Manual,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalReason {
+    /// `privchat_protocol::ErrorCode` 对应的 u32 码；未携带时为 0。
+    pub code: u32,
+    pub message: String,
+    pub source: ForcedLogoutSource,
+    pub at_ms: i64,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -1142,6 +1187,18 @@ pub enum SdkEvent {
         mime_type: String,
         message_id: u64,
         timeout_ms: u64,
+    },
+    /// Access token 已由 SDK 自动续期成功。不携带 token 内容——宿主如需使用，
+    /// 请调用 `PrivchatSdk::get_current_access_token()` 主动拉取。
+    TokenRefreshed {
+        /// 新 access_token 过期时间（Unix 毫秒，服务端下发）。
+        expires_at: u64,
+    },
+    ForcedLogout {
+        /// `privchat_protocol::ErrorCode` 对应的 u32 码；未携带时为 0。
+        code: u32,
+        message: String,
+        source: ForcedLogoutSource,
     },
     ShutdownStarted,
     ShutdownCompleted,
@@ -1291,6 +1348,10 @@ pub struct StoredMessage {
     pub thumb_status: i32,
     pub delivered: bool,
     pub pts: Option<u64>,
+    /// 引用消息的 server_message_id（envelope.reply_to_message_id）
+    pub reply_to_message_id: Option<String>,
+    /// @ 提及的用户 ID 列表（envelope.mentioned_user_ids）
+    pub mentioned_user_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1666,6 +1727,7 @@ fn map_connection_state(v: SdkConnectionState) -> ConnectionState {
         SdkConnectionState::Connected => ConnectionState::Connected,
         SdkConnectionState::LoggedIn => ConnectionState::LoggedIn,
         SdkConnectionState::Authenticated => ConnectionState::Authenticated,
+        SdkConnectionState::Terminated => ConnectionState::Terminated,
         SdkConnectionState::Shutdown => ConnectionState::Shutdown,
     }
 }
@@ -2013,8 +2075,37 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             message_id,
             timeout_ms,
         },
+        privchat_sdk::SdkEvent::TokenRefreshed { expires_at } => {
+            SdkEvent::TokenRefreshed { expires_at }
+        }
+        privchat_sdk::SdkEvent::ForcedLogout {
+            code,
+            message,
+            source,
+        } => SdkEvent::ForcedLogout {
+            code,
+            message,
+            source: map_forced_logout_source(source),
+        },
         privchat_sdk::SdkEvent::ShutdownStarted => SdkEvent::ShutdownStarted,
         privchat_sdk::SdkEvent::ShutdownCompleted => SdkEvent::ShutdownCompleted,
+    }
+}
+
+fn map_forced_logout_source(v: privchat_sdk::ForcedLogoutSource) -> ForcedLogoutSource {
+    match v {
+        privchat_sdk::ForcedLogoutSource::ConnectAuth => ForcedLogoutSource::ConnectAuth,
+        privchat_sdk::ForcedLogoutSource::RpcAuth => ForcedLogoutSource::RpcAuth,
+        privchat_sdk::ForcedLogoutSource::Manual => ForcedLogoutSource::Manual,
+    }
+}
+
+fn map_terminal_reason(v: SdkTerminalReason) -> TerminalReason {
+    TerminalReason {
+        code: v.code,
+        message: v.message,
+        source: map_forced_logout_source(v.source),
+        at_ms: v.at_ms,
     }
 }
 
@@ -2282,8 +2373,30 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "message_id": message_id,
             "timeout_ms": timeout_ms
         }),
+        SdkEvent::TokenRefreshed { expires_at } => json!({
+            "type": "token_refreshed",
+            "expires_at": expires_at
+        }),
+        SdkEvent::ForcedLogout {
+            code,
+            message,
+            source,
+        } => json!({
+            "type": "forced_logout",
+            "code": code,
+            "message": message,
+            "source": forced_logout_source_to_json(source)
+        }),
         SdkEvent::ShutdownStarted => json!({ "type": "shutdown_started" }),
         SdkEvent::ShutdownCompleted => json!({ "type": "shutdown_completed" }),
+    }
+}
+
+fn forced_logout_source_to_json(source: &ForcedLogoutSource) -> &'static str {
+    match source {
+        ForcedLogoutSource::ConnectAuth => "connect_auth",
+        ForcedLogoutSource::RpcAuth => "rpc_auth",
+        ForcedLogoutSource::Manual => "manual",
     }
 }
 
@@ -2342,6 +2455,8 @@ fn is_network_event(evt: &SdkEvent) -> bool {
             | SdkEvent::ResumeSyncCompleted { .. }
             | SdkEvent::ResumeSyncFailed { .. }
             | SdkEvent::ResumeSyncEscalated { .. }
+            | SdkEvent::TokenRefreshed { .. }
+            | SdkEvent::ForcedLogout { .. }
     )
 }
 
@@ -2426,6 +2541,16 @@ fn map_upsert_channel_extra(v: UpsertChannelExtraInput) -> SdkUpsertChannelExtra
 }
 
 fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
+    let (display_content, mut reply_to_message_id, mut mentioned_user_ids) =
+        extract_envelope_fields(&v.content);
+    // Inbound sync pipeline stores the plain text in `content` and the full envelope JSON
+    // in `extra`. Fall back to parsing `extra` when envelope fields are absent from content,
+    // so reply/mention metadata survives the push → sync → storage round trip.
+    if reply_to_message_id.is_none() && mentioned_user_ids.is_empty() && !v.extra.is_empty() {
+        let (_, extra_reply, extra_mentions) = extract_envelope_fields(&v.extra);
+        reply_to_message_id = extra_reply;
+        mentioned_user_ids = extra_mentions;
+    }
     StoredMessage {
         message_id: v.message_id,
         server_message_id: v.server_message_id,
@@ -2434,7 +2559,7 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
         channel_type: v.channel_type,
         from_uid: v.from_uid,
         message_type: v.message_type,
-        content: v.content,
+        content: display_content,
         status: v.status,
         created_at: v.created_at,
         updated_at: v.updated_at,
@@ -2446,6 +2571,46 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
         thumb_status: v.thumb_status,
         delivered: v.delivered,
         pts: v.pts,
+        reply_to_message_id,
+        mentioned_user_ids,
+    }
+}
+
+/// 将存储层原始 content 字符串解析成 (显示文本, reply_to, mentions)。
+///
+/// - 若 content 是 `MessagePayloadEnvelope` JSON（带 `content`/`reply_to_message_id`/
+///   `mentioned_user_ids` 等键），提取 envelope.content 作为显示文本，并透出引用 / mention。
+/// - 否则原样返回 content（纯文本或旧消息）。
+fn extract_envelope_fields(raw: &str) -> (String, Option<String>, Vec<u64>) {
+    use privchat_protocol::message::MessagePayloadEnvelope;
+    if raw.is_empty() {
+        return (String::new(), None, Vec::new());
+    }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => {
+            let looks_like_envelope = value
+                .as_object()
+                .map(|obj| {
+                    obj.contains_key("content")
+                        && (obj.contains_key("metadata")
+                            || obj.contains_key("reply_to_message_id")
+                            || obj.contains_key("mentioned_user_ids")
+                            || obj.contains_key("message_source"))
+                })
+                .unwrap_or(false);
+            if !looks_like_envelope {
+                return (raw.to_string(), None, Vec::new());
+            }
+            match serde_json::from_value::<MessagePayloadEnvelope>(value) {
+                Ok(env) => (
+                    env.content,
+                    env.reply_to_message_id,
+                    env.mentioned_user_ids.unwrap_or_default(),
+                ),
+                Err(_) => (raw.to_string(), None, Vec::new()),
+            }
+        }
+        Err(_) => (raw.to_string(), None, Vec::new()),
     }
 }
 
@@ -2826,6 +2991,7 @@ pub struct PrivchatClient {
     on_typing_indicator_registered: Arc<AtomicBool>,
     video_process_hook_registered: Arc<AtomicBool>,
     event_poll_count: Arc<AtomicU64>,
+    event_envelope_cursor: Arc<AtomicU64>,
 }
 
 #[uniffi::export]
@@ -2850,6 +3016,7 @@ impl PrivchatClient {
         let on_typing_indicator_registered = Arc::new(AtomicBool::new(false));
         let video_process_hook_registered = Arc::new(AtomicBool::new(false));
         let event_poll_count = Arc::new(AtomicU64::new(0));
+        let event_envelope_cursor = Arc::new(AtomicU64::new(inner.last_event_sequence_id()));
         Ok(Self {
             inner,
             event_rx,
@@ -2868,6 +3035,7 @@ impl PrivchatClient {
             on_typing_indicator_registered,
             video_process_hook_registered,
             event_poll_count,
+            event_envelope_cursor,
         })
     }
 
@@ -2960,6 +3128,26 @@ impl PrivchatClient {
         Ok(map_connection_state(state))
     }
 
+    /// 读取最近一次 Terminal 认证错误快照。
+    /// `None` 表示当前没有未清的 ForcedLogout 记录（例如已成功 Connect 一次）。
+    pub async fn last_terminal_reason(&self) -> Result<Option<TerminalReason>, PrivchatFfiError> {
+        let value = self
+            .inner
+            .last_terminal_reason()
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(value.map(map_terminal_reason))
+    }
+
+    /// 读取当前会话的 access token（只读拉取模式）。
+    /// SDK 权威地管理 token；app 层通常无需直接使用，仅在需要透传给外部服务时调用。
+    pub async fn get_current_access_token(&self) -> Result<Option<String>, PrivchatFfiError> {
+        self.inner
+            .get_current_access_token()
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn set_network_hint(&self, hint: NetworkHint) -> Result<(), PrivchatFfiError> {
         self.inner
             .set_network_hint(map_network_hint(hint))
@@ -3034,11 +3222,13 @@ impl PrivchatClient {
         timeout_ms: u64,
     ) -> Result<Option<SequencedSdkEvent>, PrivchatFfiError> {
         self.event_poll_count.fetch_add(1, Ordering::Relaxed);
-        let before_seq = self.inner.last_event_sequence_id();
         let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Some(evt) = self.inner.events_since(before_seq, 1).into_iter().next() {
+            let cursor = self.event_envelope_cursor.load(Ordering::Acquire);
+            if let Some(evt) = self.inner.events_since(cursor, 1).into_iter().next() {
+                self.event_envelope_cursor
+                    .store(evt.sequence_id, Ordering::Release);
                 return Ok(Some(map_sequenced_sdk_event(evt)));
             }
             let remain = deadline.saturating_duration_since(std::time::Instant::now());
@@ -3369,6 +3559,7 @@ impl PrivchatClient {
             ConnectionState::Connected => "connected",
             ConnectionState::LoggedIn => "logged_in",
             ConnectionState::Authenticated => "authenticated",
+            ConnectionState::Terminated => "terminated",
             ConnectionState::Shutdown => "shutdown",
         };
         let user_id = snapshot.as_ref().map(|v| v.user_id).unwrap_or(0);
@@ -6202,9 +6393,33 @@ impl PrivchatClient {
 
     pub async fn send_message_with_options(
         &self,
-        input: NewMessage,
-        _options: SendMessageOptionsInput,
+        mut input: NewMessage,
+        options: SendMessageOptionsInput,
     ) -> Result<u64, PrivchatFfiError> {
+        if let Some(raw) = options.options_json.as_deref() {
+            if let Ok(parsed) = serde_json::from_str::<SendMessageOptionsPayload>(raw) {
+                let has_reply = parsed
+                    .in_reply_to_message_id
+                    .as_ref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                let has_mentions = !parsed.mentions.is_empty();
+                if has_reply || has_mentions {
+                    let envelope = privchat_protocol::message::MessagePayloadEnvelope {
+                        content: input.content.clone(),
+                        metadata: None,
+                        reply_to_message_id: parsed
+                            .in_reply_to_message_id
+                            .filter(|s| !s.is_empty()),
+                        mentioned_user_ids: if has_mentions { Some(parsed.mentions) } else { None },
+                        message_source: None,
+                    };
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        input.content = json;
+                    }
+                }
+            }
+        }
         self.send_message_with_input(input).await
     }
 
