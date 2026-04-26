@@ -5931,6 +5931,9 @@ impl State {
             self.storage
                 .update_access_token(uid.clone(), token_for_persist, None)
                 .await?;
+            // update_access_token 不写 K_CUR_UID；与 save_login 分支保持一致，确保磁盘 current_uid
+            // 与本次 authenticate 的 uid 对齐，避免后续 with_uid! 命令读到 None。
+            self.storage.save_current_uid(uid.clone()).await?;
         } else {
             self.storage
                 .save_login(
