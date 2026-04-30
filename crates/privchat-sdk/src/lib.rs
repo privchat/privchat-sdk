@@ -8203,10 +8203,23 @@ impl State {
                 status, text
             )));
         }
-        let value = response
+        let envelope = response
             .json::<serde_json::Value>()
             .await
             .map_err(|e| Error::Serialization(format!("decode upload response: {e}")))?;
+        // server `SERVICE_RESPONSE_ENVELOPE_SPEC` v1.1：所有 HTTP 接口统一 `{code, message, data}`。
+        // upload 响应也走信封；业务字段在 `data` 子对象里。
+        let code = envelope.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
+        if code != 0 {
+            let message = envelope
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("upload failed");
+            return Err(Error::Transport(format!(
+                "upload failed: code={code} message={message}"
+            )));
+        }
+        let value = envelope.get("data").cloned().unwrap_or(envelope);
         let file_id = value
             .get("file_id")
             .and_then(|v| {
