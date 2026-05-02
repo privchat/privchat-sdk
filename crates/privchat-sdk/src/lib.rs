@@ -27,7 +27,8 @@ use msgtrans::protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfi
 use msgtrans::transport::client::{TransportClient, TransportClientBuilder};
 use msgtrans::transport::TransportOptions;
 use msgtrans::ClientEvent;
-use privchat_protocol::message::MessagePayloadEnvelope;
+use privchat_protocol::message::LocalMessagePayloadEnvelope;
+use privchat_protocol::MessagePayloadEnvelope;
 use privchat_protocol::presence::{
     PresenceBatchStatusRequest, PresenceBatchStatusResponse, PresenceChangedNotification,
     TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
@@ -3017,11 +3018,11 @@ impl State {
             match decode_message::<RpcRequest>(&payload) {
                 Ok(req) => {
                     let body_preview = {
-                        let s = req.body.to_string();
+                        let s = String::from_utf8_lossy(&req.body);
                         if s.len() > 8192 {
                             format!("{}...", &s[..8192])
                         } else {
-                            s
+                            s.into_owned()
                         }
                     };
                     eprintln!(
@@ -3059,11 +3060,11 @@ impl State {
                                 .data
                                 .as_ref()
                                 .map(|v| {
-                                    let s = v.to_string();
+                                    let s = String::from_utf8_lossy(v);
                                     if s.len() > 8192 {
                                         format!("{}...", &s[..8192])
                                     } else {
-                                        s
+                                        s.into_owned()
                                     }
                                 })
                                 .unwrap_or_else(|| "null".to_string());
@@ -3754,6 +3755,9 @@ impl State {
                 if let Ok(v) = decode_message::<RpcResponse>(data) {
                     eprintln!("[SDK.inbound] decoded RpcResponse: {:?}", v);
                 }
+            }
+            MessageType::Unknown => {
+                eprintln!("[SDK.inbound] unknown message type, len={}", data.len());
             }
         }
     }
@@ -5713,7 +5717,7 @@ impl State {
         let app_id = default_app_id(&os);
         let req = RpcRequest {
             route: "account/auth/login".to_string(),
-            body: serde_json::to_value(AuthLoginRequest {
+            body: serde_json::to_vec(&AuthLoginRequest {
                 username,
                 password,
                 device_id: device_id.clone(),
@@ -5753,7 +5757,7 @@ impl State {
         let body = rpc_resp
             .data
             .ok_or_else(|| Error::Serialization("empty rpc data".into()))?;
-        let auth: AuthResponse = serde_json::from_value(body)
+        let auth: AuthResponse = serde_json::from_slice(&body)
             .map_err(|e| Error::Serialization(format!("decode auth response: {e}")))?;
 
         let out = LoginResult {
@@ -5790,7 +5794,7 @@ impl State {
         let app_id = default_app_id(&os);
         let req = RpcRequest {
             route: routes::account_user::REGISTER.to_string(),
-            body: serde_json::to_value(UserRegisterRequest {
+            body: serde_json::to_vec(&UserRegisterRequest {
                 username,
                 password,
                 nickname: None,
@@ -5831,7 +5835,7 @@ impl State {
         let body = rpc_resp
             .data
             .ok_or_else(|| Error::Serialization("empty register data".into()))?;
-        let auth: AuthResponse = serde_json::from_value(body)
+        let auth: AuthResponse = serde_json::from_slice(&body)
             .map_err(|e| Error::Serialization(format!("decode register auth response: {e}")))?;
         let out = LoginResult {
             user_id: auth.user_id,
@@ -6075,7 +6079,7 @@ impl State {
             };
             let request = RpcRequest {
                 route: privchat_protocol::rpc::routes::entity::SYNC_ENTITIES.to_string(),
-                body: serde_json::to_value(req)
+                body: serde_json::to_vec(&req)
                     .map_err(|e| Error::Serialization(format!("encode sync_entities body: {e}")))?,
             };
             let payload = encode_message(&request)
@@ -6095,11 +6099,11 @@ impl State {
                     .data
                     .as_ref()
                     .map(|v| {
-                        let s = v.to_string();
+                        let s = String::from_utf8_lossy(v);
                         if s.len() > 512 {
                             format!("{}...", &s[..512])
                         } else {
-                            s
+                            s.into_owned()
                         }
                     })
                     .unwrap_or_else(|| "<none>".to_string());
@@ -6129,7 +6133,7 @@ impl State {
                 .data
                 .ok_or_else(|| Error::Serialization("empty sync_entities data".into()))?;
             let response: privchat_protocol::rpc::sync::SyncEntitiesResponse =
-                serde_json::from_value(body).map_err(|e| {
+                serde_json::from_slice(&body).map_err(|e| {
                     Error::Serialization(format!("decode sync_entities response: {e}"))
                 })?;
             if let Some(min_version) = response.min_version {
@@ -6208,7 +6212,7 @@ impl State {
         let ready_req = privchat_protocol::rpc::sync::SessionReadyRequest {};
         let ready_rpc = RpcRequest {
             route: routes::sync::SESSION_READY.to_string(),
-            body: serde_json::to_value(ready_req)
+            body: serde_json::to_vec(&ready_req)
                 .map_err(|e| Error::Serialization(format!("encode session_ready body: {e}")))?,
         };
         let payload = encode_message(&ready_rpc)
@@ -6234,7 +6238,7 @@ impl State {
             .data
             .ok_or_else(|| Error::Serialization("empty session_ready data".into()))?;
         let ready_ok: privchat_protocol::rpc::sync::SessionReadyResponse =
-            serde_json::from_value(body)
+            serde_json::from_slice(&body)
                 .map_err(|e| Error::Serialization(format!("decode session_ready response: {e}")))?;
         if !ready_ok {
             return Err(Error::InvalidState(
@@ -6260,7 +6264,7 @@ impl State {
         };
         let request = RpcRequest {
             route: routes::sync::GET_DIFFERENCE.to_string(),
-            body: serde_json::to_value(req)
+            body: serde_json::to_vec(&req)
                 .map_err(|e| Error::Serialization(format!("encode get_difference body: {e}")))?,
         };
         let payload = encode_message(&request)
@@ -6288,7 +6292,7 @@ impl State {
         let body = rpc_resp
             .data
             .ok_or_else(|| Error::Serialization("empty get_difference data".into()))?;
-        serde_json::from_value(body)
+        serde_json::from_slice(&body)
             .map_err(|e| Error::Serialization(format!("decode get_difference response: {e}")))
     }
 
@@ -6300,7 +6304,7 @@ impl State {
         };
         let request = RpcRequest {
             route: routes::sync::GET_CHANNEL_PTS.to_string(),
-            body: serde_json::to_value(req)
+            body: serde_json::to_vec(&req)
                 .map_err(|e| Error::Serialization(format!("encode get_channel_pts body: {e}")))?,
         };
         let payload = encode_message(&request)
@@ -6328,7 +6332,7 @@ impl State {
         let body = rpc_resp
             .data
             .ok_or_else(|| Error::Serialization("empty get_channel_pts data".into()))?;
-        let resp: GetChannelPtsResponse = serde_json::from_value(body)
+        let resp: GetChannelPtsResponse = serde_json::from_slice(&body)
             .map_err(|e| Error::Serialization(format!("decode get_channel_pts response: {e}")))?;
         Ok(resp.current_pts)
     }
@@ -7304,7 +7308,7 @@ impl State {
         let req = PresenceBatchStatusRequest { user_ids };
         let request = RpcRequest {
             route: routes::presence::STATUS_GET.to_string(),
-            body: serde_json::to_value(req).map_err(|e| {
+            body: serde_json::to_vec(&req).map_err(|e| {
                 Error::Serialization(format!("encode batch_get_presence body: {e}"))
             })?,
         };
@@ -7326,7 +7330,7 @@ impl State {
         let body = rpc_resp
             .data
             .ok_or_else(|| Error::Serialization("empty batch_get_presence data".into()))?;
-        let response: PresenceBatchStatusResponse = serde_json::from_value(body).map_err(|e| {
+        let response: PresenceBatchStatusResponse = serde_json::from_slice(&body).map_err(|e| {
             Error::Serialization(format!("decode batch_get_presence response: {e}"))
         })?;
         Ok(self.cache_presence_response(response))
@@ -7350,7 +7354,7 @@ impl State {
         };
         let request = RpcRequest {
             route: routes::presence::TYPING.to_string(),
-            body: serde_json::to_value(req)
+            body: serde_json::to_vec(&req)
                 .map_err(|e| Error::Serialization(format!("encode send_typing body: {e}")))?,
         };
         let payload = encode_message(&request)
@@ -7450,7 +7454,10 @@ impl State {
         let message_type = u32::try_from(message.message_type).map_err(|_| {
             Error::InvalidState(format!("invalid message_type: {}", message.message_type))
         })?;
-        let mut envelope = MessagePayloadEnvelope {
+        // Build envelope in legacy (Value-based) shape to keep the existing
+        // flexible content-detection logic intact, then bridge to the typed
+        // wire envelope at the FlatBuffers encode boundary below.
+        let mut envelope = LocalMessagePayloadEnvelope {
             content: content.clone(),
             metadata: serde_json::from_str::<serde_json::Value>(&message.extra)
                 .ok()
@@ -7475,7 +7482,7 @@ impl State {
 
             if looks_like_envelope {
                 if let Ok(parsed_envelope) =
-                    serde_json::from_value::<MessagePayloadEnvelope>(content_json.clone())
+                    serde_json::from_value::<LocalMessagePayloadEnvelope>(content_json.clone())
                 {
                     envelope = parsed_envelope;
                 }
@@ -7509,7 +7516,12 @@ impl State {
             }
         }
 
-        let payload = serde_json::to_vec(&envelope)
+        // Wire boundary: bridge the legacy Value-based envelope to the typed
+        // FlatBuffers envelope and encode as binary.
+        let content_type =
+            ContentMessageType::from_u32(message_type).unwrap_or(ContentMessageType::Text);
+        let typed_envelope = MessagePayloadEnvelope::from_legacy(&envelope, content_type);
+        let payload = privchat_protocol::encode_message(&typed_envelope)
             .map_err(|e| Error::Serialization(format!("encode send payload: {e}")))?;
 
         Ok(privchat_protocol::protocol::SendMessageRequest {
@@ -8773,7 +8785,12 @@ impl State {
         body: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let timeout = self.timeout();
-        let request = RpcRequest { route, body };
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| Error::Serialization(format!("encode rpc body: {e}")))?;
+        let request = RpcRequest {
+            route,
+            body: body_bytes,
+        };
         let payload = encode_message(&request)
             .map_err(|e| Error::Serialization(format!("encode rpc request: {e}")))?;
         let raw = self
@@ -8801,7 +8818,11 @@ impl State {
                 message: rpc_resp.message,
             });
         }
-        Ok(rpc_resp.data.unwrap_or(serde_json::Value::Null))
+        match rpc_resp.data {
+            Some(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Serialization(format!("decode rpc data: {e}"))),
+            _ => Ok(serde_json::Value::Null),
+        }
     }
 
     async fn rpc_call_typed<Req, Resp>(&mut self, route: &str, body: &Req) -> Result<Resp>

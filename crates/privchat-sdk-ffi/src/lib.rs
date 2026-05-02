@@ -2582,7 +2582,10 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
 ///   `mentioned_user_ids` 等键），提取 envelope.content 作为显示文本，并透出引用 / mention。
 /// - 否则原样返回 content（纯文本或旧消息）。
 fn extract_envelope_fields(raw: &str) -> (String, Option<String>, Vec<u64>) {
-    use privchat_protocol::message::MessagePayloadEnvelope;
+    // Local-content path: parses the SDK's stored JSON envelope (legacy
+    // shape, opaque metadata Value). The wire-canonical FB envelope is
+    // only used when going through the transport.
+    use privchat_protocol::message::LocalMessagePayloadEnvelope;
     if raw.is_empty() {
         return (String::new(), None, Vec::new());
     }
@@ -2601,7 +2604,7 @@ fn extract_envelope_fields(raw: &str) -> (String, Option<String>, Vec<u64>) {
             if !looks_like_envelope {
                 return (raw.to_string(), None, Vec::new());
             }
-            match serde_json::from_value::<MessagePayloadEnvelope>(value) {
+            match serde_json::from_value::<LocalMessagePayloadEnvelope>(value) {
                 Ok(env) => (
                     env.content,
                     env.reply_to_message_id,
@@ -6405,7 +6408,9 @@ impl PrivchatClient {
                     .unwrap_or(false);
                 let has_mentions = !parsed.mentions.is_empty();
                 if has_reply || has_mentions {
-                    let envelope = privchat_protocol::message::MessagePayloadEnvelope {
+                    // Stored as legacy JSON envelope in the SDK's local row;
+                    // the wire-side FB encoding happens later in the SDK.
+                    let envelope = privchat_protocol::message::LocalMessagePayloadEnvelope {
                         content: input.content.clone(),
                         metadata: None,
                         reply_to_message_id: parsed
