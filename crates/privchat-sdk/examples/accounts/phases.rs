@@ -3010,7 +3010,11 @@ impl TestPhases {
             });
         }
 
-        let create_body: CreateRoomChannelResponse = create_resp.json().await?;
+        let create_body: CreateRoomChannelResponse = create_resp
+            .json::<AdminEnvelope<CreateRoomChannelResponse>>()
+            .await?
+            .data
+            .ok_or_else(|| boxed_err("create_room_channel: empty envelope data"))?;
         metrics.rpc_successes += 1;
         let channel_id = create_body.channel_id;
 
@@ -3075,7 +3079,11 @@ impl TestPhases {
             });
         }
 
-        let broadcast_body: RoomBroadcastResponse = broadcast_resp.json().await?;
+        let broadcast_body: RoomBroadcastResponse = broadcast_resp
+            .json::<AdminEnvelope<RoomBroadcastResponse>>()
+            .await?
+            .data
+            .ok_or_else(|| boxed_err("room_broadcast: empty envelope data"))?;
         metrics.rpc_successes += 1;
 
         if broadcast_body.online_count < 3 {
@@ -3150,7 +3158,11 @@ impl TestPhases {
         metrics.rpc_calls += 1;
 
         if verify_resp.status().is_success() {
-            let channel_info: RoomChannelInfoResponse = verify_resp.json().await?;
+            let channel_info: RoomChannelInfoResponse = verify_resp
+                .json::<AdminEnvelope<RoomChannelInfoResponse>>()
+                .await?
+                .data
+                .ok_or_else(|| boxed_err("room_channel_info: empty envelope data"))?;
             metrics.rpc_successes += 1;
             if channel_info.online_count != 0 {
                 metrics.errors.push(format!(
@@ -3802,8 +3814,11 @@ impl TestPhases {
                 metrics,
             ));
         }
-        let revoke_body: serde_json::Value = revoke_resp.json().await?;
+        let revoke_envelope: serde_json::Value = revoke_resp.json().await?;
         metrics.rpc_successes += 1;
+
+        // Server wraps the response in `{ code, message, data: { channel_id, revoked_at, ... } }`.
+        let revoke_body = revoke_envelope.get("data").unwrap_or(&revoke_envelope);
 
         let resp_channel_id = revoke_body
             .get("channel_id")
@@ -3922,6 +3937,17 @@ fn parse_delivery_metrics(body: &str) -> DeliveryMetricsSnapshot {
 }
 
 // --- Admin API response types for phase31 ---
+
+/// Server wraps every admin response in `{ code, message, data }`.
+/// Test code reads typed payload from `data`.
+#[derive(Deserialize)]
+struct AdminEnvelope<T> {
+    #[allow(dead_code)]
+    code: u32,
+    #[allow(dead_code)]
+    message: String,
+    data: Option<T>,
+}
 
 #[derive(Deserialize)]
 struct CreateRoomChannelResponse {
