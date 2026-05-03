@@ -1408,7 +1408,7 @@ impl TestPhases {
 
         let check = manager.blacklist_check("alice", charlie_id).await?;
         metrics.rpc_calls += 1;
-        if check.is_blocked {
+        if check.blocked {
             metrics.rpc_successes += 1;
         } else {
             metrics

@@ -27,7 +27,7 @@ use privchat_protocol::rpc::{
     AccountPrivacyUpdateResponse, AccountProfileGetRequest, AccountProfileGetResponse,
     AccountProfileUpdateRequest, AccountProfileUpdateResponse, AccountSearchQueryRequest,
     AccountSearchResponse, BlacklistAddRequest, BlacklistAddResponse, BlacklistCheckRequest,
-    BlacklistCheckResponse, BlacklistListRequest, BlacklistRemoveRequest, BlacklistRemoveResponse,
+    BlacklistCheckResponse, BlacklistListRequest, BlacklistListResponse, BlacklistRemoveRequest, BlacklistRemoveResponse,
     ChannelHideRequest, ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse,
     ChannelPinRequest, ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse,
     FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
@@ -646,34 +646,26 @@ impl MultiAccountManager {
         key: &str,
         target_user_id: u64,
     ) -> BoxResult<BlacklistCheckResponse> {
-        let resp: BlacklistCheckCompat = self
-            .rpc_typed(
-                key,
-                routes::blacklist::CHECK,
-                &BlacklistCheckRequest {
-                    user_id: 0,
-                    target_user_id,
-                },
-            )
-            .await?;
-        Ok(BlacklistCheckResponse {
-            is_blocked: resp.is_blocked,
-        })
+        self.rpc_typed(
+            key,
+            routes::blacklist::CHECK,
+            &BlacklistCheckRequest {
+                user_id: 0,
+                target_user_id,
+            },
+        )
+        .await
     }
 
     pub async fn blacklist_list_user_ids(&self, key: &str) -> BoxResult<Vec<u64>> {
-        let resp: BlacklistListCompat = self
+        let resp: BlacklistListResponse = self
             .rpc_typed(
                 key,
                 routes::blacklist::LIST,
                 &BlacklistListRequest { user_id: 0 },
             )
             .await?;
-        Ok(resp
-            .users
-            .into_iter()
-            .filter_map(|u| u.blocked_user_id.or(u.user_id))
-            .collect())
+        Ok(resp.users.into_iter().map(|u| u.blocked_user_id).collect())
     }
 
     pub async fn user_qrcode_generate(&self, key: &str) -> BoxResult<UserQRCodeGenerateResponse> {
@@ -1410,27 +1402,10 @@ struct FriendApplyCompat {
 }
 
 #[derive(Debug, Deserialize)]
-struct BlacklistCheckCompat {
-    #[serde(alias = "blocked")]
-    is_blocked: bool,
-}
-
-#[derive(Debug, Deserialize)]
 struct FileRequestUploadTokenCompat {
     token: String,
     upload_url: String,
     file_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BlacklistListCompat {
-    users: Vec<BlacklistUserCompat>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BlacklistUserCompat {
-    user_id: Option<u64>,
-    blocked_user_id: Option<u64>,
 }
 
 fn deserialize_u64_from_string_or_number<'de, D>(deserializer: D) -> Result<u64, D::Error>
