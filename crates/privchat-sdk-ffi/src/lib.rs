@@ -119,20 +119,9 @@ struct AuthLogoutRequest {}
 
 type AuthLogoutResponse = bool;
 
-#[derive(Debug, Clone, Serialize)]
-struct AuthRefreshRequest {
-    refresh_token: String,
-    device_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct AuthRefreshResponse {
-    user_id: u64,
-    token: String,
-    refresh_token: Option<String>,
-    expires_at: u64,
-    device_id: String,
-}
+// AuthRefresh request/response types come from privchat_protocol::rpc::auth.
+// Used by `refresh_access_token` FFI as a thin RPC wrapper around the
+// `account/auth/refresh` endpoint (see TOKEN_REFRESH_SPEC v1.0 §5).
 
 #[derive(Debug, Clone, Serialize, uniffi::Record)]
 pub struct EventConfigView {
@@ -388,10 +377,26 @@ pub struct AccountPrivacyUpdateInput {
     pub allow_receive_message_from_non_friend: Option<bool>,
 }
 
+/// Input for `refresh_access_token` FFI (TOKEN_REFRESH_SPEC v1.0 §5).
+///
+/// Both fields are required: caller already knows the device_id (passed at login),
+/// and refresh_token is owned by the caller (SDK doesn't store it).
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct AuthRefreshInput {
+pub struct RefreshAccessTokenInput {
     pub refresh_token: String,
-    pub device_id: Option<String>,
+    pub device_id: String,
+}
+
+/// Result of `refresh_access_token` FFI.
+///
+/// `refresh_token` is `None` when the server doesn't rotate (B1 default).
+/// `refresh_expires_at` is reserved for B2 rotation; B1 may not return it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RefreshAccessTokenResult {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: u64,
+    pub refresh_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -4340,7 +4345,7 @@ impl PrivchatClient {
             &BlacklistListRequest { user_id },
         )
         .await?;
-        let remote_ids: HashSet<u64> = resp.users.iter().map(|u| u.user_id).collect();
+        let remote_ids: HashSet<u64> = resp.users.iter().map(|u| u.blocked_user_id).collect();
         let local_entries = self
             .inner
             .list_blacklist_entries(10_000, 0)
@@ -4382,7 +4387,7 @@ impl PrivchatClient {
             },
         )
         .await?;
-        if resp.is_blocked {
+        if resp.blocked {
             let ts = now_millis();
             let _ = self
                 .inner
@@ -4396,7 +4401,7 @@ impl PrivchatClient {
             let _ = self.inner.delete_blacklist_entry(target_user_id).await;
         }
         Ok(BlacklistCheckResult {
-            is_blocked: resp.is_blocked,
+            is_blocked: resp.blocked,
         })
     }
 
@@ -5375,22 +5380,30 @@ impl PrivchatClient {
         Ok(resp)
     }
 
-    pub async fn auth_refresh_remote(
+    /// Refresh access token via privchat-server `account/auth/refresh` RPC.
+    ///
+    /// Pure RPC wrapper. **MUST NOT** read/write SDK store, modify state, or
+    /// auto-call authenticate. Caller must:
+    /// 1) provide `refresh_token` (read from caller's own secure storage);
+    /// 2) handle errors (10009/10010 → user re-login; transport → retry);
+    /// 3) call `authenticate(uid, result.access_token, device_id)` to apply.
+    ///
+    /// 详见 TOKEN_REFRESH_SPEC v1.0 §5。
+    pub async fn refresh_access_token(
         &self,
-        payload: AuthRefreshInput,
-    ) -> Result<LoginResult, PrivchatFfiError> {
-        let req = AuthRefreshRequest {
-            refresh_token: payload.refresh_token,
-            device_id: payload.device_id,
+        input: RefreshAccessTokenInput,
+    ) -> Result<RefreshAccessTokenResult, PrivchatFfiError> {
+        let req = privchat_protocol::rpc::auth::AuthRefreshRequest {
+            refresh_token: input.refresh_token,
+            device_id: input.device_id,
         };
-        let resp: AuthRefreshResponse =
+        let resp: privchat_protocol::rpc::auth::AuthRefreshResponse =
             rpc_call_typed(&self.inner, routes::auth::REFRESH, &req).await?;
-        Ok(LoginResult {
-            user_id: resp.user_id,
-            token: resp.token,
-            device_id: resp.device_id,
+        Ok(RefreshAccessTokenResult {
+            access_token: resp.access_token,
             refresh_token: resp.refresh_token,
             expires_at: resp.expires_at,
+            refresh_expires_at: None,
         })
     }
 

@@ -33,9 +33,7 @@ use privchat_protocol::presence::{
     PresenceBatchStatusRequest, PresenceBatchStatusResponse, PresenceChangedNotification,
     TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
 };
-use privchat_protocol::rpc::auth::{
-    AuthLoginRequest, AuthRefreshRequest, AuthRefreshResponse, AuthResponse, UserRegisterRequest,
-};
+use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
 use privchat_protocol::rpc::contact::friend::FriendPendingResponse;
 use privchat_protocol::rpc::file::upload::{
     FileRequestUploadTokenRequest, FileRequestUploadTokenResponse,
@@ -2110,9 +2108,9 @@ impl SessionState {
             (SessionState::New, Action::Authenticate) => Err(Error::InvalidState(
                 "authenticate requires connect and login first".to_string(),
             )),
-            (SessionState::Terminated, Action::Authenticate) => Err(Error::InvalidState(
-                "authenticate requires connect after forced logout".to_string(),
-            )),
+            // 放开 Terminated 下的 authenticate：业务层 refresh + re-auth 走这条；
+            // 实际 transport 已断开会返回 NotConnected，由调用方决定是否先 connect。
+            (SessionState::Terminated, Action::Authenticate) => Ok(SessionState::Authenticated),
 
             (_, Action::Shutdown) => Ok(SessionState::Shutdown),
         }
@@ -5539,35 +5537,7 @@ impl State {
         .await;
         let auth_result = match first_attempt {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                // Recoverable（10000 AuthRequired / 10002 AccessTokenExpired）→ 走 refresh，
-                // 成功就用新 access_token 再握一次；refresh 或二次 authenticate 的错误
-                // 原样回滚出去，让外层按 Terminal / Transient 分别处理。
-                if matches!(e.auth_kind(), Some(AuthErrorKind::Recoverable)) {
-                    eprintln!(
-                        "[SDK.actor] monitor: access token recoverable ({e}); attempting refresh"
-                    );
-                    match self.refresh_access_token().await {
-                        Ok(new_access) => {
-                            eprintln!("[SDK.actor] monitor: refresh ok, retry authenticate");
-                            match timeout(
-                                Duration::from_secs(20),
-                                self.authenticate(user_id, new_access, device_id.clone()),
-                            )
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(_) => Err(Error::Transport(
-                                    "reconnect auth timeout after refresh".to_string(),
-                                )),
-                            }
-                        }
-                        Err(refresh_err) => Err(refresh_err),
-                    }
-                } else {
-                    Err(e)
-                }
-            }
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::Transport("reconnect auth timeout".to_string())),
         };
         match auth_result {
@@ -5958,91 +5928,6 @@ impl State {
             eprintln!("[SDK.actor] authenticate: success");
         }
         Ok(())
-    }
-
-    /// Phase B1：access token 过期时调用 `account/auth/refresh` 续期。
-    ///
-    /// 成功后原子更新 access_token / expires_at（refresh_token 仅在服务端回传新值时替换，
-    /// 缺失则保留旧值，遵守 TOKEN_REFRESH_SPEC §5 的 non-rotation 契约），并返回新 access_token，
-    /// 供调用方立刻喂给 `authenticate()` 继续握手。
-    ///
-    /// 失败时：Error::Auth 带 10009/10010 → Terminal（由上层触发 ForcedLogout）；
-    /// 传输/5xx → 其它 Error::* → Transient（上层继续 backoff）。
-    async fn refresh_access_token(&mut self) -> Result<String> {
-        eprintln!("[metric] token_refresh_attempt");
-        let result = self.refresh_access_token_inner().await;
-        match &result {
-            Ok(_) => {}
-            Err(e) => {
-                let reason = match e {
-                    Error::Auth(_) => match e.auth_kind() {
-                        Some(AuthErrorKind::Terminal) => "auth_terminal",
-                        Some(AuthErrorKind::Recoverable) => "auth_recoverable",
-                        _ => "auth_transient",
-                    },
-                    Error::Transport(_) => "transport",
-                    Error::Server { .. } => "server",
-                    _ => "other",
-                };
-                eprintln!("[metric] token_refresh_failed reason={reason}");
-            }
-        }
-        result
-    }
-
-    async fn refresh_access_token_inner(&mut self) -> Result<String> {
-        let uid = self
-            .current_uid
-            .clone()
-            .ok_or_else(|| Error::InvalidState("no current uid; cannot refresh".to_string()))?;
-        let refresh_token = self
-            .storage
-            .load_refresh_token(uid.clone())
-            .await?
-            .ok_or_else(|| {
-                // 没有 refresh_token 就和「refresh 已撤销」等价——直接 Terminal
-                Error::Auth(format!("[{}] missing refresh token", 10010))
-            })?;
-        let session = self
-            .storage
-            .load_session(uid.clone())
-            .await?
-            .ok_or_else(|| Error::InvalidState("session missing; cannot refresh".to_string()))?;
-        let req = AuthRefreshRequest {
-            refresh_token,
-            device_id: session.device_id.clone(),
-        };
-        let resp: AuthRefreshResponse = self.rpc_call_typed(routes::auth::REFRESH, &req).await?;
-        self.storage
-            .update_access_token(uid.clone(), resp.access_token.clone(), Some(resp.expires_at))
-            .await?;
-        if resp.refresh_token.is_some() {
-            self.storage
-                .update_refresh_token(uid.clone(), resp.refresh_token.clone())
-                .await?;
-        }
-        self.storage.flush_user(uid).await?;
-        eprintln!(
-            "[metric] token_refresh_success rotated={} expires_at={}",
-            resp.refresh_token.is_some(),
-            resp.expires_at
-        );
-        if let (Some(tx), Some(history), Some(seq)) = (
-            self.event_tx.as_ref(),
-            self.event_history.as_ref(),
-            self.event_seq.as_ref(),
-        ) {
-            emit_sequenced_event(
-                tx,
-                history,
-                seq,
-                self.event_history_limit,
-                SdkEvent::TokenRefreshed {
-                    expires_at: resp.expires_at,
-                },
-            );
-        }
-        Ok(resp.access_token)
     }
 
     async fn sync_entities(&mut self, entity_type: String, scope: Option<String>) -> Result<usize> {
@@ -9206,7 +9091,7 @@ impl PrivchatSdk {
                             Err(e) => {
                                 eprintln!("[SDK.actor] auto_reconnect_result fail attempt=#{attempt_n}");
                                 if e.is_auth_terminal() {
-                                    // Terminal 认证错误（token 过期/撤销/设备不匹配等）由
+                                    // Terminal 认证错误（token 撤销/设备不匹配等）由
                                     // trigger_forced_logout 统一收口：停 inbound、断 transport、
                                     // 清状态、发 ForcedLogout。继续自动重连只会把过期 token 反复
                                     // 投给服务端打满日志。
@@ -9221,6 +9106,19 @@ impl PrivchatSdk {
                                         ForcedLogoutSource::ConnectAuth,
                                     )
                                     .await;
+                                } else if matches!(
+                                    e.auth_kind(),
+                                    Some(AuthErrorKind::Recoverable)
+                                ) {
+                                    // Recoverable（10002 AccessTokenExpired 等）：
+                                    // 停 auto-reconnect，避免拿过期 token 反复打服务端。
+                                    // 业务层下次调 RPC 时会拿到 10002 错误，自行调 refreshAccessToken
+                                    // + authenticate 恢复。SDK 不发任何特殊事件、不改状态、不断 transport。
+                                    eprintln!(
+                                        "[SDK.actor] auto_reconnect: recoverable auth error; pause auto-reconnect, host should refresh + authenticate"
+                                    );
+                                    state.should_auto_reconnect = false;
+                                    state.next_reconnect_at = None;
                                 } else {
                                     state.schedule_next_reconnect();
                                 }
@@ -9550,8 +9448,10 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
-                            // 新 token 生效，解除 Terminal 闸门。
+                            // 新 token 生效，解除 Terminal 闸门、重启 auto-reconnect。
+                            // SessionState 已经在 can() 里转回 Authenticated（含 AccessTokenRefreshNeeded → Authenticated 路径）。
                             state.auth_terminal_fired = false;
+                            state.should_auto_reconnect = true;
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -13152,12 +13052,12 @@ impl PrivchatSdk {
 mod tests {
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
-        group_settings_key, Action, ConnectionState, ContentMessageType, Error, ErrorCode,
-        LoginResult, MessageCachePolicy, NetworkHint, PresenceStatus, PrivchatConfig, PrivchatSdk,
-        ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, SessionState,
-        State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput,
-        UpsertMessageReactionInput, UpsertRemoteMessageInput, UpsertUserInput,
-        NETWORK_DISCONNECTED_MESSAGE,
+        group_settings_key, Action, AuthErrorKind, ConnectionState, ContentMessageType, Error,
+        ErrorCode, LoginResult, MessageCachePolicy, NetworkHint, PresenceStatus, PrivchatConfig,
+        PrivchatSdk, ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent,
+        SessionState, State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
+        UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertRemoteMessageInput,
+        UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
     };
     use crate::local_store::LocalStore;
     use crate::receive_pipeline::ReceivePipeline;
@@ -13251,6 +13151,8 @@ mod tests {
             bootstrap_completed: true,
             snowflake: Arc::new(
                 snowflake_me::Snowflake::builder()
+                    .machine_id(&|| Ok((std::process::id() as u16) & 0x1f))
+                    .data_center_id(&|| Ok((chrono::Utc::now().timestamp_millis() as u16) & 0x1f))
                     .finalize()
                     .expect("test snowflake"),
             ),
@@ -15415,5 +15317,51 @@ mod tests {
 
         sdk.shutdown().await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ==================== TOKEN_REFRESH_SPEC v1.0 — C1 测试 ====================
+
+    /// 10002 AccessTokenExpired 必须分类为 Recoverable，**不**触发 ForcedLogout。
+    /// 业务层接到 10002 后调 refreshAccessToken + authenticate 恢复。
+    #[test]
+    fn recoverable_does_not_trigger_forced_logout() {
+        let err = Error::Auth("[10002] access token expired".to_string());
+        assert_eq!(err.auth_kind(), Some(AuthErrorKind::Recoverable));
+        assert!(
+            !err.is_auth_terminal(),
+            "10002 must NOT be classified as Terminal"
+        );
+    }
+
+    /// 10009 / 10010 是 refresh token 失效相关码，必须 Terminal。
+    #[test]
+    fn terminal_codes_classified_correctly() {
+        for code in [10001u32, 10003, 10005, 10007, 10009, 10010] {
+            let err = Error::Auth(format!("[{}] something", code));
+            assert!(
+                err.is_auth_terminal(),
+                "code {} must be classified as Terminal",
+                code
+            );
+            assert_eq!(err.auth_kind(), Some(AuthErrorKind::Terminal));
+        }
+    }
+
+    /// authenticate 在 Authenticated 状态下可调用——业务层 refresh 后直接换 token。
+    #[test]
+    fn authenticate_allowed_in_authenticated_state() {
+        assert!(matches!(
+            SessionState::Authenticated.can(Action::Authenticate),
+            Ok(SessionState::Authenticated)
+        ));
+    }
+
+    /// authenticate 在 Terminated 状态下也允许——ForcedLogout 后业务层手动重登路径。
+    #[test]
+    fn authenticate_allowed_in_terminated_state() {
+        assert!(matches!(
+            SessionState::Terminated.can(Action::Authenticate),
+            Ok(SessionState::Authenticated)
+        ));
     }
 }
