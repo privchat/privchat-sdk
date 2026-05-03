@@ -75,9 +75,9 @@ const K_MASTER_KEY_NONCE: &[u8] = b"master_key_nonce";
 const K_ACCESS_TOKEN_ALG: &[u8] = b"access_token_alg";
 const K_ACCESS_TOKEN_ENC: &[u8] = b"access_token_enc";
 const K_ACCESS_TOKEN_NONCE: &[u8] = b"access_token_nonce";
-const K_REFRESH_TOKEN_ALG: &[u8] = b"refresh_token_alg";
-const K_REFRESH_TOKEN_ENC: &[u8] = b"refresh_token_enc";
-const K_REFRESH_TOKEN_NONCE: &[u8] = b"refresh_token_nonce";
+// Refresh token 由业务层（client app）持有，SDK 不再持久化（TOKEN_REFRESH_SPEC v1.0 §4）。
+// K_REFRESH_TOKEN_ALG / _ENC / _NONCE 字段 v0.2 之前被 SDK 内部 auto-refresh 用过，
+// C1 之后已无任何调用方读它们。C4 阶段从 save_login 移除写入，相关 helper 一并删除。
 const K_TOKEN_EXPIRE_AT: &[u8] = b"token_expire_at";
 const K_DEVICE_ID_CURRENT: &[u8] = b"device_id";
 
@@ -474,12 +474,6 @@ impl LocalStore {
         let master_key = self.get_or_create_master_key(uid, &install)?;
         let access_blob =
             self.encrypt_user_blob(uid, "access_token", &master_key, login.token.as_bytes())?;
-        let refresh_blob = match login.refresh_token.as_deref() {
-            Some(token) => {
-                Some(self.encrypt_user_blob(uid, "refresh_token", &master_key, token.as_bytes())?)
-            }
-            None => None,
-        };
         let account_db = self.open_account_db(uid)?;
         let meta = account_db
             .open_tree(ACCOUNT_TREE_META)
@@ -524,18 +518,11 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("save access token nonce: {e}")))?;
         auth.insert(K_DEVICE_ID_CURRENT, login.device_id.as_bytes())
             .map_err(|e| Error::Storage(format!("save device_id: {e}")))?;
-        if let Some(refresh_blob) = refresh_blob {
-            auth.insert(K_REFRESH_TOKEN_ALG, TOKEN_ALG.as_bytes())
-                .map_err(|e| Error::Storage(format!("save refresh token alg: {e}")))?;
-            auth.insert(K_REFRESH_TOKEN_ENC, refresh_blob.ciphertext)
-                .map_err(|e| Error::Storage(format!("save refresh token enc: {e}")))?;
-            auth.insert(K_REFRESH_TOKEN_NONCE, refresh_blob.nonce)
-                .map_err(|e| Error::Storage(format!("save refresh token nonce: {e}")))?;
-        } else {
-            let _ = auth.remove(K_REFRESH_TOKEN_ALG);
-            let _ = auth.remove(K_REFRESH_TOKEN_ENC);
-            let _ = auth.remove(K_REFRESH_TOKEN_NONCE);
-        }
+        // C4: 不再持久化 refresh_token；业务层从 LoginResult.refresh_token 自取自管。
+        // 同时清掉 v0.2 / Phase A 残留（migrate path）。
+        let _ = auth.remove(b"refresh_token_alg" as &[u8]);
+        let _ = auth.remove(b"refresh_token_enc" as &[u8]);
+        let _ = auth.remove(b"refresh_token_nonce" as &[u8]);
         auth.insert(
             K_TOKEN_EXPIRE_AT,
             i64_to_be_bytes(i64::try_from(login.expires_at).unwrap_or(i64::MAX)),
@@ -611,12 +598,10 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("clear access token: {e}")))?;
         auth.remove(K_ACCESS_TOKEN_NONCE)
             .map_err(|e| Error::Storage(format!("clear access token nonce: {e}")))?;
-        auth.remove(K_REFRESH_TOKEN_ENC)
-            .map_err(|e| Error::Storage(format!("clear refresh token: {e}")))?;
-        auth.remove(K_REFRESH_TOKEN_NONCE)
-            .map_err(|e| Error::Storage(format!("clear refresh token nonce: {e}")))?;
-        auth.remove(K_REFRESH_TOKEN_ALG)
-            .map_err(|e| Error::Storage(format!("clear refresh token alg: {e}")))?;
+        // Clear v0.2 / Phase A refresh_token leftovers (best-effort; SDK no longer writes these).
+        let _ = auth.remove(b"refresh_token_enc" as &[u8]);
+        let _ = auth.remove(b"refresh_token_nonce" as &[u8]);
+        let _ = auth.remove(b"refresh_token_alg" as &[u8]);
         auth.remove(K_DEVICE_ID_CURRENT)
             .map_err(|e| Error::Storage(format!("clear device_id: {e}")))?;
         auth.remove(K_TOKEN_EXPIRE_AT)
@@ -666,24 +651,6 @@ impl LocalStore {
         Ok(())
     }
 
-    /// 原子更新 refresh token：Some → 替换；None → 保留旧值（B1 non-rotation 语义）。
-    /// 注意：这里 None 表示「不动」，不是清空。如果要清空请用 clear_session。
-    pub fn update_refresh_token(&self, uid: &str, refresh_token: Option<&str>) -> Result<()> {
-        let Some(token) = refresh_token else {
-            return Ok(());
-        };
-        let master_key = self.load_master_key(uid)?;
-        let blob = self.encrypt_user_blob(uid, "refresh_token", &master_key, token.as_bytes())?;
-        let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
-        let mut batch = sled::Batch::default();
-        batch.insert(K_REFRESH_TOKEN_ALG, TOKEN_ALG.as_bytes());
-        batch.insert(K_REFRESH_TOKEN_ENC, blob.ciphertext);
-        batch.insert(K_REFRESH_TOKEN_NONCE, blob.nonce);
-        auth.apply_batch(batch)
-            .map_err(|e| Error::Storage(format!("apply refresh token batch: {e}")))?;
-        Ok(())
-    }
-
     /// 读取当前 access_token（只读，不做 legacy session 迁移；Ok(None) 表示未登录）。
     pub fn load_access_token(&self, uid: &str) -> Result<Option<String>> {
         let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
@@ -706,26 +673,6 @@ impl LocalStore {
         )?;
         let token = String::from_utf8(plain)
             .map_err(|e| Error::Storage(format!("decode access token utf8: {e}")))?;
-        Ok(Some(token))
-    }
-
-    /// 读取 refresh token（用于 refresh RPC）。无值返回 Ok(None)。
-    pub fn load_refresh_token(&self, uid: &str) -> Result<Option<String>> {
-        let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
-        let enc = auth
-            .get(K_REFRESH_TOKEN_ENC)
-            .map_err(|e| Error::Storage(format!("load refresh token: {e}")))?;
-        let nonce = auth
-            .get(K_REFRESH_TOKEN_NONCE)
-            .map_err(|e| Error::Storage(format!("load refresh token nonce: {e}")))?;
-        let (Some(enc), Some(nonce)) = (enc, nonce) else {
-            return Ok(None);
-        };
-        let master_key = self.load_master_key(uid)?;
-        let plain =
-            self.decrypt_user_blob(uid, "refresh_token", &master_key, enc.as_ref(), nonce.as_ref())?;
-        let token = String::from_utf8(plain)
-            .map_err(|e| Error::Storage(format!("decode refresh token utf8: {e}")))?;
         Ok(Some(token))
     }
 
