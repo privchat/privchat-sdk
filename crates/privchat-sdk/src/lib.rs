@@ -9143,16 +9143,27 @@ impl PrivchatSdk {
                             let was_authenticated =
                                 state.session_state == SessionState::Authenticated;
 
-                            // 宿主在 SYNC_READY 下点 connect()（前台/网络恢复 fast-track）时，
-                            // 若 transport 仍存活就什么都不做——不要走 Action::Connect 把
-                            // Authenticated 降到 Connected，否则后续需要认证态的 RPC 全废。
-                            if was_authenticated && state.is_connected().await {
-                                if actor_logs_enabled() {
-                                    eprintln!("[SDK.actor] connect: noop (already authenticated)");
+                            // 关键不变量：宿主在 SYNC_READY / Authenticated 下点 connect()
+                            // （前台/网络恢复 fast-track），final state 必须**仍是** Authenticated，
+                            // 否则任何要 authenticated session 的 RPC（markRead / sendMessage /
+                            // search 等）会立刻挂"current: Connected"。
+                            //
+                            // 之前用过"先转 Connected 再尝试 auto-restore"两步法，但 transport 有时
+                            // 在 `state.connect()` 内部短路（没真正重建），auto-restore 又被 race
+                            // 到失败 → 留在 Connected。改用 monitor 的 try_auto_reconnect 单步法：
+                            // 它 atomic 地处理 connect + load session + re-authenticate，结果直接
+                            // 是 Authenticated（成功）/ Connected（无缓存 session）/ Err（认证失败）。
+                            let result: Result<()> = if was_authenticated {
+                                match state.try_auto_reconnect().await {
+                                    Ok(next) => {
+                                        state.session_state = next;
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(e),
                                 }
-                                let _ = resp.send(Ok(()));
                             } else {
-                                let result = match state.session_state.can(Action::Connect) {
+                                // 冷启动 / 已 logged out / forced：走原有简单 connect+transition。
+                                match state.session_state.can(Action::Connect) {
                                     Ok(next_state) => {
                                         match timeout(state.connect_timeout_total(), state.connect()).await
                                         {
@@ -9166,84 +9177,49 @@ impl PrivchatSdk {
                                         }
                                     }
                                     Err(e) => Err(e),
-                                };
-                                if result.is_ok() {
-                                    state.reset_reconnect_backoff();
-                                    // 用户主动 Connect 成功 = 新的登录回合。清 Terminal 闸门
-                                    // 和上一轮 terminal reason，让后续 Authenticate 若再遇到
-                                    // Terminal 错可以再次触发 ForcedLogout。
-                                    state.auth_terminal_fired = false;
-                                    state.last_terminal_reason = None;
-                                    start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
-                                        .await;
-
-                                    // 若上一回合是 Authenticated（transport 真正断了被重建），
-                                    // 用磁盘上的会话快照自动 re-authenticate，把 session_state
-                                    // 推回 Authenticated。和 monitor 的 try_auto_reconnect 行为一致。
-                                    if was_authenticated {
-                                        if let Some(uid) = state.current_uid.clone() {
-                                            if let Ok(Some(snapshot)) =
-                                                state.storage.load_session(uid).await
-                                            {
-                                                let user_id = snapshot.user_id;
-                                                let device_id = snapshot.device_id.clone();
-                                                let bootstrap_completed = snapshot.bootstrap_completed;
-                                                let attempt = timeout(
-                                                    Duration::from_secs(20),
-                                                    state.authenticate(
-                                                        user_id,
-                                                        snapshot.token,
-                                                        device_id,
-                                                    ),
-                                                )
-                                                .await;
-                                                match attempt {
-                                                    Ok(Ok(())) => {
-                                                        state.bootstrap_completed = bootstrap_completed;
-                                                        state.session_state = SessionState::Authenticated;
-                                                        eprintln!(
-                                                            "[SDK.actor] connect: auto-restored authenticated session"
-                                                        );
-                                                        if state.bootstrap_completed {
-                                                            if let Err(err) = state.run_resume_sync().await {
-                                                                eprintln!(
-                                                                    "[SDK.actor] connect: resume sync after auto-restore failed: {err}"
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                    Ok(Err(e)) => {
-                                                        eprintln!(
-                                                            "[SDK.actor] connect: auto-restore auth failed: {e} (stays at Connected)"
-                                                        );
-                                                    }
-                                                    Err(_) => {
-                                                        eprintln!(
-                                                            "[SDK.actor] connect: auto-restore auth timeout (stays at Connected)"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    emit_sequenced_event(
-                                        &actor_event_tx,
-                                        &actor_event_history,
-                                        &actor_event_seq,
-                                        event_history_limit,
-                                        SdkEvent::ConnectionStateChanged {
-                                            from: from_state,
-                                            to: state.session_state.as_connection_state(),
-                                        },
-                                    );
-                                } else {
-                                    // First attempt failed — schedule a backoff retry so we
-                                    // don't leave the client silently unconnected.
-                                    state.schedule_next_reconnect();
                                 }
-                                let _ = resp.send(result);
+                            };
+
+                            if result.is_ok() {
+                                state.reset_reconnect_backoff();
+                                // 用户主动 Connect 成功 = 新的登录回合。清 Terminal 闸门
+                                // 和上一轮 terminal reason，让后续 Authenticate 若再遇到
+                                // Terminal 错可以再次触发 ForcedLogout。
+                                state.auth_terminal_fired = false;
+                                state.last_terminal_reason = None;
+                                start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
+                                    .await;
+
+                                // 若 try_auto_reconnect 把 session 拉回 Authenticated 且
+                                // bootstrap 早已完成，触发一次 resume_sync 把背景期间漏掉的
+                                // 增量同步上来（与 retry driver 的成功分支一致）。
+                                if was_authenticated
+                                    && state.session_state == SessionState::Authenticated
+                                    && state.bootstrap_completed
+                                {
+                                    if let Err(err) = state.run_resume_sync().await {
+                                        eprintln!(
+                                            "[SDK.actor] connect: resume sync after auto-restore failed: {err}"
+                                        );
+                                    }
+                                }
+
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::ConnectionStateChanged {
+                                        from: from_state,
+                                        to: state.session_state.as_connection_state(),
+                                    },
+                                );
+                            } else {
+                                // First attempt failed — schedule a backoff retry so we
+                                // don't leave the client silently unconnected.
+                                state.schedule_next_reconnect();
                             }
+                            let _ = resp.send(result);
                         }
                     }
                     Command::Disconnect { resp } => {
