@@ -1199,6 +1199,14 @@ pub enum SdkEvent {
         /// 新 access_token 过期时间（Unix 毫秒，服务端下发）。
         expires_at: u64,
     },
+    /// auto-reconnect 握手撞到 Recoverable auth 错（典型 10002）；SDK 已暂停 auto-reconnect。
+    /// 业务层应调用自家 mode-aware refresh 入口（详见 TOKEN_REFRESH_SPEC §3.1）。
+    AccessTokenRefreshNeeded {
+        /// 服务端原始错误码，典型 10002。
+        code: u32,
+        /// 服务端原始 message，仅作日志/审计。
+        message: String,
+    },
     ForcedLogout {
         /// `privchat_protocol::ErrorCode` 对应的 u32 码；未携带时为 0。
         code: u32,
@@ -2083,6 +2091,9 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
         privchat_sdk::SdkEvent::TokenRefreshed { expires_at } => {
             SdkEvent::TokenRefreshed { expires_at }
         }
+        privchat_sdk::SdkEvent::AccessTokenRefreshNeeded { code, message } => {
+            SdkEvent::AccessTokenRefreshNeeded { code, message }
+        }
         privchat_sdk::SdkEvent::ForcedLogout {
             code,
             message,
@@ -2382,6 +2393,11 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "type": "token_refreshed",
             "expires_at": expires_at
         }),
+        SdkEvent::AccessTokenRefreshNeeded { code, message } => json!({
+            "type": "access_token_refresh_needed",
+            "code": code,
+            "message": message
+        }),
         SdkEvent::ForcedLogout {
             code,
             message,
@@ -2461,6 +2477,7 @@ fn is_network_event(evt: &SdkEvent) -> bool {
             | SdkEvent::ResumeSyncFailed { .. }
             | SdkEvent::ResumeSyncEscalated { .. }
             | SdkEvent::TokenRefreshed { .. }
+            | SdkEvent::AccessTokenRefreshNeeded { .. }
             | SdkEvent::ForcedLogout { .. }
     )
 }

@@ -508,6 +508,24 @@ pub enum SdkEvent {
         /// 新 access_token 的过期时间（Unix 毫秒，服务端下发）。
         expires_at: u64,
     },
+    /// auto-reconnect 握手撞到 Recoverable auth 错（典型 10002 AccessTokenExpired），
+    /// SDK 已暂停 auto-reconnect 并保留 transport，等业务层走 refresh + authenticate。
+    ///
+    /// **业务层契约**（详见 [`TOKEN_REFRESH_SPEC`](../../privchat-docs/spec/03-protocol-sdk/TOKEN_REFRESH_SPEC.md) §3.1）：
+    /// 收到事件后调用自家 mode-aware refresh 入口（privchat-app `recoverFromTokenExpired`）：
+    /// 模式 A 走 `sdk.refreshAccessToken` → `sdk.authenticate`；
+    /// 模式 B/C 走业务后台 refresh endpoint → `sdk.authenticate`。
+    ///
+    /// SDK **不**自调任何后台、**不**持 refresh_token、**不**改 ConnectionState、**不**断 transport。
+    ///
+    /// 幂等性：每次 retry 撞 Recoverable 都发一次。业务层 `authenticate` 成功后 `should_auto_reconnect`
+    /// 重置为 true，下一轮 token 过期再触发一次。
+    AccessTokenRefreshNeeded {
+        /// 服务端原始错误码，典型 10002（AccessTokenExpired）。
+        code: u32,
+        /// 服务端原始 message；仅作日志/审计，业务层不应解析 message 走分支。
+        message: String,
+    },
     /// 服务端/协议栈判定本次登录态不可自愈（token 过期/撤销、设备不匹配等）。
     /// SDK 已停止自动重连并断开当前 session，宿主收到该事件后应：
     /// 1) 清理本地登录态（token / user_id / device_id）；
@@ -821,6 +839,21 @@ fn rpc_logs_enabled() -> bool {
 fn actor_logs_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("PRIVCHAT_ACTOR_LOG").ok().as_deref() == Some("1"))
+}
+
+/// 服务端 unauth 白名单路由：自带凭证校验（refresh_token JWT / 密码 / 二维码场景 token），
+/// 不依赖 access_token 已认证的 IM session。SDK 在 Connected 状态下应允许这些路由。
+///
+/// 与 server `auth/whitelist.rs` 的 unauth allowlist 对齐；新增 unauth 路由必须在此同步登记。
+fn is_unauth_rpc_route(route: &str) -> bool {
+    use privchat_protocol::rpc::routes;
+    matches!(
+        route,
+        routes::auth::LOGIN
+            | routes::auth::REFRESH
+            | routes::account_user::REGISTER
+            | routes::qr_login::CREATE_SCENE
+    )
 }
 
 async fn start_inbound_task(
@@ -9112,13 +9145,57 @@ impl PrivchatSdk {
                                 ) {
                                     // Recoverable（10002 AccessTokenExpired 等）：
                                     // 停 auto-reconnect，避免拿过期 token 反复打服务端。
-                                    // 业务层下次调 RPC 时会拿到 10002 错误，自行调 refreshAccessToken
-                                    // + authenticate 恢复。SDK 不发任何特殊事件、不改状态、不断 transport。
+                                    //
+                                    // 关键：try_auto_reconnect 失败时已 disconnect 释放 transport，
+                                    // state 仍是 New。如果直接 emit 事件让 host refresh + authenticate，
+                                    // 但 SessionState=New 下 Action::Authenticate 会被状态机拒绝
+                                    // （spec TOKEN_REFRESH_SPEC §7：New/Shutdown 报错）。
+                                    //
+                                    // 所以在 emit 事件**之前**主动 connect 一次重建 transport，把 state
+                                    // 转回 Connected。host 收到事件后调 sdk.authenticate(uid, newToken,
+                                    // deviceId) 直接走 Connected→Authenticated 即可，不需要先 connect
+                                    // （否则 host 的 connect 又触发 try_auto_reconnect 用旧 token 撞
+                                    // 10002 死循环）。
+                                    //
+                                    // 若 connect 也失败（网络真断了）则保持 New + emit 事件，host recover
+                                    // 会因 sdk.authenticate 报 InvalidState 失败；下次 retry / 网络恢复
+                                    // 还会再 emit，最终自愈。
+                                    let code = e.auth_error_code().unwrap_or(0);
+                                    let message = e.to_string();
                                     eprintln!(
-                                        "[SDK.actor] auto_reconnect: recoverable auth error; pause auto-reconnect, host should refresh + authenticate"
+                                        "[SDK.actor] auto_reconnect: recoverable auth error code={code}; reconnect transport then emit AccessTokenRefreshNeeded"
                                     );
+                                    let pre_state = state.session_state.as_connection_state();
+                                    if let Ok(()) = timeout(state.connect_timeout_total(), state.connect()).await
+                                        .unwrap_or(Err(Error::Transport("reconnect timeout".to_string())))
+                                    {
+                                        if let Ok(next_state) = state.session_state.can(Action::Connect) {
+                                            state.session_state = next_state;
+                                            emit_sequenced_event(
+                                                &actor_event_tx,
+                                                &actor_event_history,
+                                                &actor_event_seq,
+                                                event_history_limit,
+                                                SdkEvent::ConnectionStateChanged {
+                                                    from: pre_state,
+                                                    to: state.session_state.as_connection_state(),
+                                                },
+                                            );
+                                        }
+                                    } else {
+                                        eprintln!(
+                                            "[SDK.actor] auto_reconnect recoverable: post-fail reconnect failed; emit event but host authenticate likely InvalidState"
+                                        );
+                                    }
                                     state.should_auto_reconnect = false;
                                     state.next_reconnect_at = None;
+                                    emit_sequenced_event(
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        SdkEvent::AccessTokenRefreshNeeded { code, message },
+                                    );
                                 } else {
                                     state.schedule_next_reconnect();
                                 }
@@ -9140,20 +9217,28 @@ impl PrivchatSdk {
                             // first attempt fails (e.g. server temporarily down).
                             state.should_auto_reconnect = true;
                             let from_state = state.session_state.as_connection_state();
+                            let had_local_session = state.current_uid.is_some();
                             let was_authenticated =
                                 state.session_state == SessionState::Authenticated;
 
-                            // 关键不变量：宿主在 SYNC_READY / Authenticated 下点 connect()
-                            // （前台/网络恢复 fast-track），final state 必须**仍是** Authenticated，
+                            // 关键不变量：宿主在已登录场景下点 connect()（前台 fast-track / 网络
+                            // 恢复 / 后台 disconnect 后回前台），final state 必须**仍是** Authenticated，
                             // 否则任何要 authenticated session 的 RPC（markRead / sendMessage /
                             // search 等）会立刻挂"current: Connected"。
                             //
-                            // 之前用过"先转 Connected 再尝试 auto-restore"两步法，但 transport 有时
-                            // 在 `state.connect()` 内部短路（没真正重建），auto-restore 又被 race
-                            // 到失败 → 留在 Connected。改用 monitor 的 try_auto_reconnect 单步法：
-                            // 它 atomic 地处理 connect + load session + re-authenticate，结果直接
-                            // 是 Authenticated（成功）/ Connected（无缓存 session）/ Err（认证失败）。
-                            let result: Result<()> = if was_authenticated {
+                            // 触发场景：
+                            //  1) SYNC_READY 透明 fast-track：state=Authenticated，transport 还没掉
+                            //  2) 后台超时 disconnect 后回前台：state=New，transport=None，但 storage
+                            //     里的 session snapshot 还在
+                            //  3) 网络抖动：state=New（health probe 降级过），transport=None
+                            //
+                            // 三种场景都用 try_auto_reconnect 单步法解决：它 atomic 地 connect +
+                            // load session + re-authenticate，自然收敛到 Authenticated（有 snapshot）
+                            // 或 Connected（无 snapshot：冷启动 / 已 logged out / forced）。
+                            //
+                            // 之前用过"先转 Connected 再尝试 auto-restore"两步法，transport 偶尔在
+                            // `state.connect()` 内部短路没真正重建 → auto-restore race 到失败 → 卡 Connected。
+                            let result: Result<()> = if had_local_session {
                                 match state.try_auto_reconnect().await {
                                     Ok(next) => {
                                         state.session_state = next;
@@ -9162,7 +9247,8 @@ impl PrivchatSdk {
                                     Err(e) => Err(e),
                                 }
                             } else {
-                                // 冷启动 / 已 logged out / forced：走原有简单 connect+transition。
+                                // 冷启动且无本地 session（用户没登录过）/ logged out / forced：
+                                // 走简单 connect+transition；不 authenticate（没 session 可用）。
                                 match state.session_state.can(Action::Connect) {
                                     Ok(next_state) => {
                                         match timeout(state.connect_timeout_total(), state.connect()).await
@@ -9193,7 +9279,10 @@ impl PrivchatSdk {
                                 // 若 try_auto_reconnect 把 session 拉回 Authenticated 且
                                 // bootstrap 早已完成，触发一次 resume_sync 把背景期间漏掉的
                                 // 增量同步上来（与 retry driver 的成功分支一致）。
-                                if was_authenticated
+                                // 入口可能是 Authenticated（fast-track）或 New（后台 disconnect 后回前台），
+                                // 只要本地有 session 且当前已 Authenticated，就跑 resume_sync。
+                                let _ = was_authenticated;
+                                if had_local_session
                                     && state.session_state == SessionState::Authenticated
                                     && state.bootstrap_completed
                                 {
@@ -9723,7 +9812,26 @@ impl PrivchatSdk {
                         body_json,
                         resp,
                     } => {
-                        let result = match state.require_authenticated() {
+                        // 白名单路由（auth/login/register/refresh/send-sms 等）是 server 白名单接口，
+                        // 自带 token 校验（refresh 用 refresh_token JWT 自签名，login 用密码），
+                        // 不需要 access_token 已认证的 IM session。SDK 强制 require_authenticated
+                        // 会让"10002 → refreshAccessToken 恢复"路径在 Connected 状态下失败。
+                        // 只要 transport 已连上（Connected/LoggedIn/Authenticated），就允许调用。
+                        let auth_check = if is_unauth_rpc_route(&route) {
+                            match state.session_state {
+                                SessionState::Connected
+                                | SessionState::LoggedIn
+                                | SessionState::Authenticated => Ok(()),
+                                SessionState::Shutdown => Err(Error::Shutdown),
+                                _ => Err(Error::InvalidState(format!(
+                                    "operation requires connected transport (current: {:?})",
+                                    state.session_state
+                                ))),
+                            }
+                        } else {
+                            state.require_authenticated()
+                        };
+                        let result = match auth_check {
                             Ok(()) => {
                                 let parsed_body = serde_json::from_str::<serde_json::Value>(
                                     &body_json,
