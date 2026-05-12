@@ -1,0 +1,16 @@
+[package]
+name = "transfer"
+version = "0.1.0"
+edition = "2021"
+authors = ["PrivChat Team"]
+description = "PrivChat SDK Channel Transfer example — demonstrates client→app RPC over biz_type 19/20"
+
+[workspace]
+
+[[bin]]
+name = "transfer"
+path = "main.rs"
+
+[dependencies]
+privchat-sdk = { path = "../.." }
+tokio = { version = "1", features = ["full"] }

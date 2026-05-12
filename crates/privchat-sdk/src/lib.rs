@@ -52,6 +52,7 @@ use privchat_protocol::{
     ErrorCode, MessageType, PingRequest, PongResponse, PublishRequest, PublishResponse,
     PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse, RpcRequest,
     RpcResponse, SendMessageRequest, SendMessageResponse, SubscribeRequest, SubscribeResponse,
+    TransferRequest, TransferResponse,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -301,6 +302,17 @@ pub struct SessionSnapshot {
     pub token: String,
     pub device_id: String,
     pub bootstrap_completed: bool,
+}
+
+/// Channel Transfer client-side response (decoded from wire `TransferResponse`).
+/// See `02-server/CHANNEL_TRANSFER_SPEC.md` and `07-application/BOT_INTERACTION_SPEC.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferReply {
+    pub request_id: String,
+    pub channel_id: u64,
+    pub code: i32,
+    pub message: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1707,6 +1719,13 @@ enum Command {
         route: String,
         body_json: String,
         resp: oneshot::Sender<Result<String>>,
+    },
+    Transfer {
+        channel_id: u64,
+        route: String,
+        body: Vec<u8>,
+        timeout_ms: u64,
+        resp: oneshot::Sender<Result<TransferReply>>,
     },
     RunBootstrapSync {
         resp: oneshot::Sender<Result<()>>,
@@ -3785,6 +3804,20 @@ impl State {
             MessageType::RpcResponse => {
                 if let Ok(v) = decode_message::<RpcResponse>(data) {
                     eprintln!("[SDK.inbound] decoded RpcResponse: {:?}", v);
+                }
+            }
+            // Channel Transfer wire packets are debug-logged only here. Outbound
+            // client→app TransferRequest is matched at the transport layer (see
+            // `transfer_channel`); inbound app→user TransferRequest delivery to
+            // client is out of scope for v1 (BOT_INTERACTION_SPEC §0).
+            MessageType::TransferRequest => {
+                if let Ok(v) = decode_message::<TransferRequest>(data) {
+                    eprintln!("[SDK.inbound] decoded TransferRequest: {:?}", v);
+                }
+            }
+            MessageType::TransferResponse => {
+                if let Ok(v) = decode_message::<TransferResponse>(data) {
+                    eprintln!("[SDK.inbound] decoded TransferResponse: {:?}", v);
                 }
             }
             MessageType::Unknown => {
@@ -7331,6 +7364,49 @@ impl State {
         Ok(())
     }
 
+    /// Channel Transfer client→app RPC. See `02-server/CHANNEL_TRANSFER_SPEC.md`.
+    /// `request_id` is generated locally (snowflake → string) and matched at the
+    /// transport layer; the wire `TransferResponse` is decoded into `TransferReply`.
+    async fn transfer_channel(
+        &mut self,
+        channel_id: u64,
+        route: String,
+        body: Vec<u8>,
+        timeout_ms: u64,
+    ) -> Result<TransferReply> {
+        let request_id = self
+            .snowflake
+            .next_id()
+            .map_err(|e| Error::Storage(format!("generate transfer request_id failed: {e:?}")))?
+            .to_string();
+        let req = TransferRequest {
+            request_id,
+            channel_id,
+            route: route.clone(),
+            body,
+        };
+        let payload = encode_message(&req)
+            .map_err(|e| Error::Serialization(format!("encode transfer_channel: {e}")))?;
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+        let raw = self
+            .request_bytes(
+                Bytes::from(payload),
+                MessageType::TransferRequest as u8,
+                timeout,
+                "transfer_channel",
+            )
+            .await?;
+        let resp: TransferResponse = decode_message(&raw)
+            .map_err(|e| Error::Serialization(format!("decode transfer_channel resp: {e}")))?;
+        Ok(TransferReply {
+            request_id: resp.request_id,
+            channel_id: resp.channel_id,
+            code: resp.code,
+            message: resp.message,
+            data: resp.data.unwrap_or_default(),
+        })
+    }
+
     /// 取消订阅频道事件
     async fn unsubscribe_channel(&mut self, channel_id: u64, channel_type: u8) -> Result<()> {
         let timeout = self.timeout();
@@ -9807,6 +9883,15 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::Transfer { channel_id, route, body, timeout_ms, resp } => {
+                        let result = match state.require_authenticated() {
+                            Ok(()) => state
+                                .transfer_channel(channel_id, route, body, timeout_ms)
+                                .await,
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::RpcCall {
                         route,
                         body_json,
@@ -11865,6 +11950,34 @@ impl PrivchatSdk {
             .send(Command::Unsubscribe {
                 channel_id,
                 channel_type,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// Channel Transfer client→app RPC. Sends a wire `TransferRequest` (biz_type=19),
+    /// awaits the matching `TransferResponse` (biz_type=20), and returns it decoded
+    /// as `TransferReply`. `timeout_ms` is the per-call wire timeout; default 5000ms
+    /// when zero. See `02-server/CHANNEL_TRANSFER_SPEC.md` v2.0 and
+    /// `07-application/BOT_INTERACTION_SPEC.md` for routes (e.g. `bot/menu/get`).
+    pub async fn transfer(
+        &self,
+        channel_id: u64,
+        route: String,
+        body: Vec<u8>,
+        timeout_ms: u64,
+    ) -> Result<TransferReply> {
+        self.ensure_running()?;
+        let timeout_ms = if timeout_ms == 0 { 5000 } else { timeout_ms };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Transfer {
+                channel_id,
+                route,
+                body,
+                timeout_ms,
                 resp: resp_tx,
             })
             .await

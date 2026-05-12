@@ -916,7 +916,19 @@ impl LocalStore {
         let accounts = global_db
             .open_tree(GLOBAL_TREE_ACCOUNTS)
             .map_err(|e| Error::Storage(format!("open accounts tree: {e}")))?;
-        let active_uid = get_string(&accounts, K_ACTIVE_UID)?;
+        // R8.7-impl — derive active uid from `current_user_file` (single source
+        // of truth), not the legacy `K_ACTIVE_UID` sled key. Reason: only
+        // `save_login` writes K_ACTIVE_UID; `set_current_uid` (the dominant
+        // boot-restore path) writes only the file. Reading the file aligns
+        // `is_active` with whichever account the App last set as current,
+        // eliminating the dual-store drift documented in
+        // privchat-sdk/docs/ACCOUNT_ACTIVE_AUDIT.md.
+        //
+        // K_ACTIVE_UID is intentionally left in place (still written by
+        // `save_login`, still cleared by `clear_session` / `wipe_user_full`)
+        // to keep the patch surface minimal and avoid migration. It is now
+        // dead-read; a follow-up cleanup PR can remove it if desired.
+        let active_uid = self.load_current_uid()?;
         let mut out = Vec::new();
         for item in accounts.iter() {
             let (k, v) = item.map_err(|e| Error::Storage(format!("iterate accounts: {e}")))?;
@@ -4021,7 +4033,7 @@ impl LocalStore {
 
 #[cfg(test)]
 mod tests {
-    use super::LocalStore;
+    use super::{get_string, LocalStore, GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID};
     use crate::{
         LoginResult, NewMessage, UpsertChannelExtraInput, UpsertChannelInput,
         UpsertRemoteMessageInput,
@@ -4101,6 +4113,109 @@ mod tests {
         assert!(token_enc.is_some());
         let plain = token_enc.expect("access enc exists");
         assert_ne!(plain.as_ref(), login.token.as_bytes());
+    }
+
+    // R8.7-impl — see privchat-sdk/docs/ACCOUNT_ACTIVE_AUDIT.md.
+    //
+    // `list_local_accounts` derives the active uid from `current_user_file`
+    // (single source of truth), not the legacy `K_ACTIVE_UID` sled key.
+    // These three tests lock that contract down:
+    //
+    //   1. After `save_login`, list reports the logged-in uid as active.
+    //   2. After `save_current_uid` (the path `set_current_uid` uses), list
+    //      reports the newly-current uid as active.
+    //   3. When the file says B but sled K_ACTIVE_UID still says A (the
+    //      drift scenario this round fixes), list trusts the file.
+    #[test]
+    fn list_local_accounts_after_save_login_reports_active() {
+        let store = test_store();
+        let uid = "30001";
+        let login = LoginResult {
+            user_id: uid.parse().expect("uid"),
+            token: "t".to_string(),
+            device_id: "d".to_string(),
+            refresh_token: None,
+            expires_at: 0,
+        };
+        store.save_login(uid, &login).expect("save login");
+        let (active, entries) = store.list_local_accounts().expect("list");
+        assert_eq!(active.as_deref(), Some(uid), "active uid should match login");
+        assert!(
+            entries.iter().any(|e| e.uid == uid),
+            "logged-in uid should appear in entries"
+        );
+    }
+
+    #[test]
+    fn list_local_accounts_follows_save_current_uid() {
+        let store = test_store();
+        // Two accounts, both fully logged in so both have entries.
+        let uid_a = "30010";
+        let uid_b = "30011";
+        for uid in [uid_a, uid_b] {
+            let login = LoginResult {
+                user_id: uid.parse().expect("uid"),
+                token: format!("t-{uid}"),
+                device_id: format!("d-{uid}"),
+                refresh_token: None,
+                expires_at: 0,
+            };
+            store.save_login(uid, &login).expect("save login");
+        }
+        // After both save_login calls, K_ACTIVE_UID=B and file=B (each
+        // save_login overwrites both). Switch the file pointer to A.
+        store.save_current_uid(uid_a).expect("save current uid");
+        let (active, entries) = store.list_local_accounts().expect("list");
+        assert_eq!(
+            active.as_deref(),
+            Some(uid_a),
+            "active should track the file, not the most-recent save_login"
+        );
+        assert_eq!(entries.len(), 2, "both accounts should remain listed");
+    }
+
+    #[test]
+    fn list_local_accounts_prefers_file_when_sled_drifts() {
+        let store = test_store();
+        let uid_a = "30020";
+        let uid_b = "30021";
+        for uid in [uid_a, uid_b] {
+            let login = LoginResult {
+                user_id: uid.parse().expect("uid"),
+                token: format!("t-{uid}"),
+                device_id: format!("d-{uid}"),
+                refresh_token: None,
+                expires_at: 0,
+            };
+            store.save_login(uid, &login).expect("save login");
+        }
+
+        // Construct an explicit drift: force the sled K_ACTIVE_UID back to
+        // A while leaving the file at B (state after second save_login).
+        // This mirrors the bug shape the audit identified — a `set_current_uid`-
+        // like path that updated only one of the two stores.
+        let global_db = store.open_global_db().expect("open global");
+        let accounts = global_db
+            .open_tree(GLOBAL_TREE_ACCOUNTS)
+            .expect("open accounts tree");
+        accounts
+            .insert(K_ACTIVE_UID, uid_a.as_bytes())
+            .expect("force K_ACTIVE_UID=A");
+        global_db.flush().expect("flush sled drift");
+
+        // Re-verify the drift is in place: sled says A, file should say B.
+        let sled_active = get_string(&accounts, K_ACTIVE_UID).expect("read sled");
+        assert_eq!(sled_active.as_deref(), Some(uid_a));
+        let file_active = store.load_current_uid().expect("read file");
+        assert_eq!(file_active.as_deref(), Some(uid_b));
+
+        // The contract: list trusts the file.
+        let (active, _) = store.list_local_accounts().expect("list");
+        assert_eq!(
+            active.as_deref(),
+            Some(uid_b),
+            "drift must be resolved in favor of the file (current_user_file)"
+        );
     }
 
     #[test]

@@ -17,6 +17,8 @@
 
 #![allow(clippy::new_without_default)]
 
+mod qr;
+
 use privchat_protocol::rpc::account::user::DetailSourceType;
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::{
@@ -36,6 +38,7 @@ use privchat_protocol::rpc::{
     ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse, DevicePushStatusRequest,
     DevicePushStatusResponse, DevicePushUpdateRequest, DevicePushUpdateResponse, FileGetUrlRequest,
     FileGetUrlResponse, FileRequestUploadTokenRequest, FileRequestUploadTokenResponse,
+    BotFollowRequest, BotFollowResponse, BotUnfollowRequest, BotUnfollowResponse,
     FileUploadCallbackRequest, FileUploadCallbackResponse, FriendAcceptRequest,
     FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse, FriendCheckRequest,
     FriendCheckResponse, FriendPendingRequest, FriendPendingResponse, FriendRejectRequest,
@@ -153,6 +156,17 @@ pub struct HttpClientConfigView {
     scheme: String,
 }
 
+/// Channel Transfer client→app reply (decoded from wire `TransferResponse`).
+/// See `02-server/CHANNEL_TRANSFER_SPEC.md` v2.0.
+#[derive(Debug, Clone, Serialize, uniffi::Record)]
+pub struct TransferReplyView {
+    pub request_id: String,
+    pub channel_id: u64,
+    pub code: i32,
+    pub message: String,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, uniffi::Record)]
 pub struct PresenceStatsView {
     online: u64,
@@ -268,6 +282,8 @@ pub struct AccountUserDetailView {
     pub can_send_message: bool,
     pub source_type: String,
     pub source_id: String,
+    /// 是否已关注（仅 user_type=2 Bot 有意义；非 bot 永远 false）
+    pub is_follow: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1253,6 +1269,8 @@ pub struct SearchUserEntry {
     pub search_session_id: u64,
     pub is_friend: bool,
     pub can_send_message: bool,
+    /// 是否已关注（仅 user_type=2 Bot 有意义；非 bot 永远 false）
+    pub is_follow: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1276,6 +1294,29 @@ pub struct FriendRequestResult {
 pub struct DirectChannelResult {
     pub channel_id: u64,
     pub created: bool,
+}
+
+/// Bot follow 结果（spec SERVICE_ACCOUNT_FOLLOW_SPEC §2.2）。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BotFollowResult {
+    pub bot_user_id: u64,
+    /// 与该 bot 之间的 direct channel id；后续 Subscribe / Transfer / SendMessage 都用它。
+    pub channel_id: u64,
+    /// v1.0 固定 2 (Bot)；保留以兼容未来扩展。
+    pub account_user_type: i32,
+    pub followed: bool,
+    /// `true` = 新建关系或从 unfollowed 复活；`false` = 已 followed 幂等复用。
+    pub created: bool,
+}
+
+/// Bot unfollow 结果。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BotUnfollowResult {
+    pub bot_user_id: u64,
+    /// 已存在的 direct channel id（保留，**不**删除）；`0` = 原本就没关注过。
+    pub channel_id: u64,
+    /// `true` = 已取消关注；`false` = 原本就没关注，no-op。
+    pub unfollowed: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3869,6 +3910,32 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
+    /// Channel Transfer client→app RPC. Sends a wire `TransferRequest`
+    /// (biz_type=19) and awaits the matching `TransferResponse` (biz_type=20).
+    /// `timeout_ms = 0` falls back to the SDK default (5000 ms).
+    /// See `02-server/CHANNEL_TRANSFER_SPEC.md` v2.0 and
+    /// `07-application/BOT_INTERACTION_SPEC.md` for typical routes.
+    pub async fn transfer(
+        &self,
+        channel_id: u64,
+        route: String,
+        body: Vec<u8>,
+        timeout_ms: u64,
+    ) -> Result<TransferReplyView, PrivchatFfiError> {
+        let reply = self
+            .inner
+            .transfer(channel_id, route, body, timeout_ms)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(TransferReplyView {
+            request_id: reply.request_id,
+            channel_id: reply.channel_id,
+            code: reply.code,
+            message: reply.message,
+            data: reply.data,
+        })
+    }
+
     pub async fn batch_get_presence(
         &self,
         user_ids: Vec<u64>,
@@ -4022,8 +4089,93 @@ impl PrivchatClient {
                 search_session_id: u.search_session_id,
                 is_friend: u.is_friend,
                 can_send_message: u.can_send_message,
+                is_follow: u.is_follow,
             })
             .collect())
+    }
+
+    /// 关注一个 Bot（user_type=2）；server 写 `privchat_bot_follow` + 通知 application
+    /// 写 `privchat_business_channel` binding。返回 channel_id 后即可 Subscribe + Transfer。
+    ///
+    /// Spec: `02-server/SERVICE_ACCOUNT_FOLLOW_SPEC` §3.1。
+    pub async fn follow_bot(
+        &self,
+        bot_user_id: u64,
+    ) -> Result<BotFollowResult, PrivchatFfiError> {
+        let resp: BotFollowResponse = rpc_call_typed(
+            &self.inner,
+            routes::account_bot::FOLLOW,
+            &BotFollowRequest { bot_user_id },
+        )
+        .await?;
+        // 让 SDK 本地 store 同步新 channel（与 accept_friend_request 处的 sync_channel 一致）。
+        self.inner
+            .sync_channel(resp.channel_id, 1)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        // 立刻拉 bot 详情写入本地 users 表，避免会话头没昵称（spec BOT_INTERACTION_SPEC §3.0.4）。
+        // 失败只忽略——不阻塞 follow 主路径。
+        let _ = self.persist_user_profile_local(bot_user_id).await;
+        Ok(BotFollowResult {
+            bot_user_id: resp.bot_user_id,
+            channel_id: resp.channel_id,
+            account_user_type: i32::from(resp.account_user_type),
+            followed: resp.followed,
+            created: resp.created,
+        })
+    }
+
+    /// 拉一次 `account/user/detail` 并把对端用户写入本地 users 表。
+    /// 用于 follow 后让会话头显示昵称/头像，spec BOT_INTERACTION_SPEC §3.0。
+    async fn persist_user_profile_local(&self, target_user_id: u64) -> Result<(), PrivchatFfiError> {
+        let detail: AccountUserDetailResponse = rpc_call_typed(
+            &self.inner,
+            routes::account_user::DETAIL,
+            &AccountUserDetailRequest {
+                target_user_id,
+                source: DetailSourceType::Friend.as_str().to_string(),
+                source_id: target_user_id.to_string(),
+                user_id: 0,
+            },
+        )
+        .await?;
+        let now_ms = now_millis();
+        self.inner
+            .upsert_user(SdkUpsertUserInput {
+                user_id: detail.user_id,
+                username: Some(detail.username),
+                nickname: Some(detail.nickname),
+                alias: None,
+                avatar: detail.avatar_url.unwrap_or_default(),
+                user_type: i32::from(detail.user_type),
+                is_deleted: false,
+                channel_id: String::new(),
+                version: 0,
+                updated_at: now_ms,
+            })
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(())
+    }
+
+    /// 取消关注 Bot；server 切 status=0 但**不**删 channel / 历史 / application 业务行。
+    ///
+    /// Spec: `02-server/SERVICE_ACCOUNT_FOLLOW_SPEC` §3.2。
+    pub async fn unfollow_bot(
+        &self,
+        bot_user_id: u64,
+    ) -> Result<BotUnfollowResult, PrivchatFfiError> {
+        let resp: BotUnfollowResponse = rpc_call_typed(
+            &self.inner,
+            routes::account_bot::UNFOLLOW,
+            &BotUnfollowRequest { bot_user_id },
+        )
+        .await?;
+        Ok(BotUnfollowResult {
+            bot_user_id: resp.bot_user_id,
+            channel_id: resp.channel_id,
+            unfollowed: resp.unfollowed,
+        })
     }
 
     pub async fn send_friend_request(
@@ -4079,6 +4231,7 @@ impl PrivchatClient {
                         search_session_id: u.search_session_id,
                         is_friend: u.is_friend,
                         can_send_message: u.can_send_message,
+                        is_follow: u.is_follow,
                     },
                     message: item.message,
                     created_at: item.created_at,
@@ -5315,6 +5468,7 @@ impl PrivchatClient {
                     search_session_id: u.search_session_id,
                     is_friend: u.is_friend,
                     can_send_message: u.can_send_message,
+                    is_follow: u.is_follow,
                 })
                 .collect(),
             total: resp.total as u64,
@@ -5349,6 +5503,7 @@ impl PrivchatClient {
             can_send_message: resp.can_send_message,
             source_type: resp.source_type,
             source_id: resp.source_id,
+            is_follow: resp.is_follow,
         })
     }
 
@@ -7969,6 +8124,67 @@ pub fn build_time() -> String {
         .or(option_env!("BUILD_TIME"))
         .unwrap_or("unknown")
         .to_string()
+}
+
+// ───────────────────── R8.6b-rust QR decoder ─────────────────────
+//
+// Implementation lives in `crate::qr`. The `#[uniffi::export]` /
+// `#[derive(uniffi::Error)]` annotations are kept at crate root because
+// the KMP uniffi-bindgen embeds the source module path into generated
+// C symbol names (`uniffi_<crate>::qr_fn_func_<name>`), which Clang
+// then refuses to parse during cinterop. Root-level declarations
+// produce flat `uniffi_<crate>_fn_func_<name>` symbols that cinterop
+// is happy with.
+
+/// Errors surfaced through UniFFI to Kotlin / Swift callers of
+/// [`qr_decode_luma`]. See `crate::qr::QrDecodeError`.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum QrDecodeError {
+    #[error(
+        "invalid luma dimensions: width={width} height={height} luma_len={luma_len}"
+    )]
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+        luma_len: u32,
+    },
+    #[error("decoder error: {detail}")]
+    DecoderError { detail: String },
+}
+
+impl From<qr::QrDecodeError> for QrDecodeError {
+    fn from(value: qr::QrDecodeError) -> Self {
+        match value {
+            qr::QrDecodeError::InvalidDimensions {
+                width,
+                height,
+                luma_len,
+            } => Self::InvalidDimensions {
+                width,
+                height,
+                luma_len,
+            },
+            qr::QrDecodeError::DecoderError { detail } => Self::DecoderError { detail },
+        }
+    }
+}
+
+/// Decode a QR code from an 8-bit grayscale image (Y plane of a YUV
+/// camera frame, or `0.299*R + 0.587*G + 0.114*B` of an RGB photo).
+///
+/// `luma` must be exactly `width * height` bytes, row-major.
+///
+/// - `Ok(Some(text))` — QR found
+/// - `Ok(None)`       — no QR in this frame (steady-state during live scan)
+/// - `Err(InvalidDimensions)` — caller-side dimensions / length mismatch
+/// - `Err(DecoderError)` — rxing internal failure (rare)
+#[uniffi::export]
+pub fn qr_decode_luma(
+    width: u32,
+    height: u32,
+    luma: Vec<u8>,
+) -> Result<Option<String>, QrDecodeError> {
+    qr::decode_luma(width, height, luma).map_err(Into::into)
 }
 
 #[cfg(test)]

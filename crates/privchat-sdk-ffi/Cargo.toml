@@ -20,9 +20,28 @@ privchat-protocol.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 privchat-sdk = { path = "../privchat-sdk" }
+# R8.6b-rust — QR decoder shared across Android/iOS via UniFFI.
+# Minimal feature set: `decoders` + `qrcode` only (no image, no encoders,
+# no other barcode formats, no svg, no client_support). `encoding_rs` is
+# kept on so QR byte-mode payloads with ECI charset switches (UTF-8 /
+# Shift-JIS / GBK) decode correctly — pure-ASCII login QRs work either
+# way, but defensive for future encodings adds only ~200 KB.
+rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"] }
 
 [build-dependencies]
 uniffi.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# R8.6b-rust — pure-Rust QR encoder for fixture generation in unit tests.
+# NOT pulled into release builds. Lets the round-trip test create a known
+# QR image in memory, render it as a luma byte array, and assert
+# `qr_decode_luma` returns the original payload.
+qrcode = "0.14"
+# R8.6c diagnostic — `qr_decode_image` example reads a real PNG/JPG/WebP
+# file and feeds its luma plane to qr_decode_luma. Dev-only; not in release.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+[[example]]
+name = "qr_decode_image"
+path = "examples/qr_decode_image.rs"
