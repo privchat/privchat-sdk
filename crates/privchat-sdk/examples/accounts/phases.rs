@@ -3880,6 +3880,223 @@ impl TestPhases {
             metrics,
         })
     }
+
+    /// Phase 36: BotFollow → ServerEvent → 自动 business_channel binding →
+    /// Transfer `bot/menu/get` 全链 smoke。
+    ///
+    /// 测的是 v1.1 闭环（spec `SERVER_EVENT_DISPATCH_SPEC` + `ADMIN_BOT_SPEC` §7）：
+    ///
+    /// 1. admin 登录拿 JWT
+    /// 2. POST /admin-api/privchat/bot/create with owner = alice.user_id
+    /// 3. PUT  /admin-api/privchat/bot/{bot_id}/menu 写 fixture menu_schema
+    /// 4. alice 调 wire RPC `account/bot/follow` → 拿到 channel_id
+    /// 5. 等 ServerEvent fire-and-forget 异步落 binding（最多重试 5 次 × 200ms）
+    /// 6. alice 调 wire Transfer route=`bot/menu/get` → 拿 menu_schema 字节
+    /// 7. 断言：transfer.code=0 + JSON 解码后 == 第 3 步写入的 menu_schema
+    ///
+    /// 触发条件：`PRIVCHAT_PLATFORM_BASE_URL` 非空才跑（默认 `http://127.0.0.1:8080`）。
+    /// 空时返 pass 但 `details="skipped: ..."` —— 不阻塞 server-only CI。
+    pub async fn phase36_platform_bot_followed(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let platform_base = std::env::var("PRIVCHAT_PLATFORM_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        if platform_base.is_empty() {
+            return Ok(PhaseResult {
+                phase_name: "platform-bot-followed".to_string(),
+                success: true,
+                duration: start.elapsed(),
+                details: "skipped: PRIVCHAT_PLATFORM_BASE_URL is empty".to_string(),
+                metrics,
+            });
+        }
+        let admin_user = std::env::var("PRIVCHAT_PLATFORM_ADMIN_USERNAME")
+            .unwrap_or_else(|_| "admin".to_string());
+        let admin_pass = std::env::var("PRIVCHAT_PLATFORM_ADMIN_PASSWORD")
+            .unwrap_or_else(|_| "admin123".to_string());
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        // 1. admin login
+        let login_resp = http
+            .post(format!("{}/admin-api/system/auth/login", platform_base))
+            .json(&serde_json::json!({
+                "username": admin_user,
+                "password": admin_pass,
+            }))
+            .send()
+            .await?;
+        let login_status = login_resp.status();
+        let login_body: serde_json::Value = login_resp.json().await?;
+        if !login_status.is_success() {
+            return Err(boxed_err(format!(
+                "admin login failed: status={login_status} body={login_body}"
+            )));
+        }
+        let access_token = login_body
+            .pointer("/data/accessToken")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                boxed_err(format!("admin login missing data.accessToken: {login_body}"))
+            })?
+            .to_string();
+
+        // 2. create bot —— owner = alice，避免多次跑互相覆盖：username 带 suffix
+        let alice = manager.account_config("alice")?;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let bot_username = format!("smokebot_{}", suffix);
+        let create_resp = http
+            .post(format!("{}/admin-api/privchat/bot/create", platform_base))
+            .bearer_auth(&access_token)
+            .json(&serde_json::json!({
+                "name": "Smoke Bot",
+                "username": bot_username,
+                "owner_user_id": alice.user_id,
+            }))
+            .send()
+            .await?;
+        let create_status = create_resp.status();
+        let create_body: serde_json::Value = create_resp.json().await?;
+        if !create_status.is_success() {
+            return Err(boxed_err(format!(
+                "bot create failed: status={create_status} body={create_body}"
+            )));
+        }
+        let bot_user_id = create_body
+            .pointer("/data/id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| boxed_err(format!("bot create missing data.id: {create_body}")))?;
+
+        // 3. set menu_schema —— fixture：1 个 transfer action 项
+        let menu_schema = serde_json::json!({
+            "version": 1,
+            "items": [
+                {
+                    "id": "hi",
+                    "title": "Hi",
+                    "action": { "type": "transfer", "route": "bot/echo/ping" }
+                }
+            ]
+        });
+        let menu_resp = http
+            .put(format!(
+                "{}/admin-api/privchat/bot/{}/menu",
+                platform_base, bot_user_id
+            ))
+            .bearer_auth(&access_token)
+            .json(&serde_json::json!({ "menu_schema": menu_schema }))
+            .send()
+            .await?;
+        let menu_status = menu_resp.status();
+        if !menu_status.is_success() {
+            let body: serde_json::Value = menu_resp
+                .json()
+                .await
+                .unwrap_or(serde_json::Value::Null);
+            return Err(boxed_err(format!(
+                "bot menu set failed: status={menu_status} body={body}"
+            )));
+        }
+
+        // 4. alice 调 wire RPC account/bot/follow
+        let follow_resp: privchat_protocol::rpc::account::bot::BotFollowResponse = manager
+            .rpc_typed(
+                "alice",
+                privchat_protocol::rpc::routes::account_bot::FOLLOW,
+                &privchat_protocol::rpc::account::bot::BotFollowRequest { bot_user_id },
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        let channel_id = follow_resp.channel_id;
+        if channel_id == 0 {
+            return Err(boxed_err(format!(
+                "bot.follow returned channel_id=0: {follow_resp:?}"
+            )));
+        }
+
+        // 5. 等 ServerEvent fire-and-forget 落 binding。server emit + app 写表
+        //    全异步；首发后第一个 bot/menu/get 偶尔 race 拿到 20901 ChannelNotBound，
+        //    所以容忍最多 5 次 × 200ms 重试。
+        let alice_sdk = manager.sdk("alice")?;
+        let mut transfer_reply = None;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            match alice_sdk
+                .transfer(channel_id, "bot/menu/get".to_string(), Vec::new(), 5000)
+                .await
+            {
+                Ok(reply) if reply.code == 0 => {
+                    transfer_reply = Some(reply);
+                    break;
+                }
+                Ok(reply) => {
+                    last_err = Some(format!(
+                        "transfer returned code={} message={} (attempt {})",
+                        reply.code,
+                        reply.message,
+                        attempt + 1
+                    ));
+                }
+                Err(e) => {
+                    last_err = Some(format!("transfer call err: {e} (attempt {})", attempt + 1));
+                }
+            }
+        }
+        let reply = transfer_reply.ok_or_else(|| {
+            boxed_err(format!(
+                "bot/menu/get never succeeded after 5 attempts; last={}",
+                last_err.unwrap_or_else(|| "<no error>".to_string())
+            ))
+        })?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        // 6. 断言 menu_schema round-trip
+        let data = reply.data;
+        if data.is_empty() {
+            return Err(boxed_err("bot/menu/get returned empty data".to_string()));
+        }
+        let returned_menu: serde_json::Value = serde_json::from_slice(&data).map_err(|e| {
+            boxed_err(format!(
+                "bot/menu/get data not valid JSON: {e}; raw_len={}",
+                data.len()
+            ))
+        })?;
+        if returned_menu != menu_schema {
+            return Err(boxed_err(format!(
+                "menu_schema roundtrip mismatch:\n  set:      {}\n  returned: {}",
+                serde_json::to_string(&menu_schema).unwrap_or_default(),
+                serde_json::to_string(&returned_menu).unwrap_or_default(),
+            )));
+        }
+
+        Ok(PhaseResult {
+            phase_name: "platform-bot-followed".to_string(),
+            success: true,
+            duration: start.elapsed(),
+            details: format!(
+                "bot_user_id={bot_user_id} channel_id={channel_id} menu_items={}",
+                returned_menu
+                    .pointer("/items")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0)
+            ),
+            metrics,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

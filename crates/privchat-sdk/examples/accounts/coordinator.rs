@@ -104,6 +104,8 @@ impl TestCoordinator {
             .await;
         self.run_phase(TestPhases::phase35_admin_revoke_online(manager).await)
             .await;
+        self.run_phase(TestPhases::phase36_platform_bot_followed(manager).await)
+            .await;
         Ok(())
     }
 
