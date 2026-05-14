@@ -1837,6 +1837,8 @@ impl LocalStore {
                     version: row.get::<_, i64>(11)?,
                     updated_at: row.get::<_, i64>(12)?,
                     peer_user_id: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                last_message_type: None,
+                last_message_is_revoked: false,
                 })
             },
         )
@@ -2013,6 +2015,8 @@ impl LocalStore {
                     version: row.get::<_, i64>(11)?,
                     updated_at: row.get::<_, i64>(12)?,
                     peer_user_id: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                last_message_type: None,
+                last_message_is_revoked: false,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list channels: {e}")))?;

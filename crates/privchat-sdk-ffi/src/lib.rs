@@ -913,13 +913,6 @@ fn json_encode<T: Serialize>(value: &T, what: &str) -> Result<String, PrivchatFf
     })
 }
 
-fn json_decode<T: DeserializeOwned>(value: &str, what: &str) -> Result<T, PrivchatFfiError> {
-    serde_json::from_str::<T>(value).map_err(|e| PrivchatFfiError::SdkError {
-        code: privchat_protocol::ErrorCode::InvalidJson as u32,
-        detail: format!("decode {what} failed: {e}"),
-    })
-}
-
 fn spawn_background_future<F>(label: &'static str, fut: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -940,6 +933,20 @@ where
     });
 }
 
+/// FFI typed RPC 入口——**统一委托到 [`PrivchatSdk::rpc_call_typed`]**。
+///
+/// 历史 bug：FFI 曾经自己实现了一套 encode → rpc_call → decode 的简化链路，绕过了
+/// SDK 主路径上的 [`PrivchatSdk::apply_rpc_side_effects`]，导致 `friend::ACCEPT`
+/// 这种"成功后必须同步 friend / user / channel 实体"的 RPC 在本地实体表没刷新——
+/// UI 同意好友后联系人列表不增量更新，是同一个根因。
+///
+/// **架构不变式（FFI RPC Convergence Rule）**：
+/// FFI 层不得自行重新实现 typed RPC 调用链。所有带业务语义的 RPC 必须经过
+/// [`PrivchatSdk::rpc_call_typed`]——它内部 encode → rpc_call → 统一 side-effect
+/// 编排（[`PrivchatSdk::apply_rpc_side_effects`]）→ decode。
+///
+/// 这个不变式跟"Global Service Convergence Rule"同构：业务语义只有一条主路径。
+/// FFI 只做类型映射与平台桥接，不绕开 SDK 主路径。
 async fn rpc_call_typed<Req, Resp>(
     sdk: &InnerSdk,
     route: &str,
@@ -949,12 +956,9 @@ where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    let body_json = json_encode(request, &format!("{route} request"))?;
-    let raw = sdk
-        .rpc_call(route.to_string(), body_json)
+    sdk.rpc_call_typed::<Req, Resp>(route, request)
         .await
-        .map_err(PrivchatFfiError::from)?;
-    json_decode::<Resp>(&raw, &format!("{route} response"))
+        .map_err(PrivchatFfiError::from)
 }
 
 fn parse_group_role_to_code(role: &str) -> i32 {
@@ -1435,9 +1439,15 @@ pub struct StoredChannel {
     pub mute: i32,
     pub last_msg_timestamp: i64,
     pub last_local_message_id: u64,
+    /// 最后一条消息的原始 content（TEXT = 纯文本，其他类型 = 结构化 JSON）。
+    /// UI 层基于 `last_message_type` + content + i18n 自行渲染预览，**SDK 不做改写**。
     pub last_msg_content: String,
     pub updated_at: i64,
     pub peer_user_id: Option<u64>,
+    /// 最后一条消息的协议 message_type（ContentMessageType 整型值）。
+    pub last_message_type: Option<i32>,
+    /// 最后一条消息是否已撤回。
+    pub last_message_is_revoked: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2695,6 +2705,8 @@ fn map_stored_channel(v: SdkStoredChannel) -> StoredChannel {
         last_msg_content: v.last_msg_content,
         updated_at: v.updated_at,
         peer_user_id: v.peer_user_id,
+        last_message_type: v.last_message_type,
+        last_message_is_revoked: v.last_message_is_revoked,
     }
 }
 
@@ -4245,6 +4257,9 @@ impl PrivchatClient {
         from_user_id: u64,
         message: Option<String>,
     ) -> Result<u64, PrivchatFfiError> {
+        // 同步 channel/friend/user 实体的 side-effects 由 PrivchatSdk::apply_rpc_side_effects
+        // 在 rpc_call_typed 内部统一处理（friend::ACCEPT 分支）。FFI 不再手写，参见
+        // 顶部 `rpc_call_typed` 文档中的 "FFI RPC Convergence Rule"。
         let resp: FriendAcceptResponse = rpc_call_typed(
             &self.inner,
             routes::friend::ACCEPT,
@@ -4255,10 +4270,6 @@ impl PrivchatClient {
             },
         )
         .await?;
-        self.inner
-            .sync_channel(resp, 1)
-            .await
-            .map_err(PrivchatFfiError::from)?;
         Ok(resp)
     }
 

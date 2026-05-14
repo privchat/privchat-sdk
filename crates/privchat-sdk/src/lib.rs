@@ -1123,12 +1123,20 @@ pub struct StoredChannel {
     pub mute: i32,
     pub last_msg_timestamp: i64,
     pub last_local_message_id: u64,
+    /// 最后一条消息的**原始 content**（spec/05-feature/SYSTEM_MESSAGE_SPEC §3：
+    /// TEXT 时是纯文本，其它类型是结构化 JSON）。**SDK 不再做 preview 文案改写**，
+    /// preview 完全由 UI 层基于 [`last_message_type`] + content + i18n 决定。
     pub last_msg_content: String,
     pub version: i64,
     pub updated_at: i64,
     /// DM 会话的对端用户 ID。仅 channel_type==1 时有值，其余为 None。
     /// 派生自 channel_member 表（排除当前用户后的唯一成员）。
     pub peer_user_id: Option<u64>,
+    /// 最后一条消息的 ContentMessageType 值（i32），用于让 UI 层正确渲染
+    /// `[图片] / [语音] N''` 等本地化预览。None 表示该 channel 还没有消息或类型未知。
+    pub last_message_type: Option<i32>,
+    /// 最后一条消息是否已被撤回。撤回后 UI 应统一显示"X 撤回了一条消息"占位。
+    pub last_message_is_revoked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3649,6 +3657,23 @@ impl State {
             }
             _ => None,
         }
+    }
+
+    /// 识别"好友申请已收到"事件 push（topic="friend.request.received"）。
+    ///
+    /// 服务端在 `contact/friend/apply` 成功后通过 connection_manager 推送，
+    /// SDK 这里只负责识别 + 返回 from_user_id；调用方据此发出
+    /// `SyncEntityChanged{entity_type="friend_request"}` 事件给宿主，
+    /// 触发 friend/pending RPC 刷新。
+    ///
+    /// 返回 `Some(from_user_id)` 表示是好友申请事件；`None` 表示其它 push。
+    fn push_message_to_friend_request_event(push: &PushMessageRequest) -> Option<u64> {
+        if push.topic != "friend.request.received" {
+            return None;
+        }
+        let payload_json: serde_json::Value = serde_json::from_slice(&push.payload).ok()?;
+        Self::json_field_u64(&payload_json, &["from_user_id"])
+            .or(Some(push.from_uid))
     }
 
     /// Extract a delivery receipt from a push notification, if applicable.
@@ -6777,7 +6802,13 @@ impl State {
             MessageType::PushMessageRequest => {
                 let req: PushMessageRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
-                if let Some(status_item) = Self::push_message_to_status_sync_item(&req) {
+                if let Some(from_uid) = Self::push_message_to_friend_request_event(&req) {
+                    self.pending_events.push(SdkEvent::SyncEntityChanged {
+                        entity_type: "friend_request".to_string(),
+                        entity_id: from_uid.to_string(),
+                        deleted: false,
+                    });
+                } else if let Some(status_item) = Self::push_message_to_status_sync_item(&req) {
                     read_cursor_items.push(status_item);
                 } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&req) {
                     delivery_receipts.push(receipt);
@@ -6791,7 +6822,13 @@ impl State {
                 let req: PushBatchRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push batch: {e}")))?;
                 for push in req.messages {
-                    if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                    if let Some(from_uid) = Self::push_message_to_friend_request_event(&push) {
+                        self.pending_events.push(SdkEvent::SyncEntityChanged {
+                            entity_type: "friend_request".to_string(),
+                            entity_id: from_uid.to_string(),
+                            deleted: false,
+                        });
+                    } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
                         read_cursor_items.push(status_item);
                     } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
                         delivery_receipts.push(receipt);
@@ -6811,7 +6848,13 @@ impl State {
                             push.channel_id
                         );
                     }
-                    if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                    if let Some(from_uid) = Self::push_message_to_friend_request_event(&push) {
+                        self.pending_events.push(SdkEvent::SyncEntityChanged {
+                            entity_type: "friend_request".to_string(),
+                            entity_id: from_uid.to_string(),
+                            deleted: false,
+                        });
+                    } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
                         read_cursor_items.push(status_item);
                     } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
                         delivery_receipts.push(receipt);
@@ -6826,7 +6869,13 @@ impl State {
                         );
                     }
                     for push in batch.messages {
-                        if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                        if let Some(from_uid) = Self::push_message_to_friend_request_event(&push) {
+                            self.pending_events.push(SdkEvent::SyncEntityChanged {
+                                entity_type: "friend_request".to_string(),
+                                entity_id: from_uid.to_string(),
+                                deleted: false,
+                            });
+                        } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
                             read_cursor_items.push(status_item);
                         } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
                             delivery_receipts.push(receipt);
@@ -7876,197 +7925,32 @@ impl State {
         }
     }
 
-    fn is_formatted_preview(content: &str) -> bool {
-        matches!(
-            content,
-            s if s.starts_with("[图片]")
-                || s.starts_with("[视频]")
-                || s.starts_with("[语音]")
-                || s.starts_with("[文件]")
-                || s.starts_with("[位置]")
-                || s.starts_with("[红包]")
-                || s.starts_with("[名片]")
-                || s.starts_with("[表情]")
-        )
-    }
-
-    fn preview_type_from_json(value: &serde_json::Value) -> Option<String> {
-        Self::json_get_string(value, &["type"])
-            .or_else(|| Self::json_get_string(value, &["content", "type"]))
-            .or_else(|| Self::json_get_string(value, &["metadata", "type"]))
-            .map(|v| v.to_ascii_lowercase())
-    }
-
-    fn preview_text_from_json(value: &serde_json::Value) -> Option<String> {
-        Self::json_get_string(value, &["content"])
-            .or_else(|| Self::json_get_string(value, &["text"]))
-            .or_else(|| Self::json_get_string(value, &["body"]))
-            .or_else(|| Self::json_get_string(value, &["content", "text"]))
-            .or_else(|| Self::json_get_string(value, &["content", "body"]))
-            .or_else(|| Self::json_get_string(value, &["tip"]))
-    }
-
-    fn preview_duration_from_json(value: &serde_json::Value) -> Option<i64> {
-        Self::json_get_i64(value, &["duration"])
-            .or_else(|| Self::json_get_i64(value, &["content", "duration"]))
-            .or_else(|| Self::json_get_i64(value, &["metadata", "duration"]))
-    }
-
-    fn infer_preview_kind(
-        message_type: Option<i32>,
-        content_json: Option<&serde_json::Value>,
-        extra_json: Option<&serde_json::Value>,
-    ) -> &'static str {
-        let image_type = i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(-1);
-        let file_type = i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(-1);
-        let voice_type = i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(-1);
-        let video_type = i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(-1);
-        let system_type = i32::try_from(ContentMessageType::System.as_u32()).unwrap_or(-1);
-        let location_type = i32::try_from(ContentMessageType::Location.as_u32()).unwrap_or(-1);
-        let contact_type = i32::try_from(ContentMessageType::ContactCard.as_u32()).unwrap_or(-1);
-        let sticker_type = i32::try_from(ContentMessageType::Sticker.as_u32()).unwrap_or(-1);
-
-        match message_type {
-            Some(v) if v == image_type => return "image",
-            Some(v) if v == file_type => {
-                let mime = content_json
-                    .and_then(|value| Self::json_get_string(value, &["mime_type"]))
-                    .or_else(|| {
-                        extra_json.and_then(|value| Self::json_get_string(value, &["mime_type"]))
-                    })
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                return if mime.starts_with("image/") {
-                    "image"
-                } else if mime.starts_with("video/") {
-                    "video"
-                } else if mime.starts_with("audio/") {
-                    "voice"
-                } else {
-                    "file"
-                };
-            }
-            Some(v) if v == voice_type => return "voice",
-            Some(v) if v == video_type => return "video",
-            Some(v) if v == system_type => return "system",
-            Some(v) if v == location_type => return "location",
-            Some(v) if v == contact_type => return "contact_card",
-            Some(v) if v == sticker_type => return "sticker",
-            _ => {}
-        }
-
-        let detected = content_json
-            .and_then(Self::preview_type_from_json)
-            .or_else(|| extra_json.and_then(Self::preview_type_from_json));
-        match detected.as_deref() {
-            Some("image") => "image",
-            Some("video") => "video",
-            Some("voice") | Some("audio") => "voice",
-            Some("file") => "file",
-            Some("location") => "location",
-            Some("contact_card") | Some("contactcard") | Some("card") => "contact_card",
-            Some("red_packet") | Some("redpacket") | Some("hongbao") => "red_packet",
-            Some("sticker") | Some("emoji") => "sticker",
-            Some("system") | Some("tip") => "system",
-            Some("revoked") => "revoked",
-            _ => {
-                let revoked = content_json
-                    .and_then(|value| Self::json_get_bool(value, &["revoked"]))
-                    .or_else(|| {
-                        extra_json.and_then(|value| Self::json_get_bool(value, &["revoked"]))
-                    })
-                    .unwrap_or(false);
-                if revoked {
-                    "revoked"
-                } else {
-                    "text"
-                }
-            }
-        }
-    }
-
-    fn format_conversation_preview(
-        message_type: Option<i32>,
-        content: &str,
-        extra: Option<&str>,
-    ) -> String {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return String::new();
-        }
-        if Self::is_formatted_preview(trimmed) {
-            return trimmed.to_string();
-        }
-
-        let content_json = serde_json::from_str::<serde_json::Value>(trimmed).ok();
-        let extra_json = extra
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
-        let preview_kind =
-            Self::infer_preview_kind(message_type, content_json.as_ref(), extra_json.as_ref());
-
-        match preview_kind {
-            "image" => "[图片]".to_string(),
-            "video" => "[视频]".to_string(),
-            "voice" => {
-                let duration = content_json
-                    .as_ref()
-                    .and_then(Self::preview_duration_from_json)
-                    .or_else(|| {
-                        extra_json
-                            .as_ref()
-                            .and_then(Self::preview_duration_from_json)
-                    })
-                    .unwrap_or_default();
-                if duration > 0 {
-                    format!("[语音]{duration}\"")
-                } else {
-                    "[语音]".to_string()
-                }
-            }
-            "file" => "[文件]".to_string(),
-            "location" => "[位置]".to_string(),
-            "contact_card" => "[名片]".to_string(),
-            "red_packet" => "[红包]".to_string(),
-            "sticker" => "[表情]".to_string(),
-            "system" => content_json
-                .as_ref()
-                .and_then(Self::preview_text_from_json)
-                .or_else(|| extra_json.as_ref().and_then(Self::preview_text_from_json))
-                .unwrap_or_else(|| trimmed.to_string()),
-            "revoked" => "撤回了一条消息".to_string(),
-            _ => content_json
-                .as_ref()
-                .and_then(Self::preview_text_from_json)
-                .or_else(|| extra_json.as_ref().and_then(Self::preview_text_from_json))
-                .unwrap_or_else(|| trimmed.to_string()),
-        }
-    }
-
+    /// 补全 channel 的 last_message_* 元数据字段。
+    ///
+    /// **重要**：本函数**不再改写 `last_msg_content`**（参见架构归正）。
+    /// content 字段保持为消息的原始体（TEXT = 纯文本 / 其它 = 结构化 JSON），
+    /// 预览文案由 UI 层基于 `last_message_type` + `last_message_is_revoked` + i18n 渲染。
+    ///
+    /// 行为：通过 `last_local_message_id` 查本地消息表，取出 `message_type` 与
+    /// 撤回标记后写到 channel 的相应字段。查不到时保持 None / false。
     async fn materialize_channel_preview(&self, mut channel: StoredChannel) -> StoredChannel {
-        let preview = if channel.last_local_message_id > 0 {
-            match self
+        if channel.last_local_message_id > 0 {
+            if let Ok(Some(message)) = self
                 .storage
                 .get_message_by_id(channel.last_local_message_id)
                 .await
             {
-                Ok(Some(message))
-                    if message.channel_id == channel.channel_id
-                        && message.channel_type == channel.channel_type =>
+                if message.channel_id == channel.channel_id
+                    && message.channel_type == channel.channel_type
                 {
-                    Self::format_conversation_preview(
-                        Some(message.message_type),
-                        &message.content,
-                        Some(&message.extra),
-                    )
+                    channel.last_message_type = Some(message.message_type);
+                    // StoredMessage 暂无显式 revoked 字段；客户端通过 message_type==System
+                    // + content/extra 中的 topic / metadata 推断（spec/SYSTEM_MESSAGE_SPEC §3）。
+                    // 这里保守置 false，未来如需精确从 StoredMessageExtra.revoke 派生再补。
+                    channel.last_message_is_revoked = false;
                 }
-                _ => Self::format_conversation_preview(None, &channel.last_msg_content, None),
             }
-        } else {
-            Self::format_conversation_preview(None, &channel.last_msg_content, None)
-        };
-        channel.last_msg_content = preview;
+        }
         channel
     }
 
@@ -13876,29 +13760,8 @@ mod tests {
         assert_eq!(State::attachment_placeholder_text(file, "unknown"), "[文件]");
     }
 
-    #[test]
-    fn conversation_preview_is_rendered_in_sdk_layer() {
-        assert_eq!(
-            State::format_conversation_preview(
-                Some(i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(0)),
-                "{\"type\":\"voice\",\"duration\":3}",
-                Some("{}"),
-            ),
-            "[语音]3\""
-        );
-        assert_eq!(
-            State::format_conversation_preview(
-                Some(i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0)),
-                "{\"content\":\"hello\"}",
-                Some("{}"),
-            ),
-            "hello"
-        );
-        assert_eq!(
-            State::format_conversation_preview(None, "{\"type\":\"contact_card\"}", None),
-            "[名片]"
-        );
-    }
+    // 旧测试 conversation_preview_is_rendered_in_sdk_layer 已删除——
+    // SDK 不再渲染会话预览（架构归正：preview 是 UI 层职责，参见 SYSTEM_MESSAGE_SPEC）。
 
     #[tokio::test(flavor = "current_thread")]
     async fn channel_prefs_roundtrip_through_semantic_api() {
