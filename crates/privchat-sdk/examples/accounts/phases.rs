@@ -3046,7 +3046,56 @@ impl TestPhases {
             ("bob", &bob_sdk),
             ("charlie", &charlie_sdk),
         ] {
-            match sdk.subscribe_channel(channel_id, 2, None).await {
+            // Room subscribe 必须带 ticket（spec ROOM_CHANNEL_SPEC §4.6）。
+            // server 端配 [room_ticket].secret 后强制校验，否则返
+            // reason_code=9 TICKET_MISSING。业务侧（这里替身）走
+            // `/api/service/room-tickets/issue` 拿 ticket（spec §4.5）。
+            let cfg = manager.account_config(name)?;
+            let issue_resp = client
+                .post(format!("{}/api/service/room-tickets/issue", admin_base))
+                .header("X-Service-Key", &service_key)
+                .json(&serde_json::json!({
+                    "channel_id": channel_id,
+                    "user_id": cfg.user_id,
+                    "device_id": cfg.device_id,
+                    "scope": "subscribe",
+                    "ttl_secs": 300,
+                }))
+                .send()
+                .await?;
+            metrics.rpc_calls += 1;
+            if !issue_resp.status().is_success() {
+                let status = issue_resp.status();
+                let body = issue_resp.text().await.unwrap_or_default();
+                metrics.errors.push(format!(
+                    "{} ticket issue failed: {} {}",
+                    name, status, body
+                ));
+                continue;
+            }
+            let ticket = match issue_resp
+                .json::<AdminEnvelope<IssueTicketResponse>>()
+                .await
+            {
+                Ok(env) => match env.data {
+                    Some(t) => t.ticket,
+                    None => {
+                        metrics
+                            .errors
+                            .push(format!("{} ticket issue: empty envelope data", name));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    metrics
+                        .errors
+                        .push(format!("{} ticket issue: parse err {}", name, e));
+                    continue;
+                }
+            };
+            metrics.rpc_successes += 1;
+
+            match sdk.subscribe_channel(channel_id, 2, Some(ticket)).await {
                 Ok(_) => {
                     metrics.rpc_calls += 1;
                     metrics.rpc_successes += 1;
@@ -4196,6 +4245,19 @@ struct RoomBroadcastResponse {
 #[derive(Deserialize)]
 struct RoomChannelInfoResponse {
     online_count: usize,
+}
+
+/// `POST /api/service/room-tickets/issue` ack（spec ROOM_CHANNEL_SPEC §4.5）。
+/// 套 ApiEnvelope；data 里就是这个结构。
+#[derive(Deserialize)]
+struct IssueTicketResponse {
+    ticket: String,
+    #[allow(dead_code)]
+    channel_id: u64,
+    #[allow(dead_code)]
+    user_id: u64,
+    #[allow(dead_code)]
+    exp: u64,
 }
 
 async fn send_custom(
