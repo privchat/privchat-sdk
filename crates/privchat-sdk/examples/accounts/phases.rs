@@ -3887,8 +3887,8 @@ impl TestPhases {
     /// 测的是 v1.1 闭环（spec `SERVER_EVENT_DISPATCH_SPEC` + `ADMIN_BOT_SPEC` §7）：
     ///
     /// 1. admin 登录拿 JWT
-    /// 2. POST /admin-api/privchat/bot/create with owner = alice.user_id
-    /// 3. PUT  /admin-api/privchat/bot/{bot_id}/menu 写 fixture menu_schema
+    /// 2. POST /admin/privchat/bot/create with owner = alice.user_id
+    /// 3. PUT  /admin/privchat/bot/{bot_id}/menu 写 fixture menu_schema
     /// 4. alice 调 wire RPC `account/bot/follow` → 拿到 channel_id
     /// 5. 等 ServerEvent fire-and-forget 异步落 binding（最多重试 5 次 × 200ms）
     /// 6. alice 调 wire Transfer route=`bot/menu/get` → 拿 menu_schema 字节
@@ -3924,7 +3924,7 @@ impl TestPhases {
 
         // 1. admin login
         let login_resp = http
-            .post(format!("{}/admin-api/system/auth/login", platform_base))
+            .post(format!("{}/admin/system/auth/login", platform_base))
             .json(&serde_json::json!({
                 "username": admin_user,
                 "password": admin_pass,
@@ -3954,7 +3954,7 @@ impl TestPhases {
             .unwrap_or(0);
         let bot_username = format!("smokebot_{}", suffix);
         let create_resp = http
-            .post(format!("{}/admin-api/privchat/bot/create", platform_base))
+            .post(format!("{}/admin/privchat/bot/create", platform_base))
             .bearer_auth(&access_token)
             .json(&serde_json::json!({
                 "name": "Smoke Bot",
@@ -3988,7 +3988,7 @@ impl TestPhases {
         });
         let menu_resp = http
             .put(format!(
-                "{}/admin-api/privchat/bot/{}/menu",
+                "{}/admin/privchat/bot/{}/menu",
                 platform_base, bot_user_id
             ))
             .bearer_auth(&access_token)
