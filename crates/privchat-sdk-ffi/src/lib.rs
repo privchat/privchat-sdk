@@ -1532,6 +1532,14 @@ pub struct UpsertFriendInput {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct StoredFriend {
     pub user_id: u64,
+    /// 用户名（来自 LEFT JOIN user，可能为空——例如 user profile 还没同步）。
+    pub username: Option<String>,
+    /// 昵称（同上）。
+    pub nickname: Option<String>,
+    /// 备注名（仅 accepted 行有意义；request 态 server 不填）。
+    pub alias: Option<String>,
+    /// 头像 URL。空串表示无头像。
+    pub avatar: String,
     pub tags: Option<String>,
     pub is_pinned: bool,
     pub created_at: i64,
@@ -2803,6 +2811,10 @@ fn map_upsert_friend(v: UpsertFriendInput) -> SdkUpsertFriendInput {
 fn map_stored_friend(v: SdkStoredFriend) -> StoredFriend {
     StoredFriend {
         user_id: v.user_id,
+        username: v.username,
+        nickname: v.nickname,
+        alias: v.alias,
+        avatar: v.avatar,
         tags: v.tags,
         is_pinned: v.is_pinned,
         created_at: v.created_at,
