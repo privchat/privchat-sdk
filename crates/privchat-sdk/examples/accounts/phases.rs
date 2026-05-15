@@ -4160,6 +4160,266 @@ impl TestPhases {
             metrics,
         })
     }
+
+    /// **F-sync.verify**：好友申请生命周期端到端闭环验证。
+    ///
+    /// 用 3 个一次性陌生账号（fsync_a / fsync_b / fsync_c）覆盖 3 个场景：
+    ///
+    /// 1. **accept** —— fsync_a apply alice → alice accept
+    ///    - 申请阶段：fsync_a Sent[0] 含 alice；alice Received[0] 含 fsync_a
+    ///    - accept 后：双方 friends 列表互相包含；fsync_a Sent[0]/Received[0]
+    ///      都不再含对方（status=1 不在过滤集合）
+    ///
+    /// 2. **reject** —— fsync_b apply bob → bob reject
+    ///    - reject 后：fsync_b Sent[0,3,4,5] 含 bob 且 status=3；
+    ///      bob Received[0] 不含 fsync_b（pending-only filter 把 rejected 过滤）
+    ///    - bob friends 列表不含 fsync_b
+    ///
+    /// 3. **recall** —— fsync_c apply charlie → fsync_c recall
+    ///    - recall 后：fsync_c Sent[0,3,4,5] 含 charlie 且 status=4；
+    ///      charlie Received[0] 不含 fsync_c
+    ///    - charlie friends 列表不含 fsync_c
+    pub async fn phase37_fsync_friend_request_lifecycle(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        // 引入 3 个一次性账号
+        for key in ["fsync_a", "fsync_b", "fsync_c"] {
+            manager.ensure_account(key).await?;
+        }
+
+        let alice_id = manager.user_id("alice")?;
+        let bob_id = manager.user_id("bob")?;
+        let charlie_id = manager.user_id("charlie")?;
+
+        // ---- 场景 1：accept ----
+        let _ = manager.send_friend_request("fsync_a", alice_id).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+
+        // 等 server 写 friendships + push 触发 entity sync
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // refresh_all_local_views 仅覆盖 alice/bob/charlie；fsync_* 是新引入账号，
+        // 需要显式刷它们的 entity/sync_entities("friend") 流。
+        for key in ["alice", "bob", "charlie", "fsync_a", "fsync_b", "fsync_c"] {
+            manager.refresh_local_views(key).await?;
+        }
+
+        // 申请阶段验证
+        let fsync_a_sent_pending = manager
+            .list_friend_requests("fsync_a", true, vec![0])
+            .await?;
+        metrics.rpc_calls += 1;
+        if fsync_a_sent_pending.iter().any(|f| f.user_id == alice_id) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "scenario.accept: fsync_a Sent[0] missing alice (got {} rows)",
+                fsync_a_sent_pending.len()
+            ));
+        }
+        let alice_received_pending =
+            manager.list_friend_requests("alice", false, vec![0]).await?;
+        metrics.rpc_calls += 1;
+        let fsync_a_id = manager.user_id("fsync_a")?;
+        if alice_received_pending
+            .iter()
+            .any(|f| f.user_id == fsync_a_id)
+        {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(format!(
+                "scenario.accept: alice Received[0] missing fsync_a (got {} rows)",
+                alice_received_pending.len()
+            ));
+        }
+
+        // alice accept
+        let _ = manager.accept_friend_request("alice", fsync_a_id).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // refresh_all_local_views 仅覆盖 alice/bob/charlie；fsync_* 是新引入账号，
+        // 需要显式刷它们的 entity/sync_entities("friend") 流。
+        for key in ["alice", "bob", "charlie", "fsync_a", "fsync_b", "fsync_c"] {
+            manager.refresh_local_views(key).await?;
+        }
+
+        // accept 后：两边 pending 集合都不再含对方
+        let fsync_a_sent_after = manager
+            .list_friend_requests("fsync_a", true, vec![0])
+            .await?;
+        metrics.rpc_calls += 1;
+        if !fsync_a_sent_after.iter().any(|f| f.user_id == alice_id) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("scenario.accept: fsync_a Sent[0] still has alice after accept".to_string());
+        }
+        let alice_received_after =
+            manager.list_friend_requests("alice", false, vec![0]).await?;
+        metrics.rpc_calls += 1;
+        if !alice_received_after
+            .iter()
+            .any(|f| f.user_id == fsync_a_id)
+        {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(
+                "scenario.accept: alice Received[0] still has fsync_a after accept".to_string(),
+            );
+        }
+        // 双方 friends list 互相包含
+        let fsync_a_friends = manager.list_local_friends("fsync_a").await?;
+        metrics.rpc_calls += 1;
+        if fsync_a_friends.iter().any(|f| f.user_id == alice_id) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("scenario.accept: fsync_a friends list missing alice".to_string());
+        }
+        let alice_friends = manager.list_local_friends("alice").await?;
+        metrics.rpc_calls += 1;
+        if alice_friends.iter().any(|f| f.user_id == fsync_a_id) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("scenario.accept: alice friends list missing fsync_a".to_string());
+        }
+
+        // ---- 场景 2：reject ----
+        let _ = manager.send_friend_request("fsync_b", bob_id).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // refresh_all_local_views 仅覆盖 alice/bob/charlie；fsync_* 是新引入账号，
+        // 需要显式刷它们的 entity/sync_entities("friend") 流。
+        for key in ["alice", "bob", "charlie", "fsync_a", "fsync_b", "fsync_c"] {
+            manager.refresh_local_views(key).await?;
+        }
+
+        let fsync_b_id = manager.user_id("fsync_b")?;
+        let _ = manager.reject_friend_request("bob", fsync_b_id).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // refresh_all_local_views 仅覆盖 alice/bob/charlie；fsync_* 是新引入账号，
+        // 需要显式刷它们的 entity/sync_entities("friend") 流。
+        for key in ["alice", "bob", "charlie", "fsync_a", "fsync_b", "fsync_c"] {
+            manager.refresh_local_views(key).await?;
+        }
+
+        // fsync_b 视角：Sent[0,3,4,5] 含 bob 且 status=3
+        let fsync_b_sent = manager
+            .list_friend_requests("fsync_b", true, vec![0, 3, 4, 5])
+            .await?;
+        metrics.rpc_calls += 1;
+        let bob_row = fsync_b_sent.iter().find(|f| f.user_id == bob_id);
+        match bob_row {
+            Some(row) if row.status == 3 => metrics.rpc_successes += 1,
+            Some(row) => metrics.errors.push(format!(
+                "scenario.reject: fsync_b Sent bob row status={} expected 3",
+                row.status
+            )),
+            None => metrics
+                .errors
+                .push("scenario.reject: fsync_b Sent missing bob row".to_string()),
+        }
+        // bob 视角：Received[0] **不含** fsync_b
+        let bob_received = manager.list_friend_requests("bob", false, vec![0]).await?;
+        metrics.rpc_calls += 1;
+        if !bob_received.iter().any(|f| f.user_id == fsync_b_id) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("scenario.reject: bob Received[0] still shows fsync_b after reject".to_string());
+        }
+        let bob_friends = manager.list_local_friends("bob").await?;
+        metrics.rpc_calls += 1;
+        if !bob_friends.iter().any(|f| f.user_id == fsync_b_id) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("scenario.reject: bob friends list unexpectedly has fsync_b".to_string());
+        }
+
+        // ---- 场景 3：recall ----
+        let _ = manager.send_friend_request("fsync_c", charlie_id).await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // refresh_all_local_views 仅覆盖 alice/bob/charlie；fsync_* 是新引入账号，
+        // 需要显式刷它们的 entity/sync_entities("friend") 流。
+        for key in ["alice", "bob", "charlie", "fsync_a", "fsync_b", "fsync_c"] {
+            manager.refresh_local_views(key).await?;
+        }
+
+        let fsync_c_id = manager.user_id("fsync_c")?;
+        let _ = manager
+            .recall_friend_request("fsync_c", charlie_id)
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // refresh_all_local_views 仅覆盖 alice/bob/charlie；fsync_* 是新引入账号，
+        // 需要显式刷它们的 entity/sync_entities("friend") 流。
+        for key in ["alice", "bob", "charlie", "fsync_a", "fsync_b", "fsync_c"] {
+            manager.refresh_local_views(key).await?;
+        }
+
+        // fsync_c 视角：Sent[0,3,4,5] 含 charlie 且 status=4
+        let fsync_c_sent = manager
+            .list_friend_requests("fsync_c", true, vec![0, 3, 4, 5])
+            .await?;
+        metrics.rpc_calls += 1;
+        let charlie_row = fsync_c_sent.iter().find(|f| f.user_id == charlie_id);
+        match charlie_row {
+            Some(row) if row.status == 4 => metrics.rpc_successes += 1,
+            Some(row) => metrics.errors.push(format!(
+                "scenario.recall: fsync_c Sent charlie row status={} expected 4",
+                row.status
+            )),
+            None => metrics
+                .errors
+                .push("scenario.recall: fsync_c Sent missing charlie row".to_string()),
+        }
+        // charlie 视角：Received[0] **不含** fsync_c
+        let charlie_received = manager
+            .list_friend_requests("charlie", false, vec![0])
+            .await?;
+        metrics.rpc_calls += 1;
+        if !charlie_received.iter().any(|f| f.user_id == fsync_c_id) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics.errors.push(
+                "scenario.recall: charlie Received[0] still shows fsync_c after recall".to_string(),
+            );
+        }
+        let charlie_friends = manager.list_local_friends("charlie").await?;
+        metrics.rpc_calls += 1;
+        if !charlie_friends.iter().any(|f| f.user_id == fsync_c_id) {
+            metrics.rpc_successes += 1;
+        } else {
+            metrics
+                .errors
+                .push("scenario.recall: charlie friends list unexpectedly has fsync_c".to_string());
+        }
+
+        Ok(PhaseResult {
+            phase_name: "fsync-friend-request-lifecycle".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: "apply+accept / apply+reject / apply+recall 三场景双视角全闭环".to_string(),
+            metrics,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

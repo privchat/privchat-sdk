@@ -33,8 +33,8 @@ use privchat_protocol::rpc::{
     FileRequestUploadTokenRequest, FileRequestUploadTokenResponse, FileUploadCallbackRequest,
     FileUploadCallbackResponse, FriendAcceptRequest, FriendAcceptResponse, FriendApplyRequest,
     FriendApplyResponse, FriendCheckRequest, FriendCheckResponse, FriendPendingRequest,
-    FriendPendingResponse, FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest,
-    FriendRemoveResponse, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
+    FriendPendingResponse, FriendRecallRequest, FriendRecallResponse, FriendRejectRequest,
+    FriendRejectResponse, FriendRemoveRequest, FriendRemoveResponse, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
     GetDifferenceResponse, GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse,
     GroupApprovalListRequest, GroupApprovalListResponse, GroupCreateRequest, GroupCreateResponse,
     GroupInfoRequest, GroupInfoResponse, GroupMemberAddRequest, GroupMemberAddResponse,
@@ -719,6 +719,36 @@ impl MultiAccountManager {
             },
         )
         .await
+    }
+
+    /// F-sync.verify: requester 撤回自己发出的 pending request。
+    pub async fn recall_friend_request(
+        &self,
+        from: &str,
+        target_user_id: u64,
+    ) -> BoxResult<FriendRecallResponse> {
+        self.rpc_typed(
+            from,
+            routes::friend::RECALL,
+            &FriendRecallRequest {
+                target_user_id,
+                from_user_id: 0,
+            },
+        )
+        .await
+    }
+
+    /// F-sync.verify: 读本地 friendships 投影（entity sync 已落本地）。
+    /// `outgoing=true` 我发出的；`outgoing=false` 我收到的。
+    /// `statuses` 留空 = 默认 0/3/4/5；可传具体集合做过滤。
+    pub async fn list_friend_requests(
+        &self,
+        key: &str,
+        outgoing: bool,
+        statuses: Vec<i16>,
+    ) -> BoxResult<Vec<privchat_sdk::StoredFriend>> {
+        let sdk = self.sdk(key)?;
+        Ok(sdk.list_friend_requests(outgoing, statuses, 200, 0).await?)
     }
 
     pub async fn remove_friend(

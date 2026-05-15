@@ -106,6 +106,8 @@ impl TestCoordinator {
             .await;
         self.run_phase(TestPhases::phase36_platform_bot_followed(manager).await)
             .await;
+        self.run_phase(TestPhases::phase37_fsync_friend_request_lifecycle(manager).await)
+            .await;
         Ok(())
     }
 
