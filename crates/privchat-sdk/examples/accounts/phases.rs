@@ -3002,7 +3002,7 @@ impl TestPhases {
 
         // --- Step 1: 通过 Admin API 创建 Room 频道 ---
         let create_resp = client
-            .post(format!("{}/api/admin/room", admin_base))
+            .post(format!("{}/api/service/room", admin_base))
             .header("X-Service-Key", &service_key)
             .json(&serde_json::json!({ "name": "phase31-test-channel" }))
             .send()
@@ -3115,7 +3115,7 @@ impl TestPhases {
         let broadcast_content = format!("hello-room-{}", now_millis());
         let broadcast_resp = client
             .post(format!(
-                "{}/api/admin/room/{}/broadcast",
+                "{}/api/service/room/{}/broadcast",
                 admin_base, channel_id
             ))
             .header("X-Service-Key", &service_key)
@@ -3214,7 +3214,7 @@ impl TestPhases {
 
         // --- Step 6: 验证取消订阅后在线人数为 0 ---
         let verify_resp = client
-            .get(format!("{}/api/admin/room/{}", admin_base, channel_id))
+            .get(format!("{}/api/service/room/{}", admin_base, channel_id))
             .header("X-Service-Key", &service_key)
             .send()
             .await?;
@@ -3610,7 +3610,7 @@ impl TestPhases {
     /// Phase 34: admin 推送与 RPC 推送共享同一投递入口（CONNECTION_LIFECYCLE_SPEC §8.8）
     ///
     /// 1. 快照 /metrics（投递计数器 before）
-    /// 2. 通过 admin API `POST /api/admin/messages/send` 让 charlie 向 main_group 发消息
+    /// 2. 通过 admin API `POST /api/service/messages/send` 让 charlie 向 main_group 发消息
     /// 3. 等待 fanout，刷新 alice/bob 本地视图，断言两人都收到文本
     /// 4. 快照 /metrics after，断言 delta：
     ///    - attempt_total  ≥ 2（至少覆盖 alice + bob 两个 user 粒度投递）
@@ -3649,7 +3649,7 @@ impl TestPhases {
 
         let probe = format!("admin-push-{}", now_millis());
         let resp = client
-            .post(format!("{}/api/admin/messages/send", admin_base))
+            .post(format!("{}/api/service/messages/send", admin_base))
             .header("X-Service-Key", &service_key)
             .json(&serde_json::json!({
                 "channel_id": channel_id,
@@ -3788,7 +3788,7 @@ impl TestPhases {
         // 1) 通过 admin 发一条种子消息，拿到一个确切可控的 message_id
         let probe = format!("admin-revoke-seed-{}", now_millis());
         let send_resp = client
-            .post(format!("{}/api/admin/messages/send", admin_base))
+            .post(format!("{}/api/service/messages/send", admin_base))
             .header("X-Service-Key", &service_key)
             .json(&serde_json::json!({
                 "channel_id": channel_id,
@@ -3856,7 +3856,7 @@ impl TestPhases {
         // 4) admin 撤回这条消息
         let revoke_resp = client
             .post(format!(
-                "{}/api/admin/messages/{}/revoke",
+                "{}/api/service/messages/{}/revoke",
                 admin_base, server_message_id
             ))
             .header("X-Service-Key", &service_key)
