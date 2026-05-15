@@ -316,6 +316,13 @@ enum StorageCmd {
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredFriend>>>,
     },
+    ListFriendRequests {
+        outgoing: bool,
+        statuses: Vec<i16>,
+        limit: usize,
+        offset: usize,
+        resp: oneshot::Sender<Result<Vec<StoredFriend>>>,
+    },
     UpsertBlacklistEntry {
         input: UpsertBlacklistInput,
         resp: oneshot::Sender<Result<()>>,
@@ -1250,6 +1257,26 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
+    pub async fn list_friend_requests(
+        &self,
+        outgoing: bool,
+        statuses: Vec<i16>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<StoredFriend>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::ListFriendRequests {
+                outgoing,
+                statuses,
+                limit,
+                offset,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
     pub async fn upsert_blacklist_entry(&self, input: UpsertBlacklistInput) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -2098,6 +2125,16 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             resp,
         } => {
             with_uid!(resp, |uid| store.list_friends(&uid, limit, offset));
+        }
+        StorageCmd::ListFriendRequests {
+            outgoing,
+            statuses,
+            limit,
+            offset,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store
+                .list_friend_requests(&uid, outgoing, &statuses, limit, offset));
         }
         StorageCmd::UpsertBlacklistEntry { input, resp } => {
             with_uid!(resp, |uid| store.upsert_blacklist_entry(&uid, &input));

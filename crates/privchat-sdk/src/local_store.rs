@@ -2451,14 +2451,22 @@ impl LocalStore {
     pub fn upsert_friend(&self, uid: &str, input: &UpsertFriendInput) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
-            "INSERT INTO friend (user_id, tags, is_pinned, created_at, version, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO friend (
+                user_id, tags, is_pinned, created_at, version, updated_at,
+                status, is_outgoing, request_message, request_source, request_source_id
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(user_id) DO UPDATE SET
                 tags=excluded.tags,
                 is_pinned=excluded.is_pinned,
                 created_at=excluded.created_at,
                 version=excluded.version,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                status=excluded.status,
+                is_outgoing=excluded.is_outgoing,
+                request_message=excluded.request_message,
+                request_source=excluded.request_source,
+                request_source_id=excluded.request_source_id
              WHERE excluded.version >= friend.version",
             params![
                 input.user_id as i64,
@@ -2466,7 +2474,12 @@ impl LocalStore {
                 if input.is_pinned { 1 } else { 0 },
                 input.created_at,
                 input.version,
-                input.updated_at
+                input.updated_at,
+                input.status as i64,
+                input.is_outgoing.map(|v| if v { 1i64 } else { 0i64 }),
+                input.request_message,
+                input.request_source,
+                input.request_source_id,
             ],
         )
         .map_err(|e| Error::Storage(format!("upsert friend: {e}")))?;
@@ -2490,6 +2503,9 @@ impl LocalStore {
         offset: usize,
     ) -> Result<Vec<StoredFriend>> {
         let conn = self.conn_for_user(uid)?;
+        // F-sync.2: friend 表现在同时承载 accepted 好友和各种 request 态行；
+        // 公开 list_friends 只返 status=1（accepted）—— request 态走
+        // list_friend_requests 单独查。
         let mut stmt = conn
             .prepare(
                 "SELECT
@@ -2502,9 +2518,15 @@ impl LocalStore {
                     f.is_pinned,
                     f.created_at,
                     f.version,
-                    f.updated_at
+                    f.updated_at,
+                    f.status,
+                    f.is_outgoing,
+                    f.request_message,
+                    f.request_source,
+                    f.request_source_id
                  FROM friend f
                  LEFT JOIN \"user\" u ON u.user_id = f.user_id
+                 WHERE f.status = 1
                  ORDER BY f.is_pinned DESC, f.version DESC, f.user_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
@@ -2522,12 +2544,101 @@ impl LocalStore {
                     created_at: row.get::<_, i64>(7)?,
                     version: row.get::<_, i64>(8)?,
                     updated_at: row.get::<_, i64>(9)?,
+                    status: row.get::<_, i64>(10)? as i16,
+                    is_outgoing: row.get::<_, Option<i64>>(11)?.map(|v| v != 0),
+                    request_message: row.get::<_, Option<String>>(12)?,
+                    request_source: row.get::<_, Option<String>>(13)?,
+                    request_source_id: row.get::<_, Option<String>>(14)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list friends: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(|e| Error::Storage(format!("decode list friends: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// F-sync.2: 列出好友申请（非 accepted/non-blocked 行）。
+    ///
+    /// 调用方按 [`crate::FriendRequestDirection`] 指定 sent / received；
+    /// `statuses` 是 i16 数组（status 取值集合，留空 = 0/3/4/5 全要）。
+    pub fn list_friend_requests(
+        &self,
+        uid: &str,
+        outgoing: bool,
+        statuses: &[i16],
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<StoredFriend>> {
+        let conn = self.conn_for_user(uid)?;
+        // SQLite 不便走 bind 数组，把 status 集合 inline 进 SQL（来自代码不来自
+        // 用户输入，无注入风险）；空集合时退化为所有非-accepted-非-blocked 行。
+        let status_filter = if statuses.is_empty() {
+            "f.status IN (0,3,4,5)".to_string()
+        } else {
+            let in_list = statuses
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("f.status IN ({})", in_list)
+        };
+        let outgoing_filter = if outgoing {
+            "f.is_outgoing = 1"
+        } else {
+            "f.is_outgoing = 0"
+        };
+        let sql = format!(
+            "SELECT
+                f.user_id,
+                u.username,
+                u.nickname,
+                u.alias,
+                COALESCE(u.avatar, ''),
+                f.tags,
+                f.is_pinned,
+                f.created_at,
+                f.version,
+                f.updated_at,
+                f.status,
+                f.is_outgoing,
+                f.request_message,
+                f.request_source,
+                f.request_source_id
+             FROM friend f
+             LEFT JOIN \"user\" u ON u.user_id = f.user_id
+             WHERE {status_filter} AND {outgoing_filter}
+             ORDER BY f.updated_at DESC, f.user_id DESC
+             LIMIT ?1 OFFSET ?2"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(format!("prepare list friend_requests: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64, offset as i64], |row| {
+                Ok(StoredFriend {
+                    user_id: row.get::<_, i64>(0)? as u64,
+                    username: row.get::<_, Option<String>>(1)?,
+                    nickname: row.get::<_, Option<String>>(2)?,
+                    alias: row.get::<_, Option<String>>(3)?,
+                    avatar: row.get::<_, String>(4)?,
+                    tags: row.get::<_, Option<String>>(5)?,
+                    is_pinned: row.get::<_, i32>(6)? != 0,
+                    created_at: row.get::<_, i64>(7)?,
+                    version: row.get::<_, i64>(8)?,
+                    updated_at: row.get::<_, i64>(9)?,
+                    status: row.get::<_, i64>(10)? as i16,
+                    is_outgoing: row.get::<_, Option<i64>>(11)?.map(|v| v != 0),
+                    request_message: row.get::<_, Option<String>>(12)?,
+                    request_source: row.get::<_, Option<String>>(13)?,
+                    request_source_id: row.get::<_, Option<String>>(14)?,
+                })
+            })
+            .map_err(|e| Error::Storage(format!("query list friend_requests: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| Error::Storage(format!("decode list friend_requests: {e}")))?);
         }
         Ok(out)
     }

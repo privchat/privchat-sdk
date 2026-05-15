@@ -41,8 +41,9 @@ use privchat_protocol::rpc::{
     BotFollowRequest, BotFollowResponse, BotUnfollowRequest, BotUnfollowResponse,
     FileUploadCallbackRequest, FileUploadCallbackResponse, FriendAcceptRequest,
     FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse, FriendCheckRequest,
-    FriendCheckResponse, FriendPendingRequest, FriendPendingResponse, FriendRejectRequest,
-    FriendRejectResponse, FriendRemoveRequest, FriendRemoveResponse, GetChannelPtsRequest,
+    FriendCheckResponse, FriendPendingRequest, FriendPendingResponse, FriendRecallRequest,
+    FriendRecallResponse, FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest,
+    FriendRemoveResponse, GetChannelPtsRequest,
     GetChannelPtsResponse, GetDifferenceRequest, GetDifferenceResponse,
     GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse, GroupApprovalHandleRequest,
     GroupApprovalHandleResponse, GroupApprovalListRequest, GroupApprovalListResponse,
@@ -1535,6 +1536,14 @@ pub struct StoredFriend {
     pub is_pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// F-sync.2: 0=pending / 1=accepted / 2=blocked / 3=rejected / 4=recalled / 5=expired.
+    /// `list_friends` 只返 status=1；其它态从 `list_friend_requests` 拿。
+    pub status: i16,
+    /// 申请态下 viewer 是不是 requester：true=我发出的，false=我收到的；accepted=null。
+    pub is_outgoing: Option<bool>,
+    pub request_message: Option<String>,
+    pub request_source: Option<String>,
+    pub request_source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2774,6 +2783,8 @@ fn map_stored_user(v: SdkStoredUser) -> StoredUser {
 }
 
 fn map_upsert_friend(v: UpsertFriendInput) -> SdkUpsertFriendInput {
+    // FFI 直写路径默认按 accepted (status=1) 处理——request 态由 server 的
+    // entity sync 链路灌入 friend 表，host 一侧不会直接构造请求态行。
     SdkUpsertFriendInput {
         user_id: v.user_id,
         tags: v.tags,
@@ -2781,6 +2792,11 @@ fn map_upsert_friend(v: UpsertFriendInput) -> SdkUpsertFriendInput {
         created_at: v.created_at,
         version: v.updated_at.max(0),
         updated_at: v.updated_at,
+        status: 1,
+        is_outgoing: None,
+        request_message: None,
+        request_source: None,
+        request_source_id: None,
     }
 }
 
@@ -2791,6 +2807,11 @@ fn map_stored_friend(v: SdkStoredFriend) -> StoredFriend {
         is_pinned: v.is_pinned,
         created_at: v.created_at,
         updated_at: v.updated_at,
+        status: v.status,
+        is_outgoing: v.is_outgoing,
+        request_message: v.request_message,
+        request_source: v.request_source,
+        request_source_id: v.request_source_id,
     }
 }
 
@@ -4292,6 +4313,27 @@ impl PrivchatClient {
         Ok(resp)
     }
 
+    /// F-sync.2: 撤回自己发出的、尚未处理的好友申请。
+    ///
+    /// server 把 friendships.(user_id=me, friend_id=target, status=0) 改成
+    /// Recalled(4)，并通过 push + entity sync 广播给双方所有设备。本地状态由
+    /// entity sync 拉到 friend 表（status=4），UI Sent tab 据此显示"已撤回"。
+    pub async fn recall_friend_request(
+        &self,
+        target_user_id: u64,
+    ) -> Result<bool, PrivchatFfiError> {
+        let resp: FriendRecallResponse = rpc_call_typed(
+            &self.inner,
+            routes::friend::RECALL,
+            &FriendRecallRequest {
+                target_user_id,
+                from_user_id: 0, // server 端按 session 填
+            },
+        )
+        .await?;
+        Ok(resp)
+    }
+
     pub async fn get_or_create_direct_channel(
         &self,
         peer_user_id: u64,
@@ -5262,6 +5304,11 @@ impl PrivchatClient {
                     created_at: ts,
                     version: ts.max(0),
                     updated_at: ts,
+                    status: 1, // friend/check 命中 → 一定是 accepted
+                    is_outgoing: None,
+                    request_message: None,
+                    request_source: None,
+                    request_source_id: None,
                 })
                 .await;
         } else {
@@ -7186,6 +7233,26 @@ impl PrivchatClient {
         offset: u64,
     ) -> Result<Vec<StoredFriend>, PrivchatFfiError> {
         self.list_friends(limit, offset).await
+    }
+
+    /// F-sync.2: 列出好友申请（非 accepted 行）。
+    ///
+    /// - `outgoing=true`：我发出的（is_outgoing=true）；`outgoing=false`：我收到的。
+    /// - `statuses` 留空 = 全要 pending/rejected/recalled/expired；具体传如
+    ///   [0] 只看 pending、[0,3] pending+rejected 等。
+    pub async fn list_friend_requests(
+        &self,
+        outgoing: bool,
+        statuses: Vec<i16>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<StoredFriend>, PrivchatFfiError> {
+        let out = self
+            .inner
+            .list_friend_requests(outgoing, statuses, limit as usize, offset as usize)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(out.into_iter().map(map_stored_friend).collect())
     }
 
     pub async fn upsert_blacklist_entry(

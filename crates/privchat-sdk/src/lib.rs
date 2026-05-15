@@ -1219,6 +1219,14 @@ pub struct UpsertFriendInput {
     pub created_at: i64,
     pub version: i64,
     pub updated_at: i64,
+    /// F-sync.2: 0=pending / 1=accepted / 2=blocked / 3=rejected / 4=recalled / 5=expired.
+    /// 与 server FriendshipStatus 对齐。
+    pub status: i16,
+    /// 仅 status != 1 时有意义：true=我发出的，false=我收到的。accepted 行存 None。
+    pub is_outgoing: Option<bool>,
+    pub request_message: Option<String>,
+    pub request_source: Option<String>,
+    pub request_source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1233,6 +1241,24 @@ pub struct StoredFriend {
     pub created_at: i64,
     pub version: i64,
     pub updated_at: i64,
+    /// F-sync.2: 见 UpsertFriendInput::status。
+    pub status: i16,
+    pub is_outgoing: Option<bool>,
+    pub request_message: Option<String>,
+    pub request_source: Option<String>,
+    pub request_source_id: Option<String>,
+}
+
+/// F-sync.2: friend_request 列表查询方向过滤。
+///
+/// 现在 friendships 在本地按 viewer 视角投影：所有 (peer_user_id) 行带
+/// status + is_outgoing。Sent/Received tab 用此参数选边即可。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FriendRequestDirection {
+    /// 我发出的（is_outgoing = true）
+    Sent,
+    /// 我收到的（is_outgoing = false）
+    Received,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1940,6 +1966,13 @@ enum Command {
         resp: oneshot::Sender<Result<()>>,
     },
     ListFriends {
+        limit: usize,
+        offset: usize,
+        resp: oneshot::Sender<Result<Vec<StoredFriend>>>,
+    },
+    ListFriendRequests {
+        outgoing: bool,
+        statuses: Vec<i16>,
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredFriend>>>,
@@ -3659,20 +3692,37 @@ impl State {
         }
     }
 
-    /// 识别"好友申请已收到"事件 push（topic="friend.request.received"）。
+    /// 识别 `friend.request.*` 三类在线 hint topic：
+    /// - `friend.request.received`：作为 target 收到新申请；
+    /// - `friend.request.sent`：作为 requester 自己其他设备的"我发出了申请" hint；
+    /// - `friend.request.status_changed`：accept/reject/recall 等状态变化广播。
     ///
-    /// 服务端在 `contact/friend/apply` 成功后通过 connection_manager 推送，
-    /// SDK 这里只负责识别 + 返回 from_user_id；调用方据此发出
-    /// `SyncEntityChanged{entity_type="friend_request"}` 事件给宿主，
-    /// 触发 friend/pending RPC 刷新。
+    /// **F-sync.2 变更**：原本只识别 received 这一个 topic，且发出
+    /// `SyncEntityChanged{entity_type="friend_request"}` —— 后者触发 Kotlin 侧
+    /// 走老的 `friend/pending` RPC 刷新。本轮把 entity_type 统一改成 `"friend"`
+    /// （和 entity/sync_entities 入参对齐），SDK 据此走 entity sync 把所有
+    /// pending/rejected/recalled/expired 状态拉到本地 friend 表。
     ///
-    /// 返回 `Some(from_user_id)` 表示是好友申请事件；`None` 表示其它 push。
-    fn push_message_to_friend_request_event(push: &PushMessageRequest) -> Option<u64> {
-        if push.topic != "friend.request.received" {
-            return None;
+    /// 返回 `Some(peer_user_id)` 表示这是一条 friend.request.* 事件，aggregate_id
+    /// 即 envelope 的 aggregate_id（对端 user_id 字符串，由 envelope 提供）。
+    /// 返回 `None` 表示不是好友申请事件。
+    ///
+    /// 与 USER_INBOX_EVENT_ENVELOPE_SPEC §6.1 一致：**不消费 envelope payload**，
+    /// 只是把 hint 转成 entity sync 触发点；权威数据来自 entity/sync_entities("friend")。
+    fn push_message_to_friend_event(push: &PushMessageRequest) -> Option<u64> {
+        match push.topic.as_str() {
+            "friend.request.received"
+            | "friend.request.sent"
+            | "friend.request.status_changed" => {}
+            _ => return None,
         }
-        let payload_json: serde_json::Value = serde_json::from_slice(&push.payload).ok()?;
-        Self::json_field_u64(&payload_json, &["from_user_id"])
+        // envelope.aggregate_id 是十进制 user_id 字符串（见 protocol::inbox_event）。
+        // 老的 `from_user_id` 字段 fallback 保留兼容历史 server。
+        let payload_json: serde_json::Value =
+            serde_json::from_slice(&push.payload).unwrap_or(serde_json::Value::Null);
+        Self::json_field_u64(&payload_json, &["aggregate_id"])
+            .or_else(|| Self::json_field_u64(&payload_json, &["requester_id"]))
+            .or_else(|| Self::json_field_u64(&payload_json, &["from_user_id"]))
             .or(Some(push.from_uid))
     }
 
@@ -3885,9 +3935,12 @@ impl State {
                     if user_id == 0 {
                         continue;
                     }
-                    let friend_meta = friend_sync.friend.unwrap_or_default();
-                    let embedded_user = friend_sync.user.unwrap_or_default();
+                    let friend_meta = friend_sync.friend.clone().unwrap_or_default();
+                    let embedded_user = friend_sync.user.clone().unwrap_or_default();
                     if item.deleted {
+                        // Server 在 Blocked(2) 时仍发 deleted=true 作为 friends-list
+                        // tombstone（spec/05-feature/USER_INBOX_EVENT_ENVELOPE_SPEC §4 &
+                        // server friend_service::sync_entities_page 注释）。
                         self.storage.delete_friend(user_id).await?;
                         emitted.push(SdkEvent::SyncEntityChanged {
                             entity_type: "friend".to_string(),
@@ -3896,6 +3949,9 @@ impl State {
                         });
                         continue;
                     }
+                    // F-sync.2: status 缺省按 1 (accepted) 兜底——兼容尚未升级的老 server
+                    // 不发 status 字段的情形（既有行为）。新 server 总会发 0/1/3/4/5。
+                    let status = friend_sync.status.unwrap_or(1);
                     self.storage
                         .upsert_friend(UpsertFriendInput {
                             user_id,
@@ -3915,6 +3971,11 @@ impl State {
                                 .or(friend_meta.version)
                                 .or(friend_sync.version)
                                 .unwrap_or(item.version as i64),
+                            status,
+                            is_outgoing: friend_sync.is_outgoing,
+                            request_message: friend_sync.request_message.clone(),
+                            request_source: friend_sync.request_source.clone(),
+                            request_source_id: friend_sync.request_source_id.clone(),
                         })
                         .await?;
                     // Current server returns user profile inside friend payload. We must persist it
@@ -6802,10 +6863,12 @@ impl State {
             MessageType::PushMessageRequest => {
                 let req: PushMessageRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
-                if let Some(from_uid) = Self::push_message_to_friend_request_event(&req) {
+                if let Some(peer_uid) = Self::push_message_to_friend_event(&req) {
+                    // F-sync.2: 转 entity_type="friend"，让 SDK 走 entity sync
+                    // 把 pending/rejected/recalled 状态从 server 拉到本地 friend 表。
                     self.pending_events.push(SdkEvent::SyncEntityChanged {
-                        entity_type: "friend_request".to_string(),
-                        entity_id: from_uid.to_string(),
+                        entity_type: "friend".to_string(),
+                        entity_id: peer_uid.to_string(),
                         deleted: false,
                     });
                 } else if let Some(status_item) = Self::push_message_to_status_sync_item(&req) {
@@ -6822,10 +6885,10 @@ impl State {
                 let req: PushBatchRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push batch: {e}")))?;
                 for push in req.messages {
-                    if let Some(from_uid) = Self::push_message_to_friend_request_event(&push) {
+                    if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                         self.pending_events.push(SdkEvent::SyncEntityChanged {
-                            entity_type: "friend_request".to_string(),
-                            entity_id: from_uid.to_string(),
+                            entity_type: "friend".to_string(),
+                            entity_id: peer_uid.to_string(),
                             deleted: false,
                         });
                     } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
@@ -6848,10 +6911,10 @@ impl State {
                             push.channel_id
                         );
                     }
-                    if let Some(from_uid) = Self::push_message_to_friend_request_event(&push) {
+                    if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                         self.pending_events.push(SdkEvent::SyncEntityChanged {
-                            entity_type: "friend_request".to_string(),
-                            entity_id: from_uid.to_string(),
+                            entity_type: "friend".to_string(),
+                            entity_id: peer_uid.to_string(),
                             deleted: false,
                         });
                     } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
@@ -6869,10 +6932,10 @@ impl State {
                         );
                     }
                     for push in batch.messages {
-                        if let Some(from_uid) = Self::push_message_to_friend_request_event(&push) {
+                        if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                             self.pending_events.push(SdkEvent::SyncEntityChanged {
-                                entity_type: "friend_request".to_string(),
-                                entity_id: from_uid.to_string(),
+                                entity_type: "friend".to_string(),
+                                entity_id: peer_uid.to_string(),
                                 deleted: false,
                             });
                         } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
@@ -10736,6 +10799,24 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::ListFriendRequests {
+                        outgoing,
+                        statuses,
+                        limit,
+                        offset,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => {
+                                state
+                                    .storage
+                                    .list_friend_requests(outgoing, statuses, limit, offset)
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::UpsertBlacklistEntry { input, resp } => {
                         let result = match state.current_uid_required() {
                             Ok(_) => state.storage.upsert_blacklist_entry(input).await,
@@ -12654,6 +12735,32 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    /// F-sync.2: 列出本地 friend 表的"申请态"行（非 accepted）。
+    ///
+    /// - `outgoing=true`：我发出的（`is_outgoing=true`）；`outgoing=false`：我收到的。
+    /// - `statuses` 留空 → 默认 0/3/4/5 全要；传具体集合做过滤（如 `[0]` 只看 pending）。
+    pub async fn list_friend_requests(
+        &self,
+        outgoing: bool,
+        statuses: Vec<i16>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<StoredFriend>> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::ListFriendRequests {
+                outgoing,
+                statuses,
+                limit,
+                offset,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
     pub async fn upsert_blacklist_entry(&self, input: UpsertBlacklistInput) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -13904,6 +14011,11 @@ mod tests {
                 created_at: 800,
                 version: 10,
                 updated_at: 900,
+                status: 1,
+                is_outgoing: None,
+                request_message: None,
+                request_source: None,
+                request_source_id: None,
             })
             .await
             .expect("seed friend row");
@@ -14988,6 +15100,11 @@ mod tests {
                     created_at: 200,
                     version: 202,
                     updated_at: 202,
+                    status: 1,
+                    is_outgoing: None,
+                    request_message: None,
+                    request_source: None,
+                    request_source_id: None,
                 },
             )
             .expect("seed friend");
