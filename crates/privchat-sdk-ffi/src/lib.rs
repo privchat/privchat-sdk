@@ -52,7 +52,7 @@ use privchat_protocol::rpc::{
     GroupMemberLeaveResponse, GroupMemberListRequest, GroupMemberListResponse,
     GroupMemberMuteRequest, GroupMemberMuteResponse, GroupMemberRemoveRequest,
     GroupMemberRemoveResponse, GroupMemberUnmuteRequest, GroupMemberUnmuteResponse,
-    GroupMuteAllRequest, GroupQRCodeGenerateRequest, GroupQRCodeGenerateResponse,
+    GroupMuteAllRequest,
     GroupQRCodeJoinRequest, GroupQRCodeJoinResponse, GroupRoleSetRequest, GroupRoleSetResponse,
     GroupSettingsGetRequest, GroupSettingsGetResponse, GroupSettingsUpdateRequest,
     GroupSettingsUpdateResponse, GroupTransferOwnerRequest, GroupTransferOwnerResponse,
@@ -66,9 +66,14 @@ use privchat_protocol::rpc::{
     QRCodeListResponse, QRCodeRefreshRequest, QRCodeRefreshResponse, QRCodeResolveRequest,
     QRCodeResolveResponse, QRCodeRevokeRequest, QRCodeRevokeResponse, StickerPackageDetailRequest,
     StickerPackageDetailResponse, StickerPackageListRequest, StickerPackageListResponse,
-    SyncEntitiesRequest, SyncEntitiesResponse, UserQRCodeGenerateRequest,
-    UserQRCodeGenerateResponse, UserQRCodeGetRequest, UserQRCodeGetResponse,
+    SyncEntitiesRequest, SyncEntitiesResponse,
+    // QR_CODE_SPEC v1.3 — user qrcode 路径下的类型 (顶层 glob 再导出)
+    UserQRCodeGetRequest, UserQRCodeGetResponse,
     UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
+    UserQRCodeResolveRequest, UserQRCodeResolveResponse,
+    // QR_CODE_SPEC v1.3 — group qrcode 新类型
+    GroupQRCodeGetRequest, GroupQRCodeGetResponse,
+    GroupQRCodeRefreshRequest, GroupQRCodeRefreshResponse,
 };
 use privchat_sdk::{
     ConnectionState as SdkConnectionState, Error as SdkError, FileQueueRef as SdkFileQueueRef,
@@ -321,19 +326,33 @@ pub struct QrCodeRevokeView {
     pub revoked_at: u64,
 }
 
+/// QR_CODE_SPEC v1.3 — `user/qrcode/get` 响应。
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UserQrCodeGetView {
     pub qr_key: String,
     pub qr_code: String,
-    pub created_at: u64,
-    pub used_count: u32,
+    pub user_id: u64,
 }
 
+/// QR_CODE_SPEC v1.3 — `user/qrcode/refresh` 响应。
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct UserQrCodeGenerateView {
-    pub qr_key: String,
+pub struct UserQrCodeRefreshView {
+    pub old_qr_key: String,
+    pub new_qr_key: String,
     pub qr_code: String,
-    pub created_at: u64,
+    pub user_id: u64,
+}
+
+/// QR_CODE_SPEC v1.3 — `user/qrcode/resolve` 响应（最小用户卡片，**不含** qr_key）。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct UserQrCodeResolveView {
+    pub user_id: u64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub user_type: i16,
+    pub is_friend: bool,
+    pub is_self: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -874,13 +893,21 @@ pub struct GroupRoleSetView {
     pub updated_at: Option<u64>,
 }
 
+/// QR_CODE_SPEC v1.3 — `group/qrcode/get` 响应。
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct GroupQrCodeGenerateView {
+pub struct GroupQrCodeGetView {
     pub qr_key: String,
     pub qr_code: String,
-    pub expire_at: Option<u64>,
     pub group_id: u64,
-    pub created_at: u64,
+}
+
+/// QR_CODE_SPEC v1.3 — `group/qrcode/refresh` 响应。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GroupQrCodeRefreshView {
+    pub old_qr_key: String,
+    pub new_qr_key: String,
+    pub qr_code: String,
+    pub group_id: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1334,13 +1361,14 @@ pub struct GroupCreateResult {
     pub creator_id: u64,
 }
 
+/// QR_CODE_SPEC v1.3 — `group/join/qrcode` 响应。
+/// 注意：v1.3 删除了 `expires_at` 字段（永久二维码无过期概念）。
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GroupQrCodeJoinResult {
     pub status: String,
     pub group_id: u64,
     pub request_id: Option<String>,
     pub message: Option<String>,
-    pub expires_at: Option<u64>,
     pub user_id: Option<u64>,
     pub joined_at: Option<u64>,
 }
@@ -5494,19 +5522,62 @@ impl PrivchatClient {
         })
     }
 
+    /// QR_CODE_SPEC v1.3 — `user/qrcode/get`：读自己的永久 qr_key + URL。
     pub async fn user_qrcode_get(&self) -> Result<UserQrCodeGetView, PrivchatFfiError> {
-        let user_id = self.require_current_user_id().await?.to_string();
         let resp: UserQRCodeGetResponse = rpc_call_typed(
             &self.inner,
             routes::user_qrcode::GET,
-            &UserQRCodeGetRequest { user_id },
+            &UserQRCodeGetRequest::default(),
         )
         .await?;
         Ok(UserQrCodeGetView {
             qr_key: resp.qr_key,
             qr_code: resp.qr_code,
-            created_at: resp.created_at,
-            used_count: resp.used_count,
+            user_id: resp.user_id,
+        })
+    }
+
+    /// QR_CODE_SPEC v1.3 — `user/qrcode/refresh`：旋转自己的 qr_key。
+    pub async fn user_qrcode_refresh(
+        &self,
+    ) -> Result<UserQrCodeRefreshView, PrivchatFfiError> {
+        let resp: UserQRCodeRefreshResponse = rpc_call_typed(
+            &self.inner,
+            routes::user_qrcode::REFRESH,
+            &UserQRCodeRefreshRequest::default(),
+        )
+        .await?;
+        Ok(UserQrCodeRefreshView {
+            old_qr_key: resp.old_qr_key,
+            new_qr_key: resp.new_qr_key,
+            qr_code: resp.qr_code,
+            user_id: resp.user_id,
+        })
+    }
+
+    /// QR_CODE_SPEC v1.3 — `user/qrcode/resolve`：把对端 qrkey 翻译成最小用户卡片。
+    /// 响应**不含** qr_key（避免二次扩散）。
+    pub async fn user_qrcode_resolve(
+        &self,
+        qr_key: String,
+    ) -> Result<UserQrCodeResolveView, PrivchatFfiError> {
+        let resp: UserQRCodeResolveResponse = rpc_call_typed(
+            &self.inner,
+            routes::user_qrcode::RESOLVE,
+            &UserQRCodeResolveRequest {
+                qr_key,
+                operator_id: 0,
+            },
+        )
+        .await?;
+        Ok(UserQrCodeResolveView {
+            user_id: resp.user_id,
+            username: resp.username,
+            display_name: resp.display_name,
+            avatar_url: resp.avatar_url,
+            user_type: resp.user_type,
+            is_friend: resp.is_friend,
+            is_self: resp.is_self,
         })
     }
 
@@ -5690,41 +5761,9 @@ impl PrivchatClient {
         })
     }
 
-    pub async fn user_qrcode_generate(
-        &self,
-        expire_seconds: Option<u64>,
-    ) -> Result<UserQrCodeGenerateView, PrivchatFfiError> {
-        let resp: UserQRCodeGenerateResponse = rpc_call_typed(
-            &self.inner,
-            routes::user_qrcode::GENERATE,
-            &UserQRCodeGenerateRequest {
-                expire_seconds,
-                user_id: 0,
-            },
-        )
-        .await?;
-        Ok(UserQrCodeGenerateView {
-            qr_key: resp.qr_key,
-            qr_code: resp.qr_code,
-            created_at: resp.created_at,
-        })
-    }
-
-    pub async fn user_qrcode_refresh(&self) -> Result<QrCodeRefreshView, PrivchatFfiError> {
-        let user_id = self.require_current_user_id().await?.to_string();
-        let resp: UserQRCodeRefreshResponse = rpc_call_typed(
-            &self.inner,
-            routes::user_qrcode::REFRESH,
-            &UserQRCodeRefreshRequest { user_id },
-        )
-        .await?;
-        Ok(QrCodeRefreshView {
-            old_qr_key: resp.old_qr_key,
-            new_qr_key: resp.new_qr_key,
-            new_qr_code: resp.new_qr_code,
-            revoked_at: resp.revoked_at,
-        })
-    }
+    // QR_CODE_SPEC v1.3：legacy `user_qrcode_generate` / 重复的 `user_qrcode_refresh`
+    // 已删除——`user/qrcode/generate` server 已停止注册；`refresh` 的 v1.3 版本
+    // 见上方（返回 UserQrCodeRefreshView, 含 user_id 而非 revoked_at）。
 
     pub async fn message_unread_count_remote(
         &self,
@@ -6142,42 +6181,65 @@ impl PrivchatClient {
         Ok(resp.success)
     }
 
-    pub async fn group_qrcode_generate_remote(
+    /// QR_CODE_SPEC v1.3 — `group/qrcode/get`：读群当前永久二维码。
+    /// Member 及以上可见（server 鉴权）。
+    pub async fn group_qrcode_get_remote(
         &self,
         group_id: u64,
-        expire_seconds: Option<u64>,
-    ) -> Result<GroupQrCodeGenerateView, PrivchatFfiError> {
-        let resp: GroupQRCodeGenerateResponse = rpc_call_typed(
+    ) -> Result<GroupQrCodeGetView, PrivchatFfiError> {
+        let resp: GroupQRCodeGetResponse = rpc_call_typed(
             &self.inner,
-            routes::group_qrcode::GENERATE,
-            &GroupQRCodeGenerateRequest {
+            routes::group_qrcode::GET,
+            &GroupQRCodeGetRequest {
                 group_id,
-                expire_seconds,
                 operator_id: 0,
             },
         )
         .await?;
-        Ok(GroupQrCodeGenerateView {
+        Ok(GroupQrCodeGetView {
             qr_key: resp.qr_key,
             qr_code: resp.qr_code,
-            expire_at: resp.expire_at,
             group_id: resp.group_id,
-            created_at: resp.created_at,
         })
     }
 
+    /// QR_CODE_SPEC v1.3 — `group/qrcode/refresh`：旋转群二维码。
+    /// Owner/Admin only（server 鉴权）。
+    pub async fn group_qrcode_refresh_remote(
+        &self,
+        group_id: u64,
+    ) -> Result<GroupQrCodeRefreshView, PrivchatFfiError> {
+        let resp: GroupQRCodeRefreshResponse = rpc_call_typed(
+            &self.inner,
+            routes::group_qrcode::REFRESH,
+            &GroupQRCodeRefreshRequest {
+                group_id,
+                operator_id: 0,
+            },
+        )
+        .await?;
+        Ok(GroupQrCodeRefreshView {
+            old_qr_key: resp.old_qr_key,
+            new_qr_key: resp.new_qr_key,
+            qr_code: resp.qr_code,
+            group_id: resp.group_id,
+        })
+    }
+
+    /// QR_CODE_SPEC v1.3 — `group/join/qrcode`：扫码加群。
+    /// Server 用 `qr_key` 反查 `group_id` 后走与邀请相同的 join_need_approval 流程。
+    /// v1.3 删除了 token 参数（UNIQUE qr_key 本身就是不可枚举凭证）。
     pub async fn group_qrcode_join_remote(
         &self,
         qr_key: String,
-        token: Option<String>,
+        message: Option<String>,
     ) -> Result<GroupQrCodeJoinResult, PrivchatFfiError> {
         let resp: GroupQRCodeJoinResponse = rpc_call_typed(
             &self.inner,
             routes::group_qrcode::JOIN,
             &GroupQRCodeJoinRequest {
                 qr_key,
-                token,
-                message: None,
+                message,
                 user_id: 0,
             },
         )
@@ -6187,7 +6249,6 @@ impl PrivchatClient {
             group_id: resp.group_id,
             request_id: resp.request_id,
             message: resp.message,
-            expires_at: resp.expires_at,
             user_id: resp.user_id,
             joined_at: resp.joined_at,
         })

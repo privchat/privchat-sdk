@@ -1197,7 +1197,7 @@ impl TestPhases {
             }
         }
 
-        match manager.group_qrcode_generate("alice", group_id).await {
+        match manager.group_qrcode_get("alice", group_id).await {
             Ok(qr) => {
                 metrics.rpc_calls += 1;
                 if !qr.qr_key.is_empty() {
@@ -1205,7 +1205,7 @@ impl TestPhases {
                 } else {
                     metrics
                         .errors
-                        .push("group qrcode generate empty qr_key".to_string());
+                        .push("group qrcode get empty qr_key".to_string());
                 }
             }
             Err(e) => {

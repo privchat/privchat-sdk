@@ -41,7 +41,7 @@ use privchat_protocol::rpc::{
     GroupMemberLeaveRequest, GroupMemberLeaveResponse, GroupMemberListRequest,
     GroupMemberListResponse, GroupMemberMuteRequest, GroupMemberRemoveRequest,
     GroupMemberRemoveResponse, GroupMemberUnmuteRequest, GroupMuteAllRequest, GroupMuteAllResponse,
-    GroupQRCodeGenerateRequest, GroupQRCodeGenerateResponse, GroupRoleSetRequest,
+    GroupQRCodeGetRequest, GroupQRCodeGetResponse, GroupRoleSetRequest,
     GroupRoleSetResponse, GroupSettingsGetRequest, GroupSettingsGetResponse, GroupSettingsPatch,
     GroupSettingsUpdateRequest, GroupSettingsUpdateResponse, MessageHistoryGetRequest,
     MessageHistoryResponse, MessageReactionAddRequest, MessageReactionAddResponse,
@@ -51,8 +51,10 @@ use privchat_protocol::rpc::{
     MessageReadStatsResponse, MessageRevokeRequest, MessageRevokeResponse,
     MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadPtsRequest,
     MessageStatusReadPtsResponse, StickerPackageDetailRequest, StickerPackageDetailResponse,
-    StickerPackageListRequest, StickerPackageListResponse, UserQRCodeGenerateRequest,
-    UserQRCodeGenerateResponse, UserQRCodeGetRequest, UserQRCodeGetResponse,
+    StickerPackageListRequest, StickerPackageListResponse,
+    // QR_CODE_SPEC v1.3：legacy generate types removed; the v1.3 user_qrcode types
+    // come through the same glob (re-exported in protocol/rpc/mod.rs).
+    UserQRCodeGetRequest, UserQRCodeGetResponse,
     UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
 };
 use privchat_sdk::{
@@ -668,38 +670,24 @@ impl MultiAccountManager {
         Ok(resp.users.into_iter().map(|u| u.blocked_user_id).collect())
     }
 
-    pub async fn user_qrcode_generate(&self, key: &str) -> BoxResult<UserQRCodeGenerateResponse> {
-        self.rpc_typed(
-            key,
-            routes::user_qrcode::GENERATE,
-            &UserQRCodeGenerateRequest {
-                expire_seconds: Some(3600),
-                user_id: 0,
-            },
-        )
-        .await
-    }
+    // QR_CODE_SPEC v1.3：`user_qrcode_generate` 已从 server 移除（qr_key 在注册时
+    // 自动产生）。v1.3 的 `get` / `refresh` 不再需要客户端传 user_id —— server 从
+    // ctx 读出来。
 
     pub async fn user_qrcode_get(&self, key: &str) -> BoxResult<UserQRCodeGetResponse> {
-        let uid = self.user_id(key)?;
         self.rpc_typed(
             key,
             routes::user_qrcode::GET,
-            &UserQRCodeGetRequest {
-                user_id: uid.to_string(),
-            },
+            &UserQRCodeGetRequest::default(),
         )
         .await
     }
 
     pub async fn user_qrcode_refresh(&self, key: &str) -> BoxResult<UserQRCodeRefreshResponse> {
-        let uid = self.user_id(key)?;
         self.rpc_typed(
             key,
             routes::user_qrcode::REFRESH,
-            &UserQRCodeRefreshRequest {
-                user_id: uid.to_string(),
-            },
+            &UserQRCodeRefreshRequest::default(),
         )
         .await
     }
@@ -975,17 +963,18 @@ impl MultiAccountManager {
         .await
     }
 
-    pub async fn group_qrcode_generate(
+    // QR_CODE_SPEC v1.3：`group/qrcode/generate` 已移除，现在用 `get`（读永久二维码）+
+    // `refresh`（owner/admin 旋转）。
+    pub async fn group_qrcode_get(
         &self,
         key: &str,
         group_id: u64,
-    ) -> BoxResult<GroupQRCodeGenerateResponse> {
+    ) -> BoxResult<GroupQRCodeGetResponse> {
         self.rpc_typed(
             key,
-            routes::group_qrcode::GENERATE,
-            &GroupQRCodeGenerateRequest {
+            routes::group_qrcode::GET,
+            &GroupQRCodeGetRequest {
                 group_id,
-                expire_seconds: Some(3600),
                 operator_id: 0,
             },
         )
