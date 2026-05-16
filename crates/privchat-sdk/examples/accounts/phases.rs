@@ -4420,6 +4420,228 @@ impl TestPhases {
             metrics,
         })
     }
+
+    /// **System User group invitation hard reject** —— spec
+    /// 07-application/SYSTEM_USER_SPEC §4 + 02-server/CHANNEL_SPEC §10.5。
+    ///
+    /// 验证 `group/member/add` 邀请 user_type=1 → 返 `21001
+    /// SystemUserNotGroupInvitable`（protocol::ErrorCode）。
+    ///
+    /// 前置：application 启用 `PRIVCHAT_SMOKE_SYSTEM_USER=1` 已 bootstrap
+    /// 一个 user_type=1 的 smoke System User。本 phase 通过 application
+    /// 暴露的 `/service/privchat/smoke/system-user-status` 端点拿到
+    /// system_user_id；未启用 smoke 时整 phase skipped。
+    pub async fn phase38_system_user_group_reject(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let smoke = match fetch_smoke_system_user_status().await? {
+            Some(s) => s,
+            None => {
+                return Ok(PhaseResult {
+                    phase_name: "system-user-group-reject".to_string(),
+                    success: true,
+                    duration: start.elapsed(),
+                    details: "skipped: PRIVCHAT_SMOKE_SYSTEM_USER not active (set =1 on application)".to_string(),
+                    metrics,
+                });
+            }
+        };
+
+        // 1) alice 建一个临时小群（只含自己）
+        let group_resp: privchat_protocol::rpc::group::group::GroupCreateResponse = manager
+            .rpc_typed(
+                "alice",
+                privchat_protocol::rpc::routes::group::CREATE,
+                &privchat_protocol::rpc::group::group::GroupCreateRequest {
+                    name: format!("smoke-sysuser-reject-{}", now_millis()),
+                    description: None,
+                    member_ids: None,
+                    creator_id: 0,
+                },
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        let group_id = group_resp.group_id;
+
+        // 2) 尝试把 smoke System User 拉进群 → 必须 21001。
+        // 直接用 sdk.rpc_call_typed 拿到原生 privchat_sdk::Error，便于精确 match
+        // 在 Error::Server { code, .. } 上；manager.rpc_typed 会把 SDK Error
+        // 装箱成 BoxError，丢失类型信息。
+        let alice_sdk = manager.sdk("alice")?;
+        let invite_result: Result<serde_json::Value, privchat_sdk::Error> = alice_sdk
+            .rpc_call_typed(
+                privchat_protocol::rpc::routes::group_member::ADD,
+                &privchat_protocol::rpc::group::member::GroupMemberAddRequest {
+                    group_id,
+                    user_id: smoke.system_user_id,
+                    role: None,
+                    inviter_id: 0,
+                },
+            )
+            .await;
+        metrics.rpc_calls += 1;
+        match invite_result {
+            Ok(v) => Err(boxed_err(format!(
+                "expected 21001 SystemUserNotGroupInvitable, got ok response: {v}"
+            ))),
+            Err(privchat_sdk::Error::Server { code, message })
+                if code
+                    == privchat_protocol::error_code::ErrorCode::SystemUserNotGroupInvitable
+                        .code() =>
+            {
+                metrics.rpc_successes += 1;
+                Ok(PhaseResult {
+                    phase_name: "system-user-group-reject".to_string(),
+                    success: true,
+                    duration: start.elapsed(),
+                    details: format!(
+                        "group_id={group_id} system_user_id={} returned 21001: {message}",
+                        smoke.system_user_id
+                    ),
+                    metrics,
+                })
+            }
+            Err(other) => Err(boxed_err(format!(
+                "expected 21001 SystemUserNotGroupInvitable, got: {other}"
+            ))),
+        }
+    }
+
+    /// **System User message dispatch end-to-end smoke** —— spec
+    /// 07-application/SYSTEM_USER_SPEC §8.5 验收 + SERVER_EVENT_DISPATCH_SPEC §11.1。
+    ///
+    /// 验证完整链路：
+    ///   普通用户 → wire SendMessage → server 持久化 → emit
+    ///   `system_user.message_received` → application 一级 handler 查 profile
+    ///   → SmokeNoopSystemUserConsumer.onMessageReceived → counter +1。
+    ///
+    /// 前置：application 启用 `PRIVCHAT_SMOKE_SYSTEM_USER=1`。
+    pub async fn phase39_system_user_message_smoke(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let smoke_before = match fetch_smoke_system_user_status().await? {
+            Some(s) => s,
+            None => {
+                return Ok(PhaseResult {
+                    phase_name: "system-user-message-smoke".to_string(),
+                    success: true,
+                    duration: start.elapsed(),
+                    details: "skipped: PRIVCHAT_SMOKE_SYSTEM_USER not active".to_string(),
+                    metrics,
+                });
+            }
+        };
+        let baseline_count = smoke_before.received_count;
+        let system_user_id = smoke_before.system_user_id;
+
+        // 1) alice 开 direct channel 到 smoke system user
+        let resp: privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelResponse = manager
+            .rpc_typed(
+                "alice",
+                privchat_protocol::rpc::routes::channel::DIRECT_GET_OR_CREATE,
+                &privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelRequest {
+                    target_user_id: system_user_id,
+                    source: Some("accounts-smoke".to_string()),
+                    source_id: Some("phase39".to_string()),
+                    user_id: 0,
+                },
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        let channel_id = resp.channel_id;
+        if channel_id == 0 {
+            return Err(boxed_err(
+                "direct/get_or_create returned channel_id=0".to_string(),
+            ));
+        }
+
+        // 2) alice 发一条 text 给 system user
+        let payload = format!("hello smoke assistant {}", now_millis());
+        let submit = manager
+            .send_text("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE, &payload)
+            .await?;
+        if !submit_ok(&submit) {
+            return Err(boxed_err(format!(
+                "send_text to system user not ok: {:?}",
+                submit
+            )));
+        }
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        metrics.messages_sent += 1;
+        let expected_server_msg_id = submit
+            .server_msg_id
+            .ok_or_else(|| boxed_err("submit lacks server_msg_id"))?;
+
+        // 3) poll consumer 计数器最多 10×200ms 等待 ServerEvent
+        let mut after: Option<SmokeSystemUserStatus> = None;
+        for attempt in 0..10 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let s = fetch_smoke_system_user_status()
+                .await?
+                .ok_or_else(|| boxed_err("smoke endpoint went away mid-test"))?;
+            if s.received_count > baseline_count {
+                after = Some(s);
+                break;
+            }
+            if attempt == 9 {
+                return Err(boxed_err(format!(
+                    "consumer counter never advanced past {baseline_count} after 10×200ms"
+                )));
+            }
+        }
+        let after = after.expect("loop guarantees Some or returns Err");
+
+        // 4) 断言 last_event identity 与发送的消息一致
+        let last = after.last_event.ok_or_else(|| {
+            boxed_err("consumer received but exposed last_event=null (impossible)".to_string())
+        })?;
+        if last.system_user_id != system_user_id {
+            return Err(boxed_err(format!(
+                "last_event.system_user_id mismatch: expected={system_user_id} got={}",
+                last.system_user_id
+            )));
+        }
+        if last.channel_id != channel_id {
+            return Err(boxed_err(format!(
+                "last_event.channel_id mismatch: expected={channel_id} got={}",
+                last.channel_id
+            )));
+        }
+        if last.server_message_id != expected_server_msg_id {
+            return Err(boxed_err(format!(
+                "last_event.server_message_id mismatch: expected={expected_server_msg_id} got={}",
+                last.server_message_id
+            )));
+        }
+        let alice_uid = manager.user_id("alice")?;
+        if last.from_user_id != alice_uid {
+            return Err(boxed_err(format!(
+                "last_event.from_user_id mismatch: expected={alice_uid} got={}",
+                last.from_user_id
+            )));
+        }
+
+        Ok(PhaseResult {
+            phase_name: "system-user-message-smoke".to_string(),
+            success: true,
+            duration: start.elapsed(),
+            details: format!(
+                "system_user_id={system_user_id} channel_id={channel_id} \
+                 server_message_id={expected_server_msg_id} consumer_count {baseline_count}→{}",
+                after.received_count
+            ),
+            metrics,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -4655,6 +4877,86 @@ async fn reconnect_account(manager: &MultiAccountManager, key: &str) -> BoxResul
     sdk.run_bootstrap_sync().await?;
     manager.refresh_local_views(key).await?;
     Ok(())
+}
+
+/// 拉 application 暴露的 smoke 调试端点 `/service/privchat/smoke/system-user-status`。
+///
+/// 端点行为（spec SYSTEM_USER_SPEC §8.5）：
+/// - smoke 未启用（application 启动时未设 PRIVCHAT_SMOKE_SYSTEM_USER=1）→ `enabled=false`
+/// - 启用 → `enabled=true` + system_user_id / received_count / last_event
+///
+/// Phase 在前者情况返回 `Ok(None)`，调用方据此 skip 整个 phase；后者返回完整结构。
+///
+/// 端点未配置 `PRIVCHAT_PLATFORM_BASE_URL` 也按 skip 处理（保持与 phase36 一致的
+/// "本地无 application 时 phase pass-skipped"行为）。
+async fn fetch_smoke_system_user_status() -> BoxResult<Option<SmokeSystemUserStatus>> {
+    let platform_base = std::env::var("PRIVCHAT_PLATFORM_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    if platform_base.is_empty() {
+        return Ok(None);
+    }
+    let master_key = std::env::var("PRIVCHAT_SERVICE_MASTER_KEY").unwrap_or_default();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let resp = http
+        .post(format!(
+            "{}/service/privchat/smoke/system-user-status",
+            platform_base
+        ))
+        .header("X-Service-Key", master_key)
+        .send()
+        .await?;
+    if resp.status().as_u16() == 404 {
+        // controller 未生成（旧 build）或 route 未注册——按 skip 处理
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(boxed_err(format!(
+            "smoke status endpoint http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        )));
+    }
+    let s: SmokeSystemUserStatus = resp.json().await?;
+    if !s.auth_ok {
+        return Err(boxed_err(
+            "smoke status endpoint rejected X-Service-Key — check PRIVCHAT_SERVICE_MASTER_KEY"
+                .to_string(),
+        ));
+    }
+    if !s.enabled {
+        return Ok(None);
+    }
+    Ok(Some(s))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SmokeSystemUserStatus {
+    enabled: bool,
+    #[serde(default)]
+    auth_ok: bool,
+    system_user_id: u64,
+    #[serde(default)]
+    received_count: u64,
+    #[serde(default)]
+    last_event: Option<SmokeSystemUserLastEventDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SmokeSystemUserLastEventDto {
+    system_user_id: u64,
+    from_user_id: u64,
+    channel_id: u64,
+    server_message_id: u64,
+    #[allow(dead_code)]
+    pts: u64,
+    #[allow(dead_code)]
+    message_type: String,
+    #[allow(dead_code)]
+    occurred_at: i64,
+    #[allow(dead_code)]
+    received_at_ms: i64,
 }
 
 fn first_user_id(search: &AccountSearchResponse, username: &str) -> BoxResult<u64> {
