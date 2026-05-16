@@ -8338,6 +8338,58 @@ pub fn qr_decode_luma(
     qr::decode_luma(width, height, luma).map_err(Into::into)
 }
 
+// ───────────────────── QR_CODE_SPEC v1.4 D0 — QR encoder ─────────────────────
+//
+// Local-only encoder. No network. Kotlin/Swift call this to turn the
+// `qr_code` URL string returned by `user/qrcode/get` / `group/qrcode/get`
+// into a cell matrix that gearui-kit renders directly as a `Box` grid.
+
+/// Errors surfaced through UniFFI to Kotlin / Swift callers of
+/// [`qr_encode_matrix`]. See `crate::qr::QrEncodeError`.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum QrEncodeError {
+    #[error("qr text must not be empty")]
+    EmptyText,
+    #[error("encoder error: {detail}")]
+    EncoderError { detail: String },
+}
+
+impl From<qr::QrEncodeError> for QrEncodeError {
+    fn from(value: qr::QrEncodeError) -> Self {
+        match value {
+            qr::QrEncodeError::EmptyText => Self::EmptyText,
+            qr::QrEncodeError::EncoderError { detail } => Self::EncoderError { detail },
+        }
+    }
+}
+
+/// One encoded QR matrix delivered to Kotlin/Swift.
+///
+/// Wire shape: `size` modules per side, `cells` is row-major with
+/// length `size * size`. Values are `0` (light) or `1` (dark).
+/// Quiet zone is NOT included — UI adds the standard 4-module margin
+/// as container padding.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct QrMatrixView {
+    pub size: u32,
+    pub cells: Vec<u8>,
+}
+
+/// Encode `text` to a QR matrix at error-correction level **M**
+/// (~15% redundancy, sensible for permanent name-card / group URLs).
+///
+/// - `Ok(QrMatrixView)` — success
+/// - `Err(EmptyText)`   — caller passed empty / whitespace-only text
+/// - `Err(EncoderError)` — payload too long / unsupported charset / etc.
+#[uniffi::export]
+pub fn qr_encode_matrix(text: String) -> Result<QrMatrixView, QrEncodeError> {
+    let m = qr::encode_matrix(&text).map_err(QrEncodeError::from)?;
+    Ok(QrMatrixView {
+        size: m.size,
+        cells: m.cells,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

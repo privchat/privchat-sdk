@@ -27,17 +27,19 @@ privchat-sdk = { path = "../privchat-sdk" }
 # Shift-JIS / GBK) decode correctly — pure-ASCII login QRs work either
 # way, but defensive for future encodings adds only ~200 KB.
 rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"] }
+# QR_CODE_SPEC v1.4 D0 — pure-Rust QR encoder. Pulled into release builds
+# so `qr_encode_matrix` can produce QR cell matrices that the UI layer
+# renders via gearui-kit Box grids (no platform Bitmap / CoreImage path).
+# Same crate that used to live in dev-dependencies for the R8.6b round-trip
+# test fixture — promoted here because the test path already validated
+# encode → rxing-decode round-trip.
+qrcode = { version = "0.14", default-features = false }
 
 [build-dependencies]
 uniffi.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-# R8.6b-rust — pure-Rust QR encoder for fixture generation in unit tests.
-# NOT pulled into release builds. Lets the round-trip test create a known
-# QR image in memory, render it as a luma byte array, and assert
-# `qr_decode_luma` returns the original payload.
-qrcode = "0.14"
 # R8.6c diagnostic — `qr_decode_image` example reads a real PNG/JPG/WebP
 # file and feeds its luma plane to qr_decode_luma. Dev-only; not in release.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
