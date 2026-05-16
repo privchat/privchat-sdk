@@ -4918,7 +4918,18 @@ async fn fetch_smoke_system_user_status() -> BoxResult<Option<SmokeSystemUserSta
             resp.text().await.unwrap_or_default()
         )));
     }
-    let s: SmokeSystemUserStatus = resp.json().await?;
+    // 端点返回 application 统一 envelope {code, message, data}（spec
+    // SERVICE_RESPONSE_ENVELOPE_SPEC），所以需要先剥 envelope 再拿 data。
+    let env: SmokeStatusEnvelope = resp.json().await?;
+    if env.code != 0 {
+        return Err(boxed_err(format!(
+            "smoke status endpoint envelope code={} message={}",
+            env.code, env.message
+        )));
+    }
+    let s = env
+        .data
+        .ok_or_else(|| boxed_err("smoke status endpoint envelope.data is null".to_string()))?;
     if !s.auth_ok {
         return Err(boxed_err(
             "smoke status endpoint rejected X-Service-Key — check PRIVCHAT_SERVICE_MASTER_KEY"
@@ -4931,16 +4942,32 @@ async fn fetch_smoke_system_user_status() -> BoxResult<Option<SmokeSystemUserSta
     Ok(Some(s))
 }
 
+#[derive(Debug, Deserialize)]
+struct SmokeStatusEnvelope {
+    code: i32,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: Option<SmokeSystemUserStatus>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct SmokeSystemUserStatus {
     enabled: bool,
-    #[serde(default)]
+    /// Missing field treated as auth ok（Kotlin 端在 v1.0.1 之前曾用默认值
+    /// 时会被 kotlinx.serialization 省略；新版总会发出该字段，但保留 default
+    /// 兼容老 application）。
+    #[serde(default = "default_true")]
     auth_ok: bool,
     system_user_id: u64,
     #[serde(default)]
     received_count: u64,
     #[serde(default)]
     last_event: Option<SmokeSystemUserLastEventDto>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
