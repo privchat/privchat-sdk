@@ -5648,6 +5648,12 @@ impl State {
     }
 
     async fn try_auto_reconnect(&mut self) -> Result<SessionState> {
+        // A-1 trace: 入口
+        eprintln!(
+            "[TRACE-A1][try_auto_reconnect] enter state_before={:?} current_uid_present={}",
+            self.session_state,
+            self.current_uid.is_some()
+        );
         eprintln!("[SDK.actor] monitor: reconnect start");
         match timeout(self.connect_timeout_total(), self.connect()).await {
             Ok(Ok(())) => {}
@@ -5661,16 +5667,46 @@ impl State {
                 return Err(e);
             }
         }
+        // A-1 trace: self.connect() 后的状态
+        eprintln!(
+            "[TRACE-A1][try_auto_reconnect] after self.connect() state={:?}",
+            self.session_state
+        );
 
         let uid = match self.current_uid.clone() {
             Some(v) => v,
-            None => return Ok(SessionState::Connected),
+            None => {
+                // A-1 trace: early return - 没有 current_uid
+                eprintln!(
+                    "[TRACE-A1][try_auto_reconnect] early_return=Connected reason=no_current_uid"
+                );
+                return Ok(SessionState::Connected);
+            }
         };
-        let snapshot = match self.storage.load_session(uid).await {
-            Ok(Some(v)) => v,
-            Ok(None) => return Ok(SessionState::Connected),
+        let snapshot = match self.storage.load_session(uid.clone()).await {
+            Ok(Some(v)) => {
+                // A-1 trace: load_session 命中
+                eprintln!(
+                    "[TRACE-A1][try_auto_reconnect] load_session=Some uid={} session_exists=true",
+                    uid
+                );
+                v
+            }
+            Ok(None) => {
+                // A-1 trace: early return - load_session 返 None
+                eprintln!(
+                    "[TRACE-A1][try_auto_reconnect] early_return=Connected reason=no_session_snapshot uid={} session_exists=false",
+                    uid
+                );
+                return Ok(SessionState::Connected);
+            }
             Err(e) => {
                 eprintln!("[SDK.actor] monitor: load session failed: {e}");
+                // A-1 trace: early return - load_session 出错
+                eprintln!(
+                    "[TRACE-A1][try_auto_reconnect] early_return=Connected reason=load_session_err uid={} err={e}",
+                    uid
+                );
                 return Ok(SessionState::Connected);
             }
         };
@@ -5682,6 +5718,12 @@ impl State {
         let user_id = snapshot.user_id;
         let device_id = snapshot.device_id.clone();
         let bootstrap_completed = snapshot.bootstrap_completed;
+        let has_access_token = !snapshot.token.is_empty();
+        // A-1 trace: 调 internal authenticate 之前
+        eprintln!(
+            "[TRACE-A1][try_auto_reconnect] before_internal_authenticate uid={} device_id={} has_access_token={} state_before={:?}",
+            user_id, device_id, has_access_token, self.session_state
+        );
         let first_attempt = timeout(
             Duration::from_secs(20),
             self.authenticate(user_id, snapshot.token, device_id.clone()),
@@ -5692,10 +5734,24 @@ impl State {
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::Transport("reconnect auth timeout".to_string())),
         };
+        // A-1 trace: internal authenticate 返回后
+        eprintln!(
+            "[TRACE-A1][try_auto_reconnect] after_internal_authenticate uid={} ok={} state_after_internal_auth={:?} err={:?}",
+            user_id,
+            auth_result.is_ok(),
+            self.session_state,
+            auth_result.as_ref().err().map(|e| e.to_string()),
+        );
         match auth_result {
             Ok(()) => {
                 self.bootstrap_completed = bootstrap_completed;
                 eprintln!("[SDK.actor] monitor: session restored");
+                // A-1 trace: 准备返回 Authenticated（注意：internal authenticate 不自己写 session_state，
+                // 由外层 caller 在 line 9122/9267 接 try_auto_reconnect 返回值后写）
+                eprintln!(
+                    "[TRACE-A1][try_auto_reconnect] returning Ok(Authenticated) path=auto_reconnect state_self={:?}",
+                    self.session_state
+                );
                 Ok(SessionState::Authenticated)
             }
             Err(e) => {
@@ -9582,7 +9638,21 @@ impl PrivchatSdk {
                             eprintln!("[SDK.actor] loop: cmd authenticate");
                         }
                         let from_state = state.session_state.as_connection_state();
-                        let result = match state.session_state.can(Action::Authenticate) {
+                        // A-1 trace: Command::Authenticate handler 入口
+                        let has_access_token = !token.is_empty();
+                        eprintln!(
+                            "[TRACE-A1][cmd_authenticate] enter uid={} device_id={} has_access_token={} state_before={:?}",
+                            user_id, device_id, has_access_token, state.session_state
+                        );
+                        let can_result = state.session_state.can(Action::Authenticate);
+                        eprintln!(
+                            "[TRACE-A1][cmd_authenticate] can(Authenticate) state_before={:?} ok={} next_state={:?} err={:?}",
+                            state.session_state,
+                            can_result.is_ok(),
+                            can_result.as_ref().ok(),
+                            can_result.as_ref().err().map(|e| e.to_string()),
+                        );
+                        let result = match can_result {
                             Ok(next_state) => match timeout(
                                 Duration::from_secs(20),
                                 state.authenticate(user_id, token, device_id),
@@ -9590,12 +9660,31 @@ impl PrivchatSdk {
                             .await
                             {
                                 Ok(r) => {
+                                    // A-1 trace: rpc 结果（before set state）
+                                    eprintln!(
+                                        "[TRACE-A1][cmd_authenticate] after_internal_authenticate uid={} ok={} state_before_set={:?} err={:?}",
+                                        user_id,
+                                        r.is_ok(),
+                                        state.session_state,
+                                        r.as_ref().err().map(|e| e.to_string()),
+                                    );
                                     if r.is_ok() {
                                         state.session_state = next_state;
+                                        // A-1 trace: 写完最终 state
+                                        eprintln!(
+                                            "[TRACE-A1][cmd_authenticate] state_after_set={:?} path=command_authenticate uid={}",
+                                            state.session_state, user_id
+                                        );
                                     }
                                     r
                                 }
-                                Err(_) => Err(Error::Transport("authenticate timeout".to_string())),
+                                Err(_) => {
+                                    eprintln!(
+                                        "[TRACE-A1][cmd_authenticate] timeout uid={}",
+                                        user_id
+                                    );
+                                    Err(Error::Transport("authenticate timeout".to_string()))
+                                },
                             },
                             Err(e) => Err(e),
                         };
