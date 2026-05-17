@@ -112,6 +112,8 @@ impl TestCoordinator {
             .await;
         self.run_phase(TestPhases::phase39_system_user_message_smoke(manager).await)
             .await;
+        self.run_phase(TestPhases::phase40_assistant_echo_loop(manager).await)
+            .await;
         Ok(())
     }
 

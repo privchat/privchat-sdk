@@ -4511,6 +4511,134 @@ impl TestPhases {
         }
     }
 
+    /// **Assistant Round A end-to-end echo loop** —— spec
+    /// `privchat-application-module-assistant` Round A 验收 + SYSTEM_USER_SPEC §8.5。
+    ///
+    /// 闭环：alice DM assistant System User → server emit
+    /// `system_user.message_received` → application 一级 handler → assistant
+    /// consumer.onMessageReceived → listMessages(channel_id, 20) → echo back。
+    ///
+    /// 该 phase 通过 env var **PRIVCHAT_ASSISTANT_USER_ID** 启用，传 assistant
+    /// 的 system user_id（运维一次性 onboard 后查 DB 取值）。0 / 未设 → skip。
+    ///
+    /// 与 phase39 区别：phase39 走 smoke harness 的 NoopConsumer 计数器；
+    /// 本 phase 不读 smoke endpoint，直接看 channel 是否收到 assistant 的 reply
+    /// 消息（content 包含 `PrivChat Assistant`）。
+    pub async fn phase40_assistant_echo_loop(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let assistant_uid_str = std::env::var("PRIVCHAT_ASSISTANT_USER_ID").unwrap_or_default();
+        let assistant_uid: u64 = assistant_uid_str.parse().unwrap_or(0);
+        if assistant_uid == 0 {
+            return Ok(PhaseResult {
+                phase_name: "assistant-echo-loop".to_string(),
+                success: true,
+                duration: start.elapsed(),
+                details: "skipped: PRIVCHAT_ASSISTANT_USER_ID unset or 0".to_string(),
+                metrics,
+            });
+        }
+
+        // 1) alice 开 direct channel 到 assistant
+        let resp: privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelResponse = manager
+            .rpc_typed(
+                "alice",
+                privchat_protocol::rpc::routes::channel::DIRECT_GET_OR_CREATE,
+                &privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelRequest {
+                    target_user_id: assistant_uid,
+                    source: Some("assistant-roundA".to_string()),
+                    source_id: Some("phase40".to_string()),
+                    user_id: 0,
+                },
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        let channel_id = resp.channel_id;
+        if channel_id == 0 {
+            return Err(boxed_err(
+                "direct/get_or_create returned channel_id=0".to_string(),
+            ));
+        }
+
+        // 2) 记录基线：当前 channel 已有多少条 assistant-sourced 消息
+        let baseline = manager
+            .message_history("alice", channel_id, 100)
+            .await?;
+        let baseline_assistant_msgs = baseline
+            .messages
+            .iter()
+            .filter(|m| m.sender_id == assistant_uid)
+            .count();
+
+        // 3) alice 发一条 text
+        let payload = format!("hello assistant {}", now_millis());
+        let submit = manager
+            .send_text("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE, &payload)
+            .await?;
+        if !submit_ok(&submit) {
+            return Err(boxed_err(format!(
+                "send_text to assistant not ok: {:?}",
+                submit
+            )));
+        }
+        metrics.rpc_calls += 1;
+        metrics.rpc_successes += 1;
+        metrics.messages_sent += 1;
+        let sent_msg_id = submit
+            .server_msg_id
+            .ok_or_else(|| boxed_err("submit lacks server_msg_id"))?;
+
+        // 4) 轮询 listMessages 最多 20×300ms 等 assistant 的 echo 落库
+        let mut got_reply: Option<privchat_protocol::rpc::MessageHistoryItem> = None;
+        for attempt in 0..20 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let h = manager
+                .message_history("alice", channel_id, 100)
+                .await?;
+            let new_assistant_msgs: Vec<&privchat_protocol::rpc::MessageHistoryItem> = h
+                .messages
+                .iter()
+                .filter(|m| m.sender_id == assistant_uid)
+                .collect();
+            if new_assistant_msgs.len() > baseline_assistant_msgs {
+                // 取最新一条 assistant 消息
+                got_reply = new_assistant_msgs.last().map(|m| (*m).clone());
+                break;
+            }
+            if attempt == 19 {
+                return Err(boxed_err(format!(
+                    "assistant reply never landed after 20×300ms; baseline_assistant_msgs={baseline_assistant_msgs} sent_msg_id={sent_msg_id}"
+                )));
+            }
+        }
+        let reply = got_reply.expect("loop guarantees Some or returns Err");
+
+        // 5) 断言 reply content 包含 assistant 默认标识
+        if !reply.content.contains("Assistant") && !reply.content.contains("assistant") {
+            return Err(boxed_err(format!(
+                "assistant reply content unexpected: '{}'",
+                reply.content
+            )));
+        }
+
+        Ok(PhaseResult {
+            phase_name: "assistant-echo-loop".to_string(),
+            success: true,
+            duration: start.elapsed(),
+            details: format!(
+                "assistant_uid={assistant_uid} channel_id={channel_id} \
+                 sent_msg_id={sent_msg_id} reply_id={} reply_len={}",
+                reply.message_id,
+                reply.content.len()
+            ),
+            metrics,
+        })
+    }
+
     /// **System User message dispatch end-to-end smoke** —— spec
     /// 07-application/SYSTEM_USER_SPEC §8.5 验收 + SERVER_EVENT_DISPATCH_SPEC §11.1。
     ///
