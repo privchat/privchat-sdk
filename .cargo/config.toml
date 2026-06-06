@@ -4,3 +4,19 @@
 # Without this, openssl-sys picks up the latest Xcode SDK version (e.g. 26.x)
 # which uses ___chkstk_darwin, causing undefined symbol linker errors.
 IPHONEOS_DEPLOYMENT_TARGET = "14.1"
+
+# Android 16KB page size compatibility (required by Android 15+/API 35+).
+# NDK r23+'s lld defaults to 4KB page alignment; on Android 16 devices this
+# causes the OS to run the app in compat letterbox mode. Force 16KB ELF page
+# alignment for all Android targets.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
