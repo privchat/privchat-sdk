@@ -48,8 +48,9 @@ use privchat_protocol::rpc::sync::{
 };
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
-    ClientInfo, ContentMessageType, DeviceInfo, DeviceType, DisconnectRequest, DisconnectResponse,
-    ErrorCode, MessageType, PingRequest, PongResponse, PublishRequest, PublishResponse,
+    ClientInfo, ContactCardMetadata, ContentMessageType, DeviceInfo, DeviceType,
+    DisconnectRequest, DisconnectResponse, ErrorCode, LinkMetadata, LocationMetadata,
+    MessageMetadata, MessageType, PingRequest, PongResponse, PublishRequest, PublishResponse,
     PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse, RpcRequest,
     RpcResponse, SendMessageRequest, SendMessageResponse, SubscribeRequest, SubscribeResponse,
     TransferRequest, TransferResponse,
@@ -60,6 +61,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
+pub mod attachment_crypto;
 pub mod error_codes;
 mod local_store;
 pub mod media_download;
@@ -146,6 +148,15 @@ fn env_var_trimmed(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn non_empty_trimmed(value: String) -> Option<String> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -999,6 +1010,49 @@ pub struct NewMessage {
     pub media_downloaded: bool,
     /// 缩略图状态：0=missing, 1=ready, 2=failed
     pub thumb_status: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StructuredSendOptions {
+    pub in_reply_to_message_id: Option<u64>,
+    pub mentioned_user_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LinkMessageInput {
+    pub channel_id: u64,
+    pub channel_type: i32,
+    pub from_uid: u64,
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub thumbnail_file_id: Option<u64>,
+    pub options: StructuredSendOptions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LocationMessageInput {
+    pub channel_id: u64,
+    pub channel_type: i32,
+    pub from_uid: u64,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub coordinate_system: Option<String>,
+    pub name: Option<String>,
+    pub address: Option<String>,
+    pub poi_id: Option<String>,
+    pub poi_source: Option<String>,
+    pub thumbnail_file_id: Option<u64>,
+    pub options: StructuredSendOptions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContactCardMessageInput {
+    pub channel_id: u64,
+    pub channel_type: i32,
+    pub from_uid: u64,
+    pub user_id: u64,
+    pub options: StructuredSendOptions,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -8192,11 +8246,19 @@ impl State {
         mime_type: &str,
         data: Vec<u8>,
     ) -> Result<UploadedFileInfo> {
-        let part = reqwest::multipart::Part::bytes(data)
+        // 附件加密 v1（ATTACHMENT_ENCRYPTION_SPEC）：所有聊天附件（图片/视频/文件/语音/缩略图，
+        // 均经此统一上传点）整文件 AES-256-GCM 加密；上传密文 blob = nonce||ct||tag，
+        // multipart 带 encryption_version=1 + cek(base64url)。对象存储只存密文。CEK 不进日志。
+        let (blob, cek_b64) = crate::attachment_crypto::encrypt_attachment(&data)
+            .map_err(|e| Error::Serialization(format!("attachment encrypt failed: {e}")))?;
+        let part = reqwest::multipart::Part::bytes(blob)
             .file_name(filename.to_string())
             .mime_str(mime_type)
             .map_err(|e| Error::Serialization(format!("invalid mime_type for upload part: {e}")))?;
-        let form = reqwest::multipart::Form::new().part("file", part);
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("encryption_version", "1")
+            .text("cek", cek_b64);
         let response = reqwest::Client::new()
             .post(upload_url)
             .header("X-Upload-Token", upload_token)
@@ -12289,6 +12351,131 @@ impl PrivchatSdk {
 
     pub async fn create_local_message(&self, input: NewMessage) -> Result<u64> {
         self.create_local_message_with_id(input, None).await
+    }
+
+    pub async fn send_link_message(&self, input: LinkMessageInput) -> Result<u64> {
+        let url = input.url.trim().to_string();
+        if url.is_empty() {
+            return Err(Error::InvalidState("url is empty".to_string()));
+        }
+        let title = input.title.and_then(non_empty_trimmed);
+        let description = input.description.and_then(non_empty_trimmed);
+        let display_content = title.clone().unwrap_or_else(|| url.clone());
+        let metadata = MessageMetadata::Link(LinkMetadata {
+            url,
+            title,
+            description,
+            thumbnail_file_id: input.thumbnail_file_id,
+        });
+        self.send_structured_message(
+            input.channel_id,
+            input.channel_type,
+            input.from_uid,
+            ContentMessageType::Link,
+            display_content,
+            metadata,
+            input.options,
+        )
+        .await
+    }
+
+    pub async fn send_location_message(&self, input: LocationMessageInput) -> Result<u64> {
+        let name = input.name.and_then(non_empty_trimmed);
+        let address = input.address.and_then(non_empty_trimmed);
+        let display_content = name
+            .clone()
+            .or_else(|| address.clone())
+            .unwrap_or_else(|| format!("{},{}", input.latitude, input.longitude));
+        let metadata = MessageMetadata::Location(LocationMetadata {
+            latitude: input.latitude,
+            longitude: input.longitude,
+            coordinate_system: input.coordinate_system.and_then(non_empty_trimmed),
+            name,
+            address,
+            poi_id: input.poi_id.and_then(non_empty_trimmed),
+            poi_source: input.poi_source.and_then(non_empty_trimmed),
+            thumbnail_file_id: input.thumbnail_file_id,
+        });
+        self.send_structured_message(
+            input.channel_id,
+            input.channel_type,
+            input.from_uid,
+            ContentMessageType::Location,
+            display_content,
+            metadata,
+            input.options,
+        )
+        .await
+    }
+
+    pub async fn send_contact_card_message(&self, input: ContactCardMessageInput) -> Result<u64> {
+        let metadata = MessageMetadata::ContactCard(ContactCardMetadata {
+            user_id: input.user_id,
+        });
+        self.send_structured_message(
+            input.channel_id,
+            input.channel_type,
+            input.from_uid,
+            ContentMessageType::ContactCard,
+            String::new(),
+            metadata,
+            input.options,
+        )
+        .await
+    }
+
+    async fn send_structured_message(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        from_uid: u64,
+        content_type: ContentMessageType,
+        display_content: String,
+        metadata: MessageMetadata,
+        options: StructuredSendOptions,
+    ) -> Result<u64> {
+        debug_assert!(
+            matches!(
+                (&content_type, &metadata),
+                (ContentMessageType::Link, MessageMetadata::Link(_))
+                    | (ContentMessageType::Location, MessageMetadata::Location(_))
+                    | (ContentMessageType::ContactCard, MessageMetadata::ContactCard(_))
+            ),
+            "structured message type and protocol metadata must match",
+        );
+        let metadata_value = metadata.to_inner_json_value();
+        let envelope = LocalMessagePayloadEnvelope {
+            content: display_content.clone(),
+            metadata: Some(metadata_value.clone()),
+            reply_to_message_id: options.in_reply_to_message_id.map(|id| id.to_string()),
+            mentioned_user_ids: if options.mentioned_user_ids.is_empty() {
+                None
+            } else {
+                Some(options.mentioned_user_ids)
+            },
+            message_source: None,
+        };
+        let content = serde_json::to_string(&envelope)
+            .map_err(|e| Error::Serialization(format!("encode structured message envelope: {e}")))?;
+        let extra = serde_json::to_string(&metadata_value)
+            .map_err(|e| Error::Serialization(format!("encode structured message metadata: {e}")))?;
+        let message_id = self
+            .create_local_message(NewMessage {
+                channel_id,
+                channel_type,
+                from_uid,
+                message_type: i32::try_from(content_type.as_u32()).unwrap_or(0),
+                content,
+                searchable_word: display_content,
+                setting: 0,
+                extra,
+                mime_type: None,
+                media_downloaded: false,
+                thumb_status: 0,
+            })
+            .await?;
+        self.enqueue_outbound_message(message_id, Vec::new()).await?;
+        Ok(message_id)
     }
 
     pub async fn create_local_message_with_id(
