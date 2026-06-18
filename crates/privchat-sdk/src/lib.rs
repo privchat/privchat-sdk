@@ -721,6 +721,11 @@ struct UploadedFileInfo {
     width: Option<u32>,
     height: Option<u32>,
     mime_type: String,
+    /// 本次上传所用的附件加密版本（v1=AES-GCM）。
+    encryption_version: i32,
+    /// 本次上传所用的 cek（base64url）。仅缩略图需要回写进消息 metadata 供接收端
+    /// 收到即解密；主文件的 cek 不进 metadata，走 `file/get_url` 鉴权下发。CEK 不进日志。
+    cek: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7903,6 +7908,7 @@ impl State {
                 return;
             }
         };
+        let (thumb_enc_version, thumb_cek) = Self::extract_thumbnail_crypto(content);
         let dir = media_store::get_message_dir(user_root, message_id as i64, created_at_ms);
         let thumb_path = dir.join(Self::thumb_filename_for_url(&thumb_url));
         let webp_path = dir.join(media_store::THUMB_FILENAME);
@@ -7914,7 +7920,15 @@ impl State {
             return;
         }
         tokio::spawn(async move {
-            match Self::do_download_thumbnail(&thumb_url, &dir, &thumb_path).await {
+            match Self::do_download_thumbnail(
+                &thumb_url,
+                &dir,
+                &thumb_path,
+                thumb_enc_version,
+                thumb_cek.as_deref(),
+            )
+            .await
+            {
                 Ok(()) => {
                     if let Err(e) = storage.update_thumb_status(message_id, 1).await {
                         eprintln!("[SDK.thumb] update thumb_status=1 failed: {e}");
@@ -7967,20 +7981,60 @@ impl State {
         url: &str,
         dir: &Path,
         thumb_path: &Path,
+        encryption_version: i32,
+        cek: Option<&str>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let resp = reqwest::Client::new().get(url).send().await?;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()).into());
         }
         let bytes = resp.bytes().await?;
+        // 附件加密 v1：缩略图 blob 同样是 nonce||ct||tag，用 metadata 里随消息下发的 cek
+        // 本地解密后再落盘；v0（legacy 明文）原样写入。解密失败直接报错，绝不写密文当图片。
+        let plaintext =
+            crate::attachment_crypto::decrypt_downloaded_attachment_bytes(
+                encryption_version,
+                cek,
+                &bytes,
+            )?;
         std::fs::create_dir_all(dir)?;
-        std::fs::write(thumb_path, &bytes)?;
+        std::fs::write(thumb_path, &plaintext)?;
         eprintln!(
-            "[SDK.thumb] auto-download ok: {} ({} bytes)",
+            "[SDK.thumb] auto-download ok: {} ({} bytes, enc_v={})",
             thumb_path.display(),
-            bytes.len()
+            plaintext.len(),
+            encryption_version
         );
         Ok(())
+    }
+
+    /// 从消息内容 JSON 解析缩略图加密信息（envelope `metadata` 或 flat 两种形态）。
+    /// 返回 `(encryption_version, cek)`；缺省视为 v0 明文。
+    /// 与 [`extract_thumbnail_url`] 对齐：优先在 `metadata` 下找，找不到再退回根级，
+    /// 保证 cek 与 thumbnail_url 取自同一 scope。
+    fn extract_thumbnail_crypto(content: &str) -> (i32, Option<String>) {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+            return (0, None);
+        };
+        let read = |scope: &serde_json::Value| -> Option<(i32, Option<String>)> {
+            let cek = scope
+                .get("thumbnail_cek")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let version = scope
+                .get("thumbnail_encryption_version")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            match (version, &cek) {
+                (None, None) => None, // 此 scope 无缩略图加密信息
+                (v, _) => Some((v.unwrap_or(0), cek)),
+            }
+        };
+        json.get("metadata")
+            .and_then(read)
+            .or_else(|| read(&json))
+            .unwrap_or((0, None))
     }
 
     /// 存储层 / 上传层使用的文件分类字符串，严格对齐服务端 `FileType`：
@@ -8279,7 +8333,7 @@ impl State {
         let form = reqwest::multipart::Form::new()
             .part("file", part)
             .text("encryption_version", "1")
-            .text("cek", cek_b64);
+            .text("cek", cek_b64.clone());
         let response = reqwest::Client::new()
             .post(upload_url)
             .header("X-Upload-Token", upload_token)
@@ -8359,6 +8413,8 @@ impl State {
             width,
             height,
             mime_type: resp_mime,
+            encryption_version: 1,
+            cek: Some(cek_b64),
         })
     }
 
@@ -8821,6 +8877,14 @@ impl State {
                 .as_ref()
                 .map(|v| v.file_url.clone())
                 .unwrap_or_default();
+            // 缩略图在接收端「收到即自动下载」，metadata 里的 thumbnail_url 当下即新鲜可用，
+            // 故缩略图的 cek 直接随消息 metadata 下发，接收端本地解密，无需再走 get_url。
+            // （主文件 cek 不进 metadata，按需经 file/get_url 鉴权下发。）CEK 不进日志。
+            let thumb_encryption_version = uploaded_thumbnail
+                .as_ref()
+                .map(|v| v.encryption_version)
+                .unwrap_or(0);
+            let thumb_cek = uploaded_thumbnail.as_ref().and_then(|v| v.cek.clone());
             serde_json::json!({
                 "file_type": file_type,
                 "file_id": uploaded_file_id,
@@ -8831,6 +8895,8 @@ impl State {
                 "file_size": uploaded.file_size,
                 "file_url": uploaded.file_url,
                 "thumbnail_url": thumbnail_url,
+                "thumbnail_encryption_version": thumb_encryption_version,
+                "thumbnail_cek": thumb_cek,
             })
         } else {
             serde_json::json!({
