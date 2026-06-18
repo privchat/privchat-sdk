@@ -20,7 +20,7 @@ use reqwest::StatusCode;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::{MediaDownloadState, PrivchatSdk, SdkEvent};
+use crate::{MediaDownloadState, PrivchatSdk, ResolvedFileDownload, SdkEvent};
 use privchat_protocol::ErrorCode;
 
 /// Progress events are throttled to this interval.
@@ -58,15 +58,39 @@ impl DownloadManager {
             .unwrap_or(MediaDownloadState::Idle)
     }
 
-    /// Start (or no-op restart if already Downloading/Paused) a download.
-    /// - `target_dir` must already exist.
-    /// - `payload_filename` is `payload.<ext>`.
-    /// - `download_url` must be an http(s) URL (caller-resolved).
+    /// Start a download from a legacy plaintext URL (no attachment encryption).
+    /// Backwards-compatible entry: builds a v0 ticket and delegates to
+    /// [`start_with_ticket`](Self::start_with_ticket). Prefer the ticket form for
+    /// encrypted (v1) attachments so the blob is decrypted on completion.
     pub async fn start(
         &self,
         sdk: PrivchatSdk,
         message_id: u64,
         download_url: String,
+        target_dir: PathBuf,
+        payload_filename: String,
+    ) -> Result<(), String> {
+        self.start_with_ticket(
+            sdk,
+            message_id,
+            ResolvedFileDownload::legacy_url(download_url),
+            target_dir,
+            payload_filename,
+        )
+        .await
+    }
+
+    /// Start (or no-op restart if already Downloading/Paused) a download from a
+    /// resolved ticket (`url` + `encryption_version` + optional `cek`).
+    /// - `target_dir` must already exist.
+    /// - `payload_filename` is `payload.<ext>`.
+    /// - On completion, a v1 ticket's `.part` blob is AES-GCM decrypted before
+    ///   becoming the final file; a v0 ticket is renamed as-is.
+    pub async fn start_with_ticket(
+        &self,
+        sdk: PrivchatSdk,
+        message_id: u64,
+        ticket: ResolvedFileDownload,
         target_dir: PathBuf,
         payload_filename: String,
     ) -> Result<(), String> {
@@ -102,7 +126,7 @@ impl DownloadManager {
                 sdk_c,
                 manager,
                 message_id,
-                download_url,
+                ticket,
                 target_dir,
                 payload_filename,
                 paused_c,
@@ -200,13 +224,14 @@ async fn run_download(
     sdk: PrivchatSdk,
     manager: DownloadManager,
     message_id: u64,
-    download_url: String,
+    ticket: ResolvedFileDownload,
     target_dir: PathBuf,
     payload_filename: String,
     paused: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
 ) {
+    let download_url = ticket.url;
     let final_path = target_dir.join(&payload_filename);
     let part_path = target_dir.join(format!("{payload_filename}.part"));
 
@@ -398,16 +423,69 @@ async fn run_download(
     }
     drop(file);
 
-    if let Err(e) = fs::rename(&part_path, &final_path) {
-        fail(
-            &sdk,
-            &manager,
-            message_id,
-            ErrorCode::InternalError as u32,
-            format!("rename: {e}"),
-        )
-        .await;
-        return;
+    // Finalize: v0 (legacy plaintext) renames the .part as-is; v1 reads the full
+    // blob (nonce||ciphertext||tag), AES-GCM decrypts it, and writes the plaintext
+    // as the final file. A decrypt failure deletes the .part (it is unusable and
+    // must NOT masquerade as resumable data) and surfaces as a hard failure — we
+    // never fall back to writing the encrypted bytes.
+    if ticket.encryption_version == 0 {
+        if let Err(e) = fs::rename(&part_path, &final_path) {
+            fail(
+                &sdk,
+                &manager,
+                message_id,
+                ErrorCode::InternalError as u32,
+                format!("rename: {e}"),
+            )
+            .await;
+            return;
+        }
+    } else {
+        let blob = match fs::read(&part_path) {
+            Ok(b) => b,
+            Err(e) => {
+                fail(
+                    &sdk,
+                    &manager,
+                    message_id,
+                    ErrorCode::InternalError as u32,
+                    format!("read part for decrypt: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let plaintext = match crate::attachment_crypto::decrypt_downloaded_attachment_bytes(
+            ticket.encryption_version,
+            ticket.cek.as_deref(),
+            &blob,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = fs::remove_file(&part_path);
+                fail(
+                    &sdk,
+                    &manager,
+                    message_id,
+                    ErrorCode::InternalError as u32,
+                    format!("decrypt attachment: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(e) = fs::write(&final_path, &plaintext) {
+            fail(
+                &sdk,
+                &manager,
+                message_id,
+                ErrorCode::InternalError as u32,
+                format!("write decrypted: {e}"),
+            )
+            .await;
+            return;
+        }
+        let _ = fs::remove_file(&part_path);
     }
 
     if let Err(e) = sdk.update_media_downloaded(message_id, true).await {

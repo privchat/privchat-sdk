@@ -11646,6 +11646,48 @@ impl PrivchatSdk {
             .map_err(Error::InvalidState)
     }
 
+    /// Start a streaming download for an attachment-encrypted (v1) message.
+    ///
+    /// Resolves the canonical download ticket via [`file/get_url`](Self::resolve_file_download)
+    /// (signed URL + `encryption_version` + `cek`) and dispatches it. On completion
+    /// the blob is AES-GCM decrypted before becoming the on-disk file. Legacy
+    /// plaintext messages (no `file_id`) should keep using
+    /// [`start_message_media_download`](Self::start_message_media_download).
+    pub async fn start_message_media_download_by_file_id(
+        &self,
+        message_id: u64,
+        file_id: u64,
+        mime: String,
+        filename_hint: Option<String>,
+        created_at_ms: i64,
+    ) -> Result<()> {
+        let snapshot = self.session_snapshot().await?.ok_or_else(|| {
+            Error::InvalidState("session is empty; login/authenticate required".to_string())
+        })?;
+        let uid = snapshot.user_id;
+        let ticket = self.resolve_file_download(file_id).await?;
+        let root = std::path::Path::new(self.data_dir.as_str());
+        let target_dir = media_store::ensure_attachment_dir(
+            root,
+            uid,
+            message_id as i64,
+            created_at_ms,
+        )
+        .map_err(|e| Error::Storage(format!("ensure attachment dir failed: {e}")))?;
+        let payload_filename =
+            media_store::payload_filename_with_fallback(&mime, filename_hint.as_deref());
+        self.download_manager
+            .start_with_ticket(
+                self.clone(),
+                message_id,
+                ticket,
+                target_dir,
+                payload_filename,
+            )
+            .await
+            .map_err(Error::InvalidState)
+    }
+
     pub async fn pause_message_media_download(&self, message_id: u64) {
         self.download_manager.pause(self, message_id).await;
     }
