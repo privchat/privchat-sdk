@@ -76,7 +76,10 @@ use privchat_protocol::rpc::{
     GroupQRCodeRefreshRequest, GroupQRCodeRefreshResponse,
 };
 use privchat_sdk::{
+    ContactCardMessageInput as SdkContactCardMessageInput,
     ConnectionState as SdkConnectionState, Error as SdkError, FileQueueRef as SdkFileQueueRef,
+    LinkMessageInput as SdkLinkMessageInput,
+    LocationMessageInput as SdkLocationMessageInput,
     LocalAccountSummary as SdkLocalAccountSummary, LoginResult as SdkLoginResult,
     MediaProcessOp as SdkMediaProcessOp, MentionInput as SdkMentionInput,
     NetworkHint as SdkNetworkHint, NewMessage as SdkNewMessage,
@@ -88,6 +91,7 @@ use privchat_sdk::{
     StoredFriend as SdkStoredFriend, StoredGroup as SdkStoredGroup,
     StoredGroupMember as SdkStoredGroupMember, StoredMessage as SdkStoredMessage,
     StoredMessageExtra as SdkStoredMessageExtra, StoredMessageReaction as SdkStoredMessageReaction,
+    StructuredSendOptions as SdkStructuredSendOptions,
     StoredReminder as SdkStoredReminder, StoredUser as SdkStoredUser,
     TerminalReason as SdkTerminalReason,
     TransportProtocol as SdkProtocol, TypingActionType as SdkTypingActionType,
@@ -683,6 +687,49 @@ pub struct StickerInfoView {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SendMessageOptionsInput {
     pub options_json: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct StructuredSendOptionsInput {
+    pub in_reply_to_message_id: Option<u64>,
+    pub mentioned_user_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LinkMessageInput {
+    pub channel_id: u64,
+    pub channel_type: i32,
+    pub from_uid: u64,
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub thumbnail_file_id: Option<u64>,
+    pub options: Option<StructuredSendOptionsInput>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LocationMessageInput {
+    pub channel_id: u64,
+    pub channel_type: i32,
+    pub from_uid: u64,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub coordinate_system: Option<String>,
+    pub name: Option<String>,
+    pub address: Option<String>,
+    pub poi_id: Option<String>,
+    pub poi_source: Option<String>,
+    pub thumbnail_file_id: Option<u64>,
+    pub options: Option<StructuredSendOptionsInput>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ContactCardMessageInput {
+    pub channel_id: u64,
+    pub channel_type: i32,
+    pub from_uid: u64,
+    pub user_id: u64,
+    pub options: Option<StructuredSendOptionsInput>,
 }
 
 /// Kotlin 侧 `buildJsonObject` 写入的 options JSON 字段。
@@ -2626,6 +2673,54 @@ fn map_new_message(v: NewMessage) -> SdkNewMessage {
         mime_type: v.mime_type,
         media_downloaded: v.media_downloaded,
         thumb_status: v.thumb_status,
+    }
+}
+
+fn map_structured_options(v: Option<StructuredSendOptionsInput>) -> SdkStructuredSendOptions {
+    v.map(|options| SdkStructuredSendOptions {
+        in_reply_to_message_id: options.in_reply_to_message_id,
+        mentioned_user_ids: options.mentioned_user_ids,
+    })
+    .unwrap_or_default()
+}
+
+fn map_link_message_input(v: LinkMessageInput) -> SdkLinkMessageInput {
+    SdkLinkMessageInput {
+        channel_id: v.channel_id,
+        channel_type: v.channel_type,
+        from_uid: v.from_uid,
+        url: v.url,
+        title: v.title,
+        description: v.description,
+        thumbnail_file_id: v.thumbnail_file_id,
+        options: map_structured_options(v.options),
+    }
+}
+
+fn map_location_message_input(v: LocationMessageInput) -> SdkLocationMessageInput {
+    SdkLocationMessageInput {
+        channel_id: v.channel_id,
+        channel_type: v.channel_type,
+        from_uid: v.from_uid,
+        latitude: v.latitude,
+        longitude: v.longitude,
+        coordinate_system: v.coordinate_system,
+        name: v.name,
+        address: v.address,
+        poi_id: v.poi_id,
+        poi_source: v.poi_source,
+        thumbnail_file_id: v.thumbnail_file_id,
+        options: map_structured_options(v.options),
+    }
+}
+
+fn map_contact_card_message_input(v: ContactCardMessageInput) -> SdkContactCardMessageInput {
+    SdkContactCardMessageInput {
+        channel_id: v.channel_id,
+        channel_type: v.channel_type,
+        from_uid: v.from_uid,
+        user_id: v.user_id,
+        options: map_structured_options(v.options),
     }
 }
 
@@ -6744,6 +6839,36 @@ impl PrivchatClient {
         self.send_message_with_input(input).await
     }
 
+    pub async fn send_link_message(
+        &self,
+        input: LinkMessageInput,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.inner
+            .send_link_message(map_link_message_input(input))
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn send_location_message(
+        &self,
+        input: LocationMessageInput,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.inner
+            .send_location_message(map_location_message_input(input))
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn send_contact_card_message(
+        &self,
+        input: ContactCardMessageInput,
+    ) -> Result<u64, PrivchatFfiError> {
+        self.inner
+            .send_contact_card_message(map_contact_card_message_input(input))
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn peek_outbound_messages(
         &self,
         limit: u64,
@@ -8020,6 +8145,31 @@ impl PrivchatClient {
     ) -> Result<(), PrivchatFfiError> {
         self.inner
             .start_message_media_download(message_id, download_url, mime, filename_hint, created_at_ms)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// Start a streaming download for an attachment-encrypted (v1) message by
+    /// `file_id`. The SDK resolves the signed URL + cek via `file/get_url` and
+    /// decrypts the blob on completion. Prefer this over the URL-driven entry for
+    /// any message that carries a `file_id`; the legacy URL form is retained only
+    /// for plaintext (pre-encryption) attachments.
+    pub async fn start_message_media_download_by_file_id(
+        &self,
+        message_id: u64,
+        file_id: u64,
+        mime: String,
+        filename_hint: Option<String>,
+        created_at_ms: i64,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .start_message_media_download_by_file_id(
+                message_id,
+                file_id,
+                mime,
+                filename_hint,
+                created_at_ms,
+            )
             .await
             .map_err(PrivchatFfiError::from)
     }
