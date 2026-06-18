@@ -66,4 +66,26 @@ pub fn decrypt_attachment(blob: &[u8], cek_b64: &str) -> Result<Vec<u8>, String>
         .decrypt(Nonce::from_slice(nonce_bytes), ct_with_tag)
         .map_err(|_| "attachment decrypt/auth failed".to_string())
 }
+
+/// 下载完成后按加密信息把 blob 还原成明文（run_download / thumbnail 下载统一调用）。
+///
+/// - `version=0`（或上层视为缺失时传 0）→ legacy 明文，原样返回。
+/// - `version=1` → `cek` **必须存在**，blob 校验 + AES-GCM 解密；缺 cek 或解密失败一律 Err，
+///   **绝不 fallback 成明文**（否则会把密文当图片写入，UI 显示坏图并掩盖错误）。
+pub fn decrypt_downloaded_attachment_bytes(
+    encryption_version: i32,
+    cek: Option<&str>,
+    blob: &[u8],
+) -> Result<Vec<u8>, String> {
+    match encryption_version {
+        0 => Ok(blob.to_vec()),
+        1 => {
+            let cek = cek
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "encryption_version=1 but cek missing".to_string())?;
+            decrypt_attachment(blob, cek)
+        }
+        v => Err(format!("unsupported encryption_version: {v}")),
+    }
+}
 // 单测见 tests/attachment_crypto_test.rs（集成测试，绕开 lib 内不相关的 test fixture）。

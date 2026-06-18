@@ -2,7 +2,8 @@
 // 放 tests/ 集成测试：链接 lib 非-test 构建，绕开 lib 内不相关的 #[cfg(test)] fixture。
 
 use privchat_sdk::attachment_crypto::{
-    decrypt_attachment, encrypt_attachment, MIN_BLOB_LEN, NONCE_LEN,
+    decrypt_attachment, decrypt_downloaded_attachment_bytes, encrypt_attachment, MIN_BLOB_LEN,
+    NONCE_LEN,
 };
 
 #[test]
@@ -54,4 +55,42 @@ fn bad_cek_length_rejected() {
     // 22 个 'A' = base64url(16 字节零) → 非 32B，应拒绝
     let short_cek = "AAAAAAAAAAAAAAAAAAAAAA";
     assert!(decrypt_attachment(&blob, short_cek).is_err());
+}
+
+// ---- download helper: decrypt_downloaded_attachment_bytes ----
+
+#[test]
+fn download_legacy_v0_returns_original() {
+    let raw = b"legacy plaintext bytes";
+    assert_eq!(
+        decrypt_downloaded_attachment_bytes(0, None, raw).unwrap(),
+        raw
+    );
+}
+
+#[test]
+fn download_v1_roundtrip() {
+    let plain = b"download me";
+    let (blob, cek) = encrypt_attachment(plain).unwrap();
+    let out = decrypt_downloaded_attachment_bytes(1, Some(&cek), &blob).unwrap();
+    assert_eq!(out, plain);
+}
+
+#[test]
+fn download_v1_missing_cek_fails() {
+    let (blob, _cek) = encrypt_attachment(b"x").unwrap();
+    assert!(decrypt_downloaded_attachment_bytes(1, None, &blob).is_err());
+    assert!(decrypt_downloaded_attachment_bytes(1, Some(""), &blob).is_err());
+}
+
+#[test]
+fn download_v1_short_blob_fails() {
+    assert!(decrypt_downloaded_attachment_bytes(1, Some("AAAA"), &[0u8; 10]).is_err());
+}
+
+#[test]
+fn download_v1_wrong_cek_fails() {
+    let (blob, _cek) = encrypt_attachment(b"x").unwrap();
+    let (_b2, other) = encrypt_attachment(b"y").unwrap();
+    assert!(decrypt_downloaded_attachment_bytes(1, Some(&other), &blob).is_err());
 }
