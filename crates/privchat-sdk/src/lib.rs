@@ -36,7 +36,8 @@ use privchat_protocol::presence::{
 use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
 use privchat_protocol::rpc::contact::friend::FriendPendingResponse;
 use privchat_protocol::rpc::file::upload::{
-    FileRequestUploadTokenRequest, FileRequestUploadTokenResponse,
+    FileGetUrlRequest, FileGetUrlResponse, FileRequestUploadTokenRequest,
+    FileRequestUploadTokenResponse,
 };
 use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
 use privchat_protocol::rpc::routes;
@@ -76,6 +77,26 @@ use runtime::runtime_provider::RuntimeProvider;
 use storage_actor::StorageHandle;
 use sync_commit_applier::SyncCommitApplier;
 use task::task_registry::TaskRegistry;
+
+/// 下载票据：下载前由 `file/get_url` 解析（file_id 路径），或由 legacy file_url 构造
+/// （`encryption_version=0, cek=None`）。DownloadManager / run_download 只认这个，不关心来源。
+#[derive(Debug, Clone)]
+pub struct ResolvedFileDownload {
+    pub url: String,
+    pub encryption_version: i32,
+    pub cek: Option<String>,
+}
+
+impl ResolvedFileDownload {
+    /// 旧消息只有 file_url 时的 legacy 明文票据。
+    pub fn legacy_url(url: String) -> Self {
+        Self {
+            url,
+            encryption_version: 0,
+            cek: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransportProtocol {
@@ -12126,6 +12147,28 @@ impl PrivchatSdk {
         self.apply_rpc_side_effects(route, &raw).await?;
         serde_json::from_str(&raw)
             .map_err(|e| Error::Serialization(format!("decode {route} response: {e}; raw={raw}")))
+    }
+
+    /// 下载前按 file_id 调 `file/get_url` 解析出下载票据（含解密所需 cek/version）。
+    /// 附件加密 v1：消息只带 file_id，下载权威信息（signed_url + cek + version）走此 RPC，
+    /// 不依赖消息里存的 file_url（那只作 legacy fallback）。CEK 不进日志。
+    pub async fn resolve_file_download(&self, file_id: u64) -> Result<ResolvedFileDownload> {
+        let payload = FileGetUrlRequest {
+            file_id,
+            user_id: 0, // 服务端按鉴权上下文填充
+        };
+        let resp: FileGetUrlResponse =
+            self.rpc_call_typed(routes::file::GET_URL, &payload).await?;
+        if resp.file_url.trim().is_empty() {
+            return Err(Error::Serialization(
+                "decode file/get_url response: missing file_url".to_string(),
+            ));
+        }
+        Ok(ResolvedFileDownload {
+            url: resp.file_url,
+            encryption_version: resp.encryption_version,
+            cek: resp.cek,
+        })
     }
 
     async fn apply_rpc_side_effects(&self, route: &str, raw: &str) -> Result<()> {
