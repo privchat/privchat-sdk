@@ -8910,6 +8910,10 @@ impl State {
                 "file_size": uploaded.file_size,
                 "file_url": uploaded.file_url,
                 "thumbnail_url": thumbnail_url,
+                // 原图尺寸（客户端加密前解码得到）。加密后服务端拿不到密文图片尺寸，
+                // 必须客户端带上，否则接收端 UI 没法按原比例渲染气泡（只能正方形兜底）。
+                "width": source_width.unwrap_or(0),
+                "height": source_height.unwrap_or(0),
             })
         } else {
             serde_json::json!({
@@ -8921,6 +8925,8 @@ impl State {
                 "file_size": uploaded.file_size,
                 "file_url": uploaded.file_url,
                 "thumbnail_url": uploaded.thumbnail_url,
+                "width": source_width.unwrap_or(0),
+                "height": source_height.unwrap_or(0),
             })
         };
 
