@@ -721,11 +721,6 @@ struct UploadedFileInfo {
     width: Option<u32>,
     height: Option<u32>,
     mime_type: String,
-    /// 本次上传所用的附件加密版本（v1=AES-GCM）。
-    encryption_version: i32,
-    /// 本次上传所用的 cek（base64url）。仅缩略图需要回写进消息 metadata 供接收端
-    /// 收到即解密；主文件的 cek 不进 metadata，走 `file/get_url` 鉴权下发。CEK 不进日志。
-    cek: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4746,14 +4741,23 @@ impl State {
                     if is_image_or_video && !from_self {
                         if let Ok(paths) = self.storage.get_storage_paths().await {
                             let user_root = PathBuf::from(&paths.user_root);
-                            let storage = self.storage.clone();
                             // DB stores created_at as now_ms (millis), so use
                             // the same unit for the download path to match
                             // resolveThumbnailPath which reads DB created_at.
                             let created_at_ms = chrono::Utc::now().timestamp_millis();
+                            // Scheme B：缩略图按 thumbnail_file_id 经 file/get_url 解析下载票据
+                            // （含 cek，in-actor RPC）；旧 v0 消息无 file_id 时 ticket=None，
+                            // spawn 内退回 legacy 明文 thumbnail_url。CEK 只来自 get_url。
+                            let thumb_ticket =
+                                match Self::extract_thumbnail_file_id(&extra_for_thumb) {
+                                    Some(tid) => self.resolve_thumbnail_ticket(tid).await,
+                                    None => None,
+                                };
+                            let storage = self.storage.clone();
                             // thumbnail_url lives in `extra`, not `content`
                             Self::spawn_auto_download_thumbnail(
                                 &extra_for_thumb,
+                                thumb_ticket,
                                 &user_root,
                                 message_id,
                                 created_at_ms,
@@ -7883,9 +7887,53 @@ impl State {
         None
     }
 
+    /// 从消息内容 JSON 解析缩略图的协议权威 `thumbnail_file_id`（envelope `metadata` 或 flat）。
+    /// Scheme B：接收端按此 file_id 走 `file/get_url` 拿 signed_url + cek 下载解密。
+    fn extract_thumbnail_file_id(content: &str) -> Option<u64> {
+        let json: serde_json::Value = serde_json::from_str(content).ok()?;
+        let read = |scope: &serde_json::Value| -> Option<u64> {
+            scope.get("thumbnail_file_id").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
+        };
+        read(json.get("metadata").unwrap_or(&json))
+            .or_else(|| read(&json))
+            .filter(|id| *id > 0)
+    }
+
+    /// 解析缩略图下载票据：State 内（actor 上下文）按 `thumbnail_file_id` 调 `file/get_url`，
+    /// 拿 signed_url + encryption_version + cek。失败返回 None（缩略图静默不下载，不阻塞）。
+    /// CEK 只来自此处，绝不取自消息 metadata。
+    async fn resolve_thumbnail_ticket(&mut self, thumbnail_file_id: u64) -> Option<ResolvedFileDownload> {
+        let req = FileGetUrlRequest {
+            file_id: thumbnail_file_id,
+            user_id: 0,
+        };
+        let resp: FileGetUrlResponse = self
+            .rpc_call_typed(routes::file::GET_URL, &req)
+            .await
+            .ok()?;
+        if resp.file_url.trim().is_empty() {
+            return None;
+        }
+        Some(ResolvedFileDownload {
+            url: resp.file_url,
+            encryption_version: resp.encryption_version,
+            cek: resp.cek,
+        })
+    }
+
     /// Spawn a background task to download a thumbnail for an incoming message.
+    ///
+    /// Scheme B：缩略图也是独立 file。`ticket` 是 caller 用 `thumbnail_file_id` 经
+    /// `file/get_url` 解析出的下载票据（v1 加密：url + encryption_version + cek）。
+    /// 没有 `thumbnail_file_id` 时 `ticket=None`，退回消息里的 legacy 明文 `thumbnail_url`（v0）。
+    /// **CEK 只来自 get_url ticket，绝不取自消息 metadata。**
+    #[allow(clippy::too_many_arguments)]
     fn spawn_auto_download_thumbnail(
         content: &str,
+        ticket: Option<ResolvedFileDownload>,
         user_root: &Path,
         message_id: u64,
         created_at_ms: i64,
@@ -7897,18 +7945,22 @@ impl State {
         event_seq: Option<Arc<AtomicU64>>,
         event_history_limit: usize,
     ) {
-        let thumb_url = match Self::extract_thumbnail_url(content) {
-            Some(url) if url.starts_with("http") => url,
-            _ => {
-                // Protocol-level "no thumbnail" — mark thumb_status=3 so UI
-                // renders a type-derived static placeholder instead of a loader.
-                tokio::spawn(async move {
-                    let _ = storage.update_thumb_status(message_id, 3).await;
-                });
-                return;
-            }
+        let (thumb_url, thumb_enc_version, thumb_cek) = match ticket {
+            // v1：get_url 解析的票据，密文 blob，用票据里的 cek 解密。
+            Some(t) if t.url.starts_with("http") => (t.url, t.encryption_version, t.cek),
+            // legacy：消息里只有明文 thumbnail_url（旧 v0 附件）。
+            _ => match Self::extract_thumbnail_url(content) {
+                Some(url) if url.starts_with("http") => (url, 0, None),
+                _ => {
+                    // Protocol-level "no thumbnail" — mark thumb_status=3 so UI
+                    // renders a type-derived static placeholder instead of a loader.
+                    tokio::spawn(async move {
+                        let _ = storage.update_thumb_status(message_id, 3).await;
+                    });
+                    return;
+                }
+            },
         };
-        let (thumb_enc_version, thumb_cek) = Self::extract_thumbnail_crypto(content);
         let dir = media_store::get_message_dir(user_root, message_id as i64, created_at_ms);
         let thumb_path = dir.join(Self::thumb_filename_for_url(&thumb_url));
         let webp_path = dir.join(media_store::THUMB_FILENAME);
@@ -7989,7 +8041,7 @@ impl State {
             return Err(format!("HTTP {}", resp.status()).into());
         }
         let bytes = resp.bytes().await?;
-        // 附件加密 v1：缩略图 blob 同样是 nonce||ct||tag，用 metadata 里随消息下发的 cek
+        // 附件加密 v1：缩略图 blob 同样是 nonce||ct||tag，用 file/get_url 票据里的 cek
         // 本地解密后再落盘；v0（legacy 明文）原样写入。解密失败直接报错，绝不写密文当图片。
         let plaintext =
             crate::attachment_crypto::decrypt_downloaded_attachment_bytes(
@@ -8006,35 +8058,6 @@ impl State {
             encryption_version
         );
         Ok(())
-    }
-
-    /// 从消息内容 JSON 解析缩略图加密信息（envelope `metadata` 或 flat 两种形态）。
-    /// 返回 `(encryption_version, cek)`；缺省视为 v0 明文。
-    /// 与 [`extract_thumbnail_url`] 对齐：优先在 `metadata` 下找，找不到再退回根级，
-    /// 保证 cek 与 thumbnail_url 取自同一 scope。
-    fn extract_thumbnail_crypto(content: &str) -> (i32, Option<String>) {
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
-            return (0, None);
-        };
-        let read = |scope: &serde_json::Value| -> Option<(i32, Option<String>)> {
-            let cek = scope
-                .get("thumbnail_cek")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
-            let version = scope
-                .get("thumbnail_encryption_version")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            match (version, &cek) {
-                (None, None) => None, // 此 scope 无缩略图加密信息
-                (v, _) => Some((v.unwrap_or(0), cek)),
-            }
-        };
-        json.get("metadata")
-            .and_then(read)
-            .or_else(|| read(&json))
-            .unwrap_or((0, None))
     }
 
     /// 存储层 / 上传层使用的文件分类字符串，严格对齐服务端 `FileType`：
@@ -8333,7 +8356,7 @@ impl State {
         let form = reqwest::multipart::Form::new()
             .part("file", part)
             .text("encryption_version", "1")
-            .text("cek", cek_b64.clone());
+            .text("cek", cek_b64);
         let response = reqwest::Client::new()
             .post(upload_url)
             .header("X-Upload-Token", upload_token)
@@ -8413,8 +8436,6 @@ impl State {
             width,
             height,
             mime_type: resp_mime,
-            encryption_version: 1,
-            cek: Some(cek_b64),
         })
     }
 
@@ -8877,14 +8898,8 @@ impl State {
                 .as_ref()
                 .map(|v| v.file_url.clone())
                 .unwrap_or_default();
-            // 缩略图在接收端「收到即自动下载」，metadata 里的 thumbnail_url 当下即新鲜可用，
-            // 故缩略图的 cek 直接随消息 metadata 下发，接收端本地解密，无需再走 get_url。
-            // （主文件 cek 不进 metadata，按需经 file/get_url 鉴权下发。）CEK 不进日志。
-            let thumb_encryption_version = uploaded_thumbnail
-                .as_ref()
-                .map(|v| v.encryption_version)
-                .unwrap_or(0);
-            let thumb_cek = uploaded_thumbnail.as_ref().and_then(|v| v.cek.clone());
+            // Scheme B：缩略图也是独立 file，接收端走 thumbnail_file_id -> file/get_url -> cek
+            // 统一下载解密。**CEK 永不进消息 metadata**。thumbnail_url 仅作 legacy 明文 fallback。
             serde_json::json!({
                 "file_type": file_type,
                 "file_id": uploaded_file_id,
@@ -8895,8 +8910,6 @@ impl State {
                 "file_size": uploaded.file_size,
                 "file_url": uploaded.file_url,
                 "thumbnail_url": thumbnail_url,
-                "thumbnail_encryption_version": thumb_encryption_version,
-                "thumbnail_cek": thumb_cek,
             })
         } else {
             serde_json::json!({
@@ -10477,9 +10490,16 @@ impl PrivchatSdk {
                                     if (msg.message_type == image_type || msg.message_type == video_type)
                                         && msg.thumb_status == 0
                                     {
+                                        // Scheme B：缩略图按 thumbnail_file_id 经 get_url 解析票据（含 cek）。
+                                        let thumb_ticket =
+                                            match State::extract_thumbnail_file_id(&msg.extra) {
+                                                Some(tid) => state.resolve_thumbnail_ticket(tid).await,
+                                                None => None,
+                                            };
                                         // thumbnail_url lives in `extra`, not `content`
                                         State::spawn_auto_download_thumbnail(
                                             &msg.extra,
+                                            thumb_ticket,
                                             &user_root,
                                             msg.message_id,
                                             msg.created_at,
