@@ -8253,17 +8253,33 @@ impl State {
         }
     }
 
+    /// 解码图片并应用 EXIF orientation，返回的尺寸/像素均为「显示方向」。
+    ///
+    /// `image` crate 默认不会消费 EXIF orientation：`img.width()/height()` 给的是
+    /// 传感器原始像素方向。真机横拍照片常带 orientation=6/8（旋转 90°），不处理会让
+    /// metadata 宽高反置（web 按 metadata 定气泡比例 → 比例错）且缩略图转向错。
+    /// 这里读出 orientation 并 apply 到解码结果，保证所有下游消费者拿到的是显示方向。
+    fn decode_image_oriented(source_path: &std::path::Path) -> Result<image::DynamicImage> {
+        let reader = image::ImageReader::open(source_path)
+            .map_err(|e| Error::Storage(format!("open image failed: {e}")))?;
+        let mut decoder = reader
+            .into_decoder()
+            .map_err(|e| Error::Storage(format!("decode image failed: {e}")))?;
+        let orientation = image::ImageDecoder::orientation(&mut decoder)
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut img = image::DynamicImage::from_decoder(decoder)
+            .map_err(|e| Error::Storage(format!("decode image failed: {e}")))?;
+        img.apply_orientation(orientation);
+        Ok(img)
+    }
+
     fn generate_image_thumbnail_sync(
         source_path: &std::path::Path,
         output_path: &std::path::Path,
         max_edge: u32,
         quality: u8,
     ) -> Result<(u32, u32, u64)> {
-        let reader = image::ImageReader::open(source_path)
-            .map_err(|e| Error::Storage(format!("open image failed: {e}")))?;
-        let img = reader
-            .decode()
-            .map_err(|e| Error::Storage(format!("decode image failed: {e}")))?;
+        let img = Self::decode_image_oriented(source_path)?;
         let (w, h) = (img.width(), img.height());
         let (tw, th) = if w >= h {
             let nw = w.min(max_edge).max(1);
@@ -8527,11 +8543,9 @@ impl State {
         let mut source_height = None;
         let mut thumb_upload: Option<(PathBuf, String, String)> = None;
         if file_type == "image" {
-            if let Ok(reader) = image::ImageReader::open(&body_path) {
-                if let Ok(img) = reader.decode() {
-                    source_width = Some(img.width());
-                    source_height = Some(img.height());
-                }
+            if let Ok(img) = Self::decode_image_oriented(&body_path) {
+                source_width = Some(img.width());
+                source_height = Some(img.height());
             }
             let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
             let (w, h, size) =
@@ -8939,9 +8953,27 @@ impl State {
         }
         let content = serde_json::to_string(&attachment_content)
             .map_err(|e| Error::Serialization(format!("encode attachment content: {e}")))?;
-        let req =
-            self.build_send_message_request_with_content(message, local_message_id, content)?;
-        self.direct_send_message(req).await
+        let req = self.build_send_message_request_with_content(
+            message,
+            local_message_id,
+            content.clone(),
+        )?;
+        let resp = self.direct_send_message(req).await?;
+        // 把带 width/height/file_id/thumbnail 的最终 content 回写发送端本地行。
+        // 否则本地行停在入队时的初始 content（无尺寸），发送端自己的气泡读不到宽高、
+        // 退化竖向默认 150×200（接收端拿的是 wire content，所以一直正常）。best-effort：
+        // 回写失败不影响已发出的消息，重进会话时下次读到的仍是这份 content。
+        if let Err(err) = self
+            .storage
+            .update_message_content(message.message_id, &content)
+            .await
+        {
+            eprintln!(
+                "[SDK.actor] update_message_content after send failed: message_id={} err={err}",
+                message.message_id
+            );
+        }
+        Ok(resp)
     }
 
     async fn rpc_call_json(

@@ -3351,6 +3351,35 @@ impl LocalStore {
         Ok(())
     }
 
+    /// 回写消息 content（不动 edited_at/status，避免误标「已编辑」）。
+    ///
+    /// 附件发送链路用：`process_outbound_file` 上传后才解码出 width/height、拿到
+    /// file_id/thumbnail，组成最终 attachment_content 发往服务端。但发送端**本地行**
+    /// 仍是入队时的初始 content（无尺寸），导致发送端自己的气泡读不到宽高、退化竖向
+    /// 默认（接收端拿的是 wire content 所以正常）。发送成功后用最终 content 覆盖本地行。
+    pub fn update_message_content_local(
+        &self,
+        uid: &str,
+        message_id: u64,
+        content: &str,
+    ) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let updated = conn
+            .execute(
+                "UPDATE message SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                params![content, now_ms, message_id as i64],
+            )
+            .map_err(|e| Error::Storage(format!("update message content local: {e}")))?;
+        if updated == 0 {
+            return Err(Error::Storage(format!(
+                "update message content failed: message.id={} not found",
+                message_id
+            )));
+        }
+        Ok(())
+    }
+
     pub fn update_local_message_id(
         &self,
         uid: &str,

@@ -179,6 +179,11 @@ enum StorageCmd {
         local_message_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
+    UpdateMessageContent {
+        message_id: u64,
+        content: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
     GetLocalMessageId {
         message_id: u64,
         resp: oneshot::Sender<Result<Option<u64>>>,
@@ -853,6 +858,18 @@ impl StorageHandle {
             .send(StorageCmd::MarkMessageSent {
                 message_id,
                 server_message_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn update_message_content(&self, message_id: u64, content: &str) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UpdateMessageContent {
+                message_id,
+                content: content.to_string(),
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1918,6 +1935,17 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 &uid,
                 message_id,
                 local_message_id
+            ));
+        }
+        StorageCmd::UpdateMessageContent {
+            message_id,
+            content,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.update_message_content_local(
+                &uid,
+                message_id,
+                &content
             ));
         }
         StorageCmd::GetLocalMessageId { message_id, resp } => {
