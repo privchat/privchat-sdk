@@ -5458,6 +5458,11 @@ mod tests {
                     created_at: 1000,
                     version: 1001,
                     updated_at: 1001,
+                    status: 0,
+                    is_outgoing: None,
+                    request_message: None,
+                    request_source: None,
+                    request_source_id: None,
                 },
             )
             .expect("upsert friend");
@@ -5476,6 +5481,11 @@ mod tests {
                     created_at: 999,
                     version: 1000,
                     updated_at: 1000,
+                    status: 0,
+                    is_outgoing: None,
+                    request_message: None,
+                    request_source: None,
+                    request_source_id: None,
                 },
             )
             .expect("upsert stale friend");
