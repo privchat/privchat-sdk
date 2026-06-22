@@ -789,6 +789,7 @@ fn emit_sequenced_event(
 
 async fn stop_inbound_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
     if let Some(handle) = task.take() {
+        if realtime_trace_enabled() { eprintln!("[SDK_INBOUND_TASK_END] aborting old inbound task"); }
         handle.abort();
         let _ = handle.await;
     }
@@ -849,6 +850,8 @@ async fn trigger_forced_logout(
     state.should_auto_reconnect = false;
     state.next_reconnect_at = None;
     state.reset_reconnect_backoff();
+    // 强制登出（token terminal / 被踢）→ 清订阅注册表，避免跨账号 replay 泄漏。
+    state.active_subscriptions.clear();
 
     state.last_terminal_reason = Some(TerminalReason {
         code,
@@ -873,6 +876,17 @@ async fn trigger_forced_logout(
 fn inbound_logs_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("PRIVCHAT_INBOUND_LOG").ok().as_deref() == Some("1"))
+}
+
+/// RC: 实时链路诊断日志（重连 / inbound task / push 帧 / 本地落库）的统一开关。
+/// 默认 **关闭** —— release / TestFlight 必须安静。设 `PRIVCHAT_TRACE_REALTIME=1`
+/// （或复用 `PRIVCHAT_INBOUND_LOG=1`）开启。绝不打印 token / cek / message body。
+fn realtime_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PRIVCHAT_TRACE_REALTIME").ok().as_deref() == Some("1")
+            || std::env::var("PRIVCHAT_INBOUND_LOG").ok().as_deref() == Some("1")
+    })
 }
 
 fn rpc_logs_enabled() -> bool {
@@ -911,8 +925,16 @@ async fn start_inbound_task(
     state.inbound_epoch = state.inbound_epoch.wrapping_add(1);
     let epoch = state.inbound_epoch;
     let Some(transport) = state.transport.as_ref() else {
+        if realtime_trace_enabled() { eprintln!(
+            "[SDK_INBOUND_TASK_START] epoch={} ABORTED transport=None uid={:?}",
+            epoch, state.current_uid
+        ); }
         return;
     };
+    if realtime_trace_enabled() { eprintln!(
+        "[SDK_INBOUND_TASK_START] epoch={} uid={:?} (订阅新 transport events)",
+        epoch, state.current_uid
+    ); }
     let mut event_rx = transport.subscribe_events();
     *task = Some(tokio::spawn(async move {
         loop {
@@ -2335,6 +2357,10 @@ struct State {
     cache_hit_count: u64,
     cache_miss_count: u64,
     pending_prelogin_inbound_frames: Vec<(u8, Vec<u8>)>,
+    /// 活跃订阅注册表（desired subscriptions），key=(channel_id, channel_type)，value=可选 token。
+    /// 掉线重连后必须 replay：否则服务端 subscribe_manager 已随旧会话清空，客户端不再收到
+    /// 该频道的 presence_changed / typing / room 广播。presence 与订阅严格绑定的客户端侧基础。
+    active_subscriptions: HashMap<(u64, u8), Option<String>>,
     presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
     event_tx: Option<broadcast::Sender<SdkEvent>>,
     event_history: Option<Arc<StdMutex<VecDeque<SequencedSdkEvent>>>>,
@@ -5732,6 +5758,10 @@ impl State {
     }
 
     async fn try_auto_reconnect(&mut self) -> Result<SessionState> {
+        if realtime_trace_enabled() { eprintln!(
+            "[SDK_RECONNECT_BEGIN] old_epoch={} state_before={:?} uid={:?}",
+            self.inbound_epoch, self.session_state, self.current_uid
+        ); }
         // A-1 trace: 入口
         eprintln!(
             "[TRACE-A1][try_auto_reconnect] enter state_before={:?} current_uid_present={}",
@@ -6942,13 +6972,11 @@ impl State {
                         let _ = self.pending_prelogin_inbound_frames.remove(0);
                     }
                     self.pending_prelogin_inbound_frames.push((biz_type, data));
-                    if inbound_logs_enabled() {
-                        eprintln!(
-                            "[SDK.inbound] queued pre-login frame message_type={:?} queued={}",
-                            message_type,
-                            self.pending_prelogin_inbound_frames.len()
-                        );
-                    }
+                    if realtime_trace_enabled() { eprintln!(
+                        "[SDK_INBOUND_PRELOGIN_BUFFER] biz_type={} current_uid=None queue_len={} (push 帧卡在登录前缓冲；若不 replay 即收不到)",
+                        biz_type,
+                        self.pending_prelogin_inbound_frames.len()
+                    ); }
                 }
                 _ => {
                     if inbound_logs_enabled() {
@@ -7003,6 +7031,10 @@ impl State {
             MessageType::PushMessageRequest => {
                 let req: PushMessageRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
+                if realtime_trace_enabled() { eprintln!(
+                    "[SDK_MESSAGE_EVENT_DECODED] biz=Push channel_id={} server_message_id={} from_uid={} msg_type={} payload_len={}",
+                    req.channel_id, req.server_message_id, req.from_uid, req.message_type, req.payload.len()
+                ); }
                 if let Some(peer_uid) = Self::push_message_to_friend_event(&req) {
                     // F-sync.2: 转 entity_type="friend"，让 SDK 走 entity sync
                     // 把 pending/rejected/recalled 状态从 server 拉到本地 friend 表。
@@ -7123,9 +7155,15 @@ impl State {
 
         let mut applied = 0usize;
         if !message_items.is_empty() {
+            let n = message_items.len();
+            let before = applied;
             applied += self
                 .enqueue_and_apply_sync_items("message".to_string(), None, message_items)
                 .await?;
+            if realtime_trace_enabled() { eprintln!(
+                "[SDK_LOCAL_STORE_APPLY] message_items={} applied={} uid={:?}",
+                n, applied - before, self.current_uid
+            ); }
         }
         if !read_cursor_items.is_empty() {
             applied += self
@@ -7166,16 +7204,15 @@ impl State {
             return Ok(0);
         }
         let pending = std::mem::take(&mut self.pending_prelogin_inbound_frames);
+        let count = pending.len();
         let mut applied = 0usize;
         for (biz_type, data) in pending {
             applied += self.handle_inbound_frame(biz_type, data).await?;
         }
-        if inbound_logs_enabled() {
-            eprintln!(
-                "[SDK.inbound] replayed pre-login frames applied={}",
-                applied
-            );
-        }
+        if realtime_trace_enabled() { eprintln!(
+            "[SDK_INBOUND_PRELOGIN_REPLAY] count={} applied={} current_uid={:?}",
+            count, applied, self.current_uid
+        ); }
         Ok(applied)
     }
 
@@ -7593,7 +7630,7 @@ impl State {
             channel_id,
             channel_type,
             action: 1, // SUBSCRIBE
-            param: token.unwrap_or_default(),
+            param: token.clone().unwrap_or_default(),
         };
         let payload = encode_message(&req)
             .map_err(|e| Error::Serialization(format!("encode subscribe_channel: {e}")))?;
@@ -7613,6 +7650,9 @@ impl State {
                 resp.reason_code
             )));
         }
+        // 记入 desired-subscription 注册表，供重连后 replay（presence/typing 恢复的基础）。
+        self.active_subscriptions
+            .insert((channel_id, channel_type), token);
         Ok(())
     }
 
@@ -7688,7 +7728,57 @@ impl State {
                 resp.reason_code
             )));
         }
+        // 从 desired-subscription 注册表移除：重连后不再 replay 该频道。
+        self.active_subscriptions.remove(&(channel_id, channel_type));
         Ok(())
+    }
+
+    /// 重连后重放所有活跃订阅（desired subscriptions）。服务端 subscribe_manager 随旧会话清空，
+    /// 不重放则 presence_changed / typing / room 广播全断。best-effort：单个失败不影响其它。
+    /// 注意直接发 SubscribeRequest，不复用 subscribe_channel（避免借用 active_subscriptions 同时改它）。
+    async fn replay_subscriptions(&mut self) {
+        if self.active_subscriptions.is_empty() {
+            return;
+        }
+        let subs: Vec<((u64, u8), Option<String>)> = self
+            .active_subscriptions
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        if realtime_trace_enabled() {
+            eprintln!(
+                "[SDK_RESUBSCRIBE] replaying {} active subscriptions after reconnect",
+                subs.len()
+            );
+        }
+        let timeout = self.timeout();
+        for ((channel_id, channel_type), token) in subs {
+            let req = SubscribeRequest {
+                setting: 0,
+                local_message_id: 0,
+                channel_id,
+                channel_type,
+                action: 1, // SUBSCRIBE
+                param: token.unwrap_or_default(),
+            };
+            let Ok(payload) = encode_message(&req) else {
+                continue;
+            };
+            if let Err(e) = self
+                .request_bytes(
+                    Bytes::from(payload),
+                    MessageType::SubscribeRequest as u8,
+                    timeout,
+                    "replay_subscribe",
+                )
+                .await
+            {
+                eprintln!(
+                    "[SDK_RESUBSCRIBE] replay failed channel_id={} type={} err={}",
+                    channel_id, channel_type, e
+                );
+            }
+        }
     }
 
     fn build_send_message_request_with_content(
@@ -9281,6 +9371,7 @@ impl PrivchatSdk {
                 cache_hit_count: 0,
                 cache_miss_count: 0,
                 pending_prelogin_inbound_frames: Vec::new(),
+                active_subscriptions: HashMap::new(),
                 presence_cache: actor_presence_cache,
                 event_tx: Some(actor_event_tx.clone()),
                 event_history: Some(actor_event_history.clone()),
@@ -9380,11 +9471,24 @@ impl PrivchatSdk {
                                 // 握手 + 认证全通了，解除 Terminal 闸门，后续如果再过期还能再触发一次。
                                 state.auth_terminal_fired = false;
                                 eprintln!("[SDK.actor] auto_reconnect_result ok attempt=#{attempt_n}");
+                                // [硬化] 重连成功后必须：① 重启 inbound task（订阅新 transport + bump epoch）
                                 start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
                                     .await;
+                                if realtime_trace_enabled() { eprintln!(
+                                    "[SDK_RECONNECT_OK] new_epoch={} state={:?} uid={:?}",
+                                    state.inbound_epoch, state.session_state, state.current_uid
+                                ); }
+                                // ② 防御性 replay：若有 push 帧在登录前缓冲（current_uid 恢复后），立即重放，
+                                //    避免 message/presence/typing 卡在 prelogin 队列里收不到。
+                                if let Err(err) = state.replay_prelogin_inbound_frames().await {
+                                    eprintln!("[SDK.actor] prelogin replay failed after reconnect: {err}");
+                                }
+                                // 重连后重放活跃订阅：恢复 presence_changed / typing / room 广播。
+                                state.replay_subscriptions().await;
                                 if state.session_state == SessionState::Authenticated
                                     && state.bootstrap_completed
                                 {
+                                    // ③ resume sync 把重连/断网期间漏掉的增量补回来
                                     if let Err(err) = state.run_resume_sync().await {
                                         eprintln!("[SDK.actor] resume sync failed after reconnect: {err}");
                                     }
@@ -9554,6 +9658,16 @@ impl PrivchatSdk {
                                 state.last_terminal_reason = None;
                                 start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
                                     .await;
+                                if realtime_trace_enabled() { eprintln!(
+                                    "[SDK_RECONNECT_OK] (connect-path) new_epoch={} state={:?} uid={:?}",
+                                    state.inbound_epoch, state.session_state, state.current_uid
+                                ); }
+                                // [硬化] 防御性 replay：push 帧可能在登录前缓冲，current_uid 恢复后立即重放。
+                                if let Err(err) = state.replay_prelogin_inbound_frames().await {
+                                    eprintln!("[SDK.actor] connect: prelogin replay failed: {err}");
+                                }
+                                // 重连后重放活跃订阅：恢复 presence_changed / typing / room 广播。
+                                state.replay_subscriptions().await;
 
                                 // 若 try_auto_reconnect 把 session 拉回 Authenticated 且
                                 // bootstrap 早已完成，触发一次 resume_sync 把背景期间漏掉的
@@ -9601,6 +9715,9 @@ impl PrivchatSdk {
                         let result = state.disconnect().await;
                         if result.is_ok() && state.session_state != SessionState::Shutdown {
                             state.clear_presence_cache();
+                            // 显式 disconnect（should_auto_reconnect=false，终态）→ 清订阅注册表，
+                            // 不再 replay（重连/重登录会重新订阅）。
+                            state.active_subscriptions.clear();
                             state.session_state = SessionState::New;
                             emit_sequenced_event(
                                 &actor_event_tx,
@@ -9703,8 +9820,18 @@ impl PrivchatSdk {
                         // 丢弃旧 inbound 任务遗留的帧（例如 ForcedLogout 发生时已 stop，
                         // 但 mpsc 通道里可能还有 pending 帧）。
                         if epoch != state.inbound_epoch {
+                            // [DIAG] 重连 epoch 竞态高度可疑：若 push 帧因 epoch 不匹配被丢，
+                            // 这里会持续打印 → 根因即重连 epoch 管理。
+                            if realtime_trace_enabled() { eprintln!(
+                                "[SDK_INBOUND_FRAME_DROPPED_EPOCH] frame_epoch={} current_epoch={} biz_type={} payload_len={} uid={:?}",
+                                epoch, state.inbound_epoch, biz_type, data.len(), state.current_uid
+                            ); }
                             continue;
                         }
+                        if realtime_trace_enabled() { eprintln!(
+                            "[SDK_PUSH_FRAME_RECEIVED] frame_epoch={} current_epoch={} biz_type={} payload_len={} uid={:?}",
+                            epoch, state.inbound_epoch, biz_type, data.len(), state.current_uid
+                        ); }
                         match state.handle_inbound_frame(biz_type, data).await {
                             Ok(applied) if applied > 0 => {
                                 for evt in state.last_sync_entity_events.clone() {
@@ -9893,6 +10020,32 @@ impl PrivchatSdk {
                             // SessionState 已经在 can() 里转回 Authenticated（含 AccessTokenRefreshNeeded → Authenticated 路径）。
                             state.auth_terminal_fired = false;
                             state.should_auto_reconnect = true;
+                            // [P0 根因修复] 这条路径是「token 过期 → 刷新 → 重新 authenticate」的重连主链：
+                            // try_auto_reconnect 因 10002 失败、transport 被换，真正成功的握手走这里。
+                            // 此前这里 **没有重启 inbound task** → 新 transport 上没有事件订阅 →
+                            // 服务端 push（消息/presence/typing）全部收不到，而 RPC（请求/响应）照常，
+                            // 表现为「App 能发不能收 + presence/typing 失效」。必须与 try_auto_reconnect
+                            // 成功分支对齐：① 重启 inbound task（订阅新 transport + bump epoch）。
+                            start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
+                                .await;
+                            if realtime_trace_enabled() { eprintln!(
+                                "[SDK_RECONNECT_OK] (cmd_authenticate path) new_epoch={} state={:?} uid={:?}",
+                                state.inbound_epoch, state.session_state, state.current_uid
+                            ); }
+                            // ② 防御性 replay：刷新前缓冲的 push 帧立即重放。
+                            if let Err(err) = state.replay_prelogin_inbound_frames().await {
+                                eprintln!("[SDK.actor] cmd_authenticate: prelogin replay failed: {err}");
+                            }
+                            // 重连后重放活跃订阅：恢复 presence_changed / typing / room 广播。
+                            state.replay_subscriptions().await;
+                            // ③ resume sync：把过期/重连窗口期漏掉的增量补回来。
+                            if state.session_state == SessionState::Authenticated
+                                && state.bootstrap_completed
+                            {
+                                if let Err(err) = state.run_resume_sync().await {
+                                    eprintln!("[SDK.actor] cmd_authenticate: resume sync failed: {err}");
+                                }
+                            }
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -13925,6 +14078,7 @@ mod tests {
             event_seq: None,
             event_history_limit: 0,
             pending_media_jobs: Arc::new(StdMutex::new(HashMap::new())),
+            active_subscriptions: HashMap::new(),
         };
         (state, dir)
     }
