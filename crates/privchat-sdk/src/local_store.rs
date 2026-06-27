@@ -1810,6 +1810,19 @@ impl LocalStore {
                         ORDER BY cm.role ASC, cm.member_uid ASC
                         LIMIT 1
                     ),
+                    -- TEMP compatibility fallback (remove once channel sync provides peer_user_id
+                    -- directly, see project_presence_architecture_direct): when channel_member is not
+                    -- synced for a DM, derive the peer from the latest non-self message sender so the
+                    -- conversation/header can still resolve presence. Not a final root fix.
+                    (
+                        SELECT m.from_uid
+                        FROM message m
+                        WHERE m.channel_id = c.channel_id
+                          AND m.from_uid != ?2
+                          AND m.from_uid > 0
+                        ORDER BY m.id DESC
+                        LIMIT 1
+                    ),
                     CASE
                         WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
                         THEN CAST(c.channel_name AS INTEGER)
@@ -1984,6 +1997,19 @@ impl LocalStore {
                               AND cm.channel_type = c.channel_type
                               AND cm.member_uid != ?3
                             ORDER BY cm.role ASC, cm.member_uid ASC
+                            LIMIT 1
+                        ),
+                        -- TEMP compatibility fallback (remove once channel sync provides peer_user_id
+                        -- directly, see project_presence_architecture_direct): when channel_member is
+                        -- not synced for a DM, derive the peer from the latest non-self message sender
+                        -- so the conversation list can still resolve presence. Not a final root fix.
+                        (
+                            SELECT m.from_uid
+                            FROM message m
+                            WHERE m.channel_id = c.channel_id
+                              AND m.from_uid != ?3
+                              AND m.from_uid > 0
+                            ORDER BY m.id DESC
                             LIMIT 1
                         ),
                         CASE
