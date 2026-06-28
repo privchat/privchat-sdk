@@ -364,6 +364,12 @@ pub struct GroupSettingsView {
     pub group_id: u64,
     pub join_need_approval: bool,
     pub member_can_invite: bool,
+    /// 群成员之间是否允许私自加好友（P0-5）
+    pub allow_member_add_friend: bool,
+    /// 群是否允许被搜索发现（P0-4）
+    pub allow_search: bool,
+    /// 加入策略：0=不允许申请 1=允许申请需审核 2=允许直接加入（P0-4）
+    pub join_policy: u8,
     pub all_muted: bool,
     pub max_members: u64,
     pub announcement: Option<String>,
@@ -452,6 +458,42 @@ pub struct GroupSettingsUpdateInput {
     pub name: Option<String>,
     pub description: Option<String>,
     pub avatar_url: Option<String>,
+    /// 加群是否需审批（可选）
+    pub join_need_approval: Option<bool>,
+    /// 成员是否可邀请他人入群（可选）
+    pub member_can_invite: Option<bool>,
+    /// 全员禁言（可选）
+    pub all_muted: Option<bool>,
+    /// 群成员之间是否允许私自加好友（可选，P0-5）
+    pub allow_member_add_friend: Option<bool>,
+    /// 群是否允许被搜索发现（可选，P0-4）
+    pub allow_search: Option<bool>,
+    /// 加入策略（可选）：0=不允许申请 1=允许申请需审核 2=允许直接加入
+    pub join_policy: Option<u8>,
+    /// 成员上限（可选）
+    pub max_members: Option<u32>,
+    /// 群公告（可选）
+    pub announcement: Option<String>,
+}
+
+/// 群消息置顶/取消置顶结果
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GroupPinMessageView {
+    pub success: bool,
+    pub group_id: u64,
+    pub message_id: u64,
+    pub pinned: bool,
+    pub pinned_at: Option<u64>,
+    pub pinned_by: Option<u64>,
+}
+
+/// 单条群置顶消息
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GroupPinnedMessageView {
+    pub message_id: u64,
+    pub channel_id: u64,
+    pub pinned_by: u64,
+    pub pinned_at: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -6149,6 +6191,9 @@ impl PrivchatClient {
             group_id: resp.group_id,
             join_need_approval: resp.settings.join_need_approval,
             member_can_invite: resp.settings.member_can_invite,
+            allow_member_add_friend: resp.settings.allow_member_add_friend,
+            allow_search: resp.settings.allow_search,
+            join_policy: resp.settings.join_policy,
             all_muted: resp.settings.all_muted,
             max_members: resp.settings.max_members as u64,
             announcement: resp.settings.announcement,
@@ -6166,11 +6211,14 @@ impl PrivchatClient {
             group_id: payload.group_id,
             operator_id: 0,
             settings: privchat_protocol::rpc::GroupSettingsPatch {
-                join_need_approval: None,
-                member_can_invite: None,
-                all_muted: None,
-                max_members: None,
-                announcement: None,
+                join_need_approval: payload.join_need_approval,
+                member_can_invite: payload.member_can_invite,
+                allow_member_add_friend: payload.allow_member_add_friend,
+                allow_search: payload.allow_search,
+                join_policy: payload.join_policy,
+                all_muted: payload.all_muted,
+                max_members: payload.max_members,
+                announcement: payload.announcement,
                 description: payload.description,
             },
         };
@@ -6215,6 +6263,62 @@ impl PrivchatClient {
             operator_id: resp.operator_id,
             updated_at: resp.updated_at,
         })
+    }
+
+    /// 群消息置顶 / 取消置顶（仅群主/管理员；`pinned=false` 为取消置顶）。
+    /// `channel_id` 为消息所在通信频道（群聊场景等于 group_id），服务端会三方校验一致性。
+    pub async fn group_pin_message_remote(
+        &self,
+        group_id: u64,
+        channel_id: u64,
+        message_id: u64,
+        pinned: bool,
+    ) -> Result<GroupPinMessageView, PrivchatFfiError> {
+        let operator_id = self.require_current_user_id().await?;
+        let resp: privchat_protocol::rpc::message::pin::MessagePinResponse = rpc_call_typed(
+            &self.inner,
+            routes::message::PIN,
+            &privchat_protocol::rpc::message::pin::MessagePinRequest {
+                group_id,
+                channel_id,
+                message_id,
+                pinned,
+                operator_id,
+            },
+        )
+        .await?;
+        Ok(GroupPinMessageView {
+            success: resp.success,
+            group_id: resp.group_id,
+            message_id: resp.message_id,
+            pinned: resp.pinned,
+            pinned_at: resp.pinned_at,
+            pinned_by: resp.pinned_by,
+        })
+    }
+
+    /// 获取群置顶消息列表（群成员可读，按置顶时间倒序）。
+    pub async fn group_pinned_messages_remote(
+        &self,
+        group_id: u64,
+    ) -> Result<Vec<GroupPinnedMessageView>, PrivchatFfiError> {
+        let user_id = self.require_current_user_id().await?;
+        let resp: privchat_protocol::rpc::message::pin::MessagePinListResponse = rpc_call_typed(
+            &self.inner,
+            routes::message::PIN_LIST,
+            &privchat_protocol::rpc::message::pin::MessagePinListRequest { group_id, user_id },
+        )
+        .await?;
+        Ok(resp
+            .items
+            .into_iter()
+            .map(|it| GroupPinnedMessageView {
+                message_id: it.message_id,
+                channel_id: it.channel_id,
+                pinned_by: it.pinned_by,
+                pinned_at: it.pinned_at,
+            })
+            .collect())
     }
 
     pub async fn group_approval_list_remote(
