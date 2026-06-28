@@ -1706,15 +1706,6 @@ impl LocalStore {
                                 FROM (
                                     SELECT COALESCE(
                                         c.peer_user_id,
-                                        (
-                                            SELECT cm.member_uid
-                                            FROM channel_member cm
-                                            WHERE cm.channel_id = c.channel_id
-                                              AND cm.channel_type = c.channel_type
-                                              AND cm.member_uid != ?2
-                                            ORDER BY cm.role ASC, cm.member_uid ASC
-                                            LIMIT 1
-                                        ),
                                         CASE
                                             WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
                                             THEN CAST(c.channel_name AS INTEGER)
@@ -1806,28 +1797,6 @@ impl LocalStore {
                 c.updated_at,
                 CASE WHEN c.channel_type = 1 THEN COALESCE(
                     c.peer_user_id,
-                    (
-                        SELECT cm.member_uid
-                        FROM channel_member cm
-                        WHERE cm.channel_id = c.channel_id
-                          AND cm.channel_type = c.channel_type
-                          AND cm.member_uid != ?2
-                        ORDER BY cm.role ASC, cm.member_uid ASC
-                        LIMIT 1
-                    ),
-                    -- TEMP compatibility fallback (remove once channel sync provides peer_user_id
-                    -- directly, see project_presence_architecture_direct): when channel_member is not
-                    -- synced for a DM, derive the peer from the latest non-self message sender so the
-                    -- conversation/header can still resolve presence. Not a final root fix.
-                    (
-                        SELECT m.from_uid
-                        FROM message m
-                        WHERE m.channel_id = c.channel_id
-                          AND m.from_uid != ?2
-                          AND m.from_uid > 0
-                        ORDER BY m.id DESC
-                        LIMIT 1
-                    ),
                     CASE
                         WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
                         THEN CAST(c.channel_name AS INTEGER)
@@ -1838,7 +1807,7 @@ impl LocalStore {
              WHERE c.channel_id = ?1
                AND COALESCE(c.is_deleted, 0) = 0
              LIMIT 1",
-            params![channel_id as i64, uid_i64],
+            params![channel_id as i64],
             |row| {
                 Ok(StoredChannel {
                     channel_id: row.get::<_, i64>(0)? as u64,
@@ -1897,15 +1866,6 @@ impl LocalStore {
                                 FROM (
                                     SELECT COALESCE(
                                         c.peer_user_id,
-                                        (
-                                            SELECT cm.member_uid
-                                            FROM channel_member cm
-                                            WHERE cm.channel_id = c.channel_id
-                                              AND cm.channel_type = c.channel_type
-                                              AND cm.member_uid != ?3
-                                            ORDER BY cm.role ASC, cm.member_uid ASC
-                                            LIMIT 1
-                                        ),
                                         CASE
                                             WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
                                             THEN CAST(c.channel_name AS INTEGER)
@@ -1997,28 +1957,6 @@ impl LocalStore {
                     c.updated_at,
                     CASE WHEN c.channel_type = 1 THEN COALESCE(
                         c.peer_user_id,
-                        (
-                            SELECT cm.member_uid
-                            FROM channel_member cm
-                            WHERE cm.channel_id = c.channel_id
-                              AND cm.channel_type = c.channel_type
-                              AND cm.member_uid != ?3
-                            ORDER BY cm.role ASC, cm.member_uid ASC
-                            LIMIT 1
-                        ),
-                        -- TEMP compatibility fallback (remove once channel sync provides peer_user_id
-                        -- directly, see project_presence_architecture_direct): when channel_member is
-                        -- not synced for a DM, derive the peer from the latest non-self message sender
-                        -- so the conversation list can still resolve presence. Not a final root fix.
-                        (
-                            SELECT m.from_uid
-                            FROM message m
-                            WHERE m.channel_id = c.channel_id
-                              AND m.from_uid != ?3
-                              AND m.from_uid > 0
-                            ORDER BY m.id DESC
-                            LIMIT 1
-                        ),
                         CASE
                             WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
                             THEN CAST(c.channel_name AS INTEGER)
@@ -2032,7 +1970,7 @@ impl LocalStore {
             )
             .map_err(|e| Error::Storage(format!("prepare list channels: {e}")))?;
         let rows = stmt
-            .query_map(params![limit as i64, offset as i64, uid_i64], |row| {
+            .query_map(params![limit as i64, offset as i64], |row| {
                 Ok(StoredChannel {
                     channel_id: row.get::<_, i64>(0)? as u64,
                     channel_type: row.get::<_, i32>(1)?,
