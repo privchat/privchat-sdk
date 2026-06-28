@@ -2710,6 +2710,7 @@ impl TestPhases {
                 last_local_message_id: 0,
                 last_msg_content: String::new(),
                 version: now_millis(),
+                peer_user_id: None,
             })
             .await?;
         metrics.rpc_calls += 2;

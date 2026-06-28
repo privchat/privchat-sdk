@@ -1206,6 +1206,9 @@ pub struct UpsertChannelInput {
     pub last_local_message_id: u64,
     pub last_msg_content: String,
     pub version: i64,
+    /// DM 对端 user_id，来自 channel 同步下发，持久化到 channel.peer_user_id。
+    /// 仅私聊设置，群聊为 None。
+    pub peer_user_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4406,6 +4409,10 @@ impl State {
                             last_local_message_id,
                             last_msg_content,
                             version: item.version as i64,
+                            // DM 对端：服务端仅私聊下发；None 时 upsert SQL 用 COALESCE 保留旧值
+                            peer_user_id: channel_sync
+                                .peer_user_id
+                                .or_else(|| Self::json_get_u64(&payload, &["peer_user_id"])),
                         })
                         .await?;
                     emitted.push(SdkEvent::SyncEntityChanged {
@@ -6732,6 +6739,7 @@ impl State {
                 last_local_message_id: channel.last_local_message_id,
                 last_msg_content: channel.last_msg_content,
                 version: channel.version,
+                peer_user_id: channel.peer_user_id,
             })
             .await?;
         Ok(())
@@ -9213,6 +9221,8 @@ impl State {
                 // Keep the existing channel entity version so later sync_entities(channel)
                 // payloads can still apply top/mute/name changes from the server.
                 version: existing_version,
+                // 非同步路径不触碰对端：upsert SQL 用 COALESCE 保留已存 peer_user_id。
+                peer_user_id: None,
             })
             .await?;
         Ok(())
@@ -14847,6 +14857,7 @@ mod tests {
                 last_local_message_id: 9,
                 last_msg_content: "latest".to_string(),
                 version: 10,
+                peer_user_id: None,
             })
             .await
             .expect("seed current channel");
@@ -15532,6 +15543,7 @@ mod tests {
                 last_local_message_id: 0,
                 last_msg_content: "{\"content\":\"self\"}".to_string(),
                 version: 61,
+                peer_user_id: None,
             })
             .await
             .expect("reinject stale local unread");
@@ -15592,6 +15604,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "synced-preview-baseline".to_string(),
                     version: 70,
+                    peer_user_id: None,
                 },
             )
             .expect("seed synced channel");
@@ -15646,6 +15659,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "old-synced-preview".to_string(),
                     version: 71,
+                    peer_user_id: None,
                 },
             )
             .expect("seed channel");
@@ -15932,6 +15946,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "cursor baseline".to_string(),
                     version: 601,
+                    peer_user_id: None,
                 },
             )
             .expect("seed channel");
@@ -16053,6 +16068,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "extra baseline".to_string(),
                     version: 602,
+                    peer_user_id: None,
                 },
             )
             .expect("seed channel");
@@ -16136,6 +16152,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "reaction baseline".to_string(),
                     version: 603,
+                    peer_user_id: None,
                 },
             )
             .expect("seed channel");

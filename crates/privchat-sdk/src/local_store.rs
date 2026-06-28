@@ -1636,11 +1636,11 @@ impl LocalStore {
             "INSERT INTO channel (
                 channel_id, channel_type, channel_name, channel_remark, avatar,
                 unread_count, top, mute, last_msg_timestamp, last_local_message_id,
-                last_msg_content, version, updated_at, created_at
+                last_msg_content, version, updated_at, created_at, peer_user_id
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?13
+                ?11, ?12, ?13, ?13, ?14
              )
              ON CONFLICT(channel_id) DO UPDATE SET
                 channel_type=excluded.channel_type,
@@ -1655,6 +1655,8 @@ impl LocalStore {
                 last_msg_content=excluded.last_msg_content,
                 version=excluded.version,
                 updated_at=excluded.updated_at,
+                -- 仅 DM 下发 peer_user_id；不要用 NULL（群聊/缺失）覆盖已存好值
+                peer_user_id=COALESCE(excluded.peer_user_id, channel.peer_user_id),
                 is_deleted=CASE
                     WHEN excluded.last_msg_timestamp > IFNULL(channel.last_msg_timestamp, 0)
                     THEN 0
@@ -1674,7 +1676,8 @@ impl LocalStore {
                 input.last_local_message_id as i64,
                 input.last_msg_content,
                 input.version,
-                now_ms
+                now_ms,
+                input.peer_user_id.map(|v| v as i64)
             ],
         )
         .map_err(|e| Error::Storage(format!("upsert channel: {e}")))?;
@@ -1702,6 +1705,7 @@ impl LocalStore {
                                 )
                                 FROM (
                                     SELECT COALESCE(
+                                        c.peer_user_id,
                                         (
                                             SELECT cm.member_uid
                                             FROM channel_member cm
@@ -1801,6 +1805,7 @@ impl LocalStore {
                 c.version,
                 c.updated_at,
                 CASE WHEN c.channel_type = 1 THEN COALESCE(
+                    c.peer_user_id,
                     (
                         SELECT cm.member_uid
                         FROM channel_member cm
@@ -1891,6 +1896,7 @@ impl LocalStore {
                                 )
                                 FROM (
                                     SELECT COALESCE(
+                                        c.peer_user_id,
                                         (
                                             SELECT cm.member_uid
                                             FROM channel_member cm
@@ -1990,6 +1996,7 @@ impl LocalStore {
                     c.version,
                     c.updated_at,
                     CASE WHEN c.channel_type = 1 THEN COALESCE(
+                        c.peer_user_id,
                         (
                             SELECT cm.member_uid
                             FROM channel_member cm
@@ -4939,6 +4946,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "".to_string(),
                     version: 1,
+                    peer_user_id: None,
                 },
             )
             .expect("upsert channel 501");
@@ -4958,6 +4966,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "".to_string(),
                     version: 1,
+                    peer_user_id: None,
                 },
             )
             .expect("upsert channel 502");
@@ -5148,6 +5157,7 @@ mod tests {
                     last_local_message_id: 42,
                     last_msg_content: "last-msg".to_string(),
                     version: 1001,
+                    peer_user_id: None,
                 },
             )
             .expect("upsert channel");
@@ -5178,6 +5188,7 @@ mod tests {
                     last_local_message_id: 1,
                     last_msg_content: "stale".to_string(),
                     version: 1000,
+                    peer_user_id: None,
                 },
             )
             .expect("upsert stale channel");
@@ -5221,6 +5232,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "self-message".to_string(),
                     version: 3001,
+                    peer_user_id: None,
                 },
             )
             .expect("upsert stale unread channel");
@@ -5298,6 +5310,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "synced-preview".to_string(),
                     version: 2001,
+                    peer_user_id: None,
                 },
             )
             .expect("upsert synced preview channel");
@@ -5337,6 +5350,7 @@ mod tests {
                     last_local_message_id: 0,
                     last_msg_content: "stale-synced-preview".to_string(),
                     version: 2002,
+                    peer_user_id: None,
                 },
             )
             .expect("upsert initial channel");
