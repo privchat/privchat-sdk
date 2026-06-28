@@ -7910,24 +7910,6 @@ impl PrivchatClient {
         self.builder()
     }
 
-    pub async fn dm_peer_user_id(&self, channel_id: u64) -> Result<Option<u64>, PrivchatFfiError> {
-        let me = self.require_current_user_id().await?;
-        // Try common channel types and return the first non-self member.
-        for channel_type in [1_i32, 2_i32, 3_i32] {
-            let members = self
-                .list_channel_members(channel_id, channel_type, 200, 0)
-                .await?;
-            if let Some(uid) = members
-                .into_iter()
-                .find(|m| m.member_uid != me && !m.is_deleted)
-                .map(|m| m.member_uid)
-            {
-                return Ok(Some(uid));
-            }
-        }
-        Ok(None)
-    }
-
     pub async fn get_presence_stats(&self) -> Result<PresenceStatsView, PrivchatFfiError> {
         let friends = self.list_friends(500, 0).await?;
         let user_ids: Vec<u64> = friends.into_iter().map(|f| f.user_id).collect();
