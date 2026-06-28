@@ -28,6 +28,16 @@ type BoxResult<T> = Result<T, BoxError>;
 
 #[tokio::main]
 async fn main() -> BoxResult<()> {
+    // Admin/metrics phases use reqwest against the local server (127.0.0.1).
+    // reqwest honors the macOS system HTTP proxy (e.g. Clash on :7890), which
+    // returns 502 for loopback admin calls; curl bypasses it, hence the mismatch.
+    // Never proxy localhost smoke traffic — default a loopback no_proxy unless
+    // the caller already set one.
+    if std::env::var_os("NO_PROXY").is_none() && std::env::var_os("no_proxy").is_none() {
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
+        std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
+    }
+
     println!("\nPrivChat SDK Multi-Account Example (accounts)");
     println!("================================================");
     println!("Phases: full business interoperability + local-first naming/cache rules + room + channel-state-resume smoke + unread-resume strict + admin push/revoke + platform bot-followed smoke + fsync friend lifecycle + system-user group-reject + system-user message-dispatch smoke\n");
