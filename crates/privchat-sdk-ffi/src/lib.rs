@@ -2738,6 +2738,9 @@ fn map_upsert_channel(v: UpsertChannelInput) -> SdkUpsertChannelInput {
         last_local_message_id: v.last_local_message_id,
         last_msg_content: v.last_msg_content,
         version: v.last_msg_timestamp.max(0),
+        // FFI 直接 upsert（本地建会话等）不是 peer 的权威来源；交给 channel 同步填充。
+        // upsert SQL 用 COALESCE，None 不会覆盖已存的 peer_user_id。
+        peer_user_id: None,
     }
 }
 
