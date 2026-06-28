@@ -1353,9 +1353,13 @@ impl MultiAccountManager {
                             0,
                         )
                         .await?;
+                    // 服务端登录提醒实际内容是「您的账号在 {端类型} 登录了。」（见
+                    // connect_message_handler::send_login_notice_message_bg）。早期注释里的
+                    // 「设备登录了」是旧文案，已不再产生——按 from_uid==1(系统) + 「登录了」
+                    // 匹配（欢迎语不含「登录了」，不会误判）。
                     let has_login_notice = messages
                         .iter()
-                        .any(|m| m.from_uid == 1 && m.content.contains("设备登录了"));
+                        .any(|m| m.from_uid == 1 && m.content.contains("登录了"));
                     details = format!(
                         "system_channel={} unread={} messages={} has_login_notice={}",
                         system_channel.channel_id,
