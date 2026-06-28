@@ -1157,6 +1157,9 @@ impl TestPhases {
                     max_members: Some(500),
                     announcement: Some("accounts phase15 announcement".to_string()),
                     description: None,
+                    allow_member_add_friend: None,
+                    allow_search: None,
+                    join_policy: None,
                 },
             )
             .await
