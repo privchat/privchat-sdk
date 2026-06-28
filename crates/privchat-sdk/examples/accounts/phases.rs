@@ -1972,7 +1972,11 @@ impl TestPhases {
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
-        let received_notification = tokio::time::timeout(Duration::from_secs(3), async {
+        // 订阅频道时服务端会先推一条「当前在线」初始 presence（version=1，is_online=true），
+        // 它与 bob 断开后的离线变更（version 递增、is_online=false）共用同一 "presence_changed"
+        // topic。这里只接受反映本次断开的「离线」通知——否则会把初始在线推送误当成断开事件，
+        // 与随后 query 到的离线态不一致（真实客户端按 version 收敛，这里等明确的离线状态而非固定 sleep）。
+        let received_notification = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match alice_events.recv().await {
                     Ok(privchat_sdk::SdkEvent::SubscriptionMessageReceived {
@@ -1988,7 +1992,11 @@ impl TestPhases {
                             .map_err(|e| {
                                 boxed_err(format!("decode presence_changed payload failed: {e}"))
                             })?;
-                        break Ok(notification);
+                        if notification.user_id == bob_id && !notification.snapshot.is_online {
+                            break Ok(notification);
+                        }
+                        // 初始在线 / 其他用户的 presence_changed —— 跳过，继续等 bob 的离线通知。
+                        continue;
                     }
                     Ok(_) => continue,
                     Err(e) => {
@@ -2000,7 +2008,7 @@ impl TestPhases {
             }
         })
         .await
-        .map_err(|_| boxed_err("timed out waiting for presence_changed"))??;
+        .map_err(|_| boxed_err("timed out waiting for bob offline presence_changed"))??;
 
         let received_presence_changed = true;
 
