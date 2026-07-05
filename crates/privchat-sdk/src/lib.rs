@@ -6580,6 +6580,10 @@ impl State {
                 "video" => i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(0),
                 // 注：普通音频文件（mp3/wav/...）作为 File 消息发送，不再有独立 Audio 类型
                 "file" | "audio" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
+                // RP-12：资金卡片（服务端注入）同步路径也要保留类型，否则历史/冷同步落成 Text→客户端渲染原始 JSON。
+                "red_packet" => i32::try_from(ContentMessageType::RedPacket.as_u32()).unwrap_or(0),
+                "money_transfer" => i32::try_from(ContentMessageType::MoneyTransfer.as_u32()).unwrap_or(0),
+                "system" => i32::try_from(ContentMessageType::System.as_u32()).unwrap_or(0),
                 _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
             };
             let mime_type = Self::extract_mime_type_from_json(&item.content, "");
