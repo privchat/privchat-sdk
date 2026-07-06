@@ -4816,12 +4816,24 @@ impl State {
                         message_id,
                         reason: "sync_entity".to_string(),
                     });
-                    if local_message_id > 0 || from_self {
+                    // 回显 vs 新消息：以 server_message_id 是否已存在本地（inserted_new）为准，
+                    // 不能用 from_self 判定——服务端代发消息（如 RP-12 资金卡片注入，sender=本人
+                    // 但本地无乐观原件）必须当新消息上抛；只有命中已有行（本地乐观发送的回显 /
+                    // 重复推送）才走 MessageSendStatusChanged 状态更新。from_self 只影响未读/提示，
+                    // 不决定消息是否进 timeline。
+                    if !upserted.inserted_new && (local_message_id > 0 || from_self) {
                         emitted.push(SdkEvent::MessageSendStatusChanged {
                             message_id,
                             status,
                             server_message_id: Some(server_message_id),
                         });
+                    } else if upserted.inserted_new && from_self {
+                        if inbound_logs_enabled() {
+                            eprintln!(
+                                "[SDK.inbound] server-authored self message surfaced as NEW: channel_id={} message_id={} server_message_id={}",
+                                channel_id, message_id, server_message_id
+                            );
+                        }
                     }
                 }
             }
