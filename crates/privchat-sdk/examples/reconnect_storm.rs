@@ -550,6 +550,29 @@ async fn main() -> BoxResult<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
     let stats = parse_server_log(&server_log, log_offset);
 
+    // P1-00 指标快照（/metrics 在 file server 端口暴露）：sync 维度直接来自
+    // server 侧埋点，与日志解析互为印证。老 binary 无这些指标时输出为空。
+    let metrics_port: u16 = env_or("STORM_METRICS_PORT", "9583").parse().unwrap_or(9583);
+    if let Ok(out) = Command::new("curl")
+        .arg("-s")
+        .arg("--noproxy")
+        .arg("*")
+        .arg(format!("http://{}:{}/metrics", env.host, metrics_port))
+        .output()
+    {
+        let body = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with("privchat_sync_entities"))
+            .collect();
+        if !lines.is_empty() {
+            println!("\nserver /metrics (sync dimension):");
+            for l in lines {
+                println!("  {l}");
+            }
+        }
+    }
+
     println!("\n== summary [{}] ==", env.label);
     println!(
         "clients={} channels_per_user={} recovered={}/{}",
