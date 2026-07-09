@@ -1631,6 +1631,9 @@ pub struct StoredUser {
     pub nickname: Option<String>,
     pub alias: Option<String>,
     pub avatar: String,
+    /// AVATAR_CACHE_SPEC P1: 头像本地缓存文件绝对路径（已验证文件存在）；
+    /// 空串 = 未缓存，回落 avatar（网络 URL）。
+    pub avatar_local_path: String,
     pub user_type: i32,
     pub is_deleted: bool,
     pub channel_id: String,
@@ -1657,6 +1660,9 @@ pub struct StoredFriend {
     pub alias: Option<String>,
     /// 头像 URL。空串表示无头像。
     pub avatar: String,
+    /// AVATAR_CACHE_SPEC P1: 头像本地缓存文件绝对路径（已验证文件存在）；
+    /// 空串 = 未缓存，回落 avatar（网络 URL）。
+    pub avatar_local_path: String,
     pub tags: Option<String>,
     pub is_pinned: bool,
     pub created_at: i64,
@@ -2944,6 +2950,16 @@ fn map_upsert_user(v: UpsertUserInput) -> SdkUpsertUserInput {
     }
 }
 
+/// AVATAR_CACHE_SPEC P1 §3.5 local-first 解析：本地缓存路径只有在文件确实
+/// 存在时才透传给宿主（文件被外部清理时静默回落网络 URL）。
+fn resolve_avatar_local_path(path: String) -> String {
+    if !path.is_empty() && std::path::Path::new(&path).exists() {
+        path
+    } else {
+        String::new()
+    }
+}
+
 fn map_stored_user(v: SdkStoredUser) -> StoredUser {
     StoredUser {
         user_id: v.user_id,
@@ -2951,6 +2967,7 @@ fn map_stored_user(v: SdkStoredUser) -> StoredUser {
         nickname: v.nickname,
         alias: v.alias,
         avatar: v.avatar,
+        avatar_local_path: resolve_avatar_local_path(v.avatar_local_path),
         user_type: v.user_type,
         is_deleted: v.is_deleted,
         channel_id: v.channel_id,
@@ -2983,6 +3000,7 @@ fn map_stored_friend(v: SdkStoredFriend) -> StoredFriend {
         nickname: v.nickname,
         alias: v.alias,
         avatar: v.avatar,
+        avatar_local_path: resolve_avatar_local_path(v.avatar_local_path),
         tags: v.tags,
         is_pinned: v.is_pinned,
         created_at: v.created_at,
@@ -7452,6 +7470,21 @@ impl PrivchatClient {
     pub async fn upsert_user(&self, input: UpsertUserInput) -> Result<(), PrivchatFfiError> {
         self.inner
             .upsert_user(map_upsert_user(input))
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// AVATAR_CACHE_SPEC §8: 头像上传前客户端预处理。
+    ///
+    /// decode（白名单 jpeg/png/webp，gif/损坏格式直接 Err，不消耗上传流量）→
+    /// 中心裁剪正方形 → 边长 >480 缩放到 480x480（≤480 不放大）→ 编码 PNG
+    /// 写临时文件。返回处理后文件路径，App 选图后先过它再走上传管道。
+    pub async fn prepare_avatar_image(
+        &self,
+        src_path: String,
+    ) -> Result<String, PrivchatFfiError> {
+        self.inner
+            .prepare_avatar_image(src_path)
             .await
             .map_err(PrivchatFfiError::from)
     }

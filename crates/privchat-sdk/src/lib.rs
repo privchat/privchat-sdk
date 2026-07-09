@@ -63,6 +63,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
 pub mod attachment_crypto;
+mod avatar_cache;
 pub mod error_codes;
 mod local_store;
 pub mod media_download;
@@ -1309,6 +1310,9 @@ pub struct StoredUser {
     pub channel_id: String,
     pub version: i64,
     pub updated_at: i64,
+    /// AVATAR_CACHE_SPEC P1: 头像本地缓存文件绝对路径；空 = 未缓存。
+    #[serde(default)]
+    pub avatar_local_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1347,6 +1351,9 @@ pub struct StoredFriend {
     pub request_message: Option<String>,
     pub request_source: Option<String>,
     pub request_source_id: Option<String>,
+    /// AVATAR_CACHE_SPEC P1: 头像本地缓存文件绝对路径（LEFT JOIN user）；空 = 未缓存。
+    #[serde(default)]
+    pub avatar_local_path: String,
 }
 
 /// F-sync.2: friend_request 列表查询方向过滤。
@@ -2378,9 +2385,33 @@ struct State {
     /// 宿主通过 `PrivchatSdk::submit_media_job_result` 直接（不经 actor cmd）
     /// 取出并触发。
     pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>>,
+    /// AVATAR_CACHE_SPEC P1: user 头像本地缓存管理器（in-flight/verified 去重）。
+    avatar_cache: avatar_cache::AvatarCacheManager,
 }
 
 impl State {
+    /// AVATAR_CACHE_SPEC P1: upsert_user 落库后触发头像本地缓存。
+    ///
+    /// 同步快速路径（空 URL / 进程内已验证 / 下载中）直接返回，未命中才 spawn
+    /// 后台任务——sync 循环批量灌用户时不会形成 task 洪峰。不阻塞调用方。
+    fn ensure_avatar_cached(&self, user_id: u64, avatar_url: &str) {
+        let Some(uid) = self.current_uid.as_deref() else {
+            return;
+        };
+        self.avatar_cache.ensure(
+            self.storage.clone(),
+            avatar_cache::AvatarEventSinks {
+                event_tx: self.event_tx.clone(),
+                event_history: self.event_history.clone(),
+                event_seq: self.event_seq.clone(),
+                event_history_limit: self.event_history_limit,
+            },
+            uid,
+            user_id,
+            avatar_url,
+        );
+    }
+
     fn clear_presence_cache(&self) {
         if let Ok(mut locked) = self.presence_cache.lock() {
             locked.clear();
@@ -4123,6 +4154,9 @@ impl State {
                                     .unwrap_or(item.version as i64),
                             })
                             .await?;
+                        if let Some(avatar_url) = embedded_user.avatar.as_deref() {
+                            self.ensure_avatar_cached(user_id, avatar_url);
+                        }
                     }
                     if actor_logs_enabled() {
                         eprintln!(
@@ -4194,14 +4228,15 @@ impl State {
                     if user_id == 0 {
                         continue;
                     }
+                    let avatar =
+                        Self::json_get_string(&payload, &["avatar"]).unwrap_or_default();
                     self.storage
                         .upsert_user(UpsertUserInput {
                             user_id,
                             username: Self::json_get_string(&payload, &["username"]),
                             nickname: Self::json_get_string(&payload, &["nickname", "name"]),
                             alias: Self::json_get_string(&payload, &["alias"]),
-                            avatar: Self::json_get_string(&payload, &["avatar"])
-                                .unwrap_or_default(),
+                            avatar: avatar.clone(),
                             user_type: Self::json_get_i32(&payload, &["user_type", "type"])
                                 .unwrap_or(0),
                             is_deleted: item.deleted
@@ -4213,6 +4248,9 @@ impl State {
                                 .unwrap_or(item.version as i64),
                         })
                         .await?;
+                    if !item.deleted {
+                        self.ensure_avatar_cached(user_id, &avatar);
+                    }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "user".to_string(),
                         entity_id: item.entity_id.clone(),
@@ -4546,7 +4584,7 @@ impl State {
                                 username: inferred_username.clone(),
                                 nickname: inferred_username,
                                 alias: inferred_alias,
-                                avatar: inferred_avatar,
+                                avatar: inferred_avatar.clone(),
                                 user_type: 0,
                                 is_deleted: false,
                                 channel_id: String::new(),
@@ -4557,6 +4595,7 @@ impl State {
                                     .unwrap_or(item.version as i64),
                             })
                             .await;
+                        self.ensure_avatar_cached(member_uid, &inferred_avatar);
                     }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "channel_member".to_string(),
@@ -9432,6 +9471,7 @@ impl PrivchatSdk {
                 event_seq: Some(actor_event_seq.clone()),
                 event_history_limit: event_history_limit,
                 pending_media_jobs: actor_pending_media_jobs,
+                avatar_cache: avatar_cache::AvatarCacheManager::default(),
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut health_tick = interval(Duration::from_secs(15));
@@ -11251,7 +11291,16 @@ impl PrivchatSdk {
                     }
                     Command::UpsertUser { input, resp } => {
                         let result = match state.current_uid_required() {
-                            Ok(_) => state.storage.upsert_user(input).await,
+                            Ok(_) => {
+                                let user_id = input.user_id;
+                                let avatar = input.avatar.clone();
+                                let r = state.storage.upsert_user(input).await;
+                                if r.is_ok() {
+                                    // FFI 直写路径（profile fetch 等）也触发头像缓存。
+                                    state.ensure_avatar_cached(user_id, &avatar);
+                                }
+                                r
+                            }
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -12542,6 +12591,20 @@ impl PrivchatSdk {
             encryption_version: resp.encryption_version,
             cek: resp.cek,
         })
+    }
+
+    /// AVATAR_CACHE_SPEC §8: 头像上传前客户端预处理。
+    ///
+    /// decode（白名单 jpeg/png/webp，gif/损坏格式直接 Err，不消耗上传流量）→
+    /// 中心裁剪正方形 → 边长 >480 缩放到 480x480（≤480 不放大）→ 编码 PNG
+    /// 写临时文件，返回处理后路径。App 选图后先过它再走上传管道。
+    pub async fn prepare_avatar_image(&self, src_path: String) -> Result<String> {
+        tokio::task::spawn_blocking(move || {
+            avatar_cache::prepare_avatar_image_sync(std::path::Path::new(&src_path))
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("prepare avatar image task failed: {e}")))?
     }
 
     async fn apply_rpc_side_effects(&self, route: &str, raw: &str) -> Result<()> {
@@ -14134,6 +14197,7 @@ mod tests {
             event_history_limit: 0,
             pending_media_jobs: Arc::new(StdMutex::new(HashMap::new())),
             active_subscriptions: HashMap::new(),
+            avatar_cache: crate::avatar_cache::AvatarCacheManager::default(),
         };
         (state, dir)
     }

@@ -178,6 +178,15 @@ fn token_aad(uid: &str, purpose: &str) -> String {
     format!("privchat|purpose={purpose}|uid={uid}|schema={STORAGE_SCHEMA_VERSION}")
 }
 
+/// AVATAR_CACHE_SPEC P1: user 行头像缓存状态投影（avatar_cache 模块专用）。
+#[derive(Debug, Clone, Default)]
+pub struct UserAvatarCacheRow {
+    /// 本地缓存文件对应的源 URL；与最新 avatar 不等 ⇒ 缓存过期。
+    pub avatar_cached_url: String,
+    /// 本地缓存文件绝对路径；空 = 未缓存。
+    pub avatar_local_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoragePaths {
     pub user_root: PathBuf,
@@ -2291,6 +2300,49 @@ impl LocalStore {
         Ok(())
     }
 
+    /// AVATAR_CACHE_SPEC P1: 读 user 行的头像缓存状态（cached_url + local_path）。
+    pub fn get_user_avatar_cache(
+        &self,
+        uid: &str,
+        user_id: u64,
+    ) -> Result<Option<UserAvatarCacheRow>> {
+        let conn = self.conn_for_user(uid)?;
+        conn.query_row(
+            "SELECT avatar_cached_url, avatar_local_path FROM user WHERE user_id = ?1 LIMIT 1",
+            params![user_id as i64],
+            |row| {
+                Ok(UserAvatarCacheRow {
+                    avatar_cached_url: row.get::<_, String>(0)?,
+                    avatar_local_path: row.get::<_, String>(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| Error::Storage(format!("get user avatar cache: {e}")))
+    }
+
+    /// AVATAR_CACHE_SPEC P1: 下载成功后落库缓存状态。
+    ///
+    /// `AND avatar = ?2` 守卫：下载期间用户又换了头像（avatar 列已是新 URL）
+    /// 则本次不写，返回 false——新 URL 会触发下一轮下载。
+    pub fn set_user_avatar_cache(
+        &self,
+        uid: &str,
+        user_id: u64,
+        url: &str,
+        local_path: &str,
+    ) -> Result<bool> {
+        let conn = self.conn_for_user(uid)?;
+        let changed = conn
+            .execute(
+                "UPDATE user SET avatar_local_path = ?3, avatar_cached_url = ?2
+                 WHERE user_id = ?1 AND avatar = ?2",
+                params![user_id as i64, url, local_path],
+            )
+            .map_err(|e| Error::Storage(format!("set user avatar cache: {e}")))?;
+        Ok(changed > 0)
+    }
+
     pub fn update_user_alias(&self, uid: &str, user_id: u64, alias: Option<String>) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
@@ -2309,7 +2361,7 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(
             "SELECT
-                user_id, username, nickname, alias, avatar, user_type, is_deleted, channel_id, version, updated_at
+                user_id, username, nickname, alias, avatar, user_type, is_deleted, channel_id, version, updated_at, avatar_local_path
              FROM user
              WHERE user_id = ?1
              LIMIT 1",
@@ -2326,6 +2378,7 @@ impl LocalStore {
                     channel_id: row.get::<_, String>(7)?,
                     version: row.get::<_, i64>(8)?,
                     updated_at: row.get::<_, i64>(9)?,
+                    avatar_local_path: row.get::<_, String>(10)?,
                 })
             },
         )
@@ -2343,7 +2396,7 @@ impl LocalStore {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT user_id, username, nickname, alias, avatar, user_type, is_deleted, channel_id, version, updated_at
+            "SELECT user_id, username, nickname, alias, avatar, user_type, is_deleted, channel_id, version, updated_at, avatar_local_path
              FROM user
              WHERE user_id IN ({})
              ORDER BY version DESC, user_id DESC",
@@ -2366,6 +2419,7 @@ impl LocalStore {
                     channel_id: row.get::<_, String>(7)?,
                     version: row.get::<_, i64>(8)?,
                     updated_at: row.get::<_, i64>(9)?,
+                    avatar_local_path: row.get::<_, String>(10)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list users by ids: {e}")))?;
@@ -2451,7 +2505,8 @@ impl LocalStore {
                     f.is_outgoing,
                     f.request_message,
                     f.request_source,
-                    f.request_source_id
+                    f.request_source_id,
+                    COALESCE(u.avatar_local_path, '')
                  FROM friend f
                  LEFT JOIN \"user\" u ON u.user_id = f.user_id
                  WHERE f.status = 1
@@ -2477,6 +2532,7 @@ impl LocalStore {
                     request_message: row.get::<_, Option<String>>(12)?,
                     request_source: row.get::<_, Option<String>>(13)?,
                     request_source_id: row.get::<_, Option<String>>(14)?,
+                    avatar_local_path: row.get::<_, String>(15)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list friends: {e}")))?;
@@ -2533,7 +2589,8 @@ impl LocalStore {
                 f.is_outgoing,
                 f.request_message,
                 f.request_source,
-                f.request_source_id
+                f.request_source_id,
+                COALESCE(u.avatar_local_path, '')
              FROM friend f
              LEFT JOIN \"user\" u ON u.user_id = f.user_id
              WHERE {status_filter} AND {outgoing_filter}
@@ -2561,6 +2618,7 @@ impl LocalStore {
                     request_message: row.get::<_, Option<String>>(12)?,
                     request_source: row.get::<_, Option<String>>(13)?,
                     request_source_id: row.get::<_, Option<String>>(14)?,
+                    avatar_local_path: row.get::<_, String>(15)?,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list friend_requests: {e}")))?;
