@@ -3373,13 +3373,23 @@ impl LocalStore {
         revoker: Option<u64>,
     ) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
-        let (channel_id, channel_type): (i64, i32) = conn
-            .query_row(
-                "SELECT channel_id, channel_type FROM message WHERE id = ?1",
-                params![message_id as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map_err(|e| Error::Storage(format!("query message for revoke: {e}")))?;
+        // 原消息本地不存在(新设备冷同步只带 revoke 记录不带原文)是常态,
+        // 按 no-op 容忍——绝不能让它把 bootstrap sync 整条打断(会锁死收发)。
+        let (channel_id, channel_type): (i64, i32) = match conn.query_row(
+            "SELECT channel_id, channel_type FROM message WHERE id = ?1",
+            params![message_id as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                tracing::debug!(
+                    "set_message_revoke: message {} not in local store, skip",
+                    message_id
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(Error::Storage(format!("query message for revoke: {e}"))),
+        };
         let now_ms = chrono::Utc::now().timestamp_millis();
         conn.execute(
             "INSERT INTO message_extra (
