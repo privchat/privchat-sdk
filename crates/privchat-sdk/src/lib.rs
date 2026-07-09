@@ -12635,12 +12635,12 @@ impl PrivchatSdk {
     /// 中心裁剪正方形 → 边长 >480 缩放到 480x480（≤480 不放大）→ 编码 PNG
     /// 写临时文件，返回处理后路径。App 选图后先过它再走上传管道。
     pub async fn prepare_avatar_image(&self, src_path: String) -> Result<String> {
-        tokio::task::spawn_blocking(move || {
-            avatar_cache::prepare_avatar_image_sync(std::path::Path::new(&src_path))
-                .map(|p| p.to_string_lossy().to_string())
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("prepare avatar image task failed: {e}")))?
+        // 直接同步调用:uniffi 的 async 桥在自己的 foreign executor 上 poll 本 future,
+        // 没有 Tokio runtime 上下文,spawn_blocking 会 panic「no reactor running」。
+        // 头像预处理是一次性 CPU 工作(≤480 图,数十 ms),App 已在协程里调用,
+        // 短暂阻塞该协程线程可接受。
+        avatar_cache::prepare_avatar_image_sync(std::path::Path::new(&src_path))
+            .map(|p| p.to_string_lossy().to_string())
     }
 
     async fn apply_rpc_side_effects(&self, route: &str, raw: &str) -> Result<()> {
