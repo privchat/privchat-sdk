@@ -4643,9 +4643,11 @@ impl PrivchatClient {
         let mut out_members = Vec::with_capacity(resp.members.len());
         for entry in &resp.members {
             let user_id = entry.user_id;
+            // 本地 group_member 表与 UI 契约的 role 编码:owner=2 / admin=1 / member=0
+            // (与生产 DB privchat_group_members.role 一致)。
             let role = match entry.role.to_ascii_lowercase().as_str() {
-                "owner" => 1,
-                "admin" => 2,
+                "owner" => 2,
+                "admin" => 1,
                 _ => 0,
             };
             let status = 0;
