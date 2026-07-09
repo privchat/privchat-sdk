@@ -1750,7 +1750,7 @@ impl LocalStore {
                                 LIMIT 3
                             )
                         ),
-                        ''
+                        CAST(c.channel_id AS TEXT)
                     )
                     ELSE c.channel_name
                 END AS resolved_channel_name,
@@ -1888,7 +1888,7 @@ impl LocalStore {
                                     LIMIT 3
                                 )
                             ),
-                            ''
+                            CAST(c.channel_id AS TEXT)
                         )
                         ELSE c.channel_name
                     END AS resolved_channel_name,
@@ -4107,7 +4107,7 @@ impl LocalStore {
 mod tests {
     use super::{get_string, LocalStore, GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID};
     use crate::{
-        LoginResult, NewMessage, UpsertChannelExtraInput, UpsertChannelInput,
+        LoginResult, NewMessage, UpsertChannelExtraInput, UpsertChannelInput, UpsertGroupInput,
         UpsertRemoteMessageInput,
     };
     use rand::RngCore;
@@ -5784,5 +5784,61 @@ mod tests {
         assert_eq!(extra.content_edit.as_deref(), Some("after-edit"));
         assert_eq!(extra.edited_at, 123);
         assert!(extra.is_pinned);
+    }
+
+    /// P1-17 顺手根治：空名群（本地 upsert、group.name 为 NULL、无成员行）
+    /// 必须物化 fallback 标题（链路末端 CAST(channel_id AS TEXT)），不允许空标题。
+    #[test]
+    fn empty_name_group_falls_back_to_channel_id_title() {
+        let store = test_store();
+        let uid = "10099";
+        store
+            .upsert_group(
+                uid,
+                &UpsertGroupInput {
+                    group_id: 9_900_000_001,
+                    name: None,
+                    avatar: String::new(),
+                    owner_id: Some(1),
+                    is_dismissed: false,
+                    created_at: 1,
+                    version: 1,
+                    updated_at: 1,
+                },
+            )
+            .expect("upsert group");
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 9_900_000_001,
+                    channel_type: 2,
+                    channel_name: String::new(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 0,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 0,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: None,
+                },
+            )
+            .expect("upsert channel");
+
+        let rows = store.list_channels(uid, 20, 0).expect("list channels");
+        let row = rows
+            .iter()
+            .find(|c| c.channel_id == 9_900_000_001)
+            .expect("synthetic group row present");
+        assert_eq!(row.channel_name, "9900000001");
+
+        let single = store
+            .get_channel_by_id(uid, 9_900_000_001)
+            .expect("get channel")
+            .expect("channel exists");
+        assert_eq!(single.channel_name, "9900000001");
     }
 }
