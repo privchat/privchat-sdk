@@ -1757,42 +1757,10 @@ impl LocalStore {
                 c.channel_remark,
                 c.avatar,
                 unread_count, top, mute,
-                COALESCE(
-                    (
-                        SELECT m.created_at
-                        FROM message m
-                        WHERE m.channel_id = c.channel_id
-                          AND m.channel_type = c.channel_type
-                        ORDER BY m.created_at DESC, m.id DESC
-                        LIMIT 1
-                    ),
-                    NULLIF(c.last_msg_timestamp, 0),
-                    c.updated_at,
-                    0
-                ) AS resolved_last_msg_timestamp,
-                COALESCE(
-                    (
-                        SELECT m.id
-                        FROM message m
-                        WHERE m.channel_id = c.channel_id
-                          AND m.channel_type = c.channel_type
-                        ORDER BY m.created_at DESC, m.id DESC
-                        LIMIT 1
-                    ),
-                    c.last_local_message_id
-                ) AS resolved_last_local_message_id,
-                COALESCE(
-                    (
-                        SELECT m.content
-                        FROM message m
-                        WHERE m.channel_id = c.channel_id
-                          AND m.channel_type = c.channel_type
-                        ORDER BY m.created_at DESC, m.id DESC
-                        LIMIT 1
-                    ),
-                    c.last_msg_content,
-                    ''
-                ) AS resolved_last_msg_content,
+                COALESCE(lm.created_at, NULLIF(c.last_msg_timestamp, 0), c.updated_at, 0)
+                    AS resolved_last_msg_timestamp,
+                COALESCE(lm.id, c.last_local_message_id) AS resolved_last_local_message_id,
+                COALESCE(lm.content, c.last_msg_content, '') AS resolved_last_msg_content,
                 c.version,
                 c.updated_at,
                 CASE WHEN c.channel_type = 1 THEN COALESCE(
@@ -1804,6 +1772,16 @@ impl LocalStore {
                     END
                 ) ELSE NULL END AS peer_user_id
              FROM channel c
+             -- P1-17：last message 三个字段一次取齐（原来 3 个独立相关子查询各扫
+             -- 一遍索引，且并发写入下可能取到不同消息）。timeline 优先语义不变。
+             LEFT JOIN message lm ON lm.id = (
+                 SELECT m.id
+                 FROM message m
+                 WHERE m.channel_id = c.channel_id
+                   AND m.channel_type = c.channel_type
+                 ORDER BY m.created_at DESC, m.id DESC
+                 LIMIT 1
+             )
              WHERE c.channel_id = ?1
                AND COALESCE(c.is_deleted, 0) = 0
              LIMIT 1",
@@ -1917,42 +1895,10 @@ impl LocalStore {
                     c.channel_remark,
                     c.avatar,
                     unread_count, top, mute,
-                    COALESCE(
-                        (
-                            SELECT m.created_at
-                            FROM message m
-                            WHERE m.channel_id = c.channel_id
-                              AND m.channel_type = c.channel_type
-                            ORDER BY m.created_at DESC, m.id DESC
-                            LIMIT 1
-                        ),
-                        NULLIF(c.last_msg_timestamp, 0),
-                        c.updated_at,
-                        0
-                    ) AS resolved_last_msg_timestamp,
-                    COALESCE(
-                        (
-                            SELECT m.id
-                            FROM message m
-                            WHERE m.channel_id = c.channel_id
-                              AND m.channel_type = c.channel_type
-                            ORDER BY m.created_at DESC, m.id DESC
-                            LIMIT 1
-                        ),
-                        c.last_local_message_id
-                    ) AS resolved_last_local_message_id,
-                    COALESCE(
-                        (
-                            SELECT m.content
-                            FROM message m
-                            WHERE m.channel_id = c.channel_id
-                              AND m.channel_type = c.channel_type
-                            ORDER BY m.created_at DESC, m.id DESC
-                            LIMIT 1
-                        ),
-                        c.last_msg_content,
-                        ''
-                    ) AS resolved_last_msg_content,
+                    COALESCE(lm.created_at, NULLIF(c.last_msg_timestamp, 0), c.updated_at, 0)
+                        AS resolved_last_msg_timestamp,
+                    COALESCE(lm.id, c.last_local_message_id) AS resolved_last_local_message_id,
+                    COALESCE(lm.content, c.last_msg_content, '') AS resolved_last_msg_content,
                     c.version,
                     c.updated_at,
                     CASE WHEN c.channel_type = 1 THEN COALESCE(
@@ -1964,6 +1910,17 @@ impl LocalStore {
                         END
                     ) ELSE NULL END AS peer_user_id
                  FROM channel c
+                 -- P1-17：last message 三个字段一次取齐（原来每行 3 个相关子查询各扫
+                 -- 一遍索引，低端机上列表刷新的主要成本；且并发写入下三个子查询可能
+                 -- 取到不同消息）。timeline 优先语义不变。
+                 LEFT JOIN message lm ON lm.id = (
+                     SELECT m.id
+                     FROM message m
+                     WHERE m.channel_id = c.channel_id
+                       AND m.channel_type = c.channel_type
+                     ORDER BY m.created_at DESC, m.id DESC
+                     LIMIT 1
+                 )
                  WHERE COALESCE(c.is_deleted, 0) = 0
                  ORDER BY c.top DESC, resolved_last_msg_timestamp DESC, c.channel_id DESC
                  LIMIT ?1 OFFSET ?2",
