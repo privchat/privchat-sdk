@@ -2351,6 +2351,11 @@ struct State {
     /// 双入口、重连多入口）直接跳过，避免 resume sync 全家桶连跑多轮放大重连风暴。
     /// 失败不记录（下一个触发点自然重试）；换代（重连）后必然重新执行。
     last_resume_synced: Option<(u64, Instant)>,
+    /// P1-05：room 广播按 (channel_id, server_message_id) 去重。订阅后服务端 replay
+    /// 历史与实时广播在重叠窗口会重复投递同一条；每 channel 保留最近见过的一批
+    /// server_message_id（有界 FIFO），命中即丢弃。server_message_id 缺失（旧帧/
+    /// 无 id 的 system push）不去重，原样透传。
+    room_seen_msg_ids: HashMap<u64, VecDeque<u64>>,
     /// 最近一次 Terminal 认证失败的原因。`connect()` 成功后清空。
     /// 供 debug / metrics / 冷启动诊断使用，不持久化。
     last_terminal_reason: Option<TerminalReason>,
@@ -7035,6 +7040,24 @@ impl State {
         Ok(applied)
     }
 
+    /// P1-05：room 广播去重。返回 true 表示这条 (channel_id, server_message_id) 最近
+    /// 已见过（应丢弃）。None id 一律放行（无法去重）。每 channel 有界 FIFO（256）。
+    fn room_message_is_duplicate(&mut self, channel_id: u64, server_message_id: Option<u64>) -> bool {
+        const ROOM_DEDUP_WINDOW: usize = 256;
+        let Some(id) = server_message_id else {
+            return false;
+        };
+        let seen = self.room_seen_msg_ids.entry(channel_id).or_default();
+        if seen.contains(&id) {
+            return true;
+        }
+        seen.push_back(id);
+        if seen.len() > ROOM_DEDUP_WINDOW {
+            seen.pop_front();
+        }
+        false
+    }
+
     async fn handle_inbound_frame(&mut self, biz_type: u8, data: Vec<u8>) -> Result<usize> {
         if inbound_logs_enabled() {
             eprintln!(
@@ -7218,8 +7241,20 @@ impl State {
                             req.payload.len()
                         );
                     }
+                    // P1-05：去重 replay/live 重叠窗口的重复帧。presence_changed 是无 id
+                    // 的状态帧，不参与去重（每次都应用最新态）。
                     if req.topic.as_deref() == Some("presence_changed") {
                         self.apply_presence_changed_payload(&req.payload);
+                    } else if self
+                        .room_message_is_duplicate(req.channel_id, req.server_message_id)
+                    {
+                        if inbound_logs_enabled() {
+                            eprintln!(
+                                "[SDK.inbound] drop duplicate room publish channel_id={} server_message_id={:?}",
+                                req.channel_id, req.server_message_id
+                            );
+                        }
+                        return Ok(0);
                     }
                     self.pending_events
                         .push(SdkEvent::SubscriptionMessageReceived {
@@ -9445,6 +9480,7 @@ impl PrivchatSdk {
                 auth_terminal_fired: false,
                 inbound_epoch: 0,
                 last_resume_synced: None,
+                room_seen_msg_ids: HashMap::new(),
                 last_terminal_reason: None,
                 network_hint: NetworkHint::Unknown,
                 receive_pipeline: ReceivePipeline::default(),
@@ -14171,6 +14207,7 @@ mod tests {
             auth_terminal_fired: false,
             inbound_epoch: 0,
             last_resume_synced: None,
+            room_seen_msg_ids: HashMap::new(),
             last_terminal_reason: None,
             network_hint: NetworkHint::Unknown,
             receive_pipeline: ReceivePipeline::default(),
@@ -14505,6 +14542,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn room_dedup_drops_repeats_keeps_distinct_and_null() {
+        let (mut state, dir) = new_seeded_state("room-dedup").await;
+        // 同 channel 同 id → 第二次判重
+        assert!(!state.room_message_is_duplicate(7, Some(100)));
+        assert!(state.room_message_is_duplicate(7, Some(100)));
+        // 不同 id 放行
+        assert!(!state.room_message_is_duplicate(7, Some(101)));
+        // 不同 channel 独立空间
+        assert!(!state.room_message_is_duplicate(8, Some(100)));
+        // None id 永不判重（无法去重）
+        assert!(!state.room_message_is_duplicate(7, None));
+        assert!(!state.room_message_is_duplicate(7, None));
+        // 有界：窗口滚过后最旧 id 被逐出，可再次出现（不会无限增长）
+        for i in 0..300u64 {
+            state.room_message_is_duplicate(9, Some(1000 + i));
+        }
+        assert!(!state.room_message_is_duplicate(9, Some(1000)));
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     async fn event_history_replay_is_ordered() {
         let sdk = super::PrivchatSdk::new(PrivchatConfig::default());
         sdk.shutdown().await;
