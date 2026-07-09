@@ -2339,6 +2339,11 @@ struct State {
     /// 里显式 bump；actor loop 收到 `InboundFrame` / `InboundDisconnected` 时比对，
     /// 丢弃上一 epoch 遗留在 mpsc 通道里的帧，做到"冻结旧 inbound"。
     inbound_epoch: u64,
+    /// 最近一次**成功**完成 resume sync 的 (inbound_epoch, 完成时刻)。
+    /// P0-12 单轮化：同一连接世代内短时间的重复触发（冷启动 connect+bootstrap
+    /// 双入口、重连多入口）直接跳过，避免 resume sync 全家桶连跑多轮放大重连风暴。
+    /// 失败不记录（下一个触发点自然重试）；换代（重连）后必然重新执行。
+    last_resume_synced: Option<(u64, Instant)>,
     /// 最近一次 Terminal 认证失败的原因。`connect()` 成功后清空。
     /// 供 debug / metrics / 冷启动诊断使用，不持久化。
     last_terminal_reason: Option<TerminalReason>,
@@ -2546,10 +2551,10 @@ impl State {
         self.next_reconnect_at = None;
     }
 
-    /// Compute the next retry deadline using 1s/2s/4s/8s/16s/30s capped backoff,
-    /// and advance the attempt counter.
+    /// Compute the next retry deadline using 1s/2s/4s/8s/16s/30s capped backoff
+    /// with ±30% jitter, and advance the attempt counter.
     fn schedule_next_reconnect(&mut self) {
-        let secs: u64 = match self.reconnect_attempt {
+        let base_secs: u64 = match self.reconnect_attempt {
             0 => 1,
             1 => 2,
             2 => 4,
@@ -2557,11 +2562,16 @@ impl State {
             4 => 16,
             _ => 30,
         };
+        // ±30% jitter：server 重启/发版后全体客户端固定序列会同秒撞门（reconnect
+        // storm），随机扰动把重连压力摊开（P0-12）。
+        let factor = 0.7 + rand::random::<f64>() * 0.6;
+        let delay = Duration::from_millis(((base_secs as f64) * 1000.0 * factor) as u64);
         self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
-        self.next_reconnect_at = Some(Instant::now() + Duration::from_secs(secs));
+        self.next_reconnect_at = Some(Instant::now() + delay);
         eprintln!(
-            "[SDK.actor] auto_reconnect_scheduled attempt={} delay_secs={}",
-            self.reconnect_attempt, secs
+            "[SDK.actor] auto_reconnect_scheduled attempt={} delay_ms={}",
+            self.reconnect_attempt,
+            delay.as_millis()
         );
     }
 
@@ -6773,6 +6783,21 @@ impl State {
         if !self.bootstrap_completed {
             return Ok(());
         }
+        // P0-12 单轮化：同一连接世代内一轮成功后，30s 内的重复触发直接跳过。
+        // 冷启动（connect + bootstrap 双入口）和重连（retry driver / connect /
+        // cmd_authenticate 三入口）都会连续触发多轮全家桶；连接期间的增量由
+        // push 实时覆盖，重复轮次只放大服务端压力。debounce 而非严格单次：
+        // 前台回归等超过窗口的触发仍作为安全网执行。
+        if let Some((epoch, at)) = self.last_resume_synced {
+            if epoch == self.inbound_epoch && at.elapsed() < Duration::from_secs(30) {
+                eprintln!(
+                    "[SDK.actor] resume sync skipped: epoch {} already synced {}ms ago",
+                    epoch,
+                    at.elapsed().as_millis()
+                );
+                return Ok(());
+            }
+        }
         let mut stats = ResumeRunStats::default();
         self.queue_resume_started();
         if let Err(err) = self.send_session_ready().await {
@@ -6915,6 +6940,8 @@ impl State {
             }
             channel_offset += channel_page_size;
         }
+        // 仅成功轮次记录；失败让下一个触发点自然重试。
+        self.last_resume_synced = Some((self.inbound_epoch, Instant::now()));
         self.queue_resume_completed(stats);
         Ok(())
     }
@@ -9378,6 +9405,7 @@ impl PrivchatSdk {
                 next_reconnect_at: None,
                 auth_terminal_fired: false,
                 inbound_epoch: 0,
+                last_resume_synced: None,
                 last_terminal_reason: None,
                 network_hint: NetworkHint::Unknown,
                 receive_pipeline: ReceivePipeline::default(),
@@ -14079,6 +14107,7 @@ mod tests {
             next_reconnect_at: None,
             auth_terminal_fired: false,
             inbound_epoch: 0,
+            last_resume_synced: None,
             last_terminal_reason: None,
             network_hint: NetworkHint::Unknown,
             receive_pipeline: ReceivePipeline::default(),
