@@ -4,11 +4,13 @@
 //! 因此 **URL 即缓存键**——`avatar_cached_url == avatar` 且本地文件存在时缓存
 //! 永远有效，无需 ETag/If-Modified-Since 协商。
 //!
-//! 布局（spec §3，按目标用户一层便于定向清理）：
-//! `{dataDir}/users/{selfUid}/avatars/u/{targetUid}/{sha16(url)}.{ext}`，
+//! 布局（spec §3，按主键命名——路径完全由 userId 决定，渲染时不查库、
+//! 直接 `exists()` 判定，换头像原地覆盖不堆积孤儿）：
+//! `{dataDir}/users/{selfUid}/avatars/users/{targetUid}.img`
+//! （扩展名固定 `.img`：解码器按内容嗅探，无需真实后缀；已在 iOS 验证可渲染）。
 //! 登出清空 selfUid 目录时一并回收。下载完成后更新 user 行的
-//! `avatar_local_path` + `avatar_cached_url`、清理该 uid 目录下旧文件，并发既有
-//! `SyncEntityChanged{entity_type:"user"}` 事件，UI 重查即得本地路径。
+//! `avatar_cached_url`（本地文件对应的源 URL，与最新 avatar 不等 ⇒ 需重下），
+//! 并发既有 `SyncEntityChanged{entity_type:"user"}` 事件，UI 重查即得本地路径。
 //! 失败静默（下次触发自然重试）。
 
 use std::collections::{HashSet, VecDeque};
@@ -16,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::storage_actor::StorageHandle;
@@ -30,50 +31,18 @@ pub(crate) struct AvatarEventSinks {
     pub event_history_limit: usize,
 }
 
-/// 计算某 URL 的头像缓存文件路径（spec §3）：
-/// `{user_root}/avatars/u/{targetUid}/{sha16(url)}.{ext}`，
-/// sha16 = url 的 SHA-256 前 16 hex。
-pub(crate) fn avatar_cache_path(user_root: &Path, target_uid: u64, url: &str) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(url.as_bytes());
-    let hash = hex::encode(hasher.finalize());
-    let sha16 = &hash[..16];
+/// 头像缓存文件路径（spec §3，按主键命名）：
+/// `{user_root}/avatars/users/{targetUid}.img`。
+///
+/// 路径完全由 `target_uid` 决定，与 URL 无关——渲染时不需查库、直接
+/// `exists()` 即可判定；换头像时原地覆盖同一文件，不堆积孤儿、无需目录清扫。
+/// 「文件是否过期」不看文件名，看 user 行 `avatar_cached_url != avatar`。
+/// 扩展名固定 `.img`（解码器按内容嗅探，无需真实后缀；iOS 已验证可渲染）。
+pub(crate) fn avatar_cache_path(user_root: &Path, target_uid: u64) -> PathBuf {
     user_root
         .join("avatars")
-        .join("u")
-        .join(target_uid.to_string())
-        .join(format!("{sha16}.{}", infer_ext(url)))
-}
-
-/// 下载成功换代后清理 `u/{targetUid}/` 目录下除 keep 外的所有旧文件
-/// （同人换头像不堆积；也顺带回收 `.part` 残留）。失败静默。
-fn cleanup_stale_avatar_files(dir: &Path, keep: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path != keep && path.is_file() {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-}
-
-/// 从 URL path 部分推断扩展名；推断不出（或太长/含怪字符）兜底 `img`。
-fn infer_ext(url: &str) -> String {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let name = path.rsplit('/').next().unwrap_or("");
-    match name.rsplit_once('.') {
-        Some((stem, ext))
-            if !stem.is_empty()
-                && !ext.is_empty()
-                && ext.len() <= 5
-                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
-            ext.to_ascii_lowercase()
-        }
-        _ => "img".to_string(),
-    }
+        .join("users")
+        .join(format!("{target_uid}.img"))
 }
 
 /// 下载 URL 到 dest：先写 `.part` 临时文件再 rename（原子换入）。
@@ -234,13 +203,12 @@ async fn run_ensure(
             return false;
         }
     };
-    let dest = avatar_cache_path(&paths.user_root, user_id, url);
-    // 同 uid 同 URL 文件已在（此前下载成功但落库被竞态挡掉等）则跳过下载。
-    if !dest.exists() {
-        if let Err(e) = download_to_file(url, &dest).await {
-            eprintln!("[SDK.avatar] download failed user_id={user_id} url={url}: {e}");
-            return false;
-        }
+    let dest = avatar_cache_path(&paths.user_root, user_id);
+    // 走到这里说明本地缺失或已过期（换头像 ⇒ cached_url != url）：下载并原子覆盖
+    // 同一路径（download_to_file 内部 `.part` → rename 覆盖）。
+    if let Err(e) = download_to_file(url, &dest).await {
+        eprintln!("[SDK.avatar] download failed user_id={user_id} url={url}: {e}");
+        return false;
     }
     let dest_str = dest.to_string_lossy().to_string();
     match storage
@@ -248,11 +216,8 @@ async fn run_ensure(
         .await
     {
         Ok(true) => {
-            // 换代成功后清理该 uid 目录下其它旧文件（同人换头像不堆积）。
-            if let Some(dir) = dest.parent() {
-                cleanup_stale_avatar_files(dir, &dest);
-            }
-            // 旧路径可能在别的目录（历史布局/异常残留），单独兜底删除。
+            // 同一路径原地覆盖，不产生孤儿。历史 hash 布局（旧版本装机）的文件路径
+            // 与新路径不同，单独兜底删除一次以免残留。
             if !row.avatar_local_path.is_empty() && row.avatar_local_path != dest_str {
                 let _ = std::fs::remove_file(&row.avatar_local_path);
             }
@@ -284,26 +249,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_path_layered_by_target_uid_with_sha16() {
+    fn cache_path_keyed_by_target_uid() {
         let root = Path::new("/data/users/1001");
-        let p = avatar_cache_path(root, 42, "https://cdn.example.com/a/b/c.webp?sig=1");
-        let s = p.to_string_lossy();
-        assert!(s.starts_with("/data/users/1001/avatars/u/42/"));
-        assert!(s.ends_with(".webp"));
-        // 文件名 = sha16 + ext
-        let name = p.file_stem().unwrap().to_string_lossy();
-        assert_eq!(name.len(), 16);
-        // 同 URL 稳定
+        let p = avatar_cache_path(root, 42);
         assert_eq!(
-            p,
-            avatar_cache_path(root, 42, "https://cdn.example.com/a/b/c.webp?sig=1")
+            p.to_string_lossy(),
+            "/data/users/1001/avatars/users/42.img"
         );
-        // 不同 URL / 不同目标 uid 都不同文件
-        assert_ne!(p, avatar_cache_path(root, 42, "https://cdn.example.com/a/b/d.webp"));
-        assert_ne!(
-            p,
-            avatar_cache_path(root, 43, "https://cdn.example.com/a/b/c.webp?sig=1")
-        );
+        // 路径只由 uid 决定，与 URL 无关 ⇒ 换头像原地覆盖同一文件；不同 uid 不同文件。
+        assert_eq!(p, avatar_cache_path(root, 42));
+        assert_ne!(p, avatar_cache_path(root, 43));
     }
 
     #[test]
@@ -344,14 +299,5 @@ mod tests {
         std::fs::write(&bad, b"definitely not an image").unwrap();
         assert!(prepare_avatar_image_sync(&bad).is_err());
         let _ = std::fs::remove_file(&bad);
-    }
-
-    #[test]
-    fn infer_ext_falls_back_to_img() {
-        assert_eq!(infer_ext("https://x/y/avatar.PNG"), "png");
-        assert_eq!(infer_ext("https://x/y/avatar"), "img");
-        assert_eq!(infer_ext("https://x/y/.hidden"), "img");
-        assert_eq!(infer_ext("https://x/file/get/12345"), "img");
-        assert_eq!(infer_ext("https://x/a.verylongext"), "img");
     }
 }
