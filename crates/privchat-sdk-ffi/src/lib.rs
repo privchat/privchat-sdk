@@ -4556,6 +4556,22 @@ impl PrivchatClient {
             },
         )
         .await?;
+        // 立即落本地 group 行:建群后 entity sync 到达前,channel 名解析的
+        // group 表回退才有数据(否则时间窗内群名只能落到兜底)。
+        let now = now_millis();
+        let _ = self
+            .inner
+            .upsert_group(SdkUpsertGroupInput {
+                group_id: resp.group_id,
+                name: Some(resp.name.clone()),
+                avatar: String::new(),
+                owner_id: Some(resp.creator_id),
+                is_dismissed: false,
+                created_at: now,
+                version: now.max(0),
+                updated_at: now,
+            })
+            .await;
         Ok(GroupCreateResult {
             group_id: resp.group_id,
             name: resp.name,

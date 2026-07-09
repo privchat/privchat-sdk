@@ -1750,7 +1750,7 @@ impl LocalStore {
                                 LIMIT 3
                             )
                         ),
-                        CAST(c.channel_id AS TEXT)
+                        ''
                     )
                     ELSE c.channel_name
                 END AS resolved_channel_name,
@@ -1910,7 +1910,7 @@ impl LocalStore {
                                     LIMIT 3
                                 )
                             ),
-                            CAST(c.channel_id AS TEXT)
+                            ''
                         )
                         ELSE c.channel_name
                     END AS resolved_channel_name,
