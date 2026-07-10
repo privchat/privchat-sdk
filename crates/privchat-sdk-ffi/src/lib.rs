@@ -902,11 +902,71 @@ pub struct MessageHistoryItemView {
     pub content: String,
     pub message_type: String,
     pub timestamp: u64,
+    /// per-channel pts（server message_seq）；本地排序权威 = (pts, server_message_id)
+    pub message_seq: Option<i64>,
     pub reply_to_message_id: Option<u64>,
     pub metadata_json: Option<String>,
     pub revoked: bool,
     pub revoked_at: Option<i64>,
     pub revoked_by: Option<u64>,
+}
+
+/// 搜索命中高亮区间（相对 snippet 的字符偏移 [start, end)）
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SearchHighlightRangeView {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// 云端历史搜索命中（snippet 投影——UI 展示用，**不落本地 message 表**；
+/// 点击后调 get_messages_around 拿完整上下文，spec §4/§5/§6 边界）
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SearchHistoryHitView {
+    pub channel_id: u64,
+    pub message_id: u64,
+    pub sender_user_id: u64,
+    /// 毫秒时间戳
+    pub created_at: i64,
+    pub message_type: String,
+    pub snippet: String,
+    pub highlight_ranges: Vec<SearchHighlightRangeView>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SearchHistoryView {
+    pub hits: Vec<SearchHistoryHitView>,
+    /// keyset 游标；None = 到底。原样回传给下一页请求
+    pub next_cursor: Option<String>,
+}
+
+/// jump-to-message 上下文（完整消息，SDK 已回填本地库；UI 应从本地重查渲染并定位 anchor）
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessagesAroundView {
+    pub before_messages: Vec<MessageHistoryItemView>,
+    pub anchor_message: MessageHistoryItemView,
+    pub after_messages: Vec<MessageHistoryItemView>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+}
+
+/// 协议 MessageHistoryItem → FFI view（get/around 共用，防字段漂移）
+fn history_item_view(
+    m: privchat_protocol::rpc::message::history::MessageHistoryItem,
+) -> MessageHistoryItemView {
+    MessageHistoryItemView {
+        message_id: m.message_id,
+        channel_id: m.channel_id,
+        sender_id: m.sender_id,
+        content: m.content,
+        message_type: m.message_type,
+        timestamp: m.timestamp,
+        message_seq: m.message_seq,
+        reply_to_message_id: m.reply_to_message_id,
+        metadata_json: m.metadata.map(|v| serde_json::Value::Object(v).to_string()),
+        revoked: m.revoked,
+        revoked_at: m.revoked_at,
+        revoked_by: m.revoked_by,
+    }
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -5420,40 +5480,82 @@ impl PrivchatClient {
     pub async fn get_messages_remote(
         &self,
         channel_id: u64,
+        channel_type: i32,
         before_server_message_id: Option<u64>,
         limit: Option<u32>,
     ) -> Result<MessageHistoryView, PrivchatFfiError> {
-        let user_id = self.require_current_user_id().await?;
-        let resp: MessageHistoryResponse = rpc_call_typed(
-            &self.inner,
-            routes::message_history::GET,
-            &MessageHistoryGetRequest {
-                user_id,
-                channel_id,
-                before_server_message_id,
-                limit,
-            },
-        )
-        .await?;
+        // SDK-HISTORY-2（spec §6）：get 拉回的完整消息必须回填本地库（带真实 pts），
+        // 此前这里远程直取不落库。回填后调用方应从本地库重查渲染。
+        let resp = self
+            .inner
+            .fetch_channel_history(channel_id, channel_type, before_server_message_id, limit)
+            .await
+            .map_err(PrivchatFfiError::from)?;
         Ok(MessageHistoryView {
-            messages: resp
-                .messages
+            messages: resp.messages.into_iter().map(history_item_view).collect(),
+            has_more: resp.has_more,
+        })
+    }
+
+    /// 云端历史搜索（spec §4）。channel_id: Some=CHANNEL scope / None=GLOBAL。
+    /// 命中是 snippet 投影不落本地库；服务端限频 300ms/user——UI 必须 debounce
+    /// 300–500ms、忽略过期 in-flight 结果、query<2 字符不发起远程。
+    pub async fn search_message_history(
+        &self,
+        query: String,
+        channel_id: Option<u64>,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<SearchHistoryView, PrivchatFfiError> {
+        let resp = self
+            .inner
+            .search_message_history(&query, channel_id, cursor, limit)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(SearchHistoryView {
+            hits: resp
+                .hits
                 .into_iter()
-                .map(|m| MessageHistoryItemView {
-                    message_id: m.message_id,
-                    channel_id: m.channel_id,
-                    sender_id: m.sender_id,
-                    content: m.content,
-                    message_type: m.message_type,
-                    timestamp: m.timestamp,
-                    reply_to_message_id: m.reply_to_message_id,
-                    metadata_json: m.metadata.map(|v| serde_json::Value::Object(v).to_string()),
-                    revoked: m.revoked,
-                    revoked_at: m.revoked_at,
-                    revoked_by: m.revoked_by,
+                .map(|h| SearchHistoryHitView {
+                    channel_id: h.channel_id,
+                    message_id: h.message_id,
+                    sender_user_id: h.sender_user_id,
+                    created_at: h.created_at,
+                    message_type: h.message_type,
+                    snippet: h.snippet,
+                    highlight_ranges: h
+                        .highlight_ranges
+                        .into_iter()
+                        .map(|(start, end)| SearchHighlightRangeView { start, end })
+                        .collect(),
                 })
                 .collect(),
-            has_more: resp.has_more,
+            next_cursor: resp.next_cursor,
+        })
+    }
+
+    /// jump-to-message 上下文（spec §5）：before/anchor/after 已回填本地库，
+    /// UI 从本地重查渲染并定位/高亮 anchor。anchor 不可见（不存在/撤回/删除/无权限）
+    /// 时服务端统一 not_found。
+    pub async fn get_messages_around(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        message_id: u64,
+        before_limit: Option<u32>,
+        after_limit: Option<u32>,
+    ) -> Result<MessagesAroundView, PrivchatFfiError> {
+        let resp = self
+            .inner
+            .fetch_messages_around(channel_id, channel_type, message_id, before_limit, after_limit)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(MessagesAroundView {
+            before_messages: resp.before_messages.into_iter().map(history_item_view).collect(),
+            anchor_message: history_item_view(resp.anchor_message),
+            after_messages: resp.after_messages.into_iter().map(history_item_view).collect(),
+            has_more_before: resp.has_more_before,
+            has_more_after: resp.has_more_after,
         })
     }
 
@@ -7235,9 +7337,10 @@ impl PrivchatClient {
         &self,
         message_id: u64,
         server_message_id: u64,
+        message_seq: u32,
     ) -> Result<(), PrivchatFfiError> {
         self.inner
-            .mark_message_sent(message_id, server_message_id)
+            .mark_message_sent(message_id, server_message_id, message_seq)
             .await
             .map_err(PrivchatFfiError::from)
     }

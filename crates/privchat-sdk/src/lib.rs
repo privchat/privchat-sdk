@@ -39,7 +39,11 @@ use privchat_protocol::rpc::file::upload::{
     FileGetUrlRequest, FileGetUrlResponse, FileRequestUploadTokenRequest,
     FileRequestUploadTokenResponse,
 };
-use privchat_protocol::rpc::message::history::{MessageHistoryGetRequest, MessageHistoryResponse};
+use privchat_protocol::rpc::message::history::{
+    MessageHistoryAroundRequest, MessageHistoryAroundResponse, MessageHistoryGetRequest,
+    MessageHistoryItem, MessageHistoryResponse, MessageHistorySearchRequest,
+    MessageHistorySearchResponse,
+};
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
     ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload,
@@ -1967,7 +1971,26 @@ enum Command {
     MarkMessageSent {
         message_id: u64,
         server_message_id: u64,
+        message_seq: u32,
         resp: oneshot::Sender<Result<()>>,
+    },
+    /// SDK-HISTORY-2：回填式拉取频道历史（RPC message/history/get → 本地 upsert 带 pts）。
+    /// 与 hydrate 的差别：不更新 channel last_message（向前翻页不能改会话预览）。
+    FetchChannelHistory {
+        channel_id: u64,
+        channel_type: i32,
+        before_server_message_id: Option<u64>,
+        limit: Option<u32>,
+        resp: oneshot::Sender<Result<MessageHistoryResponse>>,
+    },
+    /// spec §5：jump-to-message 上下文（RPC message/history/around → 全部回填本地）。
+    FetchMessagesAround {
+        channel_id: u64,
+        channel_type: i32,
+        message_id: u64,
+        before_limit: Option<u32>,
+        after_limit: Option<u32>,
+        resp: oneshot::Sender<Result<MessageHistoryAroundResponse>>,
     },
     UpdateMessageStatus {
         message_id: u64,
@@ -5465,7 +5488,7 @@ impl State {
                 Ok(resp) => {
                     if let Err(err) = self
                         .storage
-                        .mark_message_sent(message_id, resp.server_message_id)
+                        .mark_message_sent(message_id, resp.server_message_id, resp.message_seq)
                         .await
                     {
                         // Server has accepted this message; ack queue item to avoid duplicate sends.
@@ -5620,7 +5643,7 @@ impl State {
                 Ok(resp) => {
                     if let Err(err) = self
                         .storage
-                        .mark_message_sent(message_id, resp.server_message_id)
+                        .mark_message_sent(message_id, resp.server_message_id, resp.message_seq)
                         .await
                     {
                         // Server has accepted this message; ack queue item to avoid duplicate sends.
@@ -6626,6 +6649,113 @@ impl State {
         Ok(resp.current_pts)
     }
 
+    /// wire message_type 字符串 → 本地 i32（history/around/hydrate 共用，防三处漂移）。
+    fn wire_message_type_to_i32(t: &str) -> i32 {
+        let ct = match t {
+            "image" => ContentMessageType::Image,
+            "voice" => ContentMessageType::Voice,
+            "video" => ContentMessageType::Video,
+            // 注：普通音频文件（mp3/wav/...）作为 File 消息发送，不再有独立 Audio 类型
+            "file" | "audio" => ContentMessageType::File,
+            // RP-12：资金卡片（服务端注入）历史/冷同步必须保留类型，否则落成 Text→渲染原始 JSON
+            "red_packet" => ContentMessageType::RedPacket,
+            "money_transfer" => ContentMessageType::MoneyTransfer,
+            "system" => ContentMessageType::System,
+            _ => ContentMessageType::Text,
+        };
+        i32::try_from(ct.as_u32()).unwrap_or(0)
+    }
+
+    /// 单条历史消息落库（SDK-HISTORY-2 核心）：status=2 + 真实 pts(=message_seq)。
+    /// get/around 回填共用；upsert 的乱序回退 guard 由 order_seq 保证幂等。
+    async fn store_history_item(
+        &mut self,
+        item: &MessageHistoryItem,
+        channel_type: i32,
+    ) -> Result<u64> {
+        let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
+        let message_type = Self::wire_message_type_to_i32(&item.message_type);
+        let mime_type = Self::extract_mime_type_from_json(&item.content, "");
+        let pts = item.message_seq.unwrap_or(0);
+        Ok(self
+            .storage
+            .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                server_message_id: item.message_id,
+                local_message_id: 0,
+                channel_id: item.channel_id,
+                channel_type,
+                timestamp: timestamp_ms,
+                from_uid: item.sender_id,
+                message_type,
+                content: item.content.clone(),
+                status: 2,
+                pts,
+                setting: 0,
+                order_seq: pts,
+                searchable_word: String::new(),
+                extra: String::new(),
+                mime_type,
+            })
+            .await?
+            .message_id)
+    }
+
+    /// 回填式拉取频道历史：RPC → 逐条落库 → 返回响应（spec §6：get 结果必须回填，
+    /// UI 随后从本地库重查渲染）。不更新 last_message（向前翻页不改会话预览）。
+    async fn fetch_and_store_channel_history(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        before_server_message_id: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<MessageHistoryResponse> {
+        let req = MessageHistoryGetRequest {
+            user_id: 0,
+            channel_id,
+            before_server_message_id,
+            limit,
+        };
+        let resp: MessageHistoryResponse = self
+            .rpc_call_typed(routes::message_history::GET, &req)
+            .await?;
+        let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        for item in &resp.messages {
+            self.store_history_item(item, normalized_channel_type).await?;
+        }
+        Ok(resp)
+    }
+
+    /// jump-to-message 上下文：RPC around → before/anchor/after 全部回填 → 返回响应。
+    /// search 命中（snippet 投影）不落库；点击后走本方法拿完整消息（spec §4/§5/§6 边界）。
+    async fn fetch_and_store_messages_around(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        message_id: u64,
+        before_limit: Option<u32>,
+        after_limit: Option<u32>,
+    ) -> Result<MessageHistoryAroundResponse> {
+        let req = MessageHistoryAroundRequest {
+            channel_id,
+            message_id,
+            before_limit,
+            after_limit,
+        };
+        let resp: MessageHistoryAroundResponse = self
+            .rpc_call_typed(routes::message_history::AROUND, &req)
+            .await?;
+        let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        for item in resp
+            .before_messages
+            .iter()
+            .chain(std::iter::once(&resp.anchor_message))
+            .chain(resp.after_messages.iter())
+        {
+            self.store_history_item(item, normalized_channel_type).await?;
+        }
+        Ok(resp)
+    }
+
     async fn hydrate_channel_messages_from_history(
         &mut self,
         channel_id: u64,
@@ -6649,18 +6779,7 @@ impl State {
         let mut applied = 0usize;
         for item in resp.messages {
             let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
-            let message_type = match item.message_type.as_str() {
-                "image" => i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(0),
-                "voice" => i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(0),
-                "video" => i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(0),
-                // 注：普通音频文件（mp3/wav/...）作为 File 消息发送，不再有独立 Audio 类型
-                "file" | "audio" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
-                // RP-12：资金卡片（服务端注入）同步路径也要保留类型，否则历史/冷同步落成 Text→客户端渲染原始 JSON。
-                "red_packet" => i32::try_from(ContentMessageType::RedPacket.as_u32()).unwrap_or(0),
-                "money_transfer" => i32::try_from(ContentMessageType::MoneyTransfer.as_u32()).unwrap_or(0),
-                "system" => i32::try_from(ContentMessageType::System.as_u32()).unwrap_or(0),
-                _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
-            };
+            let message_type = Self::wire_message_type_to_i32(&item.message_type);
             let mime_type = Self::extract_mime_type_from_json(&item.content, "");
             let message_id = self
                 .storage
@@ -6674,9 +6793,11 @@ impl State {
                     message_type,
                     content: item.content.clone(),
                     status: 2,
-                    pts: 0,
+                    // SDK-HISTORY-2：server history 响应带 message_seq(=per-channel pts)，
+                    // 回填真实值（此前落 0 导致排序权威失效）；老 server 缺字段兜底 0。
+                    pts: item.message_seq.unwrap_or(0),
                     setting: 0,
-                    order_seq: 0,
+                    order_seq: item.message_seq.unwrap_or(0),
                     searchable_word: String::new(),
                     extra: String::new(),
                     mime_type,
@@ -7523,13 +7644,7 @@ impl State {
 
             for item in resp.messages {
                 let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
-                let message_type = match item.message_type.as_str() {
-                    "image" => i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(0),
-                    "voice" => i32::try_from(ContentMessageType::Voice.as_u32()).unwrap_or(0),
-                    "video" => i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(0),
-                    "file" | "audio" => i32::try_from(ContentMessageType::File.as_u32()).unwrap_or(0),
-                    _ => i32::try_from(ContentMessageType::Text.as_u32()).unwrap_or(0),
-                };
+                let message_type = Self::wire_message_type_to_i32(&item.message_type);
                 let mime_type = Self::extract_mime_type_from_json(&item.content, "");
                 let message_id = self
                     .storage
@@ -7543,9 +7658,10 @@ impl State {
                         message_type,
                         content: item.content.clone(),
                         status: 2,
-                        pts: 0,
+                        // SDK-HISTORY-2：同上，bootstrap 内联 hydrate 也回填真实 pts。
+                        pts: item.message_seq.unwrap_or(0),
                         setting: 0,
-                        order_seq: 0,
+                        order_seq: item.message_seq.unwrap_or(0),
                         searchable_word: String::new(),
                         extra: String::new(),
                         mime_type,
@@ -9274,6 +9390,18 @@ impl State {
     ) -> Result<()> {
         let existing = self.storage.get_channel_by_id(channel_id).await?;
         let unread_before = existing.as_ref().map(|c| c.unread_count).unwrap_or(0);
+        let prev_last_local_message_id = existing
+            .as_ref()
+            .map(|c| c.last_local_message_id)
+            .unwrap_or(0);
+        let prev_last_msg_content = existing
+            .as_ref()
+            .map(|c| c.last_msg_content.clone())
+            .unwrap_or_default();
+        let prev_last_msg_timestamp = existing
+            .as_ref()
+            .map(|c| c.last_msg_timestamp)
+            .unwrap_or(0);
         let (channel_name, channel_remark, avatar, top, mute, unread_count) =
             if let Some(c) = existing {
                 (
@@ -9329,6 +9457,45 @@ impl State {
                 from_uid
             );
         }
+        // 预览反乱序守卫（MESSAGE_HISTORY spec §2.5）：预览选择必须与显示排序同构
+        // （pending 最新端；已确认按 pts）。到达顺序 ≠ pts 顺序（例：登录通知 pts=2 先经
+        // push 到达，欢迎消息 pts=1 后经 sync 补齐——此前预览被"到达序"覆盖成旧消息）。
+        // 仅当新行不older于当前预览行时才覆盖预览字段；unread 计数不受影响照常更新。
+        let preview_should_update = if prev_last_local_message_id == 0
+            || prev_last_local_message_id == message_id
+        {
+            true
+        } else {
+            let new_row = self.storage.get_message_by_id(message_id).await.ok().flatten();
+            match new_row {
+                None => true, // 新行尚未落库（调用时序差异）：保守覆盖，下次调用自愈
+                Some(nr) => {
+                    if nr.server_message_id.unwrap_or(0) == 0 {
+                        true // pending 自发消息 = 时间线最新端
+                    } else {
+                        match self
+                            .storage
+                            .get_message_by_id(prev_last_local_message_id)
+                            .await
+                            .ok()
+                            .flatten()
+                        {
+                            None => true, // 旧预览行已不存在（被清理），覆盖
+                            Some(or) => {
+                                if or.server_message_id.unwrap_or(0) == 0 {
+                                    // 旧预览是 pending：收到的 server 消息按时间更新，允许覆盖
+                                    // （pending ack 回填 pts 后由后续更新自然归位）
+                                    true
+                                } else {
+                                    nr.pts.unwrap_or(0) >= or.pts.unwrap_or(0)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
         let existing_version = self
             .storage
             .get_channel_by_id(channel_id)
@@ -9345,9 +9512,21 @@ impl State {
                 unread_count,
                 top,
                 mute,
-                last_msg_timestamp: timestamp_ms,
-                last_local_message_id: message_id,
-                last_msg_content: content.to_string(),
+                last_msg_timestamp: if preview_should_update {
+                    timestamp_ms
+                } else {
+                    prev_last_msg_timestamp
+                },
+                last_local_message_id: if preview_should_update {
+                    message_id
+                } else {
+                    prev_last_local_message_id
+                },
+                last_msg_content: if preview_should_update {
+                    content.to_string()
+                } else {
+                    prev_last_msg_content.clone()
+                },
                 // Timeline preview updates must not mint a synthetic entity version.
                 // Keep the existing channel entity version so later sync_entities(channel)
                 // payloads can still apply top/mute/name changes from the server.
@@ -10937,6 +11116,7 @@ impl PrivchatSdk {
                     Command::MarkMessageSent {
                         message_id,
                         server_message_id,
+                        message_seq,
                         resp,
                     } => {
                         let message_ctx = match state.current_uid_required() {
@@ -10946,7 +11126,7 @@ impl PrivchatSdk {
                         let result = match state.current_uid_required() {
                             Ok(_) => state
                                 .storage
-                                .mark_message_sent(message_id, server_message_id)
+                                .mark_message_sent(message_id, server_message_id, message_seq)
                                 .await,
                             Err(e) => Err(e),
                         };
@@ -10968,6 +11148,56 @@ impl PrivchatSdk {
                                     status: 2,
                                     server_message_id: Some(server_message_id),
                                 },
+                            );
+                        }
+                        let _ = resp.send(result);
+                    }
+                    Command::FetchChannelHistory {
+                        channel_id,
+                        channel_type,
+                        before_server_message_id,
+                        limit,
+                        resp,
+                    } => {
+                        let result = state
+                            .fetch_and_store_channel_history(
+                                channel_id,
+                                channel_type,
+                                before_server_message_id,
+                                limit,
+                            )
+                            .await;
+                        if result.is_ok() {
+                            state.invalidate_channel_cache_with_reason(
+                                channel_id,
+                                channel_type,
+                                "fetch_channel_history",
+                            );
+                        }
+                        let _ = resp.send(result);
+                    }
+                    Command::FetchMessagesAround {
+                        channel_id,
+                        channel_type,
+                        message_id,
+                        before_limit,
+                        after_limit,
+                        resp,
+                    } => {
+                        let result = state
+                            .fetch_and_store_messages_around(
+                                channel_id,
+                                channel_type,
+                                message_id,
+                                before_limit,
+                                after_limit,
+                            )
+                            .await;
+                        if result.is_ok() {
+                            state.invalidate_channel_cache_with_reason(
+                                channel_id,
+                                channel_type,
+                                "fetch_messages_around",
                             );
                         }
                         let _ = resp.send(result);
@@ -13166,18 +13396,100 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn mark_message_sent(&self, message_id: u64, server_message_id: u64) -> Result<()> {
+    pub async fn mark_message_sent(
+        &self,
+        message_id: u64,
+        server_message_id: u64,
+        message_seq: u32,
+    ) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::MarkMessageSent {
                 message_id,
                 server_message_id,
+                message_seq,
                 resp: resp_tx,
             })
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 回填式拉取频道历史（spec §3/§6）：结果已写入本地库，UI 应随后从本地重查渲染。
+    pub async fn fetch_channel_history(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        before_server_message_id: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<privchat_protocol::rpc::message::history::MessageHistoryResponse> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::FetchChannelHistory {
+                channel_id,
+                channel_type,
+                before_server_message_id,
+                limit,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// jump-to-message 上下文（spec §5）：before/anchor/after 完整消息已回填本地库。
+    pub async fn fetch_messages_around(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        message_id: u64,
+        before_limit: Option<u32>,
+        after_limit: Option<u32>,
+    ) -> Result<privchat_protocol::rpc::message::history::MessageHistoryAroundResponse> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::FetchMessagesAround {
+                channel_id,
+                channel_type,
+                message_id,
+                before_limit,
+                after_limit,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 云端历史搜索（spec §4）。scope 由 channel_id 推导：Some=CHANNEL / None=GLOBAL。
+    /// 命中是 snippet 投影，**不落本地库**；点击命中后调 fetch_messages_around。
+    /// 服务端限频 300ms/user——调用方（UI）应 debounce 300–500ms 且忽略过期结果。
+    pub async fn search_message_history(
+        &self,
+        query: &str,
+        channel_id: Option<u64>,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<privchat_protocol::rpc::message::history::MessageHistorySearchResponse> {
+        let req = privchat_protocol::rpc::message::history::MessageHistorySearchRequest {
+            query: query.to_string(),
+            scope: if channel_id.is_some() {
+                "CHANNEL".to_string()
+            } else {
+                "GLOBAL".to_string()
+            },
+            channel_id,
+            cursor,
+            limit,
+        };
+        self.rpc_call_typed(
+            privchat_protocol::rpc::routes::message_history::SEARCH,
+            &req,
+        )
+        .await
     }
 
     pub async fn update_message_status(&self, message_id: u64, status: i32) -> Result<()> {
