@@ -1501,6 +1501,35 @@ impl LocalStore {
         self.get_message_by_id(uid, message_id as u64)
     }
 
+    /// message JOIN message_extra 标准 19 列 → StoredMessage（list_messages /
+    /// list_messages_around 共用；列序固定，新增查询照此 SELECT 列序）。
+    fn stored_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+        Ok(StoredMessage {
+            message_id: row.get::<_, i64>(0)? as u64,
+            server_message_id: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+            local_message_id: row
+                .get::<_, Option<i64>>(11)?
+                .filter(|&v| v > 0)
+                .map(|v| v as u64),
+            channel_id: row.get::<_, i64>(2)? as u64,
+            channel_type: row.get::<_, i32>(3)?,
+            from_uid: row.get::<_, i64>(4)? as u64,
+            message_type: row.get::<_, i32>(5)?,
+            content: row.get::<_, String>(6)?,
+            status: row.get::<_, i32>(7)?,
+            created_at: row.get::<_, i64>(8)?,
+            updated_at: row.get::<_, i64>(9)?,
+            extra: row.get::<_, String>(10)?,
+            revoked: row.get::<_, i32>(12)? != 0,
+            revoked_by: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+            mime_type: row.get::<_, Option<String>>(14)?,
+            media_downloaded: row.get::<_, i32>(15).unwrap_or(0) != 0,
+            thumb_status: row.get::<_, i32>(16).unwrap_or(0),
+            delivered: row.get::<_, i32>(17).unwrap_or(0) != 0,
+            pts: row.get::<_, Option<i64>>(18)?.filter(|&v| v > 0).map(|v| v as u64),
+        })
+    }
+
     pub fn list_messages(
         &self,
         uid: &str,
@@ -1533,32 +1562,7 @@ impl LocalStore {
         let rows = stmt
             .query_map(
                 params![channel_id as i64, channel_type, limit as i64, offset as i64],
-                |row| {
-                    Ok(StoredMessage {
-                        message_id: row.get::<_, i64>(0)? as u64,
-                        server_message_id: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                        local_message_id: row
-                            .get::<_, Option<i64>>(11)?
-                            .filter(|&v| v > 0)
-                            .map(|v| v as u64),
-                        channel_id: row.get::<_, i64>(2)? as u64,
-                        channel_type: row.get::<_, i32>(3)?,
-                        from_uid: row.get::<_, i64>(4)? as u64,
-                        message_type: row.get::<_, i32>(5)?,
-                        content: row.get::<_, String>(6)?,
-                        status: row.get::<_, i32>(7)?,
-                        created_at: row.get::<_, i64>(8)?,
-                        updated_at: row.get::<_, i64>(9)?,
-                        extra: row.get::<_, String>(10)?,
-                        revoked: row.get::<_, i32>(12)? != 0,
-                        revoked_by: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
-                        mime_type: row.get::<_, Option<String>>(14)?,
-                        media_downloaded: row.get::<_, i32>(15).unwrap_or(0) != 0,
-                        thumb_status: row.get::<_, i32>(16).unwrap_or(0),
-                        delivered: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                        pts: row.get::<_, Option<i64>>(18)?.filter(|&v| v > 0).map(|v| v as u64),
-                    })
-                },
+                Self::stored_message_from_row,
             )
             .map_err(|e| Error::Storage(format!("query list messages: {e}")))?;
 
@@ -1570,6 +1574,95 @@ impl LocalStore {
     }
 
     /// 更新消息的缩略图状态：0=missing, 1=ready, 2=failed
+    /// 以 anchor（server_message_id）为轴按**显示排序**读取本地上下文窗口
+    /// （MESSAGE_HISTORY spec §5/§2.5：around 回填后 UI 从本地重查渲染的原语）。
+    /// 返回 [before...(ASC), anchor, after...(ASC)] 拼好的升序窗口；
+    /// anchor 本地不存在时返回空（调用方应先经 fetch_messages_around 回填）。
+    pub fn list_messages_around(
+        &self,
+        uid: &str,
+        channel_id: u64,
+        channel_type: i32,
+        anchor_server_message_id: u64,
+        before_limit: usize,
+        after_limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let conn = self.conn_for_user(uid)?;
+        // anchor 的排序键（显示排序元组：pending 组, pts, server_message_id, id）
+        let anchor_key: Option<(i64, i64, i64, i64)> = conn
+            .query_row(
+                "SELECT
+                    CASE WHEN COALESCE(server_message_id, 0) <= 0 THEN 1 ELSE 0 END,
+                    COALESCE(pts, 0), COALESCE(server_message_id, 0), id
+                 FROM message
+                 WHERE channel_id = ?1 AND channel_type = ?2 AND server_message_id = ?3
+                 LIMIT 1",
+                params![channel_id as i64, channel_type, anchor_server_message_id as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("around anchor lookup: {e}")))?;
+        let Some((a1, a2, a3, a4)) = anchor_key else {
+            return Ok(Vec::new());
+        };
+
+        // 显示排序键的严格元组比较（SQLite 无原生元组比较，手写嵌套）
+        const KEY_LT: &str = "(k1 < ?4 OR (k1 = ?4 AND (k2 < ?5 OR (k2 = ?5 AND (k3 < ?6 OR (k3 = ?6 AND k4 < ?7))))))";
+        const KEY_GT: &str = "(k1 > ?4 OR (k1 = ?4 AND (k2 > ?5 OR (k2 = ?5 AND (k3 > ?6 OR (k3 = ?6 AND k4 > ?7))))))";
+        let base_select = "SELECT m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
+                    m.content, m.status, m.created_at, m.updated_at, m.extra, m.local_message_id,
+                    COALESCE(me.revoke, 0), me.revoker,
+                    m.mime_type, m.media_downloaded, m.thumb_status,
+                    COALESCE(me.delivered, 0),
+                    m.pts,
+                    CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END AS k1,
+                    COALESCE(m.pts, 0) AS k2, COALESCE(m.server_message_id, 0) AS k3, m.id AS k4
+             FROM message m
+             LEFT JOIN message_extra me ON me.message_id = m.id
+             WHERE m.channel_id = ?1 AND m.channel_type = ?2 AND ?3 >= 0";
+
+        let read_rows = |sql: &str, limit: usize| -> Result<Vec<StoredMessage>> {
+            let mut stmt = conn
+                .prepare(sql)
+                .map_err(|e| Error::Storage(format!("around prepare: {e}")))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        channel_id as i64,
+                        channel_type,
+                        0i64,
+                        a1,
+                        a2,
+                        a3,
+                        a4,
+                        limit as i64
+                    ],
+                    Self::stored_message_from_row,
+                )
+                .map_err(|e| Error::Storage(format!("around query: {e}")))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Storage(format!("around collect: {e}")))?;
+            Ok(rows)
+        };
+
+        // before：更旧的一段（DESC 取 N 后反转为 ASC）
+        let before_sql = format!(
+            "SELECT * FROM ({base_select} AND {KEY_LT}
+              ORDER BY k1 DESC, k2 DESC, k3 DESC, k4 DESC LIMIT ?8)
+             ORDER BY k1 ASC, k2 ASC, k3 ASC, k4 ASC"
+        );
+        // anchor 本行
+        let anchor_sql = format!("{base_select} AND m.server_message_id = ?6 LIMIT ?8");
+        // after：更新的一段（ASC 直取）
+        let after_sql =
+            format!("{base_select} AND {KEY_GT} ORDER BY k1 ASC, k2 ASC, k3 ASC, k4 ASC LIMIT ?8");
+
+        let mut out = read_rows(&before_sql, before_limit)?;
+        out.extend(read_rows(&anchor_sql, 1)?);
+        out.extend(read_rows(&after_sql, after_limit)?);
+        Ok(out)
+    }
+
     pub fn update_thumb_status(
         &self,
         uid: &str,
@@ -4761,6 +4854,67 @@ mod tests {
     }
 
     #[test]
+    /// spec §5：本地 around 窗口 = 显示排序下 anchor 前后各 N 条（乱序落库不影响窗口）。
+    #[test]
+    fn list_messages_around_returns_sorted_window() {
+        let store = test_store();
+        let uid = "10013";
+        let channel_id = 9501;
+        let channel_type = 1;
+
+        // 乱序落库 pts 1..=7
+        for pts in [4_i64, 1, 6, 2, 7, 3, 5] {
+            store
+                .upsert_remote_message_with_result(
+                    uid,
+                    &UpsertRemoteMessageInput {
+                        server_message_id: 99500 + pts as u64,
+                        local_message_id: 0,
+                        channel_id,
+                        channel_type,
+                        timestamp: 1_700_000_100_000 + pts,
+                        from_uid: 20001,
+                        message_type: 1,
+                        content: format!("{{\"content\":\"w{}\"}}", pts),
+                        status: 2,
+                        pts,
+                        setting: 0,
+                        order_seq: pts,
+                        searchable_word: String::new(),
+                        extra: String::new(),
+                        mime_type: None,
+                    },
+                )
+                .expect("upsert");
+        }
+
+        // anchor=pts4，before 2 / after 2 → [2,3,4,5,6]
+        let win = store
+            .list_messages_around(uid, channel_id, channel_type, 99504, 2, 2)
+            .expect("around window");
+        let ptss: Vec<i64> = win
+            .iter()
+            .map(|m| m.pts.map(|p| p as i64).unwrap_or(0))
+            .collect();
+        assert_eq!(ptss, vec![2, 3, 4, 5, 6]);
+
+        // 边界：anchor=pts1 无 before
+        let win = store
+            .list_messages_around(uid, channel_id, channel_type, 99501, 2, 2)
+            .expect("head window");
+        let ptss: Vec<i64> = win
+            .iter()
+            .map(|m| m.pts.map(|p| p as i64).unwrap_or(0))
+            .collect();
+        assert_eq!(ptss, vec![1, 2, 3]);
+
+        // anchor 本地不存在 → 空
+        let win = store
+            .list_messages_around(uid, channel_id, channel_type, 99599, 2, 2)
+            .expect("missing anchor");
+        assert!(win.is_empty());
+    }
+
     /// SDK-HISTORY-3（MESSAGE_HISTORY spec §2.5）：显示排序权威 = (pts, server_message_id)，
     /// pending（无 server_message_id）按本地序排在最新端；乱序落库不影响显示顺序。
     #[test]

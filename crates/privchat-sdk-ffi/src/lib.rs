@@ -7248,6 +7248,30 @@ impl PrivchatClient {
         Ok(out.into_iter().map(map_stored_message).collect())
     }
 
+    /// 以 anchor 为轴的本地上下文窗口（显示排序；spec §5 跳转渲染原语）。
+    /// 通常先调 get_messages_around 完成服务端回填，再用本方法从本地读窗口渲染。
+    pub async fn list_local_messages_around(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        anchor_server_message_id: u64,
+        before_limit: u64,
+        after_limit: u64,
+    ) -> Result<Vec<StoredMessage>, PrivchatFfiError> {
+        let out = self
+            .inner
+            .list_messages_around(
+                channel_id,
+                channel_type,
+                anchor_server_message_id,
+                before_limit as usize,
+                after_limit as usize,
+            )
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(out.into_iter().map(map_stored_message).collect())
+    }
+
     pub async fn get_messages(
         &self,
         channel_id: u64,

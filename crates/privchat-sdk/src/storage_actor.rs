@@ -142,6 +142,14 @@ enum StorageCmd {
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
     },
+    ListMessagesAround {
+        channel_id: u64,
+        channel_type: i32,
+        anchor_server_message_id: u64,
+        before_limit: usize,
+        after_limit: usize,
+        resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
+    },
     MaxMessagePts {
         channel_id: u64,
         channel_type: i32,
@@ -784,6 +792,29 @@ impl StorageHandle {
                 channel_type,
                 limit,
                 offset,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// 以 anchor 为轴的本地上下文窗口（显示排序，spec §5 跳转渲染原语）
+    pub async fn list_messages_around(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        anchor_server_message_id: u64,
+        before_limit: usize,
+        after_limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::ListMessagesAround {
+                channel_id,
+                channel_type,
+                anchor_server_message_id,
+                before_limit,
+                after_limit,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1923,6 +1954,23 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 channel_type,
                 limit,
                 offset
+            ));
+        }
+        StorageCmd::ListMessagesAround {
+            channel_id,
+            channel_type,
+            anchor_server_message_id,
+            before_limit,
+            after_limit,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_messages_around(
+                &uid,
+                channel_id,
+                channel_type,
+                anchor_server_message_id,
+                before_limit,
+                after_limit
             ));
         }
         StorageCmd::MaxMessagePts {

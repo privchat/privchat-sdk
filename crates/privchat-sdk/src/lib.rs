@@ -1935,6 +1935,14 @@ enum Command {
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
     },
+    ListMessagesAround {
+        channel_id: u64,
+        channel_type: i32,
+        anchor_server_message_id: u64,
+        before_limit: usize,
+        after_limit: usize,
+        resp: oneshot::Sender<Result<Vec<StoredMessage>>>,
+    },
     QueryTimelineSnapshot {
         channel_id: u64,
         channel_type: i32,
@@ -11031,6 +11039,31 @@ impl PrivchatSdk {
                         }
                         let _ = resp.send(result);
                     }
+                    Command::ListMessagesAround {
+                        channel_id,
+                        channel_type,
+                        anchor_server_message_id,
+                        before_limit,
+                        after_limit,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => {
+                                state
+                                    .storage
+                                    .list_messages_around(
+                                        channel_id,
+                                        channel_type,
+                                        anchor_server_message_id,
+                                        before_limit,
+                                        after_limit,
+                                    )
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::QueryTimelineSnapshot {
                         channel_id,
                         channel_type,
@@ -13283,6 +13316,32 @@ impl PrivchatSdk {
                 channel_type,
                 limit,
                 offset,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 以 anchor（server_message_id）为轴按显示排序读取本地上下文窗口
+    /// （spec §5：around 回填后 UI 从本地重查渲染）。anchor 本地不存在返回空。
+    pub async fn list_messages_around(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        anchor_server_message_id: u64,
+        before_limit: usize,
+        after_limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::ListMessagesAround {
+                channel_id,
+                channel_type,
+                anchor_server_message_id,
+                before_limit,
+                after_limit,
                 resp: resp_tx,
             })
             .await
