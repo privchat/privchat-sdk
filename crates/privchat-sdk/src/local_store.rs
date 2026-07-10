@@ -1522,7 +1522,11 @@ impl LocalStore {
                  FROM message m
                  LEFT JOIN message_extra me ON me.message_id = m.id
                  WHERE m.channel_id = ?1 AND m.channel_type = ?2
-                 ORDER BY m.id DESC
+                 ORDER BY
+                     CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END DESC,
+                     m.pts DESC,
+                     m.server_message_id DESC,
+                     m.id DESC
                  LIMIT ?3 OFFSET ?4",
             )
             .map_err(|e| Error::Storage(format!("prepare list messages: {e}")))?;
@@ -1794,7 +1798,13 @@ impl LocalStore {
                  FROM message m
                  WHERE m.channel_id = c.channel_id
                    AND m.channel_type = c.channel_type
-                 ORDER BY m.created_at DESC, m.id DESC
+                 -- 预览行选择必须与 list_messages 显示排序同构（spec §2.5）：
+                 -- pending 最新端；已确认按 pts；到达序会在乱序补投时选中旧消息。
+                 ORDER BY
+                     CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END DESC,
+                     m.pts DESC,
+                     m.server_message_id DESC,
+                     m.id DESC
                  LIMIT 1
              )
              WHERE c.channel_id = ?1
@@ -1939,7 +1949,12 @@ impl LocalStore {
                      FROM message m
                      WHERE m.channel_id = c.channel_id
                        AND m.channel_type = c.channel_type
-                     ORDER BY m.created_at DESC, m.id DESC
+                     -- 同 get_channel_by_id：预览行选择与显示排序同构（spec §2.5）
+                     ORDER BY
+                         CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END DESC,
+                         m.pts DESC,
+                         m.server_message_id DESC,
+                         m.id DESC
                      LIMIT 1
                  )
                  WHERE COALESCE(c.is_deleted, 0) = 0
@@ -3308,6 +3323,7 @@ impl LocalStore {
         uid: &str,
         message_id: u64,
         server_message_id: u64,
+        message_seq: u32,
     ) -> Result<()> {
         let mut conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -3334,12 +3350,21 @@ impl LocalStore {
             params![server_message_id as i64, message_id as i64],
         )
         .map_err(|e| Error::Storage(format!("mark message sent dedupe: {e}")))?;
+        // SDK-HISTORY-1（MESSAGE_HISTORY spec §2.5）：ack 里的 message_seq 就是该消息的
+        // per-channel pts。此前被丢弃导致自发消息本地 pts 恒 0，显示排序无法以
+        // (pts, server_message_id) 为权威。order_seq 一并写入（upsert 乱序回退 guard 用它）。
         let updated = tx
             .execute(
                 "UPDATE message
-                 SET server_message_id = ?1, status = 2, updated_at = ?2
+                 SET server_message_id = ?1, status = 2, updated_at = ?2,
+                     pts = ?4, order_seq = ?4
                  WHERE id = ?3",
-                params![server_message_id as i64, now_ms, message_id as i64],
+                params![
+                    server_message_id as i64,
+                    now_ms,
+                    message_id as i64,
+                    message_seq as i64
+                ],
             )
             .map_err(|e| Error::Storage(format!("mark message sent: {e}")))?;
         if updated == 0 {
@@ -4479,7 +4504,7 @@ mod tests {
         assert_eq!(msg.content, "hello");
 
         store
-            .mark_message_sent(uid, message_id, 900001)
+            .mark_message_sent(uid, message_id, 900001, 42)
             .expect("mark sent");
         let sent = store
             .get_message_by_id(uid, message_id)
@@ -4488,6 +4513,8 @@ mod tests {
         assert_eq!(sent.message_id, message_id);
         assert_eq!(sent.server_message_id, Some(900001));
         assert_eq!(sent.status, 2);
+        // SDK-HISTORY-1：ack 的 message_seq 必须回填为本地 pts（排序权威）
+        assert_eq!(sent.pts, Some(42));
 
         let revoked = store
             .set_message_revoke_by_server_message_id(uid, 900001, true, Some(30001))
@@ -4548,7 +4575,7 @@ mod tests {
         assert_ne!(local_id, remote_id);
 
         store
-            .mark_message_sent(uid, local_id, 900001)
+            .mark_message_sent(uid, local_id, 900001, 42)
             .expect("mark sent");
 
         let all = store
@@ -4734,6 +4761,89 @@ mod tests {
     }
 
     #[test]
+    /// SDK-HISTORY-3（MESSAGE_HISTORY spec §2.5）：显示排序权威 = (pts, server_message_id)，
+    /// pending（无 server_message_id）按本地序排在最新端；乱序落库不影响显示顺序。
+    #[test]
+    fn list_messages_orders_by_pts_with_pending_on_top() {
+        let store = test_store();
+        let uid = "10012";
+        let channel_id = 9401;
+        let channel_type = 1;
+
+        // 故意乱序落库：先 pts=30，再 pts=10，再 pts=20（模拟 around 回填的历史孤岛）
+        for (server_id, pts) in [(89430_u64, 30_i64), (89410, 10), (89420, 20)] {
+            store
+                .upsert_remote_message_with_result(
+                    uid,
+                    &UpsertRemoteMessageInput {
+                        server_message_id: server_id,
+                        local_message_id: 0,
+                        channel_id,
+                        channel_type,
+                        timestamp: 1_700_000_000_000 + pts,
+                        from_uid: 20001,
+                        message_type: 1,
+                        content: format!("{{\"content\":\"m{}\"}}", pts),
+                        status: 2,
+                        pts,
+                        setting: 0,
+                        order_seq: pts,
+                        searchable_word: String::new(),
+                        extra: String::new(),
+                        mime_type: None,
+                    },
+                )
+                .expect("upsert remote message");
+        }
+
+        // pending：本地新发、尚无 server_message_id/pts —— 必须排在最新端
+        let pending_id = store
+            .create_local_message(
+                uid,
+                &NewMessage {
+                    channel_id,
+                    channel_type,
+                    from_uid: 10012,
+                    message_type: 1,
+                    content: "{\"content\":\"pending\"}".to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: String::new(),
+                    mime_type: None,
+                    media_downloaded: false,
+                    thumb_status: 0,
+                },
+                0,
+            )
+            .expect("create pending");
+
+        let page = store
+            .list_messages(uid, channel_id, channel_type, 10, 0)
+            .expect("list messages");
+        // list_messages 返回 DESC（最新在前）：pending, pts30, pts20, pts10
+        let ids: Vec<u64> = page.iter().map(|m| m.message_id).collect();
+        assert_eq!(ids[0], pending_id, "pending must sort to the newest end");
+        let ptss: Vec<i64> = page
+            .iter()
+            .skip(1)
+            .map(|m| m.pts.map(|p| p as i64).unwrap_or(0))
+            .collect();
+        assert_eq!(ptss, vec![30, 20, 10], "acked messages must order by pts DESC");
+
+        // ack 回填 pts 后 pending 归位到 pts 序（40 > 30 仍在最前）
+        store
+            .mark_message_sent(uid, pending_id, 89440, 40)
+            .expect("ack pending");
+        let page = store
+            .list_messages(uid, channel_id, channel_type, 10, 0)
+            .expect("list after ack");
+        let ptss: Vec<i64> = page
+            .iter()
+            .map(|m| m.pts.map(|p| p as i64).unwrap_or(0))
+            .collect();
+        assert_eq!(ptss, vec![40, 30, 20, 10]);
+    }
+
     fn upsert_remote_message_ignores_out_of_order_replay() {
         let store = test_store();
         let uid = "10006";
