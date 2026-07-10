@@ -1734,13 +1734,15 @@ impl LocalStore {
                             ''
                         )
                     WHEN c.channel_type = 2 THEN COALESCE(
-                        NULLIF(c.channel_name, ''),
+                        -- 群名以 group 实体为权威：优先它，避免历史上被写坏的
+                        -- channel_name（如误写成裸 channel_id）永久盖住真正的群名。
                         (
                             SELECT NULLIF(g.name, '')
                             FROM \"group\" g
                             WHERE g.group_id = c.channel_id
                             LIMIT 1
                         ),
+                        NULLIF(c.channel_name, ''),
                         (
                             SELECT NULLIF(group_concat(name_part, '、'), '')
                             FROM (
@@ -1872,13 +1874,14 @@ impl LocalStore {
                             ''
                         )
                         WHEN c.channel_type = 2 THEN COALESCE(
-                            NULLIF(c.channel_name, ''),
+                            -- 群名以 group 实体为权威（见上方单条查询同注释）。
                             (
                                 SELECT NULLIF(g.name, '')
                                 FROM \"group\" g
                                 WHERE g.group_id = c.channel_id
                                 LIMIT 1
                             ),
+                            NULLIF(c.channel_name, ''),
                             (
                                 SELECT NULLIF(group_concat(name_part, '、'), '')
                                 FROM (

@@ -9285,17 +9285,22 @@ impl State {
                     .as_ref()
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or_default();
-                let inferred_dm_name = if channel_type == 1 {
+                // channel_type 客户端约定：1=DM，2=群，其它=房间。
+                let inferred_name = if channel_type == 1 {
                     match from_uid {
                         Some(1) => "System Message".to_string(),
                         Some(uid) if uid > 0 && uid != current_uid => uid.to_string(),
                         _ => String::new(),
                     }
                 } else {
-                    channel_id.to_string()
+                    // 群/房间的名字来自 group 实体（entity sync），这里绝不能拿 channel_id
+                    // 当名字：它会被写进 channel.channel_name，而频道列表查询对群会优先取
+                    // channel_name，于是真正的群名（即便随后同步到）被永久盖住，标题卡在裸 id。
+                    // 留空，交给查询回落到 group.name / 成员名。
+                    String::new()
                 };
                 (
-                    inferred_dm_name,
+                    inferred_name,
                     String::new(),
                     String::new(),
                     0,
