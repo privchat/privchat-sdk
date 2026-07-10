@@ -2702,6 +2702,7 @@ impl TestPhases {
                 avatar: String::new(),
                 owner_id: Some(manager.user_id("alice")?),
                 is_dismissed: false,
+                member_count: None, // 合成测试群无权威计数；None = 不覆盖既有值
                 created_at: now_millis(),
                 version: now_millis(),
                 updated_at: now_millis(),
