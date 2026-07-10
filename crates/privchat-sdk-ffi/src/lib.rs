@@ -1562,6 +1562,8 @@ pub struct StoredChannel {
     pub last_msg_content: String,
     pub updated_at: i64,
     pub peer_user_id: Option<u64>,
+    /// 群成员数（群会话有意义，来自 group 实体缓存；DM/未知为 0）。供群标题「(N)」。
+    pub member_count: u32,
     /// 最后一条消息的协议 message_type（ContentMessageType 整型值）。
     pub last_message_type: Option<i32>,
     /// 最后一条消息是否已撤回。
@@ -2896,6 +2898,7 @@ fn map_stored_channel(v: SdkStoredChannel) -> StoredChannel {
         last_msg_content: v.last_msg_content,
         updated_at: v.updated_at,
         peer_user_id: v.peer_user_id,
+        member_count: v.member_count.max(0) as u32,
         last_message_type: v.last_message_type,
         last_message_is_revoked: v.last_message_is_revoked,
     }
@@ -3036,6 +3039,7 @@ fn map_upsert_group(v: UpsertGroupInput) -> SdkUpsertGroupInput {
         avatar: v.avatar,
         owner_id: v.owner_id,
         is_dismissed: v.is_dismissed,
+        member_count: None,
         created_at: v.created_at,
         version: v.updated_at.max(0),
         updated_at: v.updated_at,
@@ -4585,6 +4589,7 @@ impl PrivchatClient {
                 avatar: String::new(),
                 owner_id: Some(resp.creator_id),
                 is_dismissed: false,
+                member_count: Some(resp.member_count as i64),
                 created_at: now,
                 version: now.max(0),
                 updated_at: now,
@@ -4621,6 +4626,7 @@ impl PrivchatClient {
                 avatar: resp.avatar_url.clone().unwrap_or_default(),
                 owner_id: Some(resp.owner_id),
                 is_dismissed: resp.is_archived.unwrap_or(false),
+                member_count: Some(resp.member_count as i64),
                 created_at,
                 version: updated_at.max(0),
                 updated_at,
@@ -6154,6 +6160,7 @@ impl PrivchatClient {
                     .unwrap_or_default(),
                 owner_id: Some(target_user_id),
                 is_dismissed: existing.as_ref().map(|g| g.is_dismissed).unwrap_or(false),
+                member_count: None,
                 created_at: existing.as_ref().map(|g| g.created_at).unwrap_or(now),
                 version: now.max(0),
                 updated_at: now,

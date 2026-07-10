@@ -1238,6 +1238,9 @@ pub struct StoredChannel {
     pub last_message_type: Option<i32>,
     /// 最后一条消息是否已被撤回。撤回后 UI 应统一显示"X 撤回了一条消息"占位。
     pub last_message_is_revoked: bool,
+    /// 群成员数（仅群会话有意义，来自 group 实体缓存；DM/未知为 0）。
+    /// 供群标题「(N)」显示，不再依赖客户端九宫格成员预览缓存兜底。
+    pub member_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1389,6 +1392,8 @@ pub struct UpsertGroupInput {
     pub avatar: String,
     pub owner_id: Option<u64>,
     pub is_dismissed: bool,
+    /// 群成员数（服务端权威计数，随 group 实体同步下发）。None 时不覆盖已有值。
+    pub member_count: Option<i64>,
     pub created_at: i64,
     pub version: i64,
     pub updated_at: i64,
@@ -4299,6 +4304,10 @@ impl State {
                             is_dismissed: item.deleted
                                 || Self::json_get_bool(&payload, &["is_dismissed"])
                                     .unwrap_or(false),
+                            member_count: group_sync
+                                .member_count
+                                .map(|c| c as i64)
+                                .or_else(|| Self::json_get_i64(&payload, &["member_count"])),
                             created_at: group_sync
                                 .created_at
                                 .or_else(|| Self::json_get_i64(&payload, &["created_at"]))
@@ -15963,6 +15972,7 @@ mod tests {
                     avatar: "avatar://group-a".to_string(),
                     owner_id: Some(88001),
                     is_dismissed: false,
+                    member_count: None,
                     created_at: 300,
                     version: 303,
                     updated_at: 303,

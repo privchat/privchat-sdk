@@ -1781,7 +1781,11 @@ impl LocalStore {
                         THEN CAST(c.channel_name AS INTEGER)
                         ELSE NULL
                     END
-                ) ELSE NULL END AS peer_user_id
+                ) ELSE NULL END AS peer_user_id,
+                COALESCE(
+                    (SELECT g.member_count FROM \"group\" g WHERE g.group_id = c.channel_id),
+                    0
+                ) AS resolved_member_count
              FROM channel c
              -- P1-17：last message 三个字段一次取齐（原来 3 个独立相关子查询各扫
              -- 一遍索引，且并发写入下可能取到不同消息）。timeline 优先语义不变。
@@ -1813,6 +1817,7 @@ impl LocalStore {
                     version: row.get::<_, i64>(11)?,
                     updated_at: row.get::<_, i64>(12)?,
                     peer_user_id: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                    member_count: row.get::<_, i64>(14)?,
                 last_message_type: None,
                 last_message_is_revoked: false,
                 })
@@ -1920,7 +1925,11 @@ impl LocalStore {
                             THEN CAST(c.channel_name AS INTEGER)
                             ELSE NULL
                         END
-                    ) ELSE NULL END AS peer_user_id
+                    ) ELSE NULL END AS peer_user_id,
+                    COALESCE(
+                        (SELECT g.member_count FROM \"group\" g WHERE g.group_id = c.channel_id),
+                        0
+                    ) AS resolved_member_count
                  FROM channel c
                  -- P1-17：last message 三个字段一次取齐（原来每行 3 个相关子查询各扫
                  -- 一遍索引，低端机上列表刷新的主要成本；且并发写入下三个子查询可能
@@ -1955,6 +1964,7 @@ impl LocalStore {
                     version: row.get::<_, i64>(11)?,
                     updated_at: row.get::<_, i64>(12)?,
                     peer_user_id: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                    member_count: row.get::<_, i64>(14)?,
                 last_message_type: None,
                 last_message_is_revoked: false,
                 })
@@ -2696,8 +2706,8 @@ impl LocalStore {
     pub fn upsert_group(&self, uid: &str, input: &UpsertGroupInput) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
-            "INSERT INTO \"group\" (group_id, name, avatar, owner_id, is_dismissed, created_at, version, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO \"group\" (group_id, name, avatar, owner_id, is_dismissed, created_at, version, updated_at, member_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, 0))
              ON CONFLICT(group_id) DO UPDATE SET
                 name=excluded.name,
                 avatar=excluded.avatar,
@@ -2705,7 +2715,9 @@ impl LocalStore {
                 is_dismissed=excluded.is_dismissed,
                 created_at=excluded.created_at,
                 version=excluded.version,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                -- member_count 为 None（?9 = NULL）时保留旧值，不被 0 冲掉
+                member_count=COALESCE(?9, \"group\".member_count)
              WHERE excluded.version >= \"group\".version",
             params![
                 input.group_id as i64,
@@ -2715,7 +2727,8 @@ impl LocalStore {
                 if input.is_dismissed { 1 } else { 0 },
                 input.created_at,
                 input.version,
-                input.updated_at
+                input.updated_at,
+                input.member_count
             ],
         )
         .map_err(|e| Error::Storage(format!("upsert group: {e}")))?;
@@ -5539,6 +5552,7 @@ mod tests {
                     avatar: "avatar://group-a".to_string(),
                     owner_id: Some(20001),
                     is_dismissed: false,
+                    member_count: None,
                     created_at: 1000,
                     version: 1002,
                     updated_at: 1002,
@@ -5560,6 +5574,7 @@ mod tests {
                     avatar: "avatar://stale-group".to_string(),
                     owner_id: Some(99999),
                     is_dismissed: true,
+                    member_count: None,
                     created_at: 999,
                     version: 1001,
                     updated_at: 1001,
@@ -5872,6 +5887,7 @@ mod tests {
                     avatar: String::new(),
                     owner_id: Some(1),
                     is_dismissed: false,
+                    member_count: None,
                     created_at: 1,
                     version: 1,
                     updated_at: 1,
