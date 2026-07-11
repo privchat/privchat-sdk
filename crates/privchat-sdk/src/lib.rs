@@ -2150,6 +2150,14 @@ enum Command {
         input: UpsertGroupMemberInput,
         resp: oneshot::Sender<Result<()>>,
     },
+    /// 显式头像 re-cache（CLIENT_GLOBAL_STATE §4.3 P2）：下载 url 到本地并强制落库。
+    /// handler 内 spawn 出去（下载可能慢，不阻塞 actor loop），完成回 oneshot。
+    /// resp = Ok((local_path, cached_url)) / Err。
+    RecacheAvatar {
+        user_id: u64,
+        url: String,
+        resp: oneshot::Sender<Result<(String, String)>>,
+    },
     DeleteGroupMember {
         group_id: u64,
         user_id: u64,
@@ -11752,6 +11760,23 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::RecacheAvatar { user_id, url, resp } => {
+                        match state.current_uid_required() {
+                            Ok(_) => {
+                                // 下载可能慢 → spawn，避免阻塞 actor loop；完成后回 oneshot。
+                                let storage = state.storage.clone();
+                                tokio::spawn(async move {
+                                    let r =
+                                        avatar_cache::recache_user_avatar(&storage, user_id, &url)
+                                            .await;
+                                    let _ = resp.send(r);
+                                });
+                            }
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                            }
+                        }
+                    }
                     Command::DeleteGroupMember {
                         group_id,
                         user_id,
@@ -14027,6 +14052,22 @@ impl PrivchatSdk {
         self.tx
             .send(Command::UpsertGroupMember {
                 input,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 显式头像 re-cache（CLIENT_GLOBAL_STATE §4.3 P2）：下载 `url` 到本地并强制落库，
+    /// 返回 `(avatar_local_path, avatar_cached_url)`。失败不污染旧缓存。
+    pub async fn recache_user_avatar(&self, user_id: u64, url: &str) -> Result<(String, String)> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::RecacheAvatar {
+                user_id,
+                url: url.to_string(),
                 resp: resp_tx,
             })
             .await

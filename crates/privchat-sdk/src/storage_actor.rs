@@ -314,6 +314,12 @@ enum StorageCmd {
         local_path: String,
         resp: oneshot::Sender<Result<bool>>,
     },
+    ForceSetUserAvatarCache {
+        user_id: u64,
+        url: String,
+        local_path: String,
+        resp: oneshot::Sender<Result<bool>>,
+    },
     UpdateUserAlias {
         user_id: u64,
         alias: Option<String>,
@@ -1285,6 +1291,25 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
+    /// 显式 re-cache 强制写（不走 avatar 门控）；见 [`LocalStore::force_set_user_avatar_cache`]。
+    pub async fn force_set_user_avatar_cache(
+        &self,
+        user_id: u64,
+        url: String,
+        local_path: String,
+    ) -> Result<bool> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::ForceSetUserAvatarCache {
+                user_id,
+                url,
+                local_path,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
     pub async fn update_user_alias(&self, user_id: u64, alias: Option<String>) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -2240,6 +2265,19 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             resp,
         } => {
             with_uid!(resp, |uid| store.set_user_avatar_cache(
+                &uid,
+                user_id,
+                &url,
+                &local_path
+            ));
+        }
+        StorageCmd::ForceSetUserAvatarCache {
+            user_id,
+            url,
+            local_path,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.force_set_user_avatar_cache(
                 &uid,
                 user_id,
                 &url,

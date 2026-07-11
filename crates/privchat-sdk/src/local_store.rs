@@ -2464,6 +2464,29 @@ impl LocalStore {
         Ok(changed > 0)
     }
 
+    /// 显式 re-cache（CLIENT_GLOBAL_STATE §4.3 / AVATAR_CACHE_SPEC P2）：调用方**已明确**知道
+    /// `url` 是该用户当前新头像（如自己上传后）。与 [`Self::set_user_avatar_cache`] 不同——
+    /// **不走** `AND avatar = ?2` 门控（自己上传时 SDK user 行 avatar 列可能还没同步到新 url），
+    /// 而是把 avatar / avatar_local_path / avatar_cached_url 三者一起对齐到 (url, path)。
+    /// 仅应在**下载成功后**调用；下载失败绝不调用 ⇒ 旧本地缓存不被污染。
+    pub fn force_set_user_avatar_cache(
+        &self,
+        uid: &str,
+        user_id: u64,
+        url: &str,
+        local_path: &str,
+    ) -> Result<bool> {
+        let conn = self.conn_for_user(uid)?;
+        let changed = conn
+            .execute(
+                "UPDATE user SET avatar = ?2, avatar_local_path = ?3, avatar_cached_url = ?2
+                 WHERE user_id = ?1",
+                params![user_id as i64, url, local_path],
+            )
+            .map_err(|e| Error::Storage(format!("force set user avatar cache: {e}")))?;
+        Ok(changed > 0)
+    }
+
     pub fn update_user_alias(&self, uid: &str, user_id: u64, alias: Option<String>) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
@@ -4325,6 +4348,66 @@ mod tests {
             hex::encode(rand_bytes)
         ));
         LocalStore::open_at(dir).expect("open test store")
+    }
+
+    #[test]
+    fn force_set_user_avatar_cache_bypasses_avatar_gate() {
+        // CLIENT_GLOBAL_STATE §4.3 P2：自己上传头像后，SDK user 行 avatar 列可能还没同步到
+        // 新 url ⇒ 门控版 set_user_avatar_cache 不写；force 版必须强制写三列。
+        let store = test_store();
+        let uid = "30001";
+        let user_id = 42u64;
+        store
+            .upsert_user(
+                uid,
+                &crate::UpsertUserInput {
+                    user_id,
+                    username: Some("self".to_string()),
+                    nickname: Some("Self".to_string()),
+                    alias: None,
+                    avatar: "https://cdn/old.png".to_string(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: "c-self".to_string(),
+                    version: 1,
+                    updated_at: 1,
+                },
+            )
+            .expect("upsert user");
+
+        // 门控版：avatar 列 != new_url ⇒ 不写（这正是自己上传后 ensure 失效的根因）。
+        let gated = store
+            .set_user_avatar_cache(
+                uid,
+                user_id,
+                "https://cdn/new.png",
+                "/root/avatars/users/42.img",
+            )
+            .expect("gated set");
+        assert!(!gated, "gated set 应因 avatar 列不匹配而不写");
+
+        // 强制版：显式命令，avatar / avatar_local_path / avatar_cached_url 三列一起对齐。
+        let forced = store
+            .force_set_user_avatar_cache(
+                uid,
+                user_id,
+                "https://cdn/new.png",
+                "/root/avatars/users/42.img",
+            )
+            .expect("force set");
+        assert!(forced, "force set 应写入");
+
+        let cache = store
+            .get_user_avatar_cache(uid, user_id)
+            .expect("get cache")
+            .expect("row exists");
+        assert_eq!(cache.avatar_cached_url, "https://cdn/new.png");
+        assert_eq!(cache.avatar_local_path, "/root/avatars/users/42.img");
+        let user = store
+            .get_user_by_id(uid, user_id)
+            .expect("get user")
+            .expect("user exists");
+        assert_eq!(user.avatar, "https://cdn/new.png");
     }
 
     #[test]

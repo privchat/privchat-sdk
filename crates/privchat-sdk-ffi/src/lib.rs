@@ -229,6 +229,15 @@ pub struct BlacklistCheckResult {
     pub is_blocked: bool,
 }
 
+/// 显式头像 re-cache 结果（CLIENT_GLOBAL_STATE §4.3 P2）。
+/// `avatar_local_path` 是本地展示主字段；`avatar_cached_url` = 本地文件对应的远程版本（freshness 判据）。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AvatarCacheResult {
+    pub user_id: u64,
+    pub avatar_local_path: String,
+    pub avatar_cached_url: String,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SeenByEntry {
     pub user_id: u64,
@@ -4767,6 +4776,27 @@ impl PrivchatClient {
         Ok(GroupMemberRemoteList {
             members: out_members,
             total: resp.total as u64,
+        })
+    }
+
+    /// 显式头像 re-cache（CLIENT_GLOBAL_STATE §4.3 P2）：把当前登录用户的新头像从 `avatar_url`
+    /// 下载到本地并强制落库（avatar / avatar_local_path / avatar_cached_url 三者对齐），返回
+    /// 本地路径 + cached_url。用于自己上传头像后立即刷新本地缓存——`avatar_local_path` 是展示主字段，
+    /// `avatar_url` 只是下载源。下载失败返回 Err，不污染旧缓存。
+    pub async fn recache_self_avatar(
+        &self,
+        avatar_url: String,
+    ) -> Result<AvatarCacheResult, PrivchatFfiError> {
+        let user_id = self.require_current_user_id().await?;
+        let (avatar_local_path, avatar_cached_url) = self
+            .inner
+            .recache_user_avatar(user_id, &avatar_url)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(AvatarCacheResult {
+            user_id,
+            avatar_local_path,
+            avatar_cached_url,
         })
     }
 

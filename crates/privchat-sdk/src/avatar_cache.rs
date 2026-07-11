@@ -47,7 +47,7 @@ pub(crate) fn avatar_cache_path(user_root: &Path, target_uid: u64) -> PathBuf {
 
 /// 下载 URL 到 dest：先写 `.part` 临时文件再 rename（原子换入）。
 /// 头像是 PUBLIC 类匿名可读文件，不带鉴权头；明文落盘（无附件加密信封）。
-async fn download_to_file(
+pub(crate) async fn download_to_file(
     url: &str,
     dest: &Path,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -244,9 +244,60 @@ async fn run_ensure(
     }
 }
 
+/// 显式 re-cache（CLIENT_GLOBAL_STATE §4.3 P2）：把 `user_id` 的头像从 `url` 下载到本地并强制落库。
+///
+/// 与 [`AvatarCacheManager::ensure`] 的差别：ensure 是 sync 循环里的 fire-and-forget + URL 门控；
+/// 本函数是**显式命令**（调用方已确认 url 是当前新头像，如自己上传后），await 完成并返回结果。
+///
+/// 流程：`get_storage_paths` → `{user_root}/avatars/users/{uid}.img` → 下载 → `force_set`。
+/// **失败不污染**：url 非法 / 下载失败 / 写文件失败 都在 force_set 之前 return Err，旧
+/// `avatar_local_path` / `avatar_cached_url` 保持不变。返回 `(local_path, cached_url)`。
+pub(crate) async fn recache_user_avatar(
+    storage: &StorageHandle,
+    user_id: u64,
+    url: &str,
+) -> crate::Result<(String, String)> {
+    let url = url.trim();
+    if url.is_empty() || !url.starts_with("http") {
+        return Err(crate::Error::Storage(format!(
+            "recache: invalid avatar url: {url:?}"
+        )));
+    }
+    let paths = storage.get_storage_paths().await?;
+    let dest = avatar_cache_path(&paths.user_root, user_id);
+    download_to_file(url, &dest)
+        .await
+        .map_err(|e| crate::Error::Storage(format!("recache download failed: {e}")))?;
+    let dest_str = dest.to_string_lossy().to_string();
+    // 只有下载 + 落盘成功才 force-set；上面任一步 Err 都不会走到这里 ⇒ 旧缓存不被覆盖。
+    storage
+        .force_set_user_avatar_cache(user_id, url.to_string(), dest_str.clone())
+        .await?;
+    Ok((dest_str, url.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recache_rejects_invalid_url_without_pollution() {
+        // 失败（url 非法/非 http）在任何 storage 写之前 return Err ⇒ 旧本地缓存不被污染。
+        use crate::storage_actor::StorageHandle;
+        let mut rand = [0u8; 6];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut rand);
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-recache-test-{}-{}",
+            std::process::id(),
+            hex::encode(rand)
+        ));
+        let storage = StorageHandle::start_at(dir).expect("start storage");
+        assert!(recache_user_avatar(&storage, 42, "").await.is_err());
+        assert!(recache_user_avatar(&storage, 42, "   ").await.is_err());
+        assert!(recache_user_avatar(&storage, 42, "ftp://x/a.png")
+            .await
+            .is_err());
+    }
 
     #[test]
     fn cache_path_keyed_by_target_uid() {
