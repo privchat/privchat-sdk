@@ -4779,15 +4779,15 @@ impl PrivchatClient {
         })
     }
 
-    /// 显式头像 re-cache（CLIENT_GLOBAL_STATE §4.3 P2）：把当前登录用户的新头像从 `avatar_url`
-    /// 下载到本地并强制落库（avatar / avatar_local_path / avatar_cached_url 三者对齐），返回
-    /// 本地路径 + cached_url。用于自己上传头像后立即刷新本地缓存——`avatar_local_path` 是展示主字段，
-    /// `avatar_url` 只是下载源。下载失败返回 Err，不污染旧缓存。
-    pub async fn recache_self_avatar(
+    /// 底层唯一头像 re-cache 能力（CLIENT_GLOBAL_STATE §4 全局统一）：把 `user_id` 的头像从
+    /// `avatar_url` 下载到本地并强制落库（avatar / avatar_local_path / avatar_cached_url 三者对齐）。
+    /// **任意头像来源**（当前用户 / 好友 / 群成员 / 会话 peer / 资料页刷新）都走这一个入口——
+    /// `avatar_local_path` 是展示主字段，`avatar_url` 只是下载源。下载失败返回 Err，不污染旧缓存。
+    pub async fn recache_user_avatar(
         &self,
+        user_id: u64,
         avatar_url: String,
     ) -> Result<AvatarCacheResult, PrivchatFfiError> {
-        let user_id = self.require_current_user_id().await?;
         let (avatar_local_path, avatar_cached_url) = self
             .inner
             .recache_user_avatar(user_id, &avatar_url)
@@ -4798,6 +4798,15 @@ impl PrivchatClient {
             avatar_local_path,
             avatar_cached_url,
         })
+    }
+
+    /// [`Self::recache_user_avatar`] 的便捷封装 = recache 当前登录用户头像。
+    pub async fn recache_self_avatar(
+        &self,
+        avatar_url: String,
+    ) -> Result<AvatarCacheResult, PrivchatFfiError> {
+        let user_id = self.require_current_user_id().await?;
+        self.recache_user_avatar(user_id, avatar_url).await
     }
 
     pub async fn delete_friend(&self, friend_id: u64) -> Result<bool, PrivchatFfiError> {
