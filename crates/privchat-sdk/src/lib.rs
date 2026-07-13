@@ -126,6 +126,17 @@ pub struct PrivchatConfig {
     pub data_dir: String,
 }
 
+static QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING: AtomicBool = AtomicBool::new(false);
+
+/// Allow QUIC clients to accept self-signed certificates.
+///
+/// This is intended for local development and load tests only. Production
+/// clients should keep certificate verification enabled and configure a valid
+/// CA/server name instead.
+pub fn set_quic_accept_self_signed_for_testing(enabled: bool) {
+    QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.store(enabled, Ordering::Release);
+}
+
 impl Default for PrivchatConfig {
     fn default() -> Self {
         Self {
@@ -183,6 +194,39 @@ fn non_empty_trimmed(value: String) -> Option<String> {
     } else {
         Some(trimmed)
     }
+}
+
+fn env_flag_enabled(key: &str) -> bool {
+    matches!(
+        env_var_trimmed(key)
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn quic_accept_self_signed_for_testing_enabled() -> bool {
+    QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.load(Ordering::Acquire)
+        || env_flag_enabled("PRIVCHAT_QUIC_ACCEPT_SELF_SIGNED")
+        || env_flag_enabled("PRIVCHAT_QUIC_INSECURE_SKIP_VERIFY")
+}
+
+/// 一次性大声警告：QUIC 证书校验被跳过。**仅限本地开发 / 压测**，生产绝不可触发
+/// （接受任意服务端证书 = MITM 风险）。在关闭校验的**唯一**入口打印，便于审计。
+fn warn_quic_insecure_verification_disabled_once() {
+    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+    WARN_ONCE.call_once(|| {
+        eprintln!(
+            "⚠️  [SECURITY] QUIC certificate verification is DISABLED via testing flag \
+             (set_quic_accept_self_signed_for_testing / PRIVCHAT_QUIC_ACCEPT_SELF_SIGNED / \
+             PRIVCHAT_QUIC_INSECURE_SKIP_VERIFY). LOCAL DEV / LOAD TEST ONLY — MUST NEVER be set \
+             in production (accepts any server cert; MITM risk)."
+        );
+        tracing::warn!(
+            "QUIC certificate verification DISABLED (testing-only self-signed accept); never enable in production"
+        );
+    });
 }
 
 #[cfg(target_os = "android")]
@@ -6063,9 +6107,14 @@ impl State {
         let target = Self::resolve_target(&ep.host, ep.port).await?;
         let mut client = match ep.protocol {
             TransportProtocol::Quic => {
-                let cfg = QuicClientConfig::new(&target)
+                let mut cfg = QuicClientConfig::new(&target)
                     .map_err(|e| Error::Transport(format!("quic config: {e}")))?
-                    .with_connect_timeout(timeout);
+                    .with_connect_timeout(timeout)
+                    .with_server_name(ep.host.clone());
+                if quic_accept_self_signed_for_testing_enabled() {
+                    warn_quic_insecure_verification_disabled_once();
+                    cfg = cfg.danger_skip_verification();
+                }
                 TransportClientBuilder::new()
                     .with_protocol(cfg)
                     .connect_timeout(timeout)
