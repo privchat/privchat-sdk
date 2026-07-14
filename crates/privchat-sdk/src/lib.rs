@@ -976,8 +976,20 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
         let dir = std::path::Path::new(data_dir);
         let path = dir.join("installation_id");
         let _ = std::fs::create_dir_all(dir);
-        // 持久化失败（磁盘/权限不可用）→ None，落到下方 ephemeral 派生；绝不谎报持久化成功。
-        read_or_create_installation_id(dir, &path).ok()
+        match read_or_create_installation_id(dir, &path) {
+            Ok(id) => Some(id),
+            // 稳定 worker 是幂等/去重契约。持久化失败→降级 ephemeral（重启后 worker 可能变化）必须**对外
+            // 可见留痕**，不能静默吞掉（对齐 Codex 复审 P2：至少 warning/metric）。
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    data_dir = %data_dir,
+                    "installation_id 持久化失败，降级为非稳定 ephemeral 雪花 worker 位（重启后 worker \
+                     可能变化，跨设备幂等/去重可能受影响）"
+                );
+                None
+            }
+        }
     };
     match installation_id {
         Some(id) => {
@@ -991,14 +1003,25 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
     }
 }
 
-/// 获取/创建持久 installation id（派生稳定雪花 worker 位）。**并发 + 崩溃安全**：
+/// fsync 目录，使其中的目录项变更（新 hard link / 删除）挺过**掉电/系统崩溃**（而不只是进程崩溃）。
+/// POSIX 上把目录作为 `File` 打开再 `sync_all`；无法把目录当 File 打开的平台（如 Windows）为 no-op
+/// —— 此时持久性退化为仅进程崩溃安全（best-effort）。
+fn sync_dir(dir: &std::path::Path) {
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
+
+/// 获取/创建持久 installation id（派生稳定雪花 worker 位）。**并发 + 崩溃 + 掉电安全**：
 /// 1. 把完整随机 id 写入**唯一命名**的临时文件并 `sync_all`（fsync）；
 /// 2. 用 `hard_link(tmp, path)` **原子发布** —— 目标已存在时返回 `AlreadyExists`（no-clobber），
 ///    故**恰好一个写者胜出**，且已发布文件**永不会被观察到半写/空**（读者只读到完整 id）——
-///    连崩溃也只会残留一个孤儿临时文件，绝不产生空的 `path`（临时文件先写满再 link）。
+///    连崩溃也只会残留一个孤儿临时文件，绝不产生空的 `path`（临时文件先写满再 link）；
+/// 3. 发布后 `sync_dir` **fsync 父目录**，让 `path` 的目录项挺过掉电（POSIX；见 [sync_dir]）。
 ///
-/// 失败语义（对齐 Codex 复审#3 P1）：写入或 `sync_all` 失败 → 删除临时文件并**返回 Err**（不谎报
-/// 成功、不残留脏文件）。旧实现遗留的**空** `path`（新实现永不发布空文件）视为损坏 → 回收重建。
+/// 失败语义（对齐 Codex 复审 P1）：写入或 `sync_all` 失败 → 删除临时文件并**返回 Err**（不谎报成功、
+/// 不残留脏文件）。损坏 `path`（**空**文件，或**非 UTF-8**/不可解析内容 —— 新实现永不发布这类文件）
+/// 一律**隔离回收后重建**，否则每次启动都会因读失败而降级到 ephemeral worker。
 fn read_or_create_installation_id(
     dir: &std::path::Path,
     path: &std::path::Path,
@@ -1016,6 +1039,11 @@ fn read_or_create_installation_id(
                 let _ = std::fs::remove_file(path);
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
+            // 非 UTF-8 / 不可解析内容 = 损坏文件 → 隔离重建（否则每次启动都读失败降级 ephemeral）。
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
+                let _ = std::fs::remove_file(path);
+            }
+            // 权限 / IO 错误 → 无法恢复，上抛（由调用方降级并告警）。
             Err(e) => return Err(e),
         }
         // 2) 发布尝试：真随机 id（rand，非 RandomState 冒充）→ 写满临时文件 fsync → 原子 hard_link。
@@ -1036,6 +1064,7 @@ fn read_or_create_installation_id(
         match std::fs::hard_link(&tmp, path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&tmp);
+                sync_dir(dir); // 掉电持久：flush 父目录（新 hard link + tmp 移除）
                 return Ok(candidate);
             }
             // 已有写者胜出 → 清理临时文件，下一轮读回其（完整）id。
@@ -1118,26 +1147,32 @@ mod snowflake_worker_bits_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn recovers_from_non_utf8_installation_id_file() {
+        // 非 UTF-8 损坏内容 → read_to_string 得 InvalidData → 必须隔离重建，而非每次启动降级 ephemeral。
+        let dir = temp_dir("utf8");
+        let path = dir.join("installation_id");
+        std::fs::write(&path, [0xffu8, 0xfe, 0x00, 0x99]).unwrap(); // 非法 UTF-8
+        let id1 = read_or_create_installation_id(&dir, &path).unwrap();
+        assert!(!id1.is_empty(), "corrupt non-utf8 file must be rebuilt to a valid id");
+        let id2 = read_or_create_installation_id(&dir, &path).unwrap(); // 重入稳定
+        assert_eq!(id1, id2, "rebuilt id must be stable across reinit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn persist_failure_returns_err_without_dirty_file() {
-        use std::os::unix::fs::PermissionsExt;
-        // 只读目录 → 无法写入 → 必须返回 Err，且不发布 installation_id、不残留临时文件（Codex 复审#3：
-        // 失败不谎报成功、不残留脏文件）。
-        let dir = temp_dir("ro");
+        // **结构性**持久化失败：父路径组件是普通文件 → 任何创建都 ENOTDIR，**确定性失败且不依赖运行
+        // 用户权限**（root/额外 capability 亦失败；对齐 Codex 复审#4 P2）。必须返回 Err，不发布 id。
+        let base = temp_dir("nopersist");
+        let blocker = base.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap(); // 普通文件（非目录）
+        let dir = blocker.join("inner"); // dir 的父组件是文件 → 其下任何 open/create 都 ENOTDIR
         let path = dir.join("installation_id");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let r = read_or_create_installation_id(&dir, &path);
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)); // 还原以便清理
-        assert!(r.is_err(), "persist failure must surface as Err, not faked success");
+        assert!(r.is_err(), "structural persist failure must surface as Err, not faked success");
         assert!(!path.exists(), "must not publish an installation_id on failure");
-        let leftover: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("installation_id"))
-            .collect();
-        assert!(leftover.is_empty(), "must not leave a dirty temp file: {leftover:?}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
