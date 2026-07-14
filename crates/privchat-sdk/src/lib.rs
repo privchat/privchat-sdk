@@ -951,6 +951,70 @@ fn actor_logs_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("PRIVCHAT_ACTOR_LOG").ok().as_deref() == Some("1"))
 }
 
+/// CODEX-8：雪花 worker 位（machine_id/data_center_id 各 5 bit）取自持久化 installation id
+/// （`<data_dir>/installation_id`，首次生成、之后复用），替代「pid + 启动毫秒」的临时派生 ——
+/// 重启/升级后 worker 位稳定不漂移。配合服务端 `(sender, device, local_message_id)` 幂等命名
+/// 空间，跨设备/跨用户碰撞不再互相判重；单设备内唯一性由雪花毫秒+序列保证。
+/// `data_dir` 为空（纯内存/测试配置，无持久身份可用）时退回旧的 pid/时间派生。
+fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
+    use std::hash::{Hash, Hasher};
+    let installation_id: Option<String> = if data_dir.trim().is_empty() {
+        None
+    } else {
+        let dir = std::path::Path::new(data_dir);
+        let path = dir.join("installation_id");
+        match std::fs::read_to_string(&path) {
+            Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => {
+                // 首次：生成并持久化。pid+微秒时间戳作熵源足够（此 id 只需本机安装间近似唯一，
+                // 真正的跨端隔离由服务端 sender+device 命名空间保证）。
+                let fresh = format!(
+                    "{:08x}{:016x}",
+                    std::process::id(),
+                    chrono::Utc::now().timestamp_micros()
+                );
+                let _ = std::fs::create_dir_all(dir);
+                std::fs::write(&path, &fresh).ok().map(|_| fresh)
+            }
+        }
+    };
+    match installation_id {
+        Some(id) => {
+            // DefaultHasher::new() 固定密钥，跨进程/重启结果稳定。
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut h);
+            let v = h.finish();
+            ((((v >> 5) & 0x1f) as u16), ((v & 0x1f) as u16))
+        }
+        None => (
+            (std::process::id() as u16) & 0x1f,
+            (chrono::Utc::now().timestamp_millis() as u16) & 0x1f,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod snowflake_worker_bits_tests {
+    #[test]
+    fn stable_across_reinit_and_persisted() {
+        let dir = std::env::temp_dir().join(format!(
+            "pc_sdk_instid_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_micros()
+        ));
+        let dir_s = dir.to_string_lossy().to_string();
+        let first = super::stable_snowflake_worker_bits(&dir_s);
+        // installation_id 已持久化
+        assert!(dir.join("installation_id").exists());
+        // 重入（模拟进程重启）→ worker 位不变
+        let second = super::stable_snowflake_worker_bits(&dir_s);
+        assert_eq!(first, second);
+        // 位宽约束：各 5 bit
+        assert!(first.0 <= 0x1f && first.1 <= 0x1f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// 服务端 unauth 白名单路由：自带凭证校验（refresh_token JWT / 密码 / 二维码场景 token），
 /// 不依赖 access_token 已认证的 IM session。SDK 在 Connected 状态下应允许这些路由。
 ///
@@ -9700,8 +9764,10 @@ impl PrivchatSdk {
             StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>,
         > = Arc::new(StdMutex::new(HashMap::new()));
         let actor_pending_media_jobs = pending_media_jobs.clone();
-        let machine_id: u16 = (std::process::id() as u16) & 0x1f;
-        let data_center_id: u16 = (chrono::Utc::now().timestamp_millis() as u16) & 0x1f;
+        // CODEX-8：worker 位取自持久化 installation id（稳定设备身份），替代 pid/启动毫秒的
+        // 临时派生 —— 重启后 worker 位不漂移；配合服务端 (sender, device, local_message_id)
+        // 幂等命名空间，雪花碰撞面收敛到单设备内（由毫秒+序列保证唯一）。
+        let (machine_id, data_center_id) = stable_snowflake_worker_bits(&config.data_dir);
         let snowflake = snowflake_me::Snowflake::builder()
             .machine_id(&|| Ok(machine_id))
             .data_center_id(&|| Ok(data_center_id))
