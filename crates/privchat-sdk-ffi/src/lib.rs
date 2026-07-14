@@ -1383,6 +1383,7 @@ pub enum SdkEvent {
     MessageDelivered {
         channel_id: u64,
         channel_type: i32,
+        message_id: u64,
         server_message_id: u64,
         delivered_at: u64,
     },
@@ -2319,11 +2320,13 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
         privchat_sdk::SdkEvent::MessageDelivered {
             channel_id,
             channel_type,
+            message_id,
             server_message_id,
             delivered_at,
         } => SdkEvent::MessageDelivered {
             channel_id,
             channel_type,
+            message_id,
             server_message_id,
             delivered_at,
         },
@@ -2619,12 +2622,14 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
         SdkEvent::MessageDelivered {
             channel_id,
             channel_type,
+            message_id,
             server_message_id,
             delivered_at,
         } => json!({
             "type": "message_delivered",
             "channel_id": channel_id,
             "channel_type": channel_type,
+            "message_id": message_id,
             "server_message_id": server_message_id,
             "delivered_at": delivered_at
         }),

@@ -3791,13 +3791,13 @@ impl LocalStore {
     }
 
     /// Mark a message as delivered (only upgrades 0→1, never downgrades).
-    /// Returns true if the row was actually updated (first receipt).
+    /// Returns the local SQLite `message.id` when the row was actually updated.
     pub fn mark_message_delivered(
         &self,
         uid: &str,
         server_message_id: u64,
         delivered_at: u64,
-    ) -> Result<bool> {
+    ) -> Result<Option<u64>> {
         let conn = self.conn_for_user(uid)?;
         // Resolve local message_id from server_message_id
         let message_row: Option<(i64, i64, i32)> = conn
@@ -3809,7 +3809,7 @@ impl LocalStore {
             .optional()
             .map_err(|e| Error::Storage(format!("mark_delivered lookup: {e}")))?;
         let Some((message_id, channel_id, channel_type)) = message_row else {
-            return Ok(false);
+            return Ok(None);
         };
         let now_ms = chrono::Utc::now().timestamp_millis();
         let updated = conn
@@ -3825,7 +3825,7 @@ impl LocalStore {
                 params![message_id, channel_id, channel_type, delivered_at as i64, now_ms],
             )
             .map_err(|e| Error::Storage(format!("mark_delivered upsert: {e}")))?;
-        Ok(updated > 0)
+        Ok((updated > 0).then_some(message_id as u64))
     }
 
     /// 基于 read cursor 精确投影本地读状态：
@@ -6147,6 +6147,57 @@ mod tests {
             .expect("query message");
         assert_eq!(row.0 as u64, 1234567890);
         assert_eq!(row.1, 2);
+    }
+
+    #[test]
+    fn mark_message_delivered_returns_local_message_id_once() {
+        let store = test_store();
+        let uid = "10004-delivery";
+        let input = NewMessage {
+            channel_id: 10,
+            channel_type: 1,
+            from_uid: 20,
+            message_type: 1,
+            content: "delivery".to_string(),
+            searchable_word: "delivery".to_string(),
+            setting: 0,
+            extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
+        };
+        let message_id = store
+            .create_local_message(uid, &input, 0)
+            .expect("create local message");
+        store
+            .mark_message_sent(uid, message_id, 9_001, 1)
+            .expect("assign server message id");
+
+        assert_eq!(
+            store
+                .mark_message_delivered(uid, 9_001, 123)
+                .expect("mark delivered"),
+            Some(message_id),
+        );
+        assert_eq!(
+            store
+                .mark_message_delivered(uid, 9_001, 456)
+                .expect("ignore duplicate receipt"),
+            None,
+        );
+        assert_eq!(
+            store
+                .mark_message_delivered(uid, 99_999, 456)
+                .expect("ignore unknown receipt"),
+            None,
+        );
+        assert!(
+            store
+                .get_message_by_id(uid, message_id)
+                .expect("read message")
+                .expect("message exists")
+                .delivered
+        );
     }
 
     #[test]

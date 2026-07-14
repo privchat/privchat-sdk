@@ -273,7 +273,7 @@ enum StorageCmd {
     MarkMessageDelivered {
         server_message_id: u64,
         delivered_at: u64,
-        resp: oneshot::Sender<Result<bool>>,
+        resp: oneshot::Sender<Result<Option<u64>>>,
     },
     SavePeerReadPts {
         channel_id: u64,
@@ -1160,7 +1160,7 @@ impl StorageHandle {
         &self,
         server_message_id: u64,
         delivered_at: u64,
-    ) -> Result<bool> {
+    ) -> Result<Option<u64>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::MarkMessageDelivered {

@@ -568,6 +568,9 @@ pub enum SdkEvent {
     MessageDelivered {
         channel_id: u64,
         channel_type: i32,
+        /// Local SQLite primary key used by client state and UI identity.
+        message_id: u64,
+        /// Server-assigned network identity retained for diagnostics and sync.
         server_message_id: u64,
         delivered_at: u64,
     },
@@ -7517,22 +7520,23 @@ impl State {
         }
         // Process delivery receipts: persist + emit events
         for (channel_id, channel_type, server_message_id, delivered_at) in delivery_receipts {
-            let was_new = self
+            let local_message_id = self
                 .storage
                 .mark_message_delivered(server_message_id, delivered_at)
                 .await
-                .unwrap_or(false);
-            if was_new {
+                .unwrap_or(None);
+            if let Some(message_id) = local_message_id {
                 self.pending_events.push(SdkEvent::MessageDelivered {
                     channel_id,
                     channel_type,
+                    message_id,
                     server_message_id,
                     delivered_at,
                 });
                 if inbound_logs_enabled() {
                     eprintln!(
-                        "[SDK.delivered] message_delivered: channel_id={} server_message_id={} delivered_at={}",
-                        channel_id, server_message_id, delivered_at
+                        "[SDK.delivered] message_delivered: channel_id={} message_id={} server_message_id={} delivered_at={}",
+                        channel_id, message_id, server_message_id, delivered_at
                     );
                 }
             }
