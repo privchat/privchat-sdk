@@ -980,28 +980,7 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
             Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
             _ => {
                 let _ = std::fs::create_dir_all(dir);
-                // 随机 UUID + pid/微秒兜底（无 uuid crate 时也够唯一）。
-                let candidate = format!(
-                    "{:08x}{:016x}{:08x}",
-                    std::process::id(),
-                    chrono::Utc::now().timestamp_micros(),
-                    // 地址熵：栈变量地址，进程内近随机。
-                    (&path as *const _ as usize) as u32,
-                );
-                // 原子：先写唯一临时文件再 rename（同目录 rename 原子）；已存在则读回胜者。
-                let tmp = dir.join(format!("installation_id.tmp.{}", std::process::id()));
-                let write_ok = std::fs::write(&tmp, &candidate).is_ok()
-                    && std::fs::rename(&tmp, &path).is_ok();
-                let _ = std::fs::remove_file(&tmp);
-                if write_ok {
-                    Some(candidate)
-                } else {
-                    // rename 输给并发者：读回已落地的真身。
-                    std::fs::read_to_string(&path)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                }
+                Some(read_or_create_installation_id(&path))
             }
         }
     };
@@ -1015,6 +994,52 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
             (chrono::Utc::now().timestamp_millis() as u16) & 0x1f,
         ),
     }
+}
+
+/// 真原子获取/创建 installation id：用 `create_new(true)`（O_EXCL，POSIX 层原子 no-clobber）竞争
+/// 创建，**至多一个进程/线程胜出**并写入随机 id；其余读回胜者（读到尚未写完的空文件时短暂重试）。
+/// 消除「rename 覆盖已存在目标 → 两个进程各用不同 id」的竞态。
+fn read_or_create_installation_id(path: &std::path::Path) -> String {
+    use std::io::{ErrorKind, Read, Write};
+    for _ in 0..50 {
+        // 已存在且非空 → 直接读回。
+        if let Ok(mut f) = std::fs::File::open(path) {
+            let mut s = String::new();
+            if f.read_to_string(&mut s).is_ok() {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return t.to_string();
+                }
+            }
+        }
+        // 不存在 → 抢占式原子创建。
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut f) => {
+                // OS 随机源（RandomState 由 OS 熵播种）+ 微秒时钟，避免依赖 rand crate。
+                use std::hash::{BuildHasher, Hasher};
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_u128(chrono::Utc::now().timestamp_micros() as u128);
+                h.write_u32(std::process::id());
+                let candidate = format!("{:016x}{:016x}", h.finish(), chrono::Utc::now().timestamp_micros());
+                let _ = f.write_all(candidate.as_bytes());
+                let _ = f.sync_all();
+                return candidate;
+            }
+            // 输给并发抢占者 → 下一轮 loop 读回其值（可能它还没写完 → 重试）。
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                std::thread::yield_now();
+                continue;
+            }
+            // 其它 IO 错误（权限等）→ 不可持久化，退回一次性派生。
+            Err(_) => break,
+        }
+    }
+    // 兜底：无法持久化时用进程/时间派生（非稳定，但不 panic）。
+    format!("{:08x}{:016x}", std::process::id(), chrono::Utc::now().timestamp_micros())
 }
 
 #[cfg(test)]
@@ -1035,6 +1060,37 @@ mod snowflake_worker_bits_tests {
         assert_eq!(first, second);
         // 位宽约束：各 5 bit
         assert!(first.0 <= 0x1f && first.1 <= 0x1f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_init_agrees_on_one_id() {
+        // N 线程同时对同一空目录初始化 → create_new 保证只有一个 id 落地，全部返回相同 worker bits。
+        let dir = std::env::temp_dir().join(format!(
+            "pc_sdk_instid_conc_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_micros()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().to_string();
+        let n = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let d = dir_s.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    super::stable_snowflake_worker_bits(&d)
+                })
+            })
+            .collect();
+        let results: Vec<(u16, u16)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // 所有线程得到相同 worker bits（同一 installation id）。
+        assert!(results.iter().all(|r| *r == results[0]), "worker bits diverged: {:?}", results);
+        // 且只有一个 installation_id 文件、单一内容。
+        let content = std::fs::read_to_string(dir.join("installation_id")).unwrap();
+        assert!(!content.trim().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
