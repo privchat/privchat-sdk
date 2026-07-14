@@ -959,8 +959,7 @@ fn actor_logs_enabled() -> bool {
 /// 复审要点：
 ///   - **固定哈希**：用 FNV-1a（算法恒定，跨 Rust 版本稳定）而非 `DefaultHasher`（标准库不保证
 ///     其算法跨版本稳定，不能作持久派生契约）。
-///   - **原子创建**：写临时文件后 rename（同目录 rename 原子），`create_new` 抢占胜者，避免两个
-///     并发初始化各写不同 id。
+///   - **原子发布**：写完整临时文件后 `hard_link` 发布（no-clobber，见 [read_or_create_installation_id]）。
 fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
     fn fnv1a_64(bytes: &[u8]) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -976,13 +975,9 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
     } else {
         let dir = std::path::Path::new(data_dir);
         let path = dir.join("installation_id");
-        match std::fs::read_to_string(&path) {
-            Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-            _ => {
-                let _ = std::fs::create_dir_all(dir);
-                Some(read_or_create_installation_id(&path))
-            }
-        }
+        let _ = std::fs::create_dir_all(dir);
+        // 持久化失败（磁盘/权限不可用）→ None，落到下方 ephemeral 派生；绝不谎报持久化成功。
+        read_or_create_installation_id(dir, &path).ok()
     };
     match installation_id {
         Some(id) => {
@@ -996,101 +991,152 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
     }
 }
 
-/// 真原子获取/创建 installation id：用 `create_new(true)`（O_EXCL，POSIX 层原子 no-clobber）竞争
-/// 创建，**至多一个进程/线程胜出**并写入随机 id；其余读回胜者（读到尚未写完的空文件时短暂重试）。
-/// 消除「rename 覆盖已存在目标 → 两个进程各用不同 id」的竞态。
-fn read_or_create_installation_id(path: &std::path::Path) -> String {
-    use std::io::{ErrorKind, Read, Write};
-    for _ in 0..50 {
-        // 已存在且非空 → 直接读回。
-        if let Ok(mut f) = std::fs::File::open(path) {
-            let mut s = String::new();
-            if f.read_to_string(&mut s).is_ok() {
+/// 获取/创建持久 installation id（派生稳定雪花 worker 位）。**并发 + 崩溃安全**：
+/// 1. 把完整随机 id 写入**唯一命名**的临时文件并 `sync_all`（fsync）；
+/// 2. 用 `hard_link(tmp, path)` **原子发布** —— 目标已存在时返回 `AlreadyExists`（no-clobber），
+///    故**恰好一个写者胜出**，且已发布文件**永不会被观察到半写/空**（读者只读到完整 id）——
+///    连崩溃也只会残留一个孤儿临时文件，绝不产生空的 `path`（临时文件先写满再 link）。
+///
+/// 失败语义（对齐 Codex 复审#3 P1）：写入或 `sync_all` 失败 → 删除临时文件并**返回 Err**（不谎报
+/// 成功、不残留脏文件）。旧实现遗留的**空** `path`（新实现永不发布空文件）视为损坏 → 回收重建。
+fn read_or_create_installation_id(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Write};
+    for _ in 0..64 {
+        // 1) 快路径：读回已发布 id（因 hard_link 发布，绝不空/半写）。
+        match std::fs::read_to_string(path) {
+            Ok(s) => {
                 let t = s.trim();
                 if !t.is_empty() {
-                    return t.to_string();
+                    return Ok(t.to_string());
                 }
+                // 空 path = 旧实现/外部篡改留下的损坏占位（新实现永不发布空文件）→ 回收后重建。
+                let _ = std::fs::remove_file(path);
             }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
-        // 不存在 → 抢占式原子创建。
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(mut f) => {
-                // OS 随机源（RandomState 由 OS 熵播种）+ 微秒时钟，避免依赖 rand crate。
-                use std::hash::{BuildHasher, Hasher};
-                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-                h.write_u128(chrono::Utc::now().timestamp_micros() as u128);
-                h.write_u32(std::process::id());
-                let candidate = format!("{:016x}{:016x}", h.finish(), chrono::Utc::now().timestamp_micros());
-                let _ = f.write_all(candidate.as_bytes());
-                let _ = f.sync_all();
-                return candidate;
+        // 2) 发布尝试：真随机 id（rand，非 RandomState 冒充）→ 写满临时文件 fsync → 原子 hard_link。
+        let candidate = format!("{:032x}", rand::random::<u128>());
+        let tmp = dir.join(format!("installation_id.tmp.{:016x}", rand::random::<u64>()));
+        if let Err(e) = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(candidate.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })() {
+            let _ = std::fs::remove_file(&tmp); // 失败不残留半写临时文件
+            return Err(e); // 失败上抛，绝不谎报成功
+        }
+        match std::fs::hard_link(&tmp, path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(candidate);
             }
-            // 输给并发抢占者 → 下一轮 loop 读回其值（可能它还没写完 → 重试）。
+            // 已有写者胜出 → 清理临时文件，下一轮读回其（完整）id。
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                std::thread::yield_now();
-                continue;
+                let _ = std::fs::remove_file(&tmp);
             }
-            // 其它 IO 错误（权限等）→ 不可持久化，退回一次性派生。
-            Err(_) => break,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
         }
     }
-    // 兜底：无法持久化时用进程/时间派生（非稳定，但不 panic）。
-    format!("{:08x}{:016x}", std::process::id(), chrono::Utc::now().timestamp_micros())
+    Err(Error::new(ErrorKind::Other, "installation id 初始化未收敛"))
 }
 
 #[cfg(test)]
 mod snowflake_worker_bits_tests {
-    #[test]
-    fn stable_across_reinit_and_persisted() {
-        let dir = std::env::temp_dir().join(format!(
-            "pc_sdk_instid_{}_{}",
+    use super::read_or_create_installation_id;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "pc_sdk_instid_{}_{}_{}",
+            tag,
             std::process::id(),
             chrono::Utc::now().timestamp_micros()
         ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn stable_across_reinit_and_persisted() {
+        let dir = temp_dir("stable");
         let dir_s = dir.to_string_lossy().to_string();
         let first = super::stable_snowflake_worker_bits(&dir_s);
-        // installation_id 已持久化
-        assert!(dir.join("installation_id").exists());
-        // 重入（模拟进程重启）→ worker 位不变
-        let second = super::stable_snowflake_worker_bits(&dir_s);
-        assert_eq!(first, second);
-        // 位宽约束：各 5 bit
-        assert!(first.0 <= 0x1f && first.1 <= 0x1f);
+        assert!(dir.join("installation_id").exists()); // 已持久化
+        let second = super::stable_snowflake_worker_bits(&dir_s); // 重入（模拟重启）
+        assert_eq!(first, second, "worker bits must be stable across reinit");
+        assert!(first.0 <= 0x1f && first.1 <= 0x1f); // 各 5 bit
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn concurrent_init_agrees_on_one_id() {
-        // N 线程同时对同一空目录初始化 → create_new 保证只有一个 id 落地，全部返回相同 worker bits。
-        let dir = std::env::temp_dir().join(format!(
-            "pc_sdk_instid_conc_{}_{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_micros()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir_s = dir.to_string_lossy().to_string();
-        let n = 16;
+    fn concurrent_init_agrees_on_one_installation_id() {
+        // N 线程并发初始化同一空目录 → hard_link 发布保证恰好一个 id 落地；所有线程必须取得**同一
+        // installation ID 字符串**（Codex 复审#3：直接断言 id，不能只比 10-bit worker bits）。
+        let dir = temp_dir("conc");
+        let path = dir.join("installation_id");
+        let n = 32;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
         let handles: Vec<_> = (0..n)
             .map(|_| {
-                let d = dir_s.clone();
-                let b = barrier.clone();
+                let (d, p, b) = (dir.clone(), path.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     b.wait();
-                    super::stable_snowflake_worker_bits(&d)
+                    read_or_create_installation_id(&d, &p).unwrap()
                 })
             })
             .collect();
-        let results: Vec<(u16, u16)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        // 所有线程得到相同 worker bits（同一 installation id）。
-        assert!(results.iter().all(|r| *r == results[0]), "worker bits diverged: {:?}", results);
-        // 且只有一个 installation_id 文件、单一内容。
-        let content = std::fs::read_to_string(dir.join("installation_id")).unwrap();
-        assert!(!content.trim().is_empty());
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winner = std::fs::read_to_string(&path).unwrap().trim().to_string();
+        assert!(!winner.is_empty());
+        assert!(
+            ids.iter().all(|id| *id == winner),
+            "installation ids diverged: winner={winner} got={ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovers_from_empty_installation_id_file() {
+        // 崩溃/旧实现遗留的**空** installation_id → 必须回收重建为稳定非空 id（不能永久回退临时 id）。
+        let dir = temp_dir("empty");
+        let path = dir.join("installation_id");
+        std::fs::write(&path, "").unwrap(); // 损坏占位
+        let id1 = read_or_create_installation_id(&dir, &path).unwrap();
+        assert!(!id1.is_empty(), "empty file must be recovered to a non-empty id");
+        let id2 = read_or_create_installation_id(&dir, &path).unwrap(); // 重入稳定
+        assert_eq!(id1, id2, "recovered id must be stable across reinit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_failure_returns_err_without_dirty_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // 只读目录 → 无法写入 → 必须返回 Err，且不发布 installation_id、不残留临时文件（Codex 复审#3：
+        // 失败不谎报成功、不残留脏文件）。
+        let dir = temp_dir("ro");
+        let path = dir.join("installation_id");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = read_or_create_installation_id(&dir, &path);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)); // 还原以便清理
+        assert!(r.is_err(), "persist failure must surface as Err, not faked success");
+        assert!(!path.exists(), "must not publish an installation_id on failure");
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("installation_id"))
+            .collect();
+        assert!(leftover.is_empty(), "must not leave a dirty temp file: {leftover:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
