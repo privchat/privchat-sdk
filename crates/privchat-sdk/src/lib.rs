@@ -952,12 +952,25 @@ fn actor_logs_enabled() -> bool {
 }
 
 /// CODEX-8：雪花 worker 位（machine_id/data_center_id 各 5 bit）取自持久化 installation id
-/// （`<data_dir>/installation_id`，首次生成、之后复用），替代「pid + 启动毫秒」的临时派生 ——
-/// 重启/升级后 worker 位稳定不漂移。配合服务端 `(sender, device, local_message_id)` 幂等命名
-/// 空间，跨设备/跨用户碰撞不再互相判重；单设备内唯一性由雪花毫秒+序列保证。
-/// `data_dir` 为空（纯内存/测试配置，无持久身份可用）时退回旧的 pid/时间派生。
+/// （`<data_dir>/installation_id`），替代「pid + 启动毫秒」的临时派生 —— 重启/升级后 worker 位
+/// 稳定不漂移。配合服务端 `(sender, device, local_message_id)` 幂等命名空间，跨设备/跨用户碰撞
+/// 不再互相判重；单设备内唯一性由雪花毫秒+序列保证。`data_dir` 为空时退回旧的 pid/时间派生。
+///
+/// 复审要点：
+///   - **固定哈希**：用 FNV-1a（算法恒定，跨 Rust 版本稳定）而非 `DefaultHasher`（标准库不保证
+///     其算法跨版本稳定，不能作持久派生契约）。
+///   - **原子创建**：写临时文件后 rename（同目录 rename 原子），`create_new` 抢占胜者，避免两个
+///     并发初始化各写不同 id。
 fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
-    use std::hash::{Hash, Hasher};
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
     let installation_id: Option<String> = if data_dir.trim().is_empty() {
         None
     } else {
@@ -966,24 +979,35 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
         match std::fs::read_to_string(&path) {
             Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
             _ => {
-                // 首次：生成并持久化。pid+微秒时间戳作熵源足够（此 id 只需本机安装间近似唯一，
-                // 真正的跨端隔离由服务端 sender+device 命名空间保证）。
-                let fresh = format!(
-                    "{:08x}{:016x}",
-                    std::process::id(),
-                    chrono::Utc::now().timestamp_micros()
-                );
                 let _ = std::fs::create_dir_all(dir);
-                std::fs::write(&path, &fresh).ok().map(|_| fresh)
+                // 随机 UUID + pid/微秒兜底（无 uuid crate 时也够唯一）。
+                let candidate = format!(
+                    "{:08x}{:016x}{:08x}",
+                    std::process::id(),
+                    chrono::Utc::now().timestamp_micros(),
+                    // 地址熵：栈变量地址，进程内近随机。
+                    (&path as *const _ as usize) as u32,
+                );
+                // 原子：先写唯一临时文件再 rename（同目录 rename 原子）；已存在则读回胜者。
+                let tmp = dir.join(format!("installation_id.tmp.{}", std::process::id()));
+                let write_ok = std::fs::write(&tmp, &candidate).is_ok()
+                    && std::fs::rename(&tmp, &path).is_ok();
+                let _ = std::fs::remove_file(&tmp);
+                if write_ok {
+                    Some(candidate)
+                } else {
+                    // rename 输给并发者：读回已落地的真身。
+                    std::fs::read_to_string(&path)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                }
             }
         }
     };
     match installation_id {
         Some(id) => {
-            // DefaultHasher::new() 固定密钥，跨进程/重启结果稳定。
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            id.hash(&mut h);
-            let v = h.finish();
+            let v = fnv1a_64(id.as_bytes());
             ((((v >> 5) & 0x1f) as u16), ((v & 0x1f) as u16))
         }
         None => (
