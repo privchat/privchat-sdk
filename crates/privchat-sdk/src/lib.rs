@@ -978,14 +978,16 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
         let _ = std::fs::create_dir_all(dir);
         match read_or_create_installation_id(dir, &path) {
             Ok(id) => Some(id),
-            // 稳定 worker 是幂等/去重契约。持久化失败→降级 ephemeral（重启后 worker 可能变化）必须**对外
-            // 可见留痕**，不能静默吞掉（对齐 Codex 复审 P2：至少 warning/metric）。
+            // 持久化失败→降级 ephemeral（重启后 worker 可能变化）必须**对外可见留痕**，不能静默吞掉
+            // （对齐 Codex 复审 P2：至少 warning/metric）。注意影响面：服务端 dedup 已按 device 隔离，
+            // 故受影响的是**同一 device 命名空间内本地雪花 ID 的稳定性/碰撞风险**，而非跨设备幂等本身。
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     data_dir = %data_dir,
-                    "installation_id 持久化失败，降级为非稳定 ephemeral 雪花 worker 位（重启后 worker \
-                     可能变化，跨设备幂等/去重可能受影响）"
+                    "installation_id 持久化失败，降级为非稳定 ephemeral 雪花 worker 位（重启后 worker 可能\
+                     变化：同一 device 命名空间内本地雪花 ID 稳定性下降、碰撞风险上升；服务端按 device 隔离\
+                     的 dedup 不受影响）"
                 );
                 None
             }
@@ -1004,12 +1006,10 @@ fn stable_snowflake_worker_bits(data_dir: &str) -> (u16, u16) {
 }
 
 /// fsync 目录，使其中的目录项变更（新 hard link / 删除）挺过**掉电/系统崩溃**（而不只是进程崩溃）。
-/// POSIX 上把目录作为 `File` 打开再 `sync_all`；无法把目录当 File 打开的平台（如 Windows）为 no-op
-/// —— 此时持久性退化为仅进程崩溃安全（best-effort）。
-fn sync_dir(dir: &std::path::Path) {
-    if let Ok(f) = std::fs::File::open(dir) {
-        let _ = f.sync_all();
-    }
+/// POSIX 上把目录作为 `File` 打开再 `sync_all`。返回 `Err` = 掉电持久性**未确认**（如无法把目录当
+/// File 打开的平台，或 fsync 失败）—— 调用方应告警但**不应据此另换 id**（final path 已发布可用）。
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// 获取/创建持久 installation id（派生稳定雪花 worker 位）。**并发 + 崩溃 + 掉电安全**：
@@ -1064,7 +1064,15 @@ fn read_or_create_installation_id(
         match std::fs::hard_link(&tmp, path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&tmp);
-                sync_dir(dir); // 掉电持久：flush 父目录（新 hard link + tmp 移除）
+                // 掉电持久：flush 父目录（新 hard link + tmp 移除）。失败 = 持久性未确认，但 id 已发布
+                // 可用 —— 告警不另换 id（另换会引入不稳定的第二个 id）。
+                if let Err(e) = sync_dir(dir) {
+                    tracing::warn!(
+                        error = %e,
+                        dir = %dir.display(),
+                        "installation_id durability_not_confirmed：父目录 fsync 失败，进程崩溃安全但掉电后目录项可能丢失"
+                    );
+                }
                 return Ok(candidate);
             }
             // 已有写者胜出 → 清理临时文件，下一轮读回其（完整）id。
