@@ -4884,11 +4884,31 @@ impl State {
                     // the authoritative count is a local projection from message timeline + read cursor.
                     // For realtime push messages, bump_unread_on_incoming is true.
                     let from_self = current_user_id.map(|v| v == from_uid).unwrap_or(false);
-                    let should_bump_unread =
-                        bump_unread_on_incoming && !from_self && upserted.inserted_new;
+                    // A delayed/replayed realtime message at or before our read cursor is already
+                    // read. Do not bump first and rely on a later channel read to self-heal: that
+                    // makes the unread badge flash and was the reason stale unread was previously
+                    // preserved incorrectly in LocalStore.
+                    let is_after_read_cursor = if bump_unread_on_incoming {
+                        match self
+                            .storage
+                            .get_channel_extra(channel_id, channel_type)
+                            .await
+                        {
+                            Ok(Some(extra)) => {
+                                u64::try_from(pts).unwrap_or_default() > extra.keep_pts
+                            }
+                            Ok(None) | Err(_) => true,
+                        }
+                    } else {
+                        false
+                    };
+                    let should_bump_unread = bump_unread_on_incoming
+                        && !from_self
+                        && upserted.inserted_new
+                        && is_after_read_cursor;
                     if inbound_logs_enabled() {
                         eprintln!(
-                            "[SDK.unread] message apply: channel_id={} channel_type={} message_id={} server_message_id={} from_uid={} from_self={} inserted_new={} bump_unread_on_incoming={} should_bump_unread={}",
+                            "[SDK.unread] message apply: channel_id={} channel_type={} message_id={} server_message_id={} from_uid={} from_self={} inserted_new={} bump_unread_on_incoming={} is_after_read_cursor={} should_bump_unread={}",
                             channel_id,
                             channel_type,
                             message_id,
@@ -4897,6 +4917,7 @@ impl State {
                             from_self,
                             upserted.inserted_new,
                             bump_unread_on_incoming,
+                            is_after_read_cursor,
                             should_bump_unread
                         );
                     }
@@ -16086,6 +16107,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn realtime_message_only_bumps_unread_after_local_read_cursor() {
+        let (mut state, dir) = new_seeded_state("realtime-unread-read-cursor").await;
+        let channel_id = 96010;
+        let channel_type = 1;
+
+        state
+            .storage
+            .upsert_channel(UpsertChannelInput {
+                channel_id,
+                channel_type,
+                channel_name: "alice".to_string(),
+                channel_remark: String::new(),
+                avatar: String::new(),
+                unread_count: 0,
+                top: 0,
+                mute: 0,
+                last_msg_timestamp: 0,
+                last_local_message_id: 0,
+                last_msg_content: String::new(),
+                version: 1,
+                peer_user_id: Some(20001),
+            })
+            .await
+            .expect("seed channel");
+        state
+            .storage
+            .project_channel_read_cursor(channel_id, channel_type, 20)
+            .await
+            .expect("seed local read cursor");
+
+        for (server_message_id, pts, expected_unread) in
+            [(896001_u64, 10_i64, 0), (896002_u64, 30_i64, 1)]
+        {
+            state
+                .apply_sync_entities(
+                    "message",
+                    None,
+                    &[SyncEntityItem {
+                        entity_id: server_message_id.to_string(),
+                        version: pts as u64,
+                        deleted: false,
+                        payload: Some(serde_json::json!({
+                            "server_message_id": server_message_id,
+                            "channel_id": channel_id,
+                            "channel_type": channel_type,
+                            "from_uid": 20001,
+                            "message_type": 0,
+                            "content": format!("message-{pts}"),
+                            "status": 2,
+                            "pts": pts,
+                            "order_seq": pts
+                        })),
+                    }],
+                    true,
+                )
+                .await
+                .expect("apply realtime message");
+
+            let channel = state
+                .storage
+                .get_channel_by_id(channel_id)
+                .await
+                .expect("read channel")
+                .expect("channel exists");
+            assert_eq!(channel.unread_count, expected_unread, "pts={pts}");
+        }
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn channel_sync_zero_unread_heals_stale_local_unread_when_materialized_projection_is_zero(
     ) {
         let (mut state, dir) = new_seeded_state("channel-zero-unread-heal").await;
@@ -16341,7 +16434,12 @@ mod tests {
             .expect("sdk get channel")
             .expect("channel exists");
         assert_eq!(channel.last_msg_timestamp, messages[0].created_at);
-        assert_eq!(channel.last_msg_content, "[图片]");
+        assert_eq!(
+            channel.last_msg_content,
+            "{\"content\":\"materialized-message\"}"
+        );
+        assert_eq!(channel.last_message_type, Some(1));
+        assert!(!channel.last_message_is_revoked);
         assert_eq!(channel.last_local_message_id, inserted.message_id);
 
         let channels = sdk.list_channels(20, 0).await.expect("sdk list channels");
@@ -16350,7 +16448,12 @@ mod tests {
             .find(|row| row.channel_id == 97002)
             .expect("listed channel exists");
         assert_eq!(listed.last_msg_timestamp, messages[0].created_at);
-        assert_eq!(listed.last_msg_content, "[图片]");
+        assert_eq!(
+            listed.last_msg_content,
+            "{\"content\":\"materialized-message\"}"
+        );
+        assert_eq!(listed.last_message_type, Some(1));
+        assert!(!listed.last_message_is_revoked);
         assert_eq!(listed.last_local_message_id, inserted.message_id);
 
         assert_eq!(messages[0].message_id, inserted.message_id);
