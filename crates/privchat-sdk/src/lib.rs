@@ -53,7 +53,8 @@ use privchat_protocol::rpc::sync::{
 };
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
-    ClientInfo, ContactCardMetadata, ContentMessageType, DeviceInfo, DeviceType,
+    CanonicalTimelineEvent, ClientInfo, ContactCardMetadata, ContentMessageType, DeviceInfo,
+    DeviceType,
     DisconnectRequest, DisconnectResponse, ErrorCode, LinkMetadata, LocationMetadata,
     MessageMetadata, MessageType, PingRequest, PongResponse, PublishRequest, PublishResponse,
     PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse, RpcRequest,
@@ -127,6 +128,8 @@ pub struct PrivchatConfig {
 }
 
 static QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING: AtomicBool = AtomicBool::new(false);
+static CANONICAL_LEGACY_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static CANONICAL_DECODE_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Allow QUIC clients to accept self-signed certificates.
 ///
@@ -3982,6 +3985,144 @@ impl State {
     }
 
     fn sync_item_from_difference_commit(
+        commit: &privchat_protocol::rpc::sync::ServerCommit,
+    ) -> (String, SyncEntityItem) {
+        let resolution = commit.resolve_canonical_event();
+        if resolution.canonical_legacy_mismatch {
+            CANONICAL_LEGACY_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                event_id = commit.event_id,
+                server_message_id = commit.server_msg_id,
+                "canonical timeline event differs from legacy projection"
+            );
+        }
+        if resolution.canonical_decode_error {
+            CANONICAL_DECODE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                event_id = commit.event_id,
+                server_message_id = commit.server_msg_id,
+                event_schema_version = commit.event_schema_version,
+                "canonical timeline event decode failed; using whole legacy event"
+            );
+        }
+
+        if matches!(
+            resolution.source,
+            privchat_protocol::rpc::sync::CanonicalEventSource::Canonical
+        ) {
+            if let Some(event) = resolution.event {
+                return Self::sync_item_from_canonical_difference_event(commit, event);
+            }
+        }
+
+        Self::sync_item_from_legacy_difference_commit(commit)
+    }
+
+    fn sync_item_from_canonical_difference_event(
+        commit: &privchat_protocol::rpc::sync::ServerCommit,
+        event: CanonicalTimelineEvent,
+    ) -> (String, SyncEntityItem) {
+        #[derive(Serialize)]
+        struct RevokeProjection {
+            message_id: u64,
+            revoke: bool,
+            revoked_by: u64,
+            revoked_at: i64,
+            channel_id: u64,
+            channel_type: i32,
+        }
+
+        #[derive(Serialize)]
+        struct ReactionProjection {
+            message_id: u64,
+            uid: u64,
+            emoji: String,
+            deleted: bool,
+            channel_id: u64,
+            channel_type: i32,
+        }
+
+        match event {
+            CanonicalTimelineEvent::NewMessage(event) => {
+                let legacy = event.payload.to_legacy();
+                let payload = serde_json::to_value(legacy).unwrap_or(serde_json::Value::Null);
+                let (content, extra) = Self::normalized_message_content_and_extra(&payload);
+                (
+                    "message".to_string(),
+                    Self::build_message_sync_item(
+                        commit.server_msg_id,
+                        commit.local_message_id.unwrap_or(0),
+                        commit.channel_id,
+                        i32::from(commit.channel_type),
+                        commit.server_timestamp,
+                        commit.sender_id,
+                        i32::try_from(event.message_type.as_u32()).unwrap_or(0),
+                        content,
+                        extra,
+                        2,
+                        i64::try_from(commit.pts).unwrap_or(i64::MAX),
+                        0,
+                        i64::try_from(commit.pts).unwrap_or(i64::MAX),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+            }
+            CanonicalTimelineEvent::Revoke(event) => {
+                let payload = serde_json::to_value(RevokeProjection {
+                    message_id: event.target_server_message_id,
+                    revoke: true,
+                    revoked_by: event.revoked_by,
+                    revoked_at: event.revoked_at,
+                    channel_id: commit.channel_id,
+                    channel_type: i32::from(commit.channel_type),
+                })
+                .unwrap_or(serde_json::Value::Null);
+                (
+                    "message_extra".to_string(),
+                    SyncEntityItem {
+                        entity_id: commit.server_msg_id.to_string(),
+                        version: commit.pts,
+                        deleted: false,
+                        payload: Some(payload),
+                    },
+                )
+            }
+            CanonicalTimelineEvent::ReactionChange(event) => {
+                let entity_id = format!(
+                    "{}:{}:{}",
+                    event.target_server_message_id, event.actor_id, event.emoji
+                );
+                let payload = serde_json::to_value(ReactionProjection {
+                    message_id: event.target_server_message_id,
+                    uid: event.actor_id,
+                    emoji: event.emoji,
+                    deleted: matches!(
+                        event.operation,
+                        privchat_protocol::ReactionOperation::Remove
+                    ),
+                    channel_id: commit.channel_id,
+                    channel_type: i32::from(commit.channel_type),
+                })
+                .unwrap_or(serde_json::Value::Null);
+                (
+                    "message_reaction".to_string(),
+                    SyncEntityItem {
+                        entity_id,
+                        version: commit.pts,
+                        deleted: false,
+                        payload: Some(payload),
+                    },
+                )
+            }
+        }
+    }
+
+    fn sync_item_from_legacy_difference_commit(
         commit: &privchat_protocol::rpc::sync::ServerCommit,
     ) -> (String, SyncEntityItem) {
         match commit.message_type.as_str() {
@@ -14844,9 +14985,11 @@ mod tests {
         PresenceBatchStatusResponse, PresenceChangedNotification, PresenceSnapshot,
     };
     use privchat_protocol::rpc::sync::SyncEntityItem;
-    use privchat_protocol::PushMessageRequest;
+    use privchat_protocol::{FlatBufferMessage, PushMessageRequest};
+    use serde::Serialize;
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15097,6 +15240,9 @@ mod tests {
             server_timestamp: 1_700_000_000_000,
             sender_id: 42,
             sender_info: None,
+            event_id: None,
+            event_schema_version: None,
+            canonical_event: None,
         };
 
         let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
@@ -15132,6 +15278,9 @@ mod tests {
             server_timestamp: 1_700_000_100_000,
             sender_id: 43,
             sender_info: None,
+            event_id: None,
+            event_schema_version: None,
+            canonical_event: None,
         };
 
         let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
@@ -15145,6 +15294,60 @@ mod tests {
         );
         assert_eq!(payload.get("uid").and_then(|v| v.as_u64()), Some(43));
         assert_eq!(payload.get("deleted").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn difference_commit_prefers_complete_canonical_event_and_reports_mismatch() {
+        #[derive(Serialize)]
+        struct LegacyReaction<'a> {
+            message_id: &'a str,
+            uid: &'a str,
+            emoji: &'a str,
+            deleted: bool,
+        }
+
+        let canonical = privchat_protocol::CanonicalTimelineEvent::ReactionChange(
+            privchat_protocol::ReactionChangeEvent {
+                target_server_message_id: 9_007_199_254_740_993,
+                actor_id: 9_007_199_254_740_995,
+                emoji: "thumbs-up".to_string(),
+                operation: privchat_protocol::ReactionOperation::Remove,
+            },
+        );
+        let before = super::CANONICAL_LEGACY_MISMATCH_COUNT.load(Ordering::Relaxed);
+        let commit = privchat_protocol::rpc::sync::ServerCommit {
+            event_id: Some(77),
+            pts: 35,
+            server_msg_id: 9_007_199_254_740_997,
+            local_message_id: None,
+            channel_id: 101,
+            channel_type: 1,
+            message_type: "message_reaction".to_string(),
+            content: serde_json::to_value(LegacyReaction {
+                message_id: "9007199254740993",
+                uid: "9007199254740995",
+                emoji: "thumbs-up",
+                deleted: false,
+            })
+            .expect("serialize legacy reaction"),
+            server_timestamp: 1_700_000_100_000,
+            sender_id: 9_007_199_254_740_995,
+            sender_info: None,
+            event_schema_version: Some(
+                privchat_protocol::CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
+            ),
+            canonical_event: Some(canonical.encode_fb().expect("encode canonical event")),
+        };
+
+        let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
+        assert_eq!(entity_type, "message_reaction");
+        assert_eq!(item.entity_id, "9007199254740993:9007199254740995:thumbs-up");
+        let payload = item.payload.expect("payload");
+        assert_eq!(payload.get("deleted").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            super::CANONICAL_LEGACY_MISMATCH_COUNT.load(Ordering::Relaxed) > before,
+            "canonical/legacy mismatch must be observable"
+        );
     }
 
     #[test]
@@ -15861,6 +16064,9 @@ mod tests {
             server_timestamp: 1_710_000_000_000,
             sender_id: 10001,
             sender_info: None,
+            event_id: None,
+            event_schema_version: None,
+            canonical_event: None,
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&revoke_commit);
         state
@@ -15884,6 +16090,9 @@ mod tests {
             server_timestamp: 1_710_000_000_100,
             sender_id: 20001,
             sender_info: None,
+            event_id: None,
+            event_schema_version: None,
+            canonical_event: None,
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&reaction_commit);
         state
