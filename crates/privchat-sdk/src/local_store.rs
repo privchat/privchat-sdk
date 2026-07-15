@@ -32,7 +32,8 @@ use crate::{
     Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
     StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
     StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
-    StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
+    PendingTimelineMutation, StoredUser, UnreadMentionCount, UpsertBlacklistInput,
+    UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
     UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
     UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
@@ -56,6 +57,7 @@ const ACCOUNT_TREE_PROFILE: &str = "profile";
 const ACCOUNT_TREE_WRAP: &str = "wrap";
 const ACCOUNT_TREE_AUTH: &str = "auth";
 const ACCOUNT_TREE_KV: &str = "kv";
+const PENDING_TIMELINE_MUTATION_PREFIX: &str = "__pending_timeline_mutation__:v1";
 
 const K_SCHEMA_VERSION: &[u8] = b"schema_version";
 const K_DEVICE_ID: &[u8] = b"device_id";
@@ -2087,6 +2089,38 @@ impl LocalStore {
             out.push(channel);
         }
         Ok(out)
+    }
+
+    /// Stable, lightweight pagination for anti-entropy. Unlike the UI channel
+    /// list this ordering does not change when new messages update previews.
+    pub fn list_channel_identifiers_after(
+        &self,
+        uid: &str,
+        after_channel_id: u64,
+        after_channel_type: i32,
+        limit: usize,
+    ) -> Result<Vec<(u64, i32)>> {
+        let conn = self.conn_for_user(uid)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT channel_id, channel_type
+                 FROM channel
+                 WHERE COALESCE(is_deleted, 0) = 0
+                   AND (channel_id > ?1 OR (channel_id = ?1 AND channel_type > ?2))
+                 ORDER BY channel_id ASC, channel_type ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| Error::Storage(format!("prepare channel identifiers: {e}")))?;
+        let rows = stmt
+            .query_map(
+                params![after_channel_id as i64, after_channel_type, limit.clamp(1, 500) as i64],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i32>(1)?)),
+            )
+            .map_err(|e| Error::Storage(format!("query channel identifiers: {e}")))?;
+        rows.map(|row| {
+            row.map_err(|e| Error::Storage(format!("decode channel identifier: {e}")))
+        })
+        .collect()
     }
 
     /// 设置本地 channel 隐藏标记。纯本地操作，不触达服务端。
@@ -4171,6 +4205,125 @@ impl LocalStore {
         Ok(())
     }
 
+    fn pending_timeline_mutation_key(mutation: &PendingTimelineMutation) -> String {
+        format!(
+            "{PENDING_TIMELINE_MUTATION_PREFIX}:{}:{:020}:{:020}:{:020}",
+            mutation.channel_type,
+            mutation.channel_id,
+            mutation.target_server_message_id,
+            mutation.event_id
+        )
+    }
+
+    fn pending_timeline_mutation_prefix(
+        channel_id: u64,
+        channel_type: i32,
+        target_server_message_id: u64,
+    ) -> String {
+        format!(
+            "{PENDING_TIMELINE_MUTATION_PREFIX}:{channel_type}:{channel_id:020}:{target_server_message_id:020}:"
+        )
+    }
+
+    fn encode_pending_timeline_mutation(mutation: &PendingTimelineMutation) -> Vec<u8> {
+        let mut value = Vec::with_capacity(17 + mutation.canonical_event.len());
+        value.push(1);
+        value.extend_from_slice(&mutation.event_id.to_be_bytes());
+        value.extend_from_slice(&mutation.pts.to_be_bytes());
+        value.extend_from_slice(&mutation.canonical_event);
+        value
+    }
+
+    fn decode_pending_timeline_mutation(
+        channel_id: u64,
+        channel_type: i32,
+        target_server_message_id: u64,
+        value: &[u8],
+    ) -> Result<PendingTimelineMutation> {
+        if value.len() < 18 || value[0] != 1 {
+            return Err(Error::Storage("invalid pending timeline mutation record".to_string()));
+        }
+        let event_id = u64::from_be_bytes(value[1..9].try_into().map_err(|_| {
+            Error::Storage("invalid pending timeline mutation event_id".to_string())
+        })?);
+        let pts = u64::from_be_bytes(value[9..17].try_into().map_err(|_| {
+            Error::Storage("invalid pending timeline mutation pts".to_string())
+        })?);
+        Ok(PendingTimelineMutation {
+            channel_id,
+            channel_type,
+            target_server_message_id,
+            event_id,
+            pts,
+            canonical_event: value[17..].to_vec(),
+        })
+    }
+
+    pub fn put_pending_timeline_mutation(
+        &self,
+        uid: &str,
+        mutation: &PendingTimelineMutation,
+    ) -> Result<()> {
+        let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
+        tree.insert(
+            Self::pending_timeline_mutation_key(mutation).as_bytes(),
+            Self::encode_pending_timeline_mutation(mutation),
+        )
+        .map_err(|e| Error::Storage(format!("put pending timeline mutation: {e}")))?;
+        tree.flush()
+            .map_err(|e| Error::Storage(format!("flush pending timeline mutation: {e}")))?;
+        Ok(())
+    }
+
+    pub fn list_pending_timeline_mutations(
+        &self,
+        uid: &str,
+        channel_id: u64,
+        channel_type: i32,
+        target_server_message_id: u64,
+    ) -> Result<Vec<PendingTimelineMutation>> {
+        let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
+        let prefix = Self::pending_timeline_mutation_prefix(
+            channel_id,
+            channel_type,
+            target_server_message_id,
+        );
+        let mut rows = Vec::new();
+        let mut corrupt_keys = Vec::new();
+        for entry in tree.scan_prefix(prefix.as_bytes()) {
+            let (key, value) = entry
+                .map_err(|e| Error::Storage(format!("scan pending timeline mutation: {e}")))?;
+            match Self::decode_pending_timeline_mutation(
+                channel_id,
+                channel_type,
+                target_server_message_id,
+                value.as_ref(),
+            ) {
+                Ok(row) => rows.push(row),
+                Err(_) => corrupt_keys.push(key),
+            }
+        }
+        for key in corrupt_keys {
+            let _ = tree.remove(key);
+        }
+        rows.sort_by_key(|row| (row.pts, row.event_id));
+        Ok(rows)
+    }
+
+    pub fn delete_pending_timeline_mutation(
+        &self,
+        uid: &str,
+        mutation: &PendingTimelineMutation,
+    ) -> Result<()> {
+        let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
+        tree.remove(Self::pending_timeline_mutation_key(mutation).as_bytes())
+            .map_err(|e| Error::Storage(format!("delete pending timeline mutation: {e}")))?;
+        tree.flush().map_err(|e| {
+            Error::Storage(format!("flush pending timeline mutation delete: {e}"))
+        })?;
+        Ok(())
+    }
+
     fn open_db(path: &Path) -> Result<sled::Db> {
         sled::open(path)
             .map_err(|e| Error::Storage(format!("open sled db {}: {e}", path.display())))
@@ -4318,8 +4471,8 @@ impl LocalStore {
 mod tests {
     use super::{get_string, LocalStore, GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID};
     use crate::{
-        LoginResult, NewMessage, UpsertChannelExtraInput, UpsertChannelInput, UpsertGroupInput,
-        UpsertRemoteMessageInput,
+        LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
+        UpsertChannelInput, UpsertGroupInput, UpsertRemoteMessageInput,
     };
     use rand::RngCore;
     use rusqlite::params;
@@ -6311,5 +6464,52 @@ mod tests {
             .expect("get channel")
             .expect("channel exists");
         assert_eq!(single.channel_name, "9900000001");
+    }
+
+    #[test]
+    fn pending_timeline_mutation_survives_restart_and_orders_by_pts() {
+        let store = test_store();
+        let base = store.base_dir().to_path_buf();
+        let uid = "pending-mutation-user";
+        let later = PendingTimelineMutation {
+            channel_id: 901,
+            channel_type: 2,
+            target_server_message_id: 902,
+            event_id: 904,
+            pts: 12,
+            canonical_event: vec![4, 5, 6],
+        };
+        let earlier = PendingTimelineMutation {
+            event_id: 903,
+            pts: 11,
+            canonical_event: vec![1, 2, 3],
+            ..later.clone()
+        };
+        store
+            .put_pending_timeline_mutation(uid, &later)
+            .expect("put later mutation");
+        store
+            .put_pending_timeline_mutation(uid, &earlier)
+            .expect("put earlier mutation");
+        drop(store);
+
+        let reopened = LocalStore::open_at(base.clone()).expect("reopen store");
+        assert_eq!(
+            reopened
+                .list_pending_timeline_mutations(uid, 901, 2, 902)
+                .expect("list pending mutations"),
+            vec![earlier.clone(), later.clone()]
+        );
+        reopened
+            .delete_pending_timeline_mutation(uid, &earlier)
+            .expect("delete applied mutation");
+        assert_eq!(
+            reopened
+                .list_pending_timeline_mutations(uid, 901, 2, 902)
+                .expect("list remaining mutations"),
+            vec![later]
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(base);
     }
 }

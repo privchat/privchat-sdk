@@ -22,8 +22,8 @@ use tokio::sync::oneshot;
 
 use crate::local_store::{LocalAccountEntry, LocalStore, StoragePaths, UserAvatarCacheRow};
 use crate::{
-    Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
-    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
+    Error, LoginResult, MentionInput, NewMessage, PendingTimelineMutation, Result, SessionSnapshot,
+    StoredBlacklistEntry, StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
     StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
     StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
@@ -167,6 +167,12 @@ enum StorageCmd {
         limit: usize,
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredChannel>>>,
+    },
+    ListChannelIdentifiersAfter {
+        after_channel_id: u64,
+        after_channel_type: i32,
+        limit: usize,
+        resp: oneshot::Sender<Result<Vec<(u64, i32)>>>,
     },
     UpsertChannelExtra {
         input: UpsertChannelExtraInput,
@@ -466,6 +472,20 @@ enum StorageCmd {
     MarkReminderDone {
         reminder_id: u64,
         done: bool,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    PutPendingTimelineMutation {
+        mutation: PendingTimelineMutation,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    ListPendingTimelineMutations {
+        channel_id: u64,
+        channel_type: i32,
+        target_server_message_id: u64,
+        resp: oneshot::Sender<Result<Vec<PendingTimelineMutation>>>,
+    },
+    DeletePendingTimelineMutation {
+        mutation: PendingTimelineMutation,
         resp: oneshot::Sender<Result<()>>,
     },
     KvPut {
@@ -867,6 +887,24 @@ impl StorageHandle {
             .send(StorageCmd::ListChannels {
                 limit,
                 offset,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn list_channel_identifiers_after(
+        &self,
+        after_channel_id: u64,
+        after_channel_type: i32,
+        limit: usize,
+    ) -> Result<Vec<(u64, i32)>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::ListChannelIdentifiersAfter {
+                after_channel_id,
+                after_channel_type,
+                limit,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -1723,6 +1761,52 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
+    pub async fn put_pending_timeline_mutation(
+        &self,
+        mutation: PendingTimelineMutation,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::PutPendingTimelineMutation {
+                mutation,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn list_pending_timeline_mutations(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        target_server_message_id: u64,
+    ) -> Result<Vec<PendingTimelineMutation>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::ListPendingTimelineMutations {
+                channel_id,
+                channel_type,
+                target_server_message_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn delete_pending_timeline_mutation(
+        &self,
+        mutation: PendingTimelineMutation,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::DeletePendingTimelineMutation {
+                mutation,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
     pub async fn kv_put(&self, key: String, value: Vec<u8>) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -2034,6 +2118,19 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 &uid,
                 channel_id,
                 channel_type
+            ));
+        }
+        StorageCmd::ListChannelIdentifiersAfter {
+            after_channel_id,
+            after_channel_type,
+            limit,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_channel_identifiers_after(
+                &uid,
+                after_channel_id,
+                after_channel_type,
+                limit
             ));
         }
         StorageCmd::MarkMessageSent {
@@ -2492,6 +2589,25 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 reminder_id,
                 done
             ));
+        }
+        StorageCmd::PutPendingTimelineMutation { mutation, resp } => {
+            with_uid!(resp, |uid| store.put_pending_timeline_mutation(&uid, &mutation));
+        }
+        StorageCmd::ListPendingTimelineMutations {
+            channel_id,
+            channel_type,
+            target_server_message_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.list_pending_timeline_mutations(
+                &uid,
+                channel_id,
+                channel_type,
+                target_server_message_id
+            ));
+        }
+        StorageCmd::DeletePendingTimelineMutation { mutation, resp } => {
+            with_uid!(resp, |uid| store.delete_pending_timeline_mutation(&uid, &mutation));
         }
         StorageCmd::KvPut { key, value, resp } => {
             with_uid!(resp, |uid| store.kv_put(&uid, &key, &value));

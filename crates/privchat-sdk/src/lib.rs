@@ -46,15 +46,16 @@ use privchat_protocol::rpc::message::history::{
 };
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
-    ChannelExtraSyncPayload, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload,
+    BatchGetChannelPtsRequest, BatchGetChannelPtsResponse, ChannelExtraSyncPayload,
+    ChannelIdentifier, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload,
     ChannelSyncPayload, FriendSyncPayload, GetChannelPtsRequest, GetChannelPtsResponse,
     GetDifferenceRequest, GetDifferenceResponse, GroupMemberSyncPayload, GroupSyncPayload,
-    MessageStatusSyncPayload, MessageSyncPayload, SyncEntityItem,
+    MessageStatusSyncPayload, MessageSyncPayload, ServerCommit, SyncEntityItem,
 };
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
     CanonicalTimelineEvent, ClientInfo, ContactCardMetadata, ContentMessageType, DeviceInfo,
-    DeviceType,
+    DeviceType, FlatBufferMessage,
     DisconnectRequest, DisconnectResponse, ErrorCode, LinkMetadata, LocationMetadata,
     MessageMetadata, MessageType, PingRequest, PongResponse, PublishRequest, PublishResponse,
     PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse, RpcRequest,
@@ -1793,6 +1794,18 @@ pub struct StoredMessageReaction {
     pub created_at: i64,
 }
 
+/// Durable canonical mutation waiting for its target message to materialize.
+/// `canonical_event` is a FlatBuffers `CanonicalTimelineEvent`, never JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTimelineMutation {
+    pub channel_id: u64,
+    pub channel_type: i32,
+    pub target_server_message_id: u64,
+    pub event_id: u64,
+    pub pts: u64,
+    pub canonical_event: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MentionInput {
     pub message_id: u64,
@@ -2678,6 +2691,11 @@ struct State {
     /// 双入口、重连多入口）直接跳过，避免 resume sync 全家桶连跑多轮放大重连风暴。
     /// 失败不记录（下一个触发点自然重试）；换代（重连）后必然重新执行。
     last_resume_synced: Option<(u64, Instant)>,
+    /// Last bounded anti-entropy scan. Realtime push is the fast path; this
+    /// periodic batch-PTS comparison repairs missed pushes without scanning
+    /// every channel on every tick.
+    last_anti_entropy_at: Instant,
+    anti_entropy_jitter: Duration,
     /// P1-05：room 广播按 (channel_id, server_message_id) 去重。订阅后服务端 replay
     /// 历史与实时广播在重叠窗口会重复投递同一条；每 channel 保留最近见过的一批
     /// server_message_id（有界 FIFO），命中即丢弃。server_message_id 缺失（旧帧/
@@ -2819,6 +2837,10 @@ impl State {
         format!("__resume_pts__:{channel_type}:{channel_id}")
     }
 
+    fn anti_entropy_cursor_key() -> String {
+        "__anti_entropy__:channel_cursor:v1".to_string()
+    }
+
     fn resume_repair_payload(classification: ResumeFailureClass, reason: &str) -> Vec<u8> {
         serde_json::json!({
             "classification": classification,
@@ -2869,6 +2891,35 @@ impl State {
     ) -> Result<()> {
         let key = Self::resume_channel_pts_key(channel_id, channel_type);
         self.storage.kv_put(key, pts.to_string().into_bytes()).await
+    }
+
+    async fn load_anti_entropy_cursor(&self) -> (u64, i32) {
+        let Some(raw) = self.storage
+            .kv_get(Self::anti_entropy_cursor_key())
+            .await
+            .ok()
+            .flatten() else {
+            return (0, -1);
+        };
+        let Ok(text) = String::from_utf8(raw) else {
+            return (0, -1);
+        };
+        let Some((channel_id, channel_type)) = text.split_once(':') else {
+            return (0, -1);
+        };
+        (
+            channel_id.parse().unwrap_or(0),
+            channel_type.parse().unwrap_or(-1),
+        )
+    }
+
+    async fn save_anti_entropy_cursor(&self, channel_id: u64, channel_type: i32) -> Result<()> {
+        self.storage
+            .kv_put(
+                Self::anti_entropy_cursor_key(),
+                format!("{channel_id}:{channel_type}").into_bytes(),
+            )
+            .await
     }
 
     #[cfg(test)]
@@ -7112,6 +7163,25 @@ impl State {
         Ok(resp.current_pts)
     }
 
+    async fn batch_get_channel_pts(
+        &mut self,
+        channels: Vec<(u64, i32)>,
+    ) -> Result<BatchGetChannelPtsResponse> {
+        self.rpc_call_typed(
+            routes::sync::BATCH_GET_CHANNEL_PTS,
+            &BatchGetChannelPtsRequest {
+                channels: channels
+                    .into_iter()
+                    .map(|(channel_id, channel_type)| ChannelIdentifier {
+                        channel_id,
+                        channel_type: u8::try_from(channel_type).unwrap_or(1),
+                    })
+                    .collect(),
+            },
+        )
+        .await
+    }
+
     /// wire message_type 字符串 → 本地 i32（history/around/hydrate 共用，防三处漂移）。
     fn wire_message_type_to_i32(t: &str) -> i32 {
         let ct = match t {
@@ -7283,6 +7353,102 @@ impl State {
         Ok(applied)
     }
 
+    async fn defer_canonical_mutation_if_target_missing(
+        &self,
+        commit: &ServerCommit,
+    ) -> Result<bool> {
+        let resolution = commit.resolve_canonical_event();
+        let Some(event) = resolution.event else {
+            return Ok(false);
+        };
+        let target_server_message_id = match &event {
+            CanonicalTimelineEvent::Revoke(event) => event.target_server_message_id,
+            CanonicalTimelineEvent::ReactionChange(event) => event.target_server_message_id,
+            CanonicalTimelineEvent::NewMessage(_) => return Ok(false),
+        };
+        if self.storage
+            .get_message_id_by_server_message_id(
+                commit.channel_id,
+                i32::from(commit.channel_type),
+                target_server_message_id,
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let Some(event_id) = commit.event_id else {
+            tracing::warn!(
+                channel_id = commit.channel_id,
+                target_server_message_id,
+                "cannot persist out-of-order legacy mutation without event_id"
+            );
+            return Ok(false);
+        };
+        self.storage
+            .put_pending_timeline_mutation(PendingTimelineMutation {
+                channel_id: commit.channel_id,
+                channel_type: i32::from(commit.channel_type),
+                target_server_message_id,
+                event_id,
+                pts: commit.pts,
+                canonical_event: event.encode_fb().map_err(|e| {
+                    Error::Serialization(format!("encode pending canonical mutation: {e}"))
+                })?,
+            })
+            .await?;
+        Ok(true)
+    }
+
+    async fn replay_pending_timeline_mutations(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        target_server_message_id: u64,
+    ) -> Result<usize> {
+        let pending = self.storage
+            .list_pending_timeline_mutations(
+                channel_id,
+                channel_type,
+                target_server_message_id,
+            )
+            .await?;
+        let mut applied = 0usize;
+        for mutation in pending {
+            let event = CanonicalTimelineEvent::decode_fb(&mutation.canonical_event)
+                .map_err(|e| Error::Serialization(format!("decode pending mutation: {e}")))?;
+            let sender_id = match &event {
+                CanonicalTimelineEvent::Revoke(event) => event.revoked_by,
+                CanonicalTimelineEvent::ReactionChange(event) => event.actor_id,
+                CanonicalTimelineEvent::NewMessage(_) => 0,
+            };
+            let commit = ServerCommit {
+                event_id: Some(mutation.event_id),
+                pts: mutation.pts,
+                server_msg_id: mutation.event_id,
+                local_message_id: None,
+                channel_id,
+                channel_type: u8::try_from(channel_type).unwrap_or(1),
+                message_type: String::new(),
+                content: serde_json::Value::Null,
+                server_timestamp: 0,
+                sender_id,
+                sender_info: None,
+                event_schema_version: Some(privchat_protocol::CANONICAL_TIMELINE_EVENT_SCHEMA_V1),
+                canonical_event: Some(mutation.canonical_event.clone()),
+            };
+            let (entity_type, item) = Self::sync_item_from_difference_commit(&commit);
+            let scope = Some(format!("{channel_type}:{channel_id}"));
+            let count = self
+                .enqueue_and_apply_sync_items(entity_type.clone(), scope.clone(), vec![item])
+                .await?;
+            self.storage.delete_pending_timeline_mutation(mutation).await?;
+            self.queue_last_sync_events(entity_type, scope, count);
+            applied += count;
+        }
+        Ok(applied)
+    }
+
     async fn resume_channel_difference(
         &mut self,
         channel_id: u64,
@@ -7331,12 +7497,25 @@ impl State {
                 break;
             }
             for commit in response.commits.iter() {
+                if self.defer_canonical_mutation_if_target_missing(commit).await? {
+                    continue;
+                }
                 let (entity_type, item) = Self::sync_item_from_difference_commit(commit);
+                let materializes_message = entity_type == "message" && !item.deleted;
                 let applied = self
                     .enqueue_and_apply_sync_items(entity_type.clone(), scope.clone(), vec![item])
                     .await?;
                 total_applied += applied;
                 self.queue_last_sync_events(entity_type, scope.clone(), applied);
+                if materializes_message {
+                    total_applied += self
+                        .replay_pending_timeline_mutations(
+                            commit.channel_id,
+                            i32::from(commit.channel_type),
+                            commit.server_msg_id,
+                        )
+                        .await?;
+                }
             }
             let next_last_pts = response
                 .commits
@@ -7406,6 +7585,73 @@ impl State {
             })
             .await?;
         Ok(())
+    }
+
+    /// Bounded repair for pushes lost while the transport still looked healthy.
+    async fn run_anti_entropy_once(&mut self) -> Result<usize> {
+        const PAGE_SIZE: usize = 100;
+        const WIFI_DIFFERENCE_BUDGET: usize = 8;
+        const CELLULAR_DIFFERENCE_BUDGET: usize = 4;
+
+        if self.session_state != SessionState::Authenticated || !self.bootstrap_completed {
+            return Ok(0);
+        }
+        let (after_channel_id, after_channel_type) = self.load_anti_entropy_cursor().await;
+        let mut channels = self.storage
+            .list_channel_identifiers_after(after_channel_id, after_channel_type, PAGE_SIZE)
+            .await?;
+        if channels.is_empty() && after_channel_id != 0 {
+            self.save_anti_entropy_cursor(0, -1).await?;
+            channels = self.storage
+                .list_channel_identifiers_after(0, -1, PAGE_SIZE)
+                .await?;
+        }
+        if channels.is_empty() {
+            return Ok(0);
+        }
+
+        let remote = self.batch_get_channel_pts(channels.clone()).await?;
+        let remote_pts: HashMap<(u64, i32), u64> = remote.channel_pts_map
+            .into_iter()
+            .map(|row| ((row.channel_id, i32::from(row.channel_type)), row.current_pts))
+            .collect();
+        let budget = if self.network_hint == NetworkHint::Cellular {
+            CELLULAR_DIFFERENCE_BUDGET
+        } else {
+            WIFI_DIFFERENCE_BUDGET
+        };
+        let mut repaired = 0usize;
+        let mut difference_calls = 0usize;
+        for (channel_id, channel_type) in channels.iter().copied() {
+            let Some(server_pts) = remote_pts.get(&(channel_id, channel_type)).copied() else {
+                continue;
+            };
+            let materialized_pts = self.storage
+                .max_message_pts(channel_id, channel_type)
+                .await?;
+            let local_pts = self.load_resume_channel_pts(channel_id, channel_type)
+                .await
+                .unwrap_or(0)
+                .max(materialized_pts);
+            if server_pts <= local_pts || difference_calls >= budget {
+                continue;
+            }
+            repaired += self.resume_channel_difference(channel_id, channel_type).await?;
+            difference_calls += 1;
+        }
+
+        if channels.len() < PAGE_SIZE {
+            self.save_anti_entropy_cursor(0, -1).await?;
+        } else if let Some((channel_id, channel_type)) = channels.last().copied() {
+            self.save_anti_entropy_cursor(channel_id, channel_type).await?;
+        }
+        tracing::debug!(
+            scanned = channels.len(),
+            difference_calls,
+            repaired,
+            "anti-entropy channel page completed"
+        );
+        Ok(repaired)
     }
 
     async fn run_resume_sync(&mut self) -> Result<()> {
@@ -10139,6 +10385,8 @@ impl PrivchatSdk {
                 auth_terminal_fired: false,
                 inbound_epoch: 0,
                 last_resume_synced: None,
+                last_anti_entropy_at: Instant::now(),
+                anti_entropy_jitter: Duration::from_secs(rand::random::<u64>() % 16),
                 room_seen_msg_ids: HashMap::new(),
                 last_terminal_reason: None,
                 network_hint: NetworkHint::Unknown,
@@ -10226,6 +10474,19 @@ impl PrivchatSdk {
                         }
 
                         let _ = state.cleanup_tmp_dirs_if_needed().await;
+
+                        if state.session_state == SessionState::Authenticated
+                            && state.bootstrap_completed
+                            && state.last_anti_entropy_at.elapsed()
+                                >= Duration::from_secs(60) + state.anti_entropy_jitter
+                        {
+                            // Advance before RPC so a transient failure cannot turn the
+                            // 15s health tick into an unbounded retry loop.
+                            state.last_anti_entropy_at = Instant::now();
+                            if let Err(err) = state.run_anti_entropy_once().await {
+                                tracing::warn!(error = %err, "anti-entropy pass failed");
+                            }
+                        }
 
                         if state.should_process_outbound_queue() {
                             let _ = state.drain_outbound_queues().await;
@@ -14971,10 +15232,11 @@ impl PrivchatSdk {
 mod tests {
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
-        group_settings_key, Action, AuthErrorKind, ConnectionState, ContentMessageType, Error,
+        group_settings_key, Action, AuthErrorKind, CanonicalTimelineEvent, ConnectionState,
+        ContentMessageType, Error,
         ErrorCode, LoginResult, MessageCachePolicy, NetworkHint, PresenceStatus, PrivchatConfig,
         PrivchatSdk, ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent,
-        SessionState, State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
+        ServerCommit, SessionState, State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
         UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertRemoteMessageInput,
         UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
     };
@@ -14991,7 +15253,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex as StdMutex};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -15085,6 +15347,8 @@ mod tests {
             auth_terminal_fired: false,
             inbound_epoch: 0,
             last_resume_synced: None,
+            last_anti_entropy_at: Instant::now(),
+            anti_entropy_jitter: Duration::ZERO,
             room_seen_msg_ids: HashMap::new(),
             last_terminal_reason: None,
             network_hint: NetworkHint::Unknown,
@@ -17407,6 +17671,96 @@ mod tests {
         assert!(!reactions[0].is_deleted);
 
         sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn canonical_mutations_wait_for_target_then_replay_in_pts_order() {
+        use privchat_protocol::{
+            NewMessageEvent, ReactionChangeEvent, ReactionOperation, RevokeEvent,
+            CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
+        };
+
+        let (mut state, dir) = new_seeded_state("pending-mutation-replay").await;
+        state.storage.upsert_channel(UpsertChannelInput {
+            channel_id: 92_500,
+            channel_type: 2,
+            channel_name: "pending-room".to_string(),
+            channel_remark: String::new(),
+            avatar: String::new(),
+            unread_count: 0,
+            top: 0,
+            mute: 0,
+            last_msg_timestamp: 0,
+            last_local_message_id: 0,
+            last_msg_content: String::new(),
+            version: 1,
+            peer_user_id: None,
+        }).await.expect("seed channel");
+
+        let target = 70_500;
+        let events = [
+            (80_501, 11, CanonicalTimelineEvent::Revoke(RevokeEvent {
+                target_server_message_id: target,
+                revoked_by: 10_001,
+                revoked_at: 1_710_000_000_000,
+            })),
+            (80_502, 12, CanonicalTimelineEvent::ReactionChange(ReactionChangeEvent {
+                target_server_message_id: target,
+                actor_id: 20_001,
+                emoji: "ok".to_string(),
+                operation: ReactionOperation::Add,
+            })),
+        ];
+        for (event_id, pts, event) in events {
+            let commit = ServerCommit {
+                event_id: Some(event_id), pts, server_msg_id: event_id,
+                local_message_id: None, channel_id: 92_500, channel_type: 2,
+                message_type: String::new(), content: serde_json::Value::Null,
+                server_timestamp: 1_710_000_000_000, sender_id: 10_001,
+                sender_info: None,
+                event_schema_version: Some(CANONICAL_TIMELINE_EVENT_SCHEMA_V1),
+                canonical_event: Some(event.encode_fb().expect("encode mutation")),
+            };
+            assert!(state.defer_canonical_mutation_if_target_missing(&commit)
+                .await.expect("defer mutation"));
+        }
+
+        let new_message = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
+            message_type: ContentMessageType::Text,
+            payload: privchat_protocol::MessagePayloadEnvelope {
+                content: "arrived after mutations".to_string(),
+                ..Default::default()
+            },
+        });
+        let commit = ServerCommit {
+            event_id: Some(target), pts: 10, server_msg_id: target,
+            local_message_id: None, channel_id: 92_500, channel_type: 2,
+            message_type: "text".to_string(), content: serde_json::Value::Null,
+            server_timestamp: 1_709_999_999_000, sender_id: 20_001,
+            sender_info: None,
+            event_schema_version: Some(CANONICAL_TIMELINE_EVENT_SCHEMA_V1),
+            canonical_event: Some(new_message.encode_fb().expect("encode message")),
+        };
+        let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
+        state.enqueue_and_apply_sync_items(
+            entity_type, Some("2:92500".to_string()), vec![item]
+        ).await.expect("materialize target");
+        assert_eq!(state.replay_pending_timeline_mutations(92_500, 2, target)
+            .await.expect("replay mutations"), 2);
+
+        let message_id = state.storage
+            .get_message_id_by_server_message_id(92_500, 2, target)
+            .await.expect("resolve target").expect("target exists");
+        assert!(state.storage.get_message_extra(message_id).await
+            .expect("message extra").expect("message extra exists").revoke);
+        let reactions = state.storage.list_message_reactions(message_id, 20, 0)
+            .await.expect("list reactions");
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].emoji, "ok");
+        assert!(state.storage.list_pending_timeline_mutations(92_500, 2, target)
+            .await.expect("pending after replay").is_empty());
+        drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }
 
