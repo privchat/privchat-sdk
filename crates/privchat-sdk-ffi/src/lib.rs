@@ -1248,6 +1248,31 @@ pub enum ResumeEscalationScope {
     FullRebuild,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SyncPhase {
+    Idle,
+    Syncing,
+    Synced,
+    Retrying,
+    FailedTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SyncRunKind {
+    Bootstrap,
+    Resume,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SyncStateSnapshot {
+    pub phase: SyncPhase,
+    pub run_kind: Option<SyncRunKind>,
+    pub attempt: u32,
+    pub error_code: Option<u32>,
+    pub message: Option<String>,
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum MediaDownloadState {
     Idle,
@@ -1281,6 +1306,9 @@ pub enum SdkEvent {
     },
     BootstrapCompleted {
         user_id: u64,
+    },
+    SyncStateChanged {
+        state: SyncStateSnapshot,
     },
     ResumeSyncStarted,
     ResumeSyncCompleted {
@@ -2063,6 +2091,28 @@ fn map_sdk_resume_escalation_scope(
     }
 }
 
+fn map_sync_state(v: privchat_sdk::SyncStateSnapshot) -> SyncStateSnapshot {
+    let phase = match v.phase {
+        privchat_sdk::SyncPhase::Idle => SyncPhase::Idle,
+        privchat_sdk::SyncPhase::Syncing => SyncPhase::Syncing,
+        privchat_sdk::SyncPhase::Synced => SyncPhase::Synced,
+        privchat_sdk::SyncPhase::Retrying => SyncPhase::Retrying,
+        privchat_sdk::SyncPhase::FailedTerminal => SyncPhase::FailedTerminal,
+    };
+    let run_kind = v.run_kind.map(|kind| match kind {
+        privchat_sdk::SyncRunKind::Bootstrap => SyncRunKind::Bootstrap,
+        privchat_sdk::SyncRunKind::Resume => SyncRunKind::Resume,
+    });
+    SyncStateSnapshot {
+        phase,
+        run_kind,
+        attempt: v.attempt,
+        error_code: v.error_code,
+        message: v.message,
+        updated_at_ms: v.updated_at_ms,
+    }
+}
+
 #[cfg(test)]
 fn parse_read_list_entries(raw: &str) -> Vec<serde_json::Value> {
     fn to_values(
@@ -2142,6 +2192,9 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
         privchat_sdk::SdkEvent::BootstrapCompleted { user_id } => {
             SdkEvent::BootstrapCompleted { user_id }
         }
+        privchat_sdk::SdkEvent::SyncStateChanged { state } => SdkEvent::SyncStateChanged {
+            state: map_sync_state(state),
+        },
         privchat_sdk::SdkEvent::ResumeSyncStarted => SdkEvent::ResumeSyncStarted,
         privchat_sdk::SdkEvent::ResumeSyncCompleted {
             entity_types_synced,
@@ -2426,6 +2479,15 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
         SdkEvent::BootstrapCompleted { user_id } => json!({
             "type": "bootstrap_completed",
             "user_id": user_id
+        }),
+        SdkEvent::SyncStateChanged { state } => json!({
+            "type": "sync_state_changed",
+            "phase": format!("{:?}", state.phase),
+            "run_kind": state.run_kind.map(|kind| format!("{kind:?}")),
+            "attempt": state.attempt,
+            "error_code": state.error_code,
+            "message": state.message,
+            "updated_at_ms": state.updated_at_ms
         }),
         SdkEvent::ResumeSyncStarted => json!({
             "type": "resume_sync_started"
@@ -3868,6 +3930,21 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from);
         eprintln!("[FFI] run_bootstrap_sync: done ok={}", out.is_ok());
         out
+    }
+
+    pub async fn ensure_synced(&self) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .ensure_synced()
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    pub async fn sync_state(&self) -> Result<SyncStateSnapshot, PrivchatFfiError> {
+        self.inner
+            .sync_state()
+            .await
+            .map(map_sync_state)
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn is_bootstrap_completed(&self) -> Result<bool, PrivchatFfiError> {
@@ -8863,9 +8940,31 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        parse_read_list_entries, parse_read_list_user_ids, PrivchatClient, PrivchatConfig,
-        SdkEvent, ServerEndpoint, TransportProtocol,
+        map_sdk_event, parse_read_list_entries, parse_read_list_user_ids, PrivchatClient,
+        PrivchatConfig, SdkEvent, ServerEndpoint, SyncPhase, SyncRunKind, TransportProtocol,
     };
+
+    #[test]
+    fn sync_state_event_preserves_typed_fields() {
+        let event = map_sdk_event(privchat_sdk::SdkEvent::SyncStateChanged {
+            state: privchat_sdk::SyncStateSnapshot {
+                phase: privchat_sdk::SyncPhase::Retrying,
+                run_kind: Some(privchat_sdk::SyncRunKind::Resume),
+                attempt: 3,
+                error_code: Some(9),
+                message: Some("transport".to_string()),
+                updated_at_ms: 42,
+            },
+        });
+        let SdkEvent::SyncStateChanged { state } = event else {
+            panic!("expected typed sync state event");
+        };
+        assert_eq!(state.phase, SyncPhase::Retrying);
+        assert_eq!(state.run_kind, Some(SyncRunKind::Resume));
+        assert_eq!(state.attempt, 3);
+        assert_eq!(state.error_code, Some(9));
+        assert_eq!(state.updated_at_ms, 42);
+    }
 
     #[test]
     fn parse_read_list_user_ids_supports_top_level_array() {
@@ -8930,7 +9029,9 @@ mod tests {
             let _ = client_for_shutdown.shutdown().await;
         });
         let evt = client
-            .next_event_envelope(200)
+            // Actor startup can contend with the rest of the FFI test suite on CI.
+            // Keep the event assertion, but use a realistic async scheduling budget.
+            .next_event_envelope(2_000)
             .await
             .expect("poll should not fail");
         assert!(

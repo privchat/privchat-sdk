@@ -77,11 +77,14 @@ mod receive_pipeline;
 mod runtime;
 mod storage_actor;
 mod sync_commit_applier;
+mod sync_coordinator;
 mod task;
 use receive_pipeline::ReceivePipeline;
 use runtime::runtime_provider::RuntimeProvider;
 use storage_actor::StorageHandle;
 use sync_commit_applier::SyncCommitApplier;
+pub use sync_coordinator::{SyncPhase, SyncRunKind, SyncStateSnapshot};
+use sync_coordinator::SyncCoordinator;
 use task::task_registry::TaskRegistry;
 
 /// 下载票据：下载前由 `file/get_url` 解析（file_id 路径），或由 legacy file_url 构造
@@ -469,6 +472,9 @@ pub enum SdkEvent {
     },
     BootstrapCompleted {
         user_id: u64,
+    },
+    SyncStateChanged {
+        state: SyncStateSnapshot,
     },
     ResumeSyncStarted,
     ResumeSyncCompleted {
@@ -2195,6 +2201,12 @@ enum Command {
     RunBootstrapSync {
         resp: oneshot::Sender<Result<()>>,
     },
+    EnsureSynced {
+        resp: oneshot::Sender<Result<()>>,
+    },
+    GetSyncState {
+        resp: oneshot::Sender<Result<SyncStateSnapshot>>,
+    },
     IsBootstrapCompleted {
         resp: oneshot::Sender<Result<bool>>,
     },
@@ -2692,6 +2704,7 @@ struct State {
     transport: Option<TransportClient>,
     session_state: SessionState,
     bootstrap_completed: bool,
+    sync_coordinator: SyncCoordinator,
     snowflake: Arc<snowflake_me::Snowflake>,
     storage: StorageHandle,
     current_uid: Option<String>,
@@ -7745,7 +7758,7 @@ impl State {
         Ok(repaired)
     }
 
-    async fn run_resume_sync(&mut self) -> Result<()> {
+    async fn execute_resume_sync(&mut self) -> Result<()> {
         if self.session_state != SessionState::Authenticated {
             let err =
                 Error::InvalidState("run_resume_sync requires authenticated state".to_string());
@@ -8299,7 +8312,7 @@ impl State {
         Ok(applied)
     }
 
-    async fn run_bootstrap_sync(&mut self) -> Result<()> {
+    async fn execute_bootstrap_sync(&mut self) -> Result<()> {
         if self.session_state != SessionState::Authenticated {
             return Err(Error::InvalidState(
                 "run_bootstrap_sync requires authenticated state".to_string(),
@@ -8307,7 +8320,7 @@ impl State {
         }
 
         if self.bootstrap_completed && !self.full_rebuild_required().await {
-            match self.run_resume_sync().await {
+            match self.execute_resume_sync().await {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     if !self.full_rebuild_required().await {
@@ -8416,6 +8429,50 @@ impl State {
         self.hydrate_system_channel_messages_from_history().await?;
 
         Ok(())
+    }
+
+    async fn ensure_synced<F>(&mut self, mut emit: F) -> Result<()>
+    where
+        F: FnMut(SdkEvent),
+    {
+        if self.session_state != SessionState::Authenticated {
+            return Err(Error::InvalidState(
+                "ensure_synced requires authenticated state".to_string(),
+            ));
+        }
+
+        let kind = if self.bootstrap_completed && !self.full_rebuild_required().await {
+            SyncRunKind::Resume
+        } else {
+            SyncRunKind::Bootstrap
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if !self.sync_coordinator.begin(kind, now_ms) {
+            return Ok(());
+        }
+        emit(SdkEvent::SyncStateChanged {
+            state: self.sync_coordinator.snapshot(),
+        });
+
+        let result = match kind {
+            SyncRunKind::Bootstrap => self.execute_bootstrap_sync().await,
+            SyncRunKind::Resume => self.execute_resume_sync().await,
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match &result {
+            Ok(()) => self.sync_coordinator.complete(kind, now_ms),
+            Err(error) => self.sync_coordinator.fail(
+                kind,
+                error.is_auth_terminal(),
+                Some(error.protocol_code()),
+                error.to_string(),
+                now_ms,
+            ),
+        }
+        emit(SdkEvent::SyncStateChanged {
+            state: self.sync_coordinator.snapshot(),
+        });
+        result
     }
 
     async fn hydrate_system_channel_messages_from_history(&mut self) -> Result<()> {
@@ -10504,6 +10561,7 @@ impl PrivchatSdk {
                     .as_ref()
                     .map(|s| s.bootstrap_completed)
                     .unwrap_or(false),
+                sync_coordinator: SyncCoordinator::new(),
                 snowflake,
                 storage: storage.clone(),
                 current_uid,
@@ -10667,7 +10725,15 @@ impl PrivchatSdk {
                                     && state.bootstrap_completed
                                 {
                                     // ③ resume sync 把重连/断网期间漏掉的增量补回来
-                                    if let Err(err) = state.run_resume_sync().await {
+                                    if let Err(err) = state.ensure_synced(|event| {
+                                        emit_sequenced_event(
+                                            &actor_event_tx,
+                                            &actor_event_history,
+                                            &actor_event_seq,
+                                            event_history_limit,
+                                            event,
+                                        );
+                                    }).await {
                                         eprintln!("[SDK.actor] resume sync failed after reconnect: {err}");
                                     }
                                 }
@@ -10857,7 +10923,15 @@ impl PrivchatSdk {
                                     && state.session_state == SessionState::Authenticated
                                     && state.bootstrap_completed
                                 {
-                                    if let Err(err) = state.run_resume_sync().await {
+                                    if let Err(err) = state.ensure_synced(|event| {
+                                        emit_sequenced_event(
+                                            &actor_event_tx,
+                                            &actor_event_history,
+                                            &actor_event_seq,
+                                            event_history_limit,
+                                            event,
+                                        );
+                                    }).await {
                                         eprintln!(
                                             "[SDK.actor] connect: resume sync after auto-restore failed: {err}"
                                         );
@@ -11220,7 +11294,15 @@ impl PrivchatSdk {
                             if state.session_state == SessionState::Authenticated
                                 && state.bootstrap_completed
                             {
-                                if let Err(err) = state.run_resume_sync().await {
+                                if let Err(err) = state.ensure_synced(|event| {
+                                    emit_sequenced_event(
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        event,
+                                    );
+                                }).await {
                                     eprintln!("[SDK.actor] cmd_authenticate: resume sync failed: {err}");
                                 }
                             }
@@ -11521,17 +11603,15 @@ impl PrivchatSdk {
                         if actor_logs_enabled() {
                             eprintln!("[SDK.actor] loop: cmd run_bootstrap_sync");
                         }
-                        let result = match timeout(
-                            Duration::from_secs(60),
-                            state.run_bootstrap_sync(),
-                        )
-                        .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => {
-                                Err(Error::Transport("run_bootstrap_sync timeout".to_string()))
-                            }
-                        };
+                        let result = state.ensure_synced(|event| {
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                event,
+                            );
+                        }).await;
                         if result.is_ok() {
                             if let Some(uid) = &state.current_uid {
                                 if let Ok(user_id) = uid.parse::<u64>() {
@@ -11546,6 +11626,40 @@ impl PrivchatSdk {
                             }
                         }
                         let _ = resp.send(result);
+                    }
+                    Command::EnsureSynced { resp } => {
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd ensure_synced");
+                        }
+                        let bootstrap_was_completed = state.bootstrap_completed;
+                        let result = state.ensure_synced(|event| {
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                event,
+                            );
+                        }).await;
+                        if result.is_ok() && !bootstrap_was_completed && state.bootstrap_completed {
+                            if let Some(user_id) = state
+                                .current_uid
+                                .as_deref()
+                                .and_then(|uid| uid.parse::<u64>().ok())
+                            {
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::BootstrapCompleted { user_id },
+                                );
+                            }
+                        }
+                        let _ = resp.send(result);
+                    }
+                    Command::GetSyncState { resp } => {
+                        let _ = resp.send(Ok(state.sync_coordinator.snapshot()));
                     }
                     Command::IsBootstrapCompleted { resp } => {
                         let _ = resp.send(Ok(state.bootstrap_completed));
@@ -11563,6 +11677,12 @@ impl PrivchatSdk {
                         state.reset_reconnect_backoff();
                         let from_state = state.session_state.as_connection_state();
                         state.bootstrap_completed = false;
+                        state
+                            .sync_coordinator
+                            .reset(chrono::Utc::now().timestamp_millis());
+                        state.pending_events.push(SdkEvent::SyncStateChanged {
+                            state: state.sync_coordinator.snapshot(),
+                        });
                         state.session_state = SessionState::Connected;
                         let result = if let Some(uid) = &state.current_uid {
                             let clear = state.storage.clear_session(uid.clone()).await;
@@ -13840,6 +13960,26 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    pub async fn ensure_synced(&self) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::EnsureSynced { resp: resp_tx })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    pub async fn sync_state(&self) -> Result<SyncStateSnapshot> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::GetSyncState { resp: resp_tx })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
     pub async fn session_snapshot(&self) -> Result<Option<SessionSnapshot>> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -15357,7 +15497,8 @@ mod tests {
         group_settings_key, Action, AuthErrorKind, CanonicalTimelineEvent, ConnectionState,
         ContentMessageType, Error, ErrorCode, LoginResult, MessageCachePolicy, NetworkHint,
         PresenceStatus, PrivchatConfig, PrivchatSdk, ResumeEscalationScope, ResumeFailureClass,
-        ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State, UpsertChannelInput,
+        ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State, SyncCoordinator,
+        UpsertChannelInput,
         UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput, UpsertMessageReactionInput,
         UpsertRemoteMessageInput, UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
     };
@@ -15453,6 +15594,7 @@ mod tests {
             transport: None,
             session_state: SessionState::Authenticated,
             bootstrap_completed: true,
+            sync_coordinator: SyncCoordinator::new(),
             snowflake: Arc::new(
                 snowflake_me::Snowflake::builder()
                     .machine_id(&|| Ok((std::process::id() as u16) & 0x1f))
