@@ -28,7 +28,6 @@ use msgtrans::transport::client::{TransportClient, TransportClientBuilder};
 use msgtrans::transport::TransportOptions;
 use msgtrans::ClientEvent;
 use privchat_protocol::message::LocalMessagePayloadEnvelope;
-use privchat_protocol::MessagePayloadEnvelope;
 use privchat_protocol::presence::{
     PresenceBatchStatusRequest, PresenceBatchStatusResponse, PresenceChangedNotification,
     TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
@@ -47,20 +46,20 @@ use privchat_protocol::rpc::message::history::{
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
     BatchGetChannelPtsRequest, BatchGetChannelPtsResponse, ChannelExtraSyncPayload,
-    ChannelIdentifier, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload,
-    ChannelSyncPayload, FriendSyncPayload, GetChannelPtsRequest, GetChannelPtsResponse,
-    GetDifferenceRequest, GetDifferenceResponse, GroupMemberSyncPayload, GroupSyncPayload,
-    MessageStatusSyncPayload, MessageSyncPayload, ServerCommit, SyncEntityItem,
+    ChannelIdentifier, ChannelMemberSyncPayload, ChannelReadCursorSyncPayload, ChannelSyncPayload,
+    FriendSyncPayload, GetChannelPtsRequest, GetChannelPtsResponse, GetDifferenceRequest,
+    GetDifferenceResponse, GroupMemberSyncPayload, GroupSyncPayload, MessageStatusSyncPayload,
+    MessageSyncPayload, ServerCommit, SyncEntityItem,
 };
+use privchat_protocol::MessagePayloadEnvelope;
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
     CanonicalTimelineEvent, ClientInfo, ContactCardMetadata, ContentMessageType, DeviceInfo,
-    DeviceType, FlatBufferMessage,
-    DisconnectRequest, DisconnectResponse, ErrorCode, LinkMetadata, LocationMetadata,
-    MessageMetadata, MessageType, PingRequest, PongResponse, PublishRequest, PublishResponse,
-    PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse, RpcRequest,
-    RpcResponse, SendMessageRequest, SendMessageResponse, SubscribeRequest, SubscribeResponse,
-    TransferRequest, TransferResponse,
+    DeviceType, DisconnectRequest, DisconnectResponse, ErrorCode, FlatBufferMessage, LinkMetadata,
+    LocationMetadata, MessageMetadata, MessageType, PingRequest, PongResponse, PublishRequest,
+    PublishResponse, PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse,
+    RpcRequest, RpcResponse, SendMessageRequest, SendMessageResponse, SubscribeRequest,
+    SubscribeResponse, TransferRequest, TransferResponse, CANONICAL_TIMELINE_PUSH_TOPIC_V1,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -762,9 +761,8 @@ pub struct LinkPreviewResult {
 /// 网址预览回调（应用层实现）。类比 [`VideoProcessHook`]：SDK 传入 URL，由宿主 App 抓取
 /// 网页 meta 和 og:image，写入本地临时路径后返回结果；宿主未注册时 SDK 不会发起抓取，
 /// `LinkMetadata` 各可选字段保持 `None`（客户端 UI 兜底空白预览）。
-pub type LinkPreviewHook = Arc<
-    dyn Fn(&str) -> std::result::Result<LinkPreviewResult, String> + Send + Sync,
->;
+pub type LinkPreviewHook =
+    Arc<dyn Fn(&str) -> std::result::Result<LinkPreviewResult, String> + Send + Sync>;
 
 #[derive(Debug, Clone)]
 struct UploadedFileInfo {
@@ -845,7 +843,9 @@ fn emit_sequenced_event(
 
 async fn stop_inbound_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
     if let Some(handle) = task.take() {
-        if realtime_trace_enabled() { eprintln!("[SDK_INBOUND_TASK_END] aborting old inbound task"); }
+        if realtime_trace_enabled() {
+            eprintln!("[SDK_INBOUND_TASK_END] aborting old inbound task");
+        }
         handle.abort();
         let _ = handle.await;
     }
@@ -1052,7 +1052,10 @@ fn read_or_create_installation_id(
         }
         // 2) 发布尝试：真随机 id（rand，非 RandomState 冒充）→ 写满临时文件 fsync → 原子 hard_link。
         let candidate = format!("{:032x}", rand::random::<u128>());
-        let tmp = dir.join(format!("installation_id.tmp.{:016x}", rand::random::<u64>()));
+        let tmp = dir.join(format!(
+            "installation_id.tmp.{:016x}",
+            rand::random::<u64>()
+        ));
         if let Err(e) = (|| -> std::io::Result<()> {
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -1153,7 +1156,10 @@ mod snowflake_worker_bits_tests {
         let path = dir.join("installation_id");
         std::fs::write(&path, "").unwrap(); // 损坏占位
         let id1 = read_or_create_installation_id(&dir, &path).unwrap();
-        assert!(!id1.is_empty(), "empty file must be recovered to a non-empty id");
+        assert!(
+            !id1.is_empty(),
+            "empty file must be recovered to a non-empty id"
+        );
         let id2 = read_or_create_installation_id(&dir, &path).unwrap(); // 重入稳定
         assert_eq!(id1, id2, "recovered id must be stable across reinit");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1166,7 +1172,10 @@ mod snowflake_worker_bits_tests {
         let path = dir.join("installation_id");
         std::fs::write(&path, [0xffu8, 0xfe, 0x00, 0x99]).unwrap(); // 非法 UTF-8
         let id1 = read_or_create_installation_id(&dir, &path).unwrap();
-        assert!(!id1.is_empty(), "corrupt non-utf8 file must be rebuilt to a valid id");
+        assert!(
+            !id1.is_empty(),
+            "corrupt non-utf8 file must be rebuilt to a valid id"
+        );
         let id2 = read_or_create_installation_id(&dir, &path).unwrap(); // 重入稳定
         assert_eq!(id1, id2, "rebuilt id must be stable across reinit");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1182,8 +1191,14 @@ mod snowflake_worker_bits_tests {
         let dir = blocker.join("inner"); // dir 的父组件是文件 → 其下任何 open/create 都 ENOTDIR
         let path = dir.join("installation_id");
         let r = read_or_create_installation_id(&dir, &path);
-        assert!(r.is_err(), "structural persist failure must surface as Err, not faked success");
-        assert!(!path.exists(), "must not publish an installation_id on failure");
+        assert!(
+            r.is_err(),
+            "structural persist failure must surface as Err, not faked success"
+        );
+        assert!(
+            !path.exists(),
+            "must not publish an installation_id on failure"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
@@ -1214,16 +1229,20 @@ async fn start_inbound_task(
     state.inbound_epoch = state.inbound_epoch.wrapping_add(1);
     let epoch = state.inbound_epoch;
     let Some(transport) = state.transport.as_ref() else {
-        if realtime_trace_enabled() { eprintln!(
-            "[SDK_INBOUND_TASK_START] epoch={} ABORTED transport=None uid={:?}",
-            epoch, state.current_uid
-        ); }
+        if realtime_trace_enabled() {
+            eprintln!(
+                "[SDK_INBOUND_TASK_START] epoch={} ABORTED transport=None uid={:?}",
+                epoch, state.current_uid
+            );
+        }
         return;
     };
-    if realtime_trace_enabled() { eprintln!(
-        "[SDK_INBOUND_TASK_START] epoch={} uid={:?} (订阅新 transport events)",
-        epoch, state.current_uid
-    ); }
+    if realtime_trace_enabled() {
+        eprintln!(
+            "[SDK_INBOUND_TASK_START] epoch={} uid={:?} (订阅新 transport events)",
+            epoch, state.current_uid
+        );
+    }
     let mut event_rx = transport.subscribe_events();
     *task = Some(tokio::spawn(async move {
         loop {
@@ -2894,11 +2913,13 @@ impl State {
     }
 
     async fn load_anti_entropy_cursor(&self) -> (u64, i32) {
-        let Some(raw) = self.storage
+        let Some(raw) = self
+            .storage
             .kv_get(Self::anti_entropy_cursor_key())
             .await
             .ok()
-            .flatten() else {
+            .flatten()
+        else {
             return (0, -1);
         };
         let Ok(text) = String::from_utf8(raw) else {
@@ -3966,6 +3987,11 @@ impl State {
         if payload.is_empty() {
             return (String::new(), None);
         }
+        if let Ok(envelope) = decode_message::<privchat_protocol::MessagePayloadEnvelope>(payload) {
+            if let Ok(value) = serde_json::to_value(envelope.to_legacy()) {
+                return Self::normalized_message_content_and_extra(&value);
+            }
+        }
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
             return Self::normalized_message_content_and_extra(&value);
         }
@@ -4291,6 +4317,54 @@ impl State {
         item
     }
 
+    async fn apply_canonical_timeline_push(
+        &mut self,
+        push: &PushMessageRequest,
+    ) -> Result<Option<usize>> {
+        if push.topic != CANONICAL_TIMELINE_PUSH_TOPIC_V1 {
+            return Ok(None);
+        }
+        let event = CanonicalTimelineEvent::decode_fb(&push.payload)
+            .map_err(|e| Error::Serialization(format!("decode canonical timeline push: {e}")))?;
+        let commit = ServerCommit {
+            event_id: Some(push.server_message_id),
+            pts: u64::from(push.message_seq),
+            server_msg_id: push.server_message_id,
+            local_message_id: None,
+            channel_id: push.channel_id,
+            channel_type: push.channel_type,
+            message_type: String::new(),
+            content: serde_json::Value::Null,
+            server_timestamp: i64::from(push.timestamp).saturating_mul(1_000),
+            sender_id: push.from_uid,
+            sender_info: None,
+            event_schema_version: Some(privchat_protocol::CANONICAL_TIMELINE_EVENT_SCHEMA_V1),
+            canonical_event: Some(push.payload.clone()),
+        };
+        if self
+            .defer_canonical_mutation_if_target_missing(&commit)
+            .await?
+        {
+            return Ok(Some(0));
+        }
+        let (entity_type, item) = Self::sync_item_from_canonical_difference_event(&commit, event);
+        let materializes_message = entity_type == "message" && !item.deleted;
+        let scope = Some(format!("{}:{}", push.channel_type, push.channel_id));
+        let mut applied = self
+            .enqueue_and_apply_sync_items(entity_type, scope, vec![item])
+            .await?;
+        if materializes_message {
+            applied += self
+                .replay_pending_timeline_mutations(
+                    push.channel_id,
+                    i32::from(push.channel_type),
+                    push.server_message_id,
+                )
+                .await?;
+        }
+        Ok(Some(applied))
+    }
+
     fn json_field_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
         let mut cur = value;
         for key in path {
@@ -4377,9 +4451,8 @@ impl State {
     /// 只是把 hint 转成 entity sync 触发点；权威数据来自 entity/sync_entities("friend")。
     fn push_message_to_friend_event(push: &PushMessageRequest) -> Option<u64> {
         match push.topic.as_str() {
-            "friend.request.received"
-            | "friend.request.sent"
-            | "friend.request.status_changed" => {}
+            "friend.request.received" | "friend.request.sent" | "friend.request.status_changed" => {
+            }
             _ => return None,
         }
         // envelope.aggregate_id 是十进制 user_id 字符串（见 protocol::inbox_event）。
@@ -4393,9 +4466,7 @@ impl State {
     }
 
     /// Extract a delivery receipt from a push notification, if applicable.
-    fn push_message_to_delivery_receipt(
-        push: &PushMessageRequest,
-    ) -> Option<(u64, i32, u64, u64)> {
+    fn push_message_to_delivery_receipt(push: &PushMessageRequest) -> Option<(u64, i32, u64, u64)> {
         let payload_json: serde_json::Value = serde_json::from_slice(&push.payload).ok()?;
         let notification_type =
             Self::json_field_string(&payload_json, &["metadata", "notification_type"])?;
@@ -4412,8 +4483,7 @@ impl State {
             Self::json_field_u64(&payload_json, &["metadata", "channel_type"]).unwrap_or(1) as i32;
         let server_message_id =
             Self::json_field_u64(&payload_json, &["server_message_id"]).unwrap_or(0);
-        let delivered_at =
-            Self::json_field_u64(&payload_json, &["delivered_at"]).unwrap_or(0);
+        let delivered_at = Self::json_field_u64(&payload_json, &["delivered_at"]).unwrap_or(0);
         if server_message_id == 0 {
             return None;
         }
@@ -4749,8 +4819,7 @@ impl State {
                     if user_id == 0 {
                         continue;
                     }
-                    let avatar =
-                        Self::json_get_string(&payload, &["avatar"]).unwrap_or_default();
+                    let avatar = Self::json_get_string(&payload, &["avatar"]).unwrap_or_default();
                     self.storage
                         .upsert_user(UpsertUserInput {
                             user_id,
@@ -5400,17 +5469,24 @@ impl State {
                         }
                     }
 
-                    emitted.push(SdkEvent::SyncEntityChanged {
-                        entity_type: "message".to_string(),
-                        entity_id: item.entity_id.clone(),
-                        deleted: false,
-                    });
-                    emitted.push(SdkEvent::TimelineUpdated {
-                        channel_id,
-                        channel_type,
-                        message_id,
-                        reason: "sync_entity".to_string(),
-                    });
+                    // NewMessage is immutable. Realtime delivery and anti-entropy may overlap,
+                    // so replaying an already materialized server message must not trigger a
+                    // second entity/timeline refresh or flood the SDK broadcast channel.
+                    // Optimistic echo reconciliation is surfaced separately through
+                    // MessageSendStatusChanged below.
+                    if upserted.inserted_new {
+                        emitted.push(SdkEvent::SyncEntityChanged {
+                            entity_type: "message".to_string(),
+                            entity_id: item.entity_id.clone(),
+                            deleted: false,
+                        });
+                        emitted.push(SdkEvent::TimelineUpdated {
+                            channel_id,
+                            channel_type,
+                            message_id,
+                            reason: "sync_entity".to_string(),
+                        });
+                    }
                     // 回显 vs 新消息：以 server_message_id 是否已存在本地（inserted_new）为准，
                     // 不能用 from_self 判定——服务端代发消息（如 RP-12 资金卡片注入，sender=本人
                     // 但本地无乐观原件）必须当新消息上抛；只有命中已有行（本地乐观发送的回显 /
@@ -6372,10 +6448,12 @@ impl State {
     }
 
     async fn try_auto_reconnect(&mut self) -> Result<SessionState> {
-        if realtime_trace_enabled() { eprintln!(
-            "[SDK_RECONNECT_BEGIN] old_epoch={} state_before={:?} uid={:?}",
-            self.inbound_epoch, self.session_state, self.current_uid
-        ); }
+        if realtime_trace_enabled() {
+            eprintln!(
+                "[SDK_RECONNECT_BEGIN] old_epoch={} state_before={:?} uid={:?}",
+                self.inbound_epoch, self.session_state, self.current_uid
+            );
+        }
         // A-1 trace: 入口
         eprintln!(
             "[TRACE-A1][try_auto_reconnect] enter state_before={:?} current_uid_present={}",
@@ -6836,12 +6914,7 @@ impl State {
         // authenticate() 的职责只是用当前 access_token 握手；不应覆盖 login/register 写入的
         // refresh_token 或过期时间。若该用户已有会话，只原子刷新 access_token；否则才走
         // save_login（用于外部认证首次 handshake，无 refresh_token）。
-        let existing_session = self
-            .storage
-            .load_session(uid.clone())
-            .await
-            .ok()
-            .flatten();
+        let existing_session = self.storage.load_session(uid.clone()).await.ok().flatten();
         if existing_session.is_some() {
             self.storage
                 .update_access_token(uid.clone(), token_for_persist, None)
@@ -7253,7 +7326,8 @@ impl State {
             .await?;
         let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
         for item in &resp.messages {
-            self.store_history_item(item, normalized_channel_type).await?;
+            self.store_history_item(item, normalized_channel_type)
+                .await?;
         }
         Ok(resp)
     }
@@ -7284,7 +7358,8 @@ impl State {
             .chain(std::iter::once(&resp.anchor_message))
             .chain(resp.after_messages.iter())
         {
-            self.store_history_item(item, normalized_channel_type).await?;
+            self.store_history_item(item, normalized_channel_type)
+                .await?;
         }
         Ok(resp)
     }
@@ -7366,7 +7441,8 @@ impl State {
             CanonicalTimelineEvent::ReactionChange(event) => event.target_server_message_id,
             CanonicalTimelineEvent::NewMessage(_) => return Ok(false),
         };
-        if self.storage
+        if self
+            .storage
             .get_message_id_by_server_message_id(
                 commit.channel_id,
                 i32::from(commit.channel_type),
@@ -7406,12 +7482,9 @@ impl State {
         channel_type: i32,
         target_server_message_id: u64,
     ) -> Result<usize> {
-        let pending = self.storage
-            .list_pending_timeline_mutations(
-                channel_id,
-                channel_type,
-                target_server_message_id,
-            )
+        let pending = self
+            .storage
+            .list_pending_timeline_mutations(channel_id, channel_type, target_server_message_id)
             .await?;
         let mut applied = 0usize;
         for mutation in pending {
@@ -7442,7 +7515,9 @@ impl State {
             let count = self
                 .enqueue_and_apply_sync_items(entity_type.clone(), scope.clone(), vec![item])
                 .await?;
-            self.storage.delete_pending_timeline_mutation(mutation).await?;
+            self.storage
+                .delete_pending_timeline_mutation(mutation)
+                .await?;
             self.queue_last_sync_events(entity_type, scope, count);
             applied += count;
         }
@@ -7497,7 +7572,10 @@ impl State {
                 break;
             }
             for commit in response.commits.iter() {
-                if self.defer_canonical_mutation_if_target_missing(commit).await? {
+                if self
+                    .defer_canonical_mutation_if_target_missing(commit)
+                    .await?
+                {
                     continue;
                 }
                 let (entity_type, item) = Self::sync_item_from_difference_commit(commit);
@@ -7597,12 +7675,14 @@ impl State {
             return Ok(0);
         }
         let (after_channel_id, after_channel_type) = self.load_anti_entropy_cursor().await;
-        let mut channels = self.storage
+        let mut channels = self
+            .storage
             .list_channel_identifiers_after(after_channel_id, after_channel_type, PAGE_SIZE)
             .await?;
         if channels.is_empty() && after_channel_id != 0 {
             self.save_anti_entropy_cursor(0, -1).await?;
-            channels = self.storage
+            channels = self
+                .storage
                 .list_channel_identifiers_after(0, -1, PAGE_SIZE)
                 .await?;
         }
@@ -7611,9 +7691,15 @@ impl State {
         }
 
         let remote = self.batch_get_channel_pts(channels.clone()).await?;
-        let remote_pts: HashMap<(u64, i32), u64> = remote.channel_pts_map
+        let remote_pts: HashMap<(u64, i32), u64> = remote
+            .channel_pts_map
             .into_iter()
-            .map(|row| ((row.channel_id, i32::from(row.channel_type)), row.current_pts))
+            .map(|row| {
+                (
+                    (row.channel_id, i32::from(row.channel_type)),
+                    row.current_pts,
+                )
+            })
             .collect();
         let budget = if self.network_hint == NetworkHint::Cellular {
             CELLULAR_DIFFERENCE_BUDGET
@@ -7626,24 +7712,29 @@ impl State {
             let Some(server_pts) = remote_pts.get(&(channel_id, channel_type)).copied() else {
                 continue;
             };
-            let materialized_pts = self.storage
+            let materialized_pts = self
+                .storage
                 .max_message_pts(channel_id, channel_type)
                 .await?;
-            let local_pts = self.load_resume_channel_pts(channel_id, channel_type)
+            let local_pts = self
+                .load_resume_channel_pts(channel_id, channel_type)
                 .await
                 .unwrap_or(0)
                 .max(materialized_pts);
             if server_pts <= local_pts || difference_calls >= budget {
                 continue;
             }
-            repaired += self.resume_channel_difference(channel_id, channel_type).await?;
+            repaired += self
+                .resume_channel_difference(channel_id, channel_type)
+                .await?;
             difference_calls += 1;
         }
 
         if channels.len() < PAGE_SIZE {
             self.save_anti_entropy_cursor(0, -1).await?;
         } else if let Some((channel_id, channel_type)) = channels.last().copied() {
-            self.save_anti_entropy_cursor(channel_id, channel_type).await?;
+            self.save_anti_entropy_cursor(channel_id, channel_type)
+                .await?;
         }
         tracing::debug!(
             scanned = channels.len(),
@@ -7881,7 +7972,11 @@ impl State {
 
     /// P1-05：room 广播去重。返回 true 表示这条 (channel_id, server_message_id) 最近
     /// 已见过（应丢弃）。None id 一律放行（无法去重）。每 channel 有界 FIFO（256）。
-    fn room_message_is_duplicate(&mut self, channel_id: u64, server_message_id: Option<u64>) -> bool {
+    fn room_message_is_duplicate(
+        &mut self,
+        channel_id: u64,
+        server_message_id: Option<u64>,
+    ) -> bool {
         const ROOM_DEDUP_WINDOW: usize = 256;
         let Some(id) = server_message_id else {
             return false;
@@ -7924,11 +8019,13 @@ impl State {
                         let _ = self.pending_prelogin_inbound_frames.remove(0);
                     }
                     self.pending_prelogin_inbound_frames.push((biz_type, data));
-                    if realtime_trace_enabled() { eprintln!(
+                    if realtime_trace_enabled() {
+                        eprintln!(
                         "[SDK_INBOUND_PRELOGIN_BUFFER] biz_type={} current_uid=None queue_len={} (push 帧卡在登录前缓冲；若不 replay 即收不到)",
                         biz_type,
                         self.pending_prelogin_inbound_frames.len()
-                    ); }
+                    );
+                    }
                 }
                 _ => {
                     if inbound_logs_enabled() {
@@ -7943,6 +8040,7 @@ impl State {
         }
         let mut message_items = Vec::new();
         let mut read_cursor_items = Vec::new();
+        let mut direct_applied = 0usize;
         // (channel_id, channel_type, server_message_id, delivered_at)
         let mut delivery_receipts: Vec<(u64, i32, u64, u64)> = Vec::new();
         match message_type {
@@ -7983,11 +8081,15 @@ impl State {
             MessageType::PushMessageRequest => {
                 let req: PushMessageRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
-                if realtime_trace_enabled() { eprintln!(
+                if realtime_trace_enabled() {
+                    eprintln!(
                     "[SDK_MESSAGE_EVENT_DECODED] biz=Push channel_id={} server_message_id={} from_uid={} msg_type={} payload_len={}",
                     req.channel_id, req.server_message_id, req.from_uid, req.message_type, req.payload.len()
-                ); }
-                if let Some(peer_uid) = Self::push_message_to_friend_event(&req) {
+                );
+                }
+                if let Some(count) = self.apply_canonical_timeline_push(&req).await? {
+                    direct_applied += count;
+                } else if let Some(peer_uid) = Self::push_message_to_friend_event(&req) {
                     // F-sync.2: 转 entity_type="friend"，让 SDK 走 entity sync
                     // 把 pending/rejected/recalled 状态从 server 拉到本地 friend 表。
                     self.pending_events.push(SdkEvent::SyncEntityChanged {
@@ -8009,13 +8111,16 @@ impl State {
                 let req: PushBatchRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push batch: {e}")))?;
                 for push in req.messages {
-                    if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
+                    if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
+                        direct_applied += count;
+                    } else if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                         self.pending_events.push(SdkEvent::SyncEntityChanged {
                             entity_type: "friend".to_string(),
                             entity_id: peer_uid.to_string(),
                             deleted: false,
                         });
-                    } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                    } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push)
+                    {
                         read_cursor_items.push(status_item);
                     } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
                         delivery_receipts.push(receipt);
@@ -8035,13 +8140,16 @@ impl State {
                             push.channel_id
                         );
                     }
-                    if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
+                    if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
+                        direct_applied += count;
+                    } else if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                         self.pending_events.push(SdkEvent::SyncEntityChanged {
                             entity_type: "friend".to_string(),
                             entity_id: peer_uid.to_string(),
                             deleted: false,
                         });
-                    } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                    } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push)
+                    {
                         read_cursor_items.push(status_item);
                     } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
                         delivery_receipts.push(receipt);
@@ -8056,15 +8164,20 @@ impl State {
                         );
                     }
                     for push in batch.messages {
-                        if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
+                        if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
+                            direct_applied += count;
+                        } else if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                             self.pending_events.push(SdkEvent::SyncEntityChanged {
                                 entity_type: "friend".to_string(),
                                 entity_id: peer_uid.to_string(),
                                 deleted: false,
                             });
-                        } else if let Some(status_item) = Self::push_message_to_status_sync_item(&push) {
+                        } else if let Some(status_item) =
+                            Self::push_message_to_status_sync_item(&push)
+                        {
                             read_cursor_items.push(status_item);
-                        } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push) {
+                        } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&push)
+                        {
                             delivery_receipts.push(receipt);
                         } else {
                             message_items.push(Self::push_message_to_sync_item(push));
@@ -8084,8 +8197,7 @@ impl State {
                     // 的状态帧，不参与去重（每次都应用最新态）。
                     if req.topic.as_deref() == Some("presence_changed") {
                         self.apply_presence_changed_payload(&req.payload);
-                    } else if self
-                        .room_message_is_duplicate(req.channel_id, req.server_message_id)
+                    } else if self.room_message_is_duplicate(req.channel_id, req.server_message_id)
                     {
                         if inbound_logs_enabled() {
                             eprintln!(
@@ -8117,17 +8229,21 @@ impl State {
             }
         }
 
-        let mut applied = 0usize;
+        let mut applied = direct_applied;
         if !message_items.is_empty() {
             let n = message_items.len();
             let before = applied;
             applied += self
                 .enqueue_and_apply_sync_items("message".to_string(), None, message_items)
                 .await?;
-            if realtime_trace_enabled() { eprintln!(
-                "[SDK_LOCAL_STORE_APPLY] message_items={} applied={} uid={:?}",
-                n, applied - before, self.current_uid
-            ); }
+            if realtime_trace_enabled() {
+                eprintln!(
+                    "[SDK_LOCAL_STORE_APPLY] message_items={} applied={} uid={:?}",
+                    n,
+                    applied - before,
+                    self.current_uid
+                );
+            }
         }
         if !read_cursor_items.is_empty() {
             applied += self
@@ -8174,10 +8290,12 @@ impl State {
         for (biz_type, data) in pending {
             applied += self.handle_inbound_frame(biz_type, data).await?;
         }
-        if realtime_trace_enabled() { eprintln!(
-            "[SDK_INBOUND_PRELOGIN_REPLAY] count={} applied={} current_uid={:?}",
-            count, applied, self.current_uid
-        ); }
+        if realtime_trace_enabled() {
+            eprintln!(
+                "[SDK_INBOUND_PRELOGIN_REPLAY] count={} applied={} current_uid={:?}",
+                count, applied, self.current_uid
+            );
+        }
         Ok(applied)
     }
 
@@ -8689,7 +8807,8 @@ impl State {
             )));
         }
         // 从 desired-subscription 注册表移除：重连后不再 replay 该频道。
-        self.active_subscriptions.remove(&(channel_id, channel_type));
+        self.active_subscriptions
+            .remove(&(channel_id, channel_type));
         Ok(())
     }
 
@@ -8955,7 +9074,10 @@ impl State {
     /// 解析缩略图下载票据：State 内（actor 上下文）按 `thumbnail_file_id` 调 `file/get_url`，
     /// 拿 signed_url + encryption_version + cek。失败返回 None（缩略图静默不下载，不阻塞）。
     /// CEK 只来自此处，绝不取自消息 metadata。
-    async fn resolve_thumbnail_ticket(&mut self, thumbnail_file_id: u64) -> Option<ResolvedFileDownload> {
+    async fn resolve_thumbnail_ticket(
+        &mut self,
+        thumbnail_file_id: u64,
+    ) -> Option<ResolvedFileDownload> {
         let req = FileGetUrlRequest {
             file_id: thumbnail_file_id,
             user_id: 0,
@@ -9093,12 +9215,11 @@ impl State {
         let bytes = resp.bytes().await?;
         // 附件加密 v1：缩略图 blob 同样是 nonce||ct||tag，用 file/get_url 票据里的 cek
         // 本地解密后再落盘；v0（legacy 明文）原样写入。解密失败直接报错，绝不写密文当图片。
-        let plaintext =
-            crate::attachment_crypto::decrypt_downloaded_attachment_bytes(
-                encryption_version,
-                cek,
-                &bytes,
-            )?;
+        let plaintext = crate::attachment_crypto::decrypt_downloaded_attachment_bytes(
+            encryption_version,
+            cek,
+            &bytes,
+        )?;
         std::fs::create_dir_all(dir)?;
         std::fs::write(thumb_path, &plaintext)?;
         eprintln!(
@@ -9223,12 +9344,13 @@ impl State {
         let Some(obj) = attachment_content.as_object_mut() else {
             return;
         };
-        let insert_u32 = |obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, v: u64| {
-            obj.insert(
-                key.to_string(),
-                serde_json::Value::from(v.min(u32::MAX as u64) as u32),
-            );
-        };
+        let insert_u32 =
+            |obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, v: u64| {
+                obj.insert(
+                    key.to_string(),
+                    serde_json::Value::from(v.min(u32::MAX as u64) as u32),
+                );
+            };
         if let Some(duration) = Self::pick_u64_from_extra(extra, "duration") {
             insert_u32(obj, "duration", duration);
         }
@@ -9563,21 +9685,16 @@ impl State {
             });
 
         // Canonical payload filename: payload.{ext} (Spec §7.5 v2)
-        let filename = media_store::payload_filename_with_fallback(
-            &mime_type,
-            original_filename.as_deref(),
-        );
+        let filename =
+            media_store::payload_filename_with_fallback(&mime_type, original_filename.as_deref());
 
         let file_type =
             Self::guess_file_type(message.message_type, &filename, &mime_type).to_string();
 
         let storage_paths = self.storage.get_storage_paths().await?;
         let user_root = PathBuf::from(&storage_paths.user_root);
-        let files_dir = media_store::get_message_dir(
-            &user_root,
-            message.message_id as i64,
-            message.created_at,
-        );
+        let files_dir =
+            media_store::get_message_dir(&user_root, message.message_id as i64, message.created_at);
         std::fs::create_dir_all(&files_dir)
             .map_err(|e| Error::Storage(format!("create files dir failed: {e}")))?;
 
@@ -9600,7 +9717,10 @@ impl State {
             let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
             let (w, h, size) =
                 Self::generate_image_thumbnail_sync(&body_path, &canonical_thumb, 320, 85)?;
-            let _ = self.storage.update_thumb_status(message.message_id, 1).await;
+            let _ = self
+                .storage
+                .update_thumb_status(message.message_id, 1)
+                .await;
             thumb_upload = Some((
                 canonical_thumb,
                 "image/webp".to_string(),
@@ -9635,13 +9755,9 @@ impl State {
             if let Some(hook) = self.video_process_hook.as_ref() {
                 // Hook writes compressed output in place to `payload.{ext}`.
                 // On failure the implementation must leave the file untouched.
-                let compressed_ok = hook(
-                    MediaProcessOp::Compress,
-                    &body_path,
-                    &meta_path,
-                    &body_path,
-                )
-                .map_err(|e| Error::Storage(format!("video compress hook failed: {e}")))?;
+                let compressed_ok =
+                    hook(MediaProcessOp::Compress, &body_path, &meta_path, &body_path)
+                        .map_err(|e| Error::Storage(format!("video compress hook failed: {e}")))?;
                 if compressed_ok {
                     upload_payload = std::fs::read(&body_path).map_err(|e| {
                         Error::Storage(format!("read compressed video failed: {e}"))
@@ -9658,10 +9774,15 @@ impl State {
             // loading modal. If present, trust it: set thumb_status=1 and skip both the
             // sync hook and Plan 2 async path.
             if canonical_thumb.exists()
-                && std::fs::metadata(&canonical_thumb).map(|m| m.len() > 0).unwrap_or(false)
+                && std::fs::metadata(&canonical_thumb)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
             {
                 hook_used = true;
-                let _ = self.storage.update_thumb_status(message.message_id, 1).await;
+                let _ = self
+                    .storage
+                    .update_thumb_status(message.message_id, 1)
+                    .await;
                 thumb_upload = Some((
                     canonical_thumb.clone(),
                     "image/webp".to_string(),
@@ -9687,7 +9808,10 @@ impl State {
                         ) {
                             Ok(_) => {
                                 hook_used = true;
-                                let _ = self.storage.update_thumb_status(message.message_id, 1).await;
+                                let _ = self
+                                    .storage
+                                    .update_thumb_status(message.message_id, 1)
+                                    .await;
                                 thumb_upload = Some((
                                     canonical_thumb.clone(),
                                     "image/webp".to_string(),
@@ -9712,7 +9836,10 @@ impl State {
                     .next_id()
                     .map(|id| id.to_string())
                     .unwrap_or_else(|_| {
-                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string()
+                        chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or(0)
+                            .to_string()
                     });
                 let (job_tx, job_rx) = oneshot::channel::<MediaJobResult>();
                 {
@@ -9738,11 +9865,9 @@ impl State {
                 ) {
                     emit_sequenced_event(tx, history, seq, self.event_history_limit, event);
                 }
-                let wait = tokio::time::timeout(
-                    Duration::from_millis(VIDEO_THUMBNAIL_TIMEOUT_MS),
-                    job_rx,
-                )
-                .await;
+                let wait =
+                    tokio::time::timeout(Duration::from_millis(VIDEO_THUMBNAIL_TIMEOUT_MS), job_rx)
+                        .await;
                 // Clear the entry on any exit path — host may submit after timeout.
                 if let Ok(mut locked) = self.pending_media_jobs.lock() {
                     locked.remove(&job_id);
@@ -9805,7 +9930,10 @@ impl State {
                 }
             }
             if !hook_used {
-                let _ = self.storage.update_thumb_status(message.message_id, 3).await;
+                let _ = self
+                    .storage
+                    .update_thumb_status(message.message_id, 3)
+                    .await;
             }
 
             let (thumb_w, thumb_h, thumb_size, thumb_mime) = match thumb_upload.as_ref() {
@@ -10108,10 +10236,7 @@ impl State {
             .as_ref()
             .map(|c| c.last_msg_content.clone())
             .unwrap_or_default();
-        let prev_last_msg_timestamp = existing
-            .as_ref()
-            .map(|c| c.last_msg_timestamp)
-            .unwrap_or(0);
+        let prev_last_msg_timestamp = existing.as_ref().map(|c| c.last_msg_timestamp).unwrap_or(0);
         let (channel_name, channel_remark, avatar, top, mute, unread_count) =
             if let Some(c) = existing {
                 (
@@ -10171,40 +10296,44 @@ impl State {
         // （pending 最新端；已确认按 pts）。到达顺序 ≠ pts 顺序（例：登录通知 pts=2 先经
         // push 到达，欢迎消息 pts=1 后经 sync 补齐——此前预览被"到达序"覆盖成旧消息）。
         // 仅当新行不older于当前预览行时才覆盖预览字段；unread 计数不受影响照常更新。
-        let preview_should_update = if prev_last_local_message_id == 0
-            || prev_last_local_message_id == message_id
-        {
-            true
-        } else {
-            let new_row = self.storage.get_message_by_id(message_id).await.ok().flatten();
-            match new_row {
-                None => true, // 新行尚未落库（调用时序差异）：保守覆盖，下次调用自愈
-                Some(nr) => {
-                    if nr.server_message_id.unwrap_or(0) == 0 {
-                        true // pending 自发消息 = 时间线最新端
-                    } else {
-                        match self
-                            .storage
-                            .get_message_by_id(prev_last_local_message_id)
-                            .await
-                            .ok()
-                            .flatten()
-                        {
-                            None => true, // 旧预览行已不存在（被清理），覆盖
-                            Some(or) => {
-                                if or.server_message_id.unwrap_or(0) == 0 {
-                                    // 旧预览是 pending：收到的 server 消息按时间更新，允许覆盖
-                                    // （pending ack 回填 pts 后由后续更新自然归位）
-                                    true
-                                } else {
-                                    nr.pts.unwrap_or(0) >= or.pts.unwrap_or(0)
+        let preview_should_update =
+            if prev_last_local_message_id == 0 || prev_last_local_message_id == message_id {
+                true
+            } else {
+                let new_row = self
+                    .storage
+                    .get_message_by_id(message_id)
+                    .await
+                    .ok()
+                    .flatten();
+                match new_row {
+                    None => true, // 新行尚未落库（调用时序差异）：保守覆盖，下次调用自愈
+                    Some(nr) => {
+                        if nr.server_message_id.unwrap_or(0) == 0 {
+                            true // pending 自发消息 = 时间线最新端
+                        } else {
+                            match self
+                                .storage
+                                .get_message_by_id(prev_last_local_message_id)
+                                .await
+                                .ok()
+                                .flatten()
+                            {
+                                None => true, // 旧预览行已不存在（被清理），覆盖
+                                Some(or) => {
+                                    if or.server_message_id.unwrap_or(0) == 0 {
+                                        // 旧预览是 pending：收到的 server 消息按时间更新，允许覆盖
+                                        // （pending ack 回填 pts 后由后续更新自然归位）
+                                        true
+                                    } else {
+                                        nr.pts.unwrap_or(0) >= or.pts.unwrap_or(0)
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        };
+            };
 
         let existing_version = self
             .storage
@@ -10316,9 +10445,8 @@ impl PrivchatSdk {
         let actor_startup_error = startup_error.clone();
         let presence_cache = Arc::new(StdMutex::new(HashMap::new()));
         let actor_presence_cache = presence_cache.clone();
-        let pending_media_jobs: Arc<
-            StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>,
-        > = Arc::new(StdMutex::new(HashMap::new()));
+        let pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
         let actor_pending_media_jobs = pending_media_jobs.clone();
         // CODEX-8：worker 位取自持久化 installation id（稳定设备身份），替代 pid/启动毫秒的
         // 临时派生 —— 重启后 worker 位不漂移；配合服务端 (sender, device, local_message_id)
@@ -13054,13 +13182,9 @@ impl PrivchatSdk {
         })?;
         let uid = snapshot.user_id;
         let root = std::path::Path::new(self.data_dir.as_str());
-        let target_dir = media_store::ensure_attachment_dir(
-            root,
-            uid,
-            message_id as i64,
-            created_at_ms,
-        )
-        .map_err(|e| Error::Storage(format!("ensure attachment dir failed: {e}")))?;
+        let target_dir =
+            media_store::ensure_attachment_dir(root, uid, message_id as i64, created_at_ms)
+                .map_err(|e| Error::Storage(format!("ensure attachment dir failed: {e}")))?;
         let payload_filename =
             media_store::payload_filename_with_fallback(&mime, filename_hint.as_deref());
         self.download_manager
@@ -13096,13 +13220,9 @@ impl PrivchatSdk {
         let uid = snapshot.user_id;
         let ticket = self.resolve_file_download(file_id).await?;
         let root = std::path::Path::new(self.data_dir.as_str());
-        let target_dir = media_store::ensure_attachment_dir(
-            root,
-            uid,
-            message_id as i64,
-            created_at_ms,
-        )
-        .map_err(|e| Error::Storage(format!("ensure attachment dir failed: {e}")))?;
+        let target_dir =
+            media_store::ensure_attachment_dir(root, uid, message_id as i64, created_at_ms)
+                .map_err(|e| Error::Storage(format!("ensure attachment dir failed: {e}")))?;
         let payload_filename =
             media_store::payload_filename_with_fallback(&mime, filename_hint.as_deref());
         self.download_manager
@@ -13628,8 +13748,7 @@ impl PrivchatSdk {
             file_id,
             user_id: 0, // 服务端按鉴权上下文填充
         };
-        let resp: FileGetUrlResponse =
-            self.rpc_call_typed(routes::file::GET_URL, &payload).await?;
+        let resp: FileGetUrlResponse = self.rpc_call_typed(routes::file::GET_URL, &payload).await?;
         if resp.file_url.trim().is_empty() {
             return Err(Error::Serialization(
                 "decode file/get_url response: missing file_url".to_string(),
@@ -13967,7 +14086,10 @@ impl PrivchatSdk {
                 (&content_type, &metadata),
                 (ContentMessageType::Link, MessageMetadata::Link(_))
                     | (ContentMessageType::Location, MessageMetadata::Location(_))
-                    | (ContentMessageType::ContactCard, MessageMetadata::ContactCard(_))
+                    | (
+                        ContentMessageType::ContactCard,
+                        MessageMetadata::ContactCard(_)
+                    )
             ),
             "structured message type and protocol metadata must match",
         );
@@ -13983,10 +14105,12 @@ impl PrivchatSdk {
             },
             message_source: None,
         };
-        let content = serde_json::to_string(&envelope)
-            .map_err(|e| Error::Serialization(format!("encode structured message envelope: {e}")))?;
-        let extra = serde_json::to_string(&metadata_value)
-            .map_err(|e| Error::Serialization(format!("encode structured message metadata: {e}")))?;
+        let content = serde_json::to_string(&envelope).map_err(|e| {
+            Error::Serialization(format!("encode structured message envelope: {e}"))
+        })?;
+        let extra = serde_json::to_string(&metadata_value).map_err(|e| {
+            Error::Serialization(format!("encode structured message metadata: {e}"))
+        })?;
         let message_id = self
             .create_local_message(NewMessage {
                 channel_id,
@@ -14002,7 +14126,8 @@ impl PrivchatSdk {
                 thumb_status: 0,
             })
             .await?;
-        self.enqueue_outbound_message(message_id, Vec::new()).await?;
+        self.enqueue_outbound_message(message_id, Vec::new())
+            .await?;
         Ok(message_id)
     }
 
@@ -14392,10 +14517,7 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn delete_message_local(
-        &self,
-        message_id: u64,
-    ) -> Result<Option<StoredMessage>> {
+    pub async fn delete_message_local(&self, message_id: u64) -> Result<Option<StoredMessage>> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
@@ -15233,12 +15355,11 @@ mod tests {
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
         group_settings_key, Action, AuthErrorKind, CanonicalTimelineEvent, ConnectionState,
-        ContentMessageType, Error,
-        ErrorCode, LoginResult, MessageCachePolicy, NetworkHint, PresenceStatus, PrivchatConfig,
-        PrivchatSdk, ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent,
-        ServerCommit, SessionState, State, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
-        UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertRemoteMessageInput,
-        UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
+        ContentMessageType, Error, ErrorCode, LoginResult, MessageCachePolicy, NetworkHint,
+        PresenceStatus, PrivchatConfig, PrivchatSdk, ResumeEscalationScope, ResumeFailureClass,
+        ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State, UpsertChannelInput,
+        UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput, UpsertMessageReactionInput,
+        UpsertRemoteMessageInput, UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
     };
     use crate::local_store::LocalStore;
     use crate::receive_pipeline::ReceivePipeline;
@@ -15460,6 +15581,114 @@ mod tests {
                 .unwrap_or_default(),
             "hello"
         );
+
+        let typed_push = PushMessageRequest {
+            server_message_id: 900002,
+            message_seq: 78,
+            channel_id: 100,
+            channel_type: 1,
+            from_uid: 100002,
+            message_type: ContentMessageType::Text.as_u32(),
+            payload: privchat_protocol::encode_message(
+                &privchat_protocol::MessagePayloadEnvelope {
+                    content: "typed hello".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("encode typed payload"),
+            ..PushMessageRequest::default()
+        };
+        let typed_item = State::push_message_to_sync_item(typed_push);
+        assert_eq!(
+            typed_item
+                .payload
+                .expect("typed sync payload")
+                .get("content")
+                .and_then(|value| value.as_str()),
+            Some("typed hello")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replayed_canonical_message_does_not_emit_duplicate_timeline_update() {
+        use privchat_protocol::{
+            CanonicalTimelineEvent, NewMessageEvent, CANONICAL_TIMELINE_PUSH_TOPIC_V1,
+        };
+
+        let (mut state, dir) = new_seeded_state("canonical-message-idempotent-event").await;
+        state
+            .storage
+            .upsert_channel(UpsertChannelInput {
+                channel_id: 93_100,
+                channel_type: 2,
+                channel_name: "idempotent-room".to_string(),
+                channel_remark: String::new(),
+                avatar: String::new(),
+                unread_count: 0,
+                top: 0,
+                mute: 0,
+                last_msg_timestamp: 0,
+                last_local_message_id: 0,
+                last_msg_content: String::new(),
+                version: 1,
+                peer_user_id: None,
+            })
+            .await
+            .expect("seed channel");
+        let event = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
+            message_type: ContentMessageType::Text,
+            payload: privchat_protocol::MessagePayloadEnvelope {
+                content: "deliver once".to_string(),
+                ..Default::default()
+            },
+        });
+        let push = PushMessageRequest {
+            server_message_id: 903_100,
+            message_seq: 42,
+            channel_id: 93_100,
+            channel_type: 2,
+            from_uid: 20_001,
+            message_type: ContentMessageType::System.as_u32(),
+            timestamp: 1_710_000_000,
+            topic: CANONICAL_TIMELINE_PUSH_TOPIC_V1.to_string(),
+            payload: event.encode_fb().expect("encode canonical message"),
+            ..Default::default()
+        };
+
+        state
+            .apply_canonical_timeline_push(&push)
+            .await
+            .expect("apply first delivery");
+        assert_eq!(
+            state
+                .last_sync_entity_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SdkEvent::TimelineUpdated { .. } | SdkEvent::SyncEntityChanged { .. }
+                ))
+                .count(),
+            2
+        );
+
+        state
+            .apply_canonical_timeline_push(&push)
+            .await
+            .expect("apply replayed delivery");
+        assert_eq!(
+            state
+                .last_sync_entity_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SdkEvent::TimelineUpdated { .. } | SdkEvent::SyncEntityChanged { .. }
+                ))
+                .count(),
+            0
+        );
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -15597,15 +15826,16 @@ mod tests {
             server_timestamp: 1_700_000_100_000,
             sender_id: 9_007_199_254_740_995,
             sender_info: None,
-            event_schema_version: Some(
-                privchat_protocol::CANONICAL_TIMELINE_EVENT_SCHEMA_V1,
-            ),
+            event_schema_version: Some(privchat_protocol::CANONICAL_TIMELINE_EVENT_SCHEMA_V1),
             canonical_event: Some(canonical.encode_fb().expect("encode canonical event")),
         };
 
         let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
         assert_eq!(entity_type, "message_reaction");
-        assert_eq!(item.entity_id, "9007199254740993:9007199254740995:thumbs-up");
+        assert_eq!(
+            item.entity_id,
+            "9007199254740993:9007199254740995:thumbs-up"
+        );
         let payload = item.payload.expect("payload");
         assert_eq!(payload.get("deleted").and_then(|v| v.as_bool()), Some(true));
         assert!(
@@ -15882,7 +16112,10 @@ mod tests {
         assert_eq!(State::attachment_placeholder_text(file, "image"), "[图片]");
         assert_eq!(State::attachment_placeholder_text(file, "video"), "[视频]");
         assert_eq!(State::attachment_placeholder_text(file, "file"), "[文件]");
-        assert_eq!(State::attachment_placeholder_text(file, "unknown"), "[文件]");
+        assert_eq!(
+            State::attachment_placeholder_text(file, "unknown"),
+            "[文件]"
+        );
     }
 
     // 旧测试 conversation_preview_is_rendered_in_sdk_layer 已删除——
@@ -17682,48 +17915,75 @@ mod tests {
         };
 
         let (mut state, dir) = new_seeded_state("pending-mutation-replay").await;
-        state.storage.upsert_channel(UpsertChannelInput {
-            channel_id: 92_500,
-            channel_type: 2,
-            channel_name: "pending-room".to_string(),
-            channel_remark: String::new(),
-            avatar: String::new(),
-            unread_count: 0,
-            top: 0,
-            mute: 0,
-            last_msg_timestamp: 0,
-            last_local_message_id: 0,
-            last_msg_content: String::new(),
-            version: 1,
-            peer_user_id: None,
-        }).await.expect("seed channel");
+        state
+            .storage
+            .upsert_channel(UpsertChannelInput {
+                channel_id: 92_500,
+                channel_type: 2,
+                channel_name: "pending-room".to_string(),
+                channel_remark: String::new(),
+                avatar: String::new(),
+                unread_count: 0,
+                top: 0,
+                mute: 0,
+                last_msg_timestamp: 0,
+                last_local_message_id: 0,
+                last_msg_content: String::new(),
+                version: 1,
+                peer_user_id: None,
+            })
+            .await
+            .expect("seed channel");
 
         let target = 70_500;
         let events = [
-            (80_501, 11, CanonicalTimelineEvent::Revoke(RevokeEvent {
-                target_server_message_id: target,
-                revoked_by: 10_001,
-                revoked_at: 1_710_000_000_000,
-            })),
-            (80_502, 12, CanonicalTimelineEvent::ReactionChange(ReactionChangeEvent {
-                target_server_message_id: target,
-                actor_id: 20_001,
-                emoji: "ok".to_string(),
-                operation: ReactionOperation::Add,
-            })),
+            (
+                80_501,
+                11,
+                CanonicalTimelineEvent::Revoke(RevokeEvent {
+                    target_server_message_id: target,
+                    revoked_by: 10_001,
+                    revoked_at: 1_710_000_000_000,
+                }),
+            ),
+            (
+                80_502,
+                12,
+                CanonicalTimelineEvent::ReactionChange(ReactionChangeEvent {
+                    target_server_message_id: target,
+                    actor_id: 20_001,
+                    emoji: "ok".to_string(),
+                    operation: ReactionOperation::Add,
+                }),
+            ),
         ];
         for (event_id, pts, event) in events {
-            let commit = ServerCommit {
-                event_id: Some(event_id), pts, server_msg_id: event_id,
-                local_message_id: None, channel_id: 92_500, channel_type: 2,
-                message_type: String::new(), content: serde_json::Value::Null,
-                server_timestamp: 1_710_000_000_000, sender_id: 10_001,
-                sender_info: None,
-                event_schema_version: Some(CANONICAL_TIMELINE_EVENT_SCHEMA_V1),
-                canonical_event: Some(event.encode_fb().expect("encode mutation")),
+            let push = PushMessageRequest {
+                setting: Default::default(),
+                msg_key: format!("event_{event_id}"),
+                server_message_id: event_id,
+                message_seq: pts as u32,
+                local_message_id: 0,
+                stream_no: String::new(),
+                stream_seq: 0,
+                stream_flag: 0,
+                timestamp: 1_710_000_000,
+                channel_id: 92_500,
+                channel_type: 2,
+                message_type: ContentMessageType::System.as_u32(),
+                expire: 0,
+                topic: privchat_protocol::CANONICAL_TIMELINE_PUSH_TOPIC_V1.to_string(),
+                from_uid: 10_001,
+                payload: event.encode_fb().expect("encode mutation"),
+                deleted: false,
             };
-            assert!(state.defer_canonical_mutation_if_target_missing(&commit)
-                .await.expect("defer mutation"));
+            assert_eq!(
+                state
+                    .apply_canonical_timeline_push(&push)
+                    .await
+                    .expect("apply mutation push"),
+                Some(0)
+            );
         }
 
         let new_message = CanonicalTimelineEvent::NewMessage(NewMessageEvent {
@@ -17734,32 +17994,61 @@ mod tests {
             },
         });
         let commit = ServerCommit {
-            event_id: Some(target), pts: 10, server_msg_id: target,
-            local_message_id: None, channel_id: 92_500, channel_type: 2,
-            message_type: "text".to_string(), content: serde_json::Value::Null,
-            server_timestamp: 1_709_999_999_000, sender_id: 20_001,
+            event_id: Some(target),
+            pts: 10,
+            server_msg_id: target,
+            local_message_id: None,
+            channel_id: 92_500,
+            channel_type: 2,
+            message_type: "text".to_string(),
+            content: serde_json::Value::Null,
+            server_timestamp: 1_709_999_999_000,
+            sender_id: 20_001,
             sender_info: None,
             event_schema_version: Some(CANONICAL_TIMELINE_EVENT_SCHEMA_V1),
             canonical_event: Some(new_message.encode_fb().expect("encode message")),
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
-        state.enqueue_and_apply_sync_items(
-            entity_type, Some("2:92500".to_string()), vec![item]
-        ).await.expect("materialize target");
-        assert_eq!(state.replay_pending_timeline_mutations(92_500, 2, target)
-            .await.expect("replay mutations"), 2);
+        state
+            .enqueue_and_apply_sync_items(entity_type, Some("2:92500".to_string()), vec![item])
+            .await
+            .expect("materialize target");
+        assert_eq!(
+            state
+                .replay_pending_timeline_mutations(92_500, 2, target)
+                .await
+                .expect("replay mutations"),
+            2
+        );
 
-        let message_id = state.storage
+        let message_id = state
+            .storage
             .get_message_id_by_server_message_id(92_500, 2, target)
-            .await.expect("resolve target").expect("target exists");
-        assert!(state.storage.get_message_extra(message_id).await
-            .expect("message extra").expect("message extra exists").revoke);
-        let reactions = state.storage.list_message_reactions(message_id, 20, 0)
-            .await.expect("list reactions");
+            .await
+            .expect("resolve target")
+            .expect("target exists");
+        assert!(
+            state
+                .storage
+                .get_message_extra(message_id)
+                .await
+                .expect("message extra")
+                .expect("message extra exists")
+                .revoke
+        );
+        let reactions = state
+            .storage
+            .list_message_reactions(message_id, 20, 0)
+            .await
+            .expect("list reactions");
         assert_eq!(reactions.len(), 1);
         assert_eq!(reactions[0].emoji, "ok");
-        assert!(state.storage.list_pending_timeline_mutations(92_500, 2, target)
-            .await.expect("pending after replay").is_empty());
+        assert!(state
+            .storage
+            .list_pending_timeline_mutations(92_500, 2, target)
+            .await
+            .expect("pending after replay")
+            .is_empty());
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }
