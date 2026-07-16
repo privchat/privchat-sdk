@@ -40,8 +40,7 @@ use privchat_protocol::rpc::file::upload::{
 };
 use privchat_protocol::rpc::message::history::{
     MessageHistoryAroundRequest, MessageHistoryAroundResponse, MessageHistoryGetRequest,
-    MessageHistoryItem, MessageHistoryResponse, MessageHistorySearchRequest,
-    MessageHistorySearchResponse,
+    MessageHistoryItem, MessageHistoryResponse,
 };
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::{
@@ -16137,6 +16136,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
     async fn event_history_replay_is_ordered() {
         let sdk = super::PrivchatSdk::new(PrivchatConfig::default());
         sdk.shutdown().await;

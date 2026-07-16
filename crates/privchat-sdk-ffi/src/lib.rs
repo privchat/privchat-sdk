@@ -22,67 +22,169 @@ mod qr;
 use privchat_protocol::rpc::account::user::DetailSourceType;
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::{
-    AccountPrivacyGetRequest, AccountPrivacyGetResponse, AccountPrivacyUpdateRequest,
-    AccountPrivacyUpdateResponse, AccountProfileGetRequest, AccountProfileGetResponse,
-    AccountProfileUpdateRequest, AccountProfileUpdateResponse, AccountSearchByQRCodeRequest,
-    AccountSearchQueryRequest, AccountSearchResponse, AccountUserDetailRequest,
-    AccountUserDetailResponse, AccountUserShareCardRequest, AccountUserShareCardResponse,
-    AccountUserUpdateRequest, AccountUserUpdateResponse, BatchGetChannelPtsRequest,
-    BatchGetChannelPtsResponse, BlacklistAddRequest, BlacklistAddResponse, BlacklistCheckRequest,
-    BlacklistCheckResponse, BlacklistListRequest, BlacklistListResponse, BlacklistRemoveRequest,
-    BlacklistRemoveResponse, ChannelBroadcastCreateRequest, ChannelBroadcastCreateResponse,
-    ChannelBroadcastListRequest, ChannelBroadcastListResponse, ChannelBroadcastSubscribeRequest,
-    ChannelBroadcastSubscribeResponse, ChannelContentListRequest, ChannelContentListResponse,
-    ChannelContentPublishRequest, ChannelContentPublishResponse, ChannelHideRequest,
-    ChannelHideResponse, ChannelMuteRequest, ChannelMuteResponse, ChannelPinRequest,
-    ChannelPinResponse, ClientSubmitRequest, ClientSubmitResponse, DevicePushStatusRequest,
-    DevicePushStatusResponse, DevicePushUpdateRequest, DevicePushUpdateResponse, FileGetUrlRequest,
-    FileGetUrlResponse, FileRequestUploadTokenRequest, FileRequestUploadTokenResponse,
-    BotFollowRequest, BotFollowResponse, BotUnfollowRequest, BotUnfollowResponse,
-    FileUploadCallbackRequest, FileUploadCallbackResponse, FriendAcceptRequest,
-    FriendAcceptResponse, FriendApplyRequest, FriendApplyResponse, FriendCheckRequest,
-    FriendCheckResponse, FriendPendingRequest, FriendPendingResponse, FriendRecallRequest,
-    FriendRecallResponse, FriendRejectRequest, FriendRejectResponse, FriendRemoveRequest,
-    FriendRemoveResponse, GetChannelPtsRequest,
-    GetChannelPtsResponse, GetDifferenceRequest, GetDifferenceResponse,
-    GetOrCreateDirectChannelRequest, GetOrCreateDirectChannelResponse, GroupApprovalHandleRequest,
-    GroupApprovalHandleResponse, GroupApprovalListRequest, GroupApprovalListResponse,
-    GroupCreateRequest, GroupCreateResponse, GroupInfoRequest, GroupInfoResponse,
-    GroupMemberAddRequest, GroupMemberAddResponse, GroupMemberLeaveRequest,
-    GroupMemberLeaveResponse, GroupMemberListRequest, GroupMemberListResponse,
-    GroupMemberMuteRequest, GroupMemberMuteResponse, GroupMemberRemoveRequest,
-    GroupMemberRemoveResponse, GroupMemberUnmuteRequest, GroupMemberUnmuteResponse,
+    AccountPrivacyGetRequest,
+    AccountPrivacyGetResponse,
+    AccountPrivacyUpdateRequest,
+    AccountPrivacyUpdateResponse,
+    AccountProfileGetRequest,
+    AccountProfileGetResponse,
+    AccountProfileUpdateRequest,
+    AccountProfileUpdateResponse,
+    AccountSearchByQRCodeRequest,
+    AccountSearchQueryRequest,
+    AccountSearchResponse,
+    AccountUserDetailRequest,
+    AccountUserDetailResponse,
+    AccountUserShareCardRequest,
+    AccountUserShareCardResponse,
+    AccountUserUpdateRequest,
+    AccountUserUpdateResponse,
+    BatchGetChannelPtsRequest,
+    BatchGetChannelPtsResponse,
+    BlacklistAddRequest,
+    BlacklistAddResponse,
+    BlacklistCheckRequest,
+    BlacklistCheckResponse,
+    BlacklistListRequest,
+    BlacklistListResponse,
+    BlacklistRemoveRequest,
+    BlacklistRemoveResponse,
+    BotFollowRequest,
+    BotFollowResponse,
+    BotUnfollowRequest,
+    BotUnfollowResponse,
+    ChannelBroadcastCreateRequest,
+    ChannelBroadcastCreateResponse,
+    ChannelBroadcastListRequest,
+    ChannelBroadcastListResponse,
+    ChannelBroadcastSubscribeRequest,
+    ChannelBroadcastSubscribeResponse,
+    ChannelContentListRequest,
+    ChannelContentListResponse,
+    ChannelContentPublishRequest,
+    ChannelContentPublishResponse,
+    ChannelHideRequest,
+    ChannelHideResponse,
+    ChannelMuteRequest,
+    ChannelMuteResponse,
+    ChannelPinRequest,
+    ChannelPinResponse,
+    ClientSubmitRequest,
+    ClientSubmitResponse,
+    DevicePushStatusRequest,
+    DevicePushStatusResponse,
+    DevicePushUpdateRequest,
+    DevicePushUpdateResponse,
+    FileGetUrlRequest,
+    FileGetUrlResponse,
+    FileRequestUploadTokenRequest,
+    FileRequestUploadTokenResponse,
+    FileUploadCallbackRequest,
+    FileUploadCallbackResponse,
+    FriendAcceptRequest,
+    FriendAcceptResponse,
+    FriendApplyRequest,
+    FriendApplyResponse,
+    FriendCheckRequest,
+    FriendCheckResponse,
+    FriendPendingRequest,
+    FriendPendingResponse,
+    FriendRecallRequest,
+    FriendRecallResponse,
+    FriendRejectRequest,
+    FriendRejectResponse,
+    FriendRemoveRequest,
+    FriendRemoveResponse,
+    GetChannelPtsRequest,
+    GetChannelPtsResponse,
+    GetDifferenceRequest,
+    GetDifferenceResponse,
+    GetOrCreateDirectChannelRequest,
+    GetOrCreateDirectChannelResponse,
+    GroupApprovalHandleRequest,
+    GroupApprovalHandleResponse,
+    GroupApprovalListRequest,
+    GroupApprovalListResponse,
+    GroupCreateRequest,
+    GroupCreateResponse,
+    GroupInfoRequest,
+    GroupInfoResponse,
+    GroupMemberAddRequest,
+    GroupMemberAddResponse,
+    GroupMemberLeaveRequest,
+    GroupMemberLeaveResponse,
+    GroupMemberListRequest,
+    GroupMemberListResponse,
+    GroupMemberMuteRequest,
+    GroupMemberMuteResponse,
+    GroupMemberRemoveRequest,
+    GroupMemberRemoveResponse,
+    GroupMemberUnmuteRequest,
+    GroupMemberUnmuteResponse,
     GroupMuteAllRequest,
-    GroupQRCodeJoinRequest, GroupQRCodeJoinResponse, GroupRoleSetRequest, GroupRoleSetResponse,
-    GroupSettingsGetRequest, GroupSettingsGetResponse, GroupSettingsUpdateRequest,
-    GroupSettingsUpdateResponse, GroupTransferOwnerRequest, GroupTransferOwnerResponse,
-    MessageHistoryGetRequest, MessageHistoryResponse, MessageReactionAddRequest,
-    MessageReactionAddResponse, MessageReactionListRequest, MessageReactionListResponse,
-    MessageReactionRemoveRequest, MessageReactionRemoveResponse, MessageReactionStatsRequest,
-    MessageReactionStatsResponse, MessageReadListRequest, MessageReadListResponse,
-    MessageReadStatsRequest, MessageReadStatsResponse, MessageRevokeRequest, MessageRevokeResponse,
-    MessageStatusCountRequest, MessageStatusCountResponse, MessageStatusReadPtsRequest,
-    MessageStatusReadPtsResponse, QRCodeGenerateRequest, QRCodeGenerateResponse, QRCodeListRequest,
-    QRCodeListResponse, QRCodeRefreshRequest, QRCodeRefreshResponse, QRCodeResolveRequest,
-    QRCodeResolveResponse, QRCodeRevokeRequest, QRCodeRevokeResponse, StickerPackageDetailRequest,
-    StickerPackageDetailResponse, StickerPackageListRequest, StickerPackageListResponse,
-    SyncEntitiesRequest, SyncEntitiesResponse,
-    // QR_CODE_SPEC v1.3 — user qrcode 路径下的类型 (顶层 glob 再导出)
-    UserQRCodeGetRequest, UserQRCodeGetResponse,
-    UserQRCodeRefreshRequest, UserQRCodeRefreshResponse,
-    UserQRCodeResolveRequest, UserQRCodeResolveResponse,
     // QR_CODE_SPEC v1.3 — group qrcode 新类型
-    GroupQRCodeGetRequest, GroupQRCodeGetResponse,
-    GroupQRCodeRefreshRequest, GroupQRCodeRefreshResponse,
+    GroupQRCodeGetRequest,
+    GroupQRCodeGetResponse,
+    GroupQRCodeJoinRequest,
+    GroupQRCodeJoinResponse,
+    GroupQRCodeRefreshRequest,
+    GroupQRCodeRefreshResponse,
+    GroupRoleSetRequest,
+    GroupRoleSetResponse,
+    GroupSettingsGetRequest,
+    GroupSettingsGetResponse,
+    GroupSettingsUpdateRequest,
+    GroupSettingsUpdateResponse,
+    GroupTransferOwnerRequest,
+    GroupTransferOwnerResponse,
+    MessageReactionAddRequest,
+    MessageReactionAddResponse,
+    MessageReactionListRequest,
+    MessageReactionListResponse,
+    MessageReactionRemoveRequest,
+    MessageReactionRemoveResponse,
+    MessageReactionStatsRequest,
+    MessageReactionStatsResponse,
+    MessageReadListRequest,
+    MessageReadListResponse,
+    MessageReadStatsRequest,
+    MessageReadStatsResponse,
+    MessageRevokeRequest,
+    MessageRevokeResponse,
+    MessageStatusCountRequest,
+    MessageStatusCountResponse,
+    MessageStatusReadPtsRequest,
+    MessageStatusReadPtsResponse,
+    QRCodeGenerateRequest,
+    QRCodeGenerateResponse,
+    QRCodeListRequest,
+    QRCodeListResponse,
+    QRCodeRefreshRequest,
+    QRCodeRefreshResponse,
+    QRCodeResolveRequest,
+    QRCodeResolveResponse,
+    QRCodeRevokeRequest,
+    QRCodeRevokeResponse,
+    StickerPackageDetailRequest,
+    StickerPackageDetailResponse,
+    StickerPackageListRequest,
+    StickerPackageListResponse,
+    SyncEntitiesRequest,
+    SyncEntitiesResponse,
+    // QR_CODE_SPEC v1.3 — user qrcode 路径下的类型 (顶层 glob 再导出)
+    UserQRCodeGetRequest,
+    UserQRCodeGetResponse,
+    UserQRCodeRefreshRequest,
+    UserQRCodeRefreshResponse,
+    UserQRCodeResolveRequest,
+    UserQRCodeResolveResponse,
 };
 use privchat_sdk::{
-    ContactCardMessageInput as SdkContactCardMessageInput,
-    ConnectionState as SdkConnectionState, Error as SdkError, FileQueueRef as SdkFileQueueRef,
-    LinkMessageInput as SdkLinkMessageInput,
-    LocationMessageInput as SdkLocationMessageInput,
-    LocalAccountSummary as SdkLocalAccountSummary, LoginResult as SdkLoginResult,
-    MediaProcessOp as SdkMediaProcessOp, MentionInput as SdkMentionInput,
-    NetworkHint as SdkNetworkHint, NewMessage as SdkNewMessage,
+    ConnectionState as SdkConnectionState, ContactCardMessageInput as SdkContactCardMessageInput,
+    Error as SdkError, FileQueueRef as SdkFileQueueRef, LinkMessageInput as SdkLinkMessageInput,
+    LocalAccountSummary as SdkLocalAccountSummary, LocationMessageInput as SdkLocationMessageInput,
+    LoginResult as SdkLoginResult, MediaProcessOp as SdkMediaProcessOp,
+    MentionInput as SdkMentionInput, NetworkHint as SdkNetworkHint, NewMessage as SdkNewMessage,
     PresenceStatus as SdkPresenceStatus, PrivchatConfig as SdkConfig, PrivchatSdk as InnerSdk,
     QueueMessage as SdkQueueMessage, SequencedSdkEvent as SdkSequencedSdkEvent,
     ServerEndpoint as SdkServerEndpoint, SessionSnapshot as SdkSessionSnapshot,
@@ -91,9 +193,8 @@ use privchat_sdk::{
     StoredFriend as SdkStoredFriend, StoredGroup as SdkStoredGroup,
     StoredGroupMember as SdkStoredGroupMember, StoredMessage as SdkStoredMessage,
     StoredMessageExtra as SdkStoredMessageExtra, StoredMessageReaction as SdkStoredMessageReaction,
-    StructuredSendOptions as SdkStructuredSendOptions,
     StoredReminder as SdkStoredReminder, StoredUser as SdkStoredUser,
-    TerminalReason as SdkTerminalReason,
+    StructuredSendOptions as SdkStructuredSendOptions, TerminalReason as SdkTerminalReason,
     TransportProtocol as SdkProtocol, TypingActionType as SdkTypingActionType,
     UnreadMentionCount as SdkUnreadMentionCount, UpsertBlacklistInput as SdkUpsertBlacklistInput,
     UpsertChannelExtraInput as SdkUpsertChannelExtraInput,
@@ -737,7 +838,40 @@ pub struct StickerInfoView {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SendMessageOptionsInput {
-    pub options_json: Option<String>,
+    pub in_reply_to_message_id: Option<u64>,
+    pub mentioned_user_ids: Vec<u64>,
+    pub silent: bool,
+    pub extra_json: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LocalAttachmentMetadataInput {
+    pub file_name: String,
+    pub mime_type: String,
+    pub duration: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub thumbnail_width: Option<u32>,
+    pub thumbnail_height: Option<u32>,
+    pub extension_json: Option<String>,
+}
+
+fn metadata_input_extension(
+    raw: Option<&str>,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, PrivchatFfiError> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+        PrivchatFfiError::from(SdkError::Serialization(format!(
+            "decode attachment extension_json: {e}"
+        )))
+    })?;
+    value.as_object().cloned().map(Some).ok_or_else(|| {
+        PrivchatFfiError::from(SdkError::Serialization(
+            "attachment extension_json must be an object".to_string(),
+        ))
+    })
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -781,31 +915,6 @@ pub struct ContactCardMessageInput {
     pub from_uid: u64,
     pub user_id: u64,
     pub options: Option<StructuredSendOptionsInput>,
-}
-
-/// Kotlin 侧 `buildJsonObject` 写入的 options JSON 字段。
-/// ULong 经 Kotlin 的 `JsonPrimitive(toString())` 包装为字符串，所以这里两种都要兼容。
-#[derive(Debug, Default, serde::Deserialize)]
-struct SendMessageOptionsPayload {
-    #[serde(default)]
-    in_reply_to_message_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_u64_list")]
-    mentions: Vec<u64>,
-}
-
-fn deserialize_u64_list<'de, D>(deserializer: D) -> Result<Vec<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error as _;
-    let raw = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?.unwrap_or_default();
-    raw.into_iter()
-        .map(|v| match v {
-            serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| D::Error::custom("mentions: not a u64")),
-            serde_json::Value::String(s) => s.parse::<u64>().map_err(D::Error::custom),
-            _ => Err(D::Error::custom("mentions: expected number or string")),
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2458,7 +2567,6 @@ fn map_media_download_state(v: privchat_sdk::MediaDownloadState) -> MediaDownloa
         }
     }
 }
-
 
 fn map_sequenced_sdk_event(v: SdkSequencedSdkEvent) -> SequencedSdkEvent {
     SequencedSdkEvent {
@@ -4484,10 +4592,7 @@ impl PrivchatClient {
     /// 写 `privchat_business_channel` binding。返回 channel_id 后即可 Subscribe + Transfer。
     ///
     /// Spec: `02-server/SERVICE_ACCOUNT_FOLLOW_SPEC` §3.1。
-    pub async fn follow_bot(
-        &self,
-        bot_user_id: u64,
-    ) -> Result<BotFollowResult, PrivchatFfiError> {
+    pub async fn follow_bot(&self, bot_user_id: u64) -> Result<BotFollowResult, PrivchatFfiError> {
         let resp: BotFollowResponse = rpc_call_typed(
             &self.inner,
             routes::account_bot::FOLLOW,
@@ -4513,7 +4618,10 @@ impl PrivchatClient {
 
     /// 拉一次 `account/user/detail` 并把对端用户写入本地 users 表。
     /// 用于 follow 后让会话头显示昵称/头像，spec BOT_INTERACTION_SPEC §3.0。
-    async fn persist_user_profile_local(&self, target_user_id: u64) -> Result<(), PrivchatFfiError> {
+    async fn persist_user_profile_local(
+        &self,
+        target_user_id: u64,
+    ) -> Result<(), PrivchatFfiError> {
         let detail: AccountUserDetailResponse = rpc_call_typed(
             &self.inner,
             routes::account_user::DETAIL,
@@ -5105,10 +5213,7 @@ impl PrivchatClient {
 
     /// 本地删除消息：删 DB 行 + 清附件目录。不触达服务端。
     /// 返回 true 表示确实删到了行；false 表示消息不存在（幂等）。
-    pub async fn delete_message_local(
-        &self,
-        message_id: u64,
-    ) -> Result<bool, PrivchatFfiError> {
+    pub async fn delete_message_local(&self, message_id: u64) -> Result<bool, PrivchatFfiError> {
         let stored = self
             .inner
             .delete_message_local(message_id)
@@ -5480,10 +5585,7 @@ impl PrivchatClient {
 
     /// 本地删除 channel：标记隐藏 + 清空所有关联消息与附件文件。不触达服务端。
     /// 返回 true 表示 channel 原本存在；false 表示 channel 不存在或没有消息（幂等）。
-    pub async fn delete_channel_local(
-        &self,
-        channel_id: u64,
-    ) -> Result<bool, PrivchatFfiError> {
+    pub async fn delete_channel_local(&self, channel_id: u64) -> Result<bool, PrivchatFfiError> {
         let messages = self
             .inner
             .delete_channel_local(channel_id)
@@ -5668,13 +5770,27 @@ impl PrivchatClient {
     ) -> Result<MessagesAroundView, PrivchatFfiError> {
         let resp = self
             .inner
-            .fetch_messages_around(channel_id, channel_type, message_id, before_limit, after_limit)
+            .fetch_messages_around(
+                channel_id,
+                channel_type,
+                message_id,
+                before_limit,
+                after_limit,
+            )
             .await
             .map_err(PrivchatFfiError::from)?;
         Ok(MessagesAroundView {
-            before_messages: resp.before_messages.into_iter().map(history_item_view).collect(),
+            before_messages: resp
+                .before_messages
+                .into_iter()
+                .map(history_item_view)
+                .collect(),
             anchor_message: history_item_view(resp.anchor_message),
-            after_messages: resp.after_messages.into_iter().map(history_item_view).collect(),
+            after_messages: resp
+                .after_messages
+                .into_iter()
+                .map(history_item_view)
+                .collect(),
             has_more_before: resp.has_more_before,
             has_more_after: resp.has_more_after,
         })
@@ -5943,9 +6059,7 @@ impl PrivchatClient {
     }
 
     /// QR_CODE_SPEC v1.3 — `user/qrcode/refresh`：旋转自己的 qr_key。
-    pub async fn user_qrcode_refresh(
-        &self,
-    ) -> Result<UserQrCodeRefreshView, PrivchatFfiError> {
+    pub async fn user_qrcode_refresh(&self) -> Result<UserQrCodeRefreshView, PrivchatFfiError> {
         let resp: UserQRCodeRefreshResponse = rpc_call_typed(
             &self.inner,
             routes::user_qrcode::REFRESH,
@@ -6626,7 +6740,7 @@ impl PrivchatClient {
 
     pub async fn group_approval_handle_remote(
         &self,
-        approval_id: u64,
+        request_id: String,
         approved: bool,
         reason: Option<String>,
     ) -> Result<bool, PrivchatFfiError> {
@@ -6635,7 +6749,7 @@ impl PrivchatClient {
             &self.inner,
             routes::group_approval::HANDLE,
             &GroupApprovalHandleRequest {
-                request_id: approval_id.to_string(),
+                request_id,
                 operator_id,
                 action: if approved {
                     "approve".to_string()
@@ -7183,33 +7297,69 @@ impl PrivchatClient {
         mut input: NewMessage,
         options: SendMessageOptionsInput,
     ) -> Result<u64, PrivchatFfiError> {
-        if let Some(raw) = options.options_json.as_deref() {
-            if let Ok(parsed) = serde_json::from_str::<SendMessageOptionsPayload>(raw) {
-                let has_reply = parsed
-                    .in_reply_to_message_id
-                    .as_ref()
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
-                let has_mentions = !parsed.mentions.is_empty();
-                if has_reply || has_mentions {
-                    // Stored as legacy JSON envelope in the SDK's local row;
-                    // the wire-side FB encoding happens later in the SDK.
-                    let envelope = privchat_protocol::message::LocalMessagePayloadEnvelope {
-                        content: input.content.clone(),
-                        metadata: None,
-                        reply_to_message_id: parsed
-                            .in_reply_to_message_id
-                            .filter(|s| !s.is_empty()),
-                        mentioned_user_ids: if has_mentions { Some(parsed.mentions) } else { None },
-                        message_source: None,
-                    };
-                    if let Ok(json) = serde_json::to_string(&envelope) {
-                        input.content = json;
-                    }
-                }
+        let has_reply = options.in_reply_to_message_id.is_some();
+        let has_mentions = !options.mentioned_user_ids.is_empty();
+        if has_reply || has_mentions {
+            // SQLite still stores the legacy envelope, but its shape is built
+            // from a protocol type here rather than JSON assembled by callers.
+            let envelope = privchat_protocol::message::LocalMessagePayloadEnvelope {
+                content: input.content.clone(),
+                metadata: None,
+                reply_to_message_id: options.in_reply_to_message_id.map(|id| id.to_string()),
+                mentioned_user_ids: has_mentions.then_some(options.mentioned_user_ids),
+                message_source: None,
+            };
+            input.content = serde_json::to_string(&envelope).map_err(|e| {
+                PrivchatFfiError::from(SdkError::Serialization(format!(
+                    "encode local message envelope: {e}"
+                )))
+            })?;
+        }
+        if let Some(extra) = options.extra_json.filter(|value| !value.trim().is_empty()) {
+            // `extra_json` remains an explicitly opaque application extension;
+            // standard send options above are fully typed.
+            input.extra = extra;
+        }
+        let _ = options.silent;
+        self.send_message_with_input(input).await
+    }
+
+    pub async fn create_local_attachment_placeholder_typed(
+        &self,
+        mut input: NewMessage,
+        local_message_id: u64,
+        metadata: LocalAttachmentMetadataInput,
+    ) -> Result<u64, PrivchatFfiError> {
+        let extension_json = metadata.extension_json.clone();
+        let metadata = privchat_protocol::message::LocalAttachmentMetadata {
+            file_name: metadata.file_name,
+            mime_type: metadata.mime_type,
+            duration: metadata.duration,
+            width: metadata.width,
+            height: metadata.height,
+            thumbnail_width: metadata.thumbnail_width,
+            thumbnail_height: metadata.thumbnail_height,
+        };
+        let mut encoded = serde_json::to_value(&metadata).map_err(|e| {
+            PrivchatFfiError::from(SdkError::Serialization(format!(
+                "encode local attachment metadata: {e}"
+            )))
+        })?;
+        if let (Some(target), Some(extension)) = (
+            encoded.as_object_mut(),
+            metadata_input_extension(extension_json.as_deref())?,
+        ) {
+            for (key, value) in extension {
+                target.entry(key).or_insert(value);
             }
         }
-        self.send_message_with_input(input).await
+        input.extra = serde_json::to_string(&encoded).map_err(|e| {
+            PrivchatFfiError::from(SdkError::Serialization(format!(
+                "serialize local attachment metadata: {e}"
+            )))
+        })?;
+        self.create_local_attachment_placeholder(input, Some(local_message_id))
+            .await
     }
 
     pub async fn send_link_message(
@@ -7734,10 +7884,7 @@ impl PrivchatClient {
     /// decode（白名单 jpeg/png/webp，gif/损坏格式直接 Err，不消耗上传流量）→
     /// 中心裁剪正方形 → 边长 >480 缩放到 480x480（≤480 不放大）→ 编码 PNG
     /// 写临时文件。返回处理后文件路径，App 选图后先过它再走上传管道。
-    pub async fn prepare_avatar_image(
-        &self,
-        src_path: String,
-    ) -> Result<String, PrivchatFfiError> {
+    pub async fn prepare_avatar_image(&self, src_path: String) -> Result<String, PrivchatFfiError> {
         self.inner
             .prepare_avatar_image(src_path)
             .await
@@ -8539,7 +8686,13 @@ impl PrivchatClient {
         created_at_ms: i64,
     ) -> Result<(), PrivchatFfiError> {
         self.inner
-            .start_message_media_download(message_id, download_url, mime, filename_hint, created_at_ms)
+            .start_message_media_download(
+                message_id,
+                download_url,
+                mime,
+                filename_hint,
+                created_at_ms,
+            )
             .await
             .map_err(PrivchatFfiError::from)
     }
@@ -8616,7 +8769,10 @@ impl PrivchatClient {
         let data_dir = self.config.lock().unwrap().data_dir.clone();
         let root = std::path::Path::new(&data_dir);
         let dir = privchat_sdk::media_store::get_canonical_message_dir(
-            root, uid, message_id, created_at_ms,
+            root,
+            uid,
+            message_id,
+            created_at_ms,
         );
         for name in &[
             privchat_sdk::media_store::THUMB_FILENAME,
@@ -8836,9 +8992,7 @@ pub fn build_time() -> String {
 /// [`qr_decode_luma`]. See `crate::qr::QrDecodeError`.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum QrDecodeError {
-    #[error(
-        "invalid luma dimensions: width={width} height={height} luma_len={luma_len}"
-    )]
+    #[error("invalid luma dimensions: width={width} height={height} luma_len={luma_len}")]
     InvalidDimensions {
         width: u32,
         height: u32,
@@ -8940,9 +9094,26 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        map_sdk_event, parse_read_list_entries, parse_read_list_user_ids, PrivchatClient,
-        PrivchatConfig, SdkEvent, ServerEndpoint, SyncPhase, SyncRunKind, TransportProtocol,
+        map_sdk_event, metadata_input_extension, parse_read_list_entries, parse_read_list_user_ids,
+        PrivchatClient, PrivchatConfig, SdkEvent, ServerEndpoint, SyncPhase, SyncRunKind,
+        TransportProtocol,
     };
+
+    #[test]
+    fn attachment_extension_requires_an_object() {
+        assert!(metadata_input_extension(Some("[]")).is_err());
+        assert!(metadata_input_extension(Some("not-json")).is_err());
+        assert_eq!(metadata_input_extension(Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn attachment_extension_preserves_opaque_fields() {
+        let extension = metadata_input_extension(Some(r#"{"vendor":"camera","width":1}"#))
+            .expect("valid object")
+            .expect("present object");
+        assert_eq!(extension["vendor"], "camera");
+        assert_eq!(extension["width"], 1);
+    }
 
     #[test]
     fn sync_state_event_preserves_typed_fields() {

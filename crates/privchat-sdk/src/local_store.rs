@@ -5075,7 +5075,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// spec §5：本地 around 窗口 = 显示排序下 anchor 前后各 N 条（乱序落库不影响窗口）。
     #[test]
     fn list_messages_around_returns_sorted_window() {
@@ -5220,6 +5219,7 @@ mod tests {
         assert_eq!(ptss, vec![40, 30, 20, 10]);
     }
 
+    #[test]
     fn upsert_remote_message_ignores_out_of_order_replay() {
         let store = test_store();
         let uid = "10006";
