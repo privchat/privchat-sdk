@@ -51,13 +51,15 @@ fn main() {
     for pixel in rgb.pixels() {
         // ITU-R BT.601 luma — same formula used by Android side's
         // bitmapToLuma() and rxing's HybridBinarizer expects.
-        let y = (pixel.0[0] as u32 * 299
-            + pixel.0[1] as u32 * 587
-            + pixel.0[2] as u32 * 114)
-            / 1000;
+        let y =
+            (pixel.0[0] as u32 * 299 + pixel.0[1] as u32 * 587 + pixel.0[2] as u32 * 114) / 1000;
         luma.push(y as u8);
     }
-    eprintln!("luma plane: {} bytes (expected {})", luma.len(), (w * h) as usize);
+    eprintln!(
+        "luma plane: {} bytes (expected {})",
+        luma.len(),
+        (w * h) as usize
+    );
 
     // Call the same function the FFI / Android / iOS bindings call.
     // Going through the public re-export verifies the symbol path too.

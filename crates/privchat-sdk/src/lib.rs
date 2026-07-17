@@ -82,8 +82,8 @@ use receive_pipeline::ReceivePipeline;
 use runtime::runtime_provider::RuntimeProvider;
 use storage_actor::StorageHandle;
 use sync_commit_applier::SyncCommitApplier;
-pub use sync_coordinator::{SyncPhase, SyncRunKind, SyncStateSnapshot};
 use sync_coordinator::SyncCoordinator;
+pub use sync_coordinator::{SyncPhase, SyncRunKind, SyncStateSnapshot};
 use task::task_registry::TaskRegistry;
 
 /// 下载票据：下载前由 `file/get_url` 解析（file_id 路径），或由 legacy file_url 构造
@@ -130,6 +130,7 @@ pub struct PrivchatConfig {
 }
 
 static QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING: AtomicBool = AtomicBool::new(false);
+static SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING: AtomicBool = AtomicBool::new(false);
 static CANONICAL_LEGACY_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 static CANONICAL_DECODE_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -140,6 +141,16 @@ static CANONICAL_DECODE_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 /// CA/server name instead.
 pub fn set_quic_accept_self_signed_for_testing(enabled: bool) {
     QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.store(enabled, Ordering::Release);
+}
+
+/// Disables local persistence of realtime timeline pushes for SDK instances
+/// created after this call. This process-global switch exists only for the
+/// server backpressure load gate, where hundreds of logical clients share one
+/// machine and per-client SQLite writes would benchmark the generator instead
+/// of server delivery. Transport receive and request ACK behavior are unchanged.
+/// Production applications must never enable this mode.
+pub fn set_skip_inbound_materialization_for_load_testing(enabled: bool) {
+    SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.store(enabled, Ordering::SeqCst);
 }
 
 impl Default for PrivchatConfig {
@@ -1273,6 +1284,21 @@ async fn start_inbound_task(
                             context.respond(ack_bytes);
                         }
                     }
+                    if SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.load(Ordering::Relaxed)
+                        && matches!(
+                            MessageType::from(biz_type),
+                            MessageType::SendMessageRequest
+                                | MessageType::PushMessageRequest
+                                | MessageType::PushBatchRequest
+                                | MessageType::PublishRequest
+                        )
+                    {
+                        // The transport request has already been acknowledged.
+                        // Do not enqueue server-timeline traffic behind load-generator
+                        // RPC commands; doing so would benchmark one host's synthetic
+                        // SDK actors rather than server slow-consumer behavior.
+                        continue;
+                    }
                     if actor_tx
                         .send(Command::InboundFrame {
                             epoch,
@@ -1292,10 +1318,12 @@ async fn start_inbound_task(
                 }
                 Ok(_) => {}
                 Err(RecvError::Lagged(skipped)) => {
-                    eprintln!(
-                        "[SDK.inbound] event stream lagged, skipped={} (continue)",
-                        skipped
-                    );
+                    if !SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.load(Ordering::Relaxed) {
+                        eprintln!(
+                            "[SDK.inbound] event stream lagged, skipped={} (continue)",
+                            skipped
+                        );
+                    }
                 }
                 Err(RecvError::Closed) => {
                     eprintln!("[SDK.inbound] event stream closed");
@@ -2706,6 +2734,7 @@ struct State {
     sync_coordinator: SyncCoordinator,
     snowflake: Arc<snowflake_me::Snowflake>,
     storage: StorageHandle,
+    skip_inbound_materialization_for_load_testing: bool,
     current_uid: Option<String>,
     should_auto_reconnect: bool,
     reconnect_attempt: u32,
@@ -3980,7 +4009,12 @@ impl State {
     ) -> (String, Option<String>) {
         match payload {
             serde_json::Value::Null => (String::new(), None),
-            serde_json::Value::String(text) => (text.clone(), None),
+            serde_json::Value::String(text) => {
+                if let Some(envelope) = Self::decode_legacy_message_envelope(text) {
+                    return Self::normalized_message_content_and_extra(&envelope);
+                }
+                (text.clone(), None)
+            }
             serde_json::Value::Object(_) => (
                 Self::json_get_string(payload, &["content"])
                     .or_else(|| Self::json_get_string(payload, &["text"]))
@@ -3993,6 +4027,52 @@ impl State {
             serde_json::Value::Array(_) => (String::new(), Some(payload.to_string())),
             other => (other.to_string(), None),
         }
+    }
+
+    /// A bare JSON object containing only `content` may be intentional user
+    /// text. Unwrap only legacy protocol envelopes carrying an additional
+    /// message marker, matching the TypeScript SDK boundary rule.
+    fn decode_legacy_message_envelope(text: &str) -> Option<serde_json::Value> {
+        let trimmed = text.trim();
+        if !trimmed.starts_with('{') {
+            return None;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+        let object = value.as_object()?;
+        object.get("content")?.as_str()?;
+        [
+            "metadata",
+            "reply_to_message_id",
+            "mentioned_user_ids",
+            "message_source",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key))
+        .then_some(value)
+    }
+
+    fn normalize_new_message(mut input: NewMessage) -> NewMessage {
+        let Some(mut envelope) = Self::decode_legacy_message_envelope(&input.content) else {
+            return input;
+        };
+        let display_content = envelope
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if envelope.get("metadata").is_none() {
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&input.extra) {
+                if !metadata.is_null() {
+                    if let Some(object) = envelope.as_object_mut() {
+                        object.insert("metadata".to_string(), metadata);
+                    }
+                }
+            }
+        }
+        input.content = display_content.clone();
+        input.searchable_word = display_content;
+        input.extra = envelope.to_string();
+        input
     }
 
     fn payload_bytes_to_message_content_and_extra(payload: &[u8]) -> (String, Option<String>) {
@@ -6466,81 +6546,53 @@ impl State {
                 self.inbound_epoch, self.session_state, self.current_uid
             );
         }
-        // A-1 trace: 入口
-        eprintln!(
-            "[TRACE-A1][try_auto_reconnect] enter state_before={:?} current_uid_present={}",
-            self.session_state,
-            self.current_uid.is_some()
+        tracing::debug!(
+            state_before = ?self.session_state,
+            current_uid_present = self.current_uid.is_some(),
+            "auto reconnect started"
         );
-        eprintln!("[SDK.actor] monitor: reconnect start");
         match timeout(self.connect_timeout_total(), self.connect()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                eprintln!("[SDK.actor] monitor: reconnect failed: {e}");
+                tracing::warn!(error = %e, "auto reconnect transport failed");
                 return Err(e);
             }
             Err(_) => {
                 let e = Error::Transport("reconnect timeout".to_string());
-                eprintln!("[SDK.actor] monitor: reconnect failed: {e}");
+                tracing::warn!(error = %e, "auto reconnect timed out");
                 return Err(e);
             }
         }
-        // A-1 trace: self.connect() 后的状态
-        eprintln!(
-            "[TRACE-A1][try_auto_reconnect] after self.connect() state={:?}",
-            self.session_state
-        );
-
         let uid = match self.current_uid.clone() {
             Some(v) => v,
             None => {
-                // A-1 trace: early return - 没有 current_uid
-                eprintln!(
-                    "[TRACE-A1][try_auto_reconnect] early_return=Connected reason=no_current_uid"
-                );
+                tracing::debug!("auto reconnect has no persisted user");
                 return Ok(SessionState::Connected);
             }
         };
         let snapshot = match self.storage.load_session(uid.clone()).await {
-            Ok(Some(v)) => {
-                // A-1 trace: load_session 命中
-                eprintln!(
-                    "[TRACE-A1][try_auto_reconnect] load_session=Some uid={} session_exists=true",
-                    uid
-                );
-                v
-            }
+            Ok(Some(v)) => v,
             Ok(None) => {
-                // A-1 trace: early return - load_session 返 None
-                eprintln!(
-                    "[TRACE-A1][try_auto_reconnect] early_return=Connected reason=no_session_snapshot uid={} session_exists=false",
-                    uid
-                );
+                tracing::debug!(user_id = %uid, "auto reconnect has no session snapshot");
                 return Ok(SessionState::Connected);
             }
             Err(e) => {
-                eprintln!("[SDK.actor] monitor: load session failed: {e}");
-                // A-1 trace: early return - load_session 出错
-                eprintln!(
-                    "[TRACE-A1][try_auto_reconnect] early_return=Connected reason=load_session_err uid={} err={e}",
-                    uid
-                );
+                tracing::warn!(user_id = %uid, error = %e, "auto reconnect session load failed");
                 return Ok(SessionState::Connected);
             }
         };
 
-        eprintln!(
-            "[SDK.actor] monitor: restoring session user_id={}",
-            snapshot.user_id
-        );
+        tracing::debug!(user_id = %snapshot.user_id, "restoring persisted session");
         let user_id = snapshot.user_id;
         let device_id = snapshot.device_id.clone();
         let bootstrap_completed = snapshot.bootstrap_completed;
         let has_access_token = !snapshot.token.is_empty();
-        // A-1 trace: 调 internal authenticate 之前
-        eprintln!(
-            "[TRACE-A1][try_auto_reconnect] before_internal_authenticate uid={} device_id={} has_access_token={} state_before={:?}",
-            user_id, device_id, has_access_token, self.session_state
+        tracing::debug!(
+            user_id = %user_id,
+            device_id = %device_id,
+            has_access_token,
+            state_before = ?self.session_state,
+            "authenticating restored session"
         );
         let first_attempt = timeout(
             Duration::from_secs(20),
@@ -6552,24 +6604,10 @@ impl State {
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::Transport("reconnect auth timeout".to_string())),
         };
-        // A-1 trace: internal authenticate 返回后
-        eprintln!(
-            "[TRACE-A1][try_auto_reconnect] after_internal_authenticate uid={} ok={} state_after_internal_auth={:?} err={:?}",
-            user_id,
-            auth_result.is_ok(),
-            self.session_state,
-            auth_result.as_ref().err().map(|e| e.to_string()),
-        );
         match auth_result {
             Ok(()) => {
                 self.bootstrap_completed = bootstrap_completed;
-                eprintln!("[SDK.actor] monitor: session restored");
-                // A-1 trace: 准备返回 Authenticated（注意：internal authenticate 不自己写 session_state，
-                // 由外层 caller 在 line 9122/9267 接 try_auto_reconnect 返回值后写）
-                eprintln!(
-                    "[TRACE-A1][try_auto_reconnect] returning Ok(Authenticated) path=auto_reconnect state_self={:?}",
-                    self.session_state
-                );
+                tracing::debug!(user_id = %user_id, "persisted session restored");
                 Ok(SessionState::Authenticated)
             }
             Err(e) => {
@@ -8093,6 +8131,9 @@ impl State {
             MessageType::PushMessageRequest => {
                 let req: PushMessageRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push message: {e}")))?;
+                if self.skip_inbound_materialization_for_load_testing {
+                    return Ok(0);
+                }
                 if realtime_trace_enabled() {
                     eprintln!(
                     "[SDK_MESSAGE_EVENT_DECODED] biz=Push channel_id={} server_message_id={} from_uid={} msg_type={} payload_len={}",
@@ -8122,6 +8163,9 @@ impl State {
             MessageType::PushBatchRequest => {
                 let req: PushBatchRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode push batch: {e}")))?;
+                if self.skip_inbound_materialization_for_load_testing {
+                    return Ok(0);
+                }
                 for push in req.messages {
                     if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
                         direct_applied += count;
@@ -8145,6 +8189,9 @@ impl State {
                 let req: PublishRequest = decode_message(&data)
                     .map_err(|e| Error::Serialization(format!("decode publish request: {e}")))?;
                 if let Ok(push) = decode_message::<PushMessageRequest>(&req.payload) {
+                    if self.skip_inbound_materialization_for_load_testing {
+                        return Ok(0);
+                    }
                     // IM 场景：payload 是 PushMessageRequest（私聊/群聊消息走 sync pipeline）
                     if inbound_logs_enabled() {
                         eprintln!(
@@ -8169,6 +8216,9 @@ impl State {
                         message_items.push(Self::push_message_to_sync_item(push));
                     }
                 } else if let Ok(batch) = decode_message::<PushBatchRequest>(&req.payload) {
+                    if self.skip_inbound_materialization_for_load_testing {
+                        return Ok(0);
+                    }
                     if inbound_logs_enabled() {
                         eprintln!(
                             "[SDK.inbound] publish payload decoded as PushBatchRequest count={}",
@@ -8928,7 +8978,9 @@ impl State {
         // Build envelope in legacy (Value-based) shape to keep the existing
         // flexible content-detection logic intact, then bridge to the typed
         // wire envelope at the FlatBuffers encode boundary below.
-        let mut envelope = LocalMessagePayloadEnvelope {
+        let extra_envelope = Self::decode_legacy_message_envelope(&message.extra)
+            .and_then(|value| serde_json::from_value::<LocalMessagePayloadEnvelope>(value).ok());
+        let mut envelope = extra_envelope.unwrap_or_else(|| LocalMessagePayloadEnvelope {
             content: content.clone(),
             metadata: serde_json::from_str::<serde_json::Value>(&message.extra)
                 .ok()
@@ -8936,28 +8988,16 @@ impl State {
             reply_to_message_id: None,
             mentioned_user_ids: None,
             message_source: None,
-        };
+        });
 
-        if let Ok(content_json) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Only treat as canonical envelope when payload explicitly carries envelope keys.
-            let looks_like_envelope = content_json
-                .as_object()
-                .map(|obj| {
-                    obj.contains_key("content")
-                        || obj.contains_key("metadata")
-                        || obj.contains_key("reply_to_message_id")
-                        || obj.contains_key("mentioned_user_ids")
-                        || obj.contains_key("message_source")
-                })
-                .unwrap_or(false);
-
-            if looks_like_envelope {
-                if let Ok(parsed_envelope) =
-                    serde_json::from_value::<LocalMessagePayloadEnvelope>(content_json.clone())
-                {
-                    envelope = parsed_envelope;
-                }
-            } else if content_json
+        if let Some(content_json) = Self::decode_legacy_message_envelope(&content) {
+            if let Ok(parsed_envelope) =
+                serde_json::from_value::<LocalMessagePayloadEnvelope>(content_json)
+            {
+                envelope = parsed_envelope;
+            }
+        } else if let Ok(content_json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if content_json
                 .get("file_id")
                 .or_else(|| content_json.get("thumbnail_file_id"))
                 .is_some()
@@ -10563,6 +10603,8 @@ impl PrivchatSdk {
                 sync_coordinator: SyncCoordinator::new(),
                 snowflake,
                 storage: storage.clone(),
+                skip_inbound_materialization_for_load_testing:
+                    SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.load(Ordering::SeqCst),
                 current_uid,
                 should_auto_reconnect: false,
                 reconnect_attempt: 0,
@@ -11216,20 +11258,15 @@ impl PrivchatSdk {
                             eprintln!("[SDK.actor] loop: cmd authenticate");
                         }
                         let from_state = state.session_state.as_connection_state();
-                        // A-1 trace: Command::Authenticate handler 入口
                         let has_access_token = !token.is_empty();
-                        eprintln!(
-                            "[TRACE-A1][cmd_authenticate] enter uid={} device_id={} has_access_token={} state_before={:?}",
-                            user_id, device_id, has_access_token, state.session_state
+                        tracing::debug!(
+                            user_id = %user_id,
+                            device_id = %device_id,
+                            has_access_token,
+                            state_before = ?state.session_state,
+                            "authenticate command started"
                         );
                         let can_result = state.session_state.can(Action::Authenticate);
-                        eprintln!(
-                            "[TRACE-A1][cmd_authenticate] can(Authenticate) state_before={:?} ok={} next_state={:?} err={:?}",
-                            state.session_state,
-                            can_result.is_ok(),
-                            can_result.as_ref().ok(),
-                            can_result.as_ref().err().map(|e| e.to_string()),
-                        );
                         let result = match can_result {
                             Ok(next_state) => match timeout(
                                 Duration::from_secs(20),
@@ -11238,29 +11275,18 @@ impl PrivchatSdk {
                             .await
                             {
                                 Ok(r) => {
-                                    // A-1 trace: rpc 结果（before set state）
-                                    eprintln!(
-                                        "[TRACE-A1][cmd_authenticate] after_internal_authenticate uid={} ok={} state_before_set={:?} err={:?}",
-                                        user_id,
-                                        r.is_ok(),
-                                        state.session_state,
-                                        r.as_ref().err().map(|e| e.to_string()),
-                                    );
                                     if r.is_ok() {
                                         state.session_state = next_state;
-                                        // A-1 trace: 写完最终 state
-                                        eprintln!(
-                                            "[TRACE-A1][cmd_authenticate] state_after_set={:?} path=command_authenticate uid={}",
-                                            state.session_state, user_id
+                                        tracing::debug!(
+                                            user_id = %user_id,
+                                            state_after = ?state.session_state,
+                                            "authenticate command completed"
                                         );
                                     }
                                     r
                                 }
                                 Err(_) => {
-                                    eprintln!(
-                                        "[TRACE-A1][cmd_authenticate] timeout uid={}",
-                                        user_id
-                                    );
+                                    tracing::warn!(user_id = %user_id, "authenticate command timed out");
                                     Err(Error::Transport("authenticate timeout".to_string()))
                                 },
                             },
@@ -14244,11 +14270,8 @@ impl PrivchatSdk {
             },
             message_source: None,
         };
-        let content = serde_json::to_string(&envelope).map_err(|e| {
+        let extra = serde_json::to_string(&envelope).map_err(|e| {
             Error::Serialization(format!("encode structured message envelope: {e}"))
-        })?;
-        let extra = serde_json::to_string(&metadata_value).map_err(|e| {
-            Error::Serialization(format!("encode structured message metadata: {e}"))
         })?;
         let message_id = self
             .create_local_message(NewMessage {
@@ -14256,7 +14279,7 @@ impl PrivchatSdk {
                 channel_type,
                 from_uid,
                 message_type: i32::try_from(content_type.as_u32()).unwrap_or(0),
-                content,
+                content: display_content.clone(),
                 searchable_word: display_content,
                 setting: 0,
                 extra,
@@ -14276,6 +14299,7 @@ impl PrivchatSdk {
         local_message_id: Option<u64>,
     ) -> Result<u64> {
         self.ensure_running()?;
+        let input = State::normalize_new_message(input);
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::CreateLocalMessage {
@@ -15495,11 +15519,11 @@ mod tests {
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
         group_settings_key, Action, AuthErrorKind, CanonicalTimelineEvent, ConnectionState,
         ContentMessageType, Error, ErrorCode, LoginResult, MessageCachePolicy, NetworkHint,
-        PresenceStatus, PrivchatConfig, PrivchatSdk, ResumeEscalationScope, ResumeFailureClass,
-        ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State, SyncCoordinator,
-        UpsertChannelInput,
-        UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput, UpsertMessageReactionInput,
-        UpsertRemoteMessageInput, UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
+        NewMessage, PresenceStatus, PrivchatConfig, PrivchatSdk, ResumeEscalationScope,
+        ResumeFailureClass, ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State,
+        SyncCoordinator, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
+        UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertRemoteMessageInput,
+        UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
     };
     use crate::local_store::LocalStore;
     use crate::receive_pipeline::ReceivePipeline;
@@ -15525,6 +15549,50 @@ mod tests {
             "privchat-sdk-{name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn legacy_message_envelope_is_normalized_at_storage_boundary() {
+        let serialized = serde_json::json!({
+            "content": "归一化后的正文",
+            "mentioned_user_ids": [],
+            "reply_to_message_id": "600997771041832960"
+        })
+        .to_string();
+        let (content, extra) =
+            State::normalized_message_content_and_extra(&serde_json::Value::String(serialized));
+        assert_eq!(content, "归一化后的正文");
+        let extra = extra.expect("legacy envelope must remain available as message extra");
+        assert!(extra.contains("600997771041832960"));
+    }
+
+    #[test]
+    fn user_authored_json_text_is_not_unwrapped() {
+        let literal = r#"{"content":"literal user JSON"}"#;
+        let (content, extra) = State::normalized_message_content_and_extra(
+            &serde_json::Value::String(literal.to_string()),
+        );
+        assert_eq!(content, literal);
+        assert!(extra.is_none());
+    }
+
+    #[test]
+    fn outbound_legacy_envelope_is_split_into_content_and_extra() {
+        let input = NewMessage {
+            content: serde_json::json!({
+                "content": "正文",
+                "mentioned_user_ids": [],
+                "reply_to_message_id": "600997771041832960"
+            })
+            .to_string(),
+            searchable_word: "legacy envelope".to_string(),
+            extra: String::new(),
+            ..NewMessage::default()
+        };
+        let normalized = State::normalize_new_message(input);
+        assert_eq!(normalized.content, "正文");
+        assert_eq!(normalized.searchable_word, "正文");
+        assert!(normalized.extra.contains("600997771041832960"));
     }
 
     async fn new_seeded_sdk(name: &str) -> (PrivchatSdk, PathBuf) {
@@ -15602,6 +15670,7 @@ mod tests {
                     .expect("test snowflake"),
             ),
             storage,
+            skip_inbound_materialization_for_load_testing: false,
             current_uid: Some("10001".to_string()),
             should_auto_reconnect: false,
             reconnect_attempt: 0,
@@ -15748,6 +15817,47 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("typed hello")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_test_mode_acks_transport_but_skips_timeline_materialization() {
+        let (mut state, dir) = new_seeded_state("skip-inbound-materialization").await;
+        state.skip_inbound_materialization_for_load_testing = true;
+        let server_message_id = 904_001;
+        let push = PushMessageRequest {
+            server_message_id,
+            message_seq: 43,
+            channel_id: 94_001,
+            channel_type: 2,
+            from_uid: 20_001,
+            message_type: ContentMessageType::Text.as_u32(),
+            payload: privchat_protocol::encode_message(
+                &privchat_protocol::MessagePayloadEnvelope {
+                    content: "load-only delivery".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("encode typed payload"),
+            ..Default::default()
+        };
+
+        let applied = state
+            .handle_inbound_frame(
+                u8::from(privchat_protocol::MessageType::PushMessageRequest),
+                privchat_protocol::encode_message(&push).expect("encode push"),
+            )
+            .await
+            .expect("handle load-test push");
+
+        assert_eq!(applied, 0);
+        assert!(state.pending_events.is_empty());
+        assert!(state
+            .storage
+            .get_message_id_by_server_message_id(94_001, 2, server_message_id)
+            .await
+            .expect("query message")
+            .is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -18241,3 +18351,4 @@ mod tests {
         ));
     }
 }
+pub mod message_content;

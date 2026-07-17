@@ -126,7 +126,12 @@ async fn rpc(c: &Client, route: &str, body: serde_json::Value) -> BoxResult<serd
     Ok(serde_json::from_str(&resp)?)
 }
 
-async fn send_text(c: &Client, channel_id: u64, channel_type: u8, text: &str) -> BoxResult<serde_json::Value> {
+async fn send_text(
+    c: &Client,
+    channel_id: u64,
+    channel_type: u8,
+    text: &str,
+) -> BoxResult<serde_json::Value> {
     let pts = rpc(
         c,
         "sync/get_channel_pts",
@@ -161,7 +166,10 @@ async fn main() -> BoxResult<()> {
     let cwd = PathBuf::from(env_or("STORM_SERVER_CWD", "../privchat-server")).canonicalize()?;
     let config = env_or("STORM_SERVER_CONFIG", "config.storm.toml");
 
-    if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {
+    if tokio::net::TcpStream::connect((host.as_str(), port))
+        .await
+        .is_ok()
+    {
         return Err(format!("port {port} already in use — kill leftover storm server").into());
     }
 
@@ -210,7 +218,9 @@ async fn main() -> BoxResult<()> {
         serde_json::json!({"target_user_id": b.user_id, "source": "hydration", "source_id": "t", "user_id": 0}),
     )
     .await?;
-    let direct_id = direct["channel_id"].as_u64().ok_or("direct channel_id missing")?;
+    let direct_id = direct["channel_id"]
+        .as_u64()
+        .ok_or("direct channel_id missing")?;
     let group_probe = format!("group-probe-{}", now_millis());
     send_text(&a, group_id, 2, &group_probe).await?;
     send_text(&a, direct_id, 1, &format!("dm-probe-{}", now_millis())).await?;
@@ -236,20 +246,34 @@ async fn main() -> BoxResult<()> {
     // ---- 断言 ----
     let mut failures: Vec<String> = Vec::new();
     let mut check = |name: &str, ok: bool, detail: String| {
-        println!("  [{}] {} {}", if ok { "PASS" } else { "FAIL" }, name, detail);
+        println!(
+            "  [{}] {} {}",
+            if ok { "PASS" } else { "FAIL" },
+            name,
+            detail
+        );
         if !ok {
             failures.push(format!("{name}: {detail}"));
         }
     };
 
     // 1. 群名
-    let info = rpc(&a, "group/group/info", serde_json::json!({"group_id": group_id, "user_id": 0})).await?;
+    let info = rpc(
+        &a,
+        "group/group/info",
+        serde_json::json!({"group_id": group_id, "user_id": 0}),
+    )
+    .await?;
     let got_name = info
         .pointer("/group_info/name")
         .or_else(|| info.pointer("/name"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    check("group-name", got_name == group_name, format!("expected='{group_name}' actual='{got_name}'"));
+    check(
+        "group-name",
+        got_name == group_name,
+        format!("expected='{group_name}' actual='{got_name}'"),
+    );
 
     // 2. 全员禁言设置
     let settings = rpc(
@@ -263,7 +287,11 @@ async fn main() -> BoxResult<()> {
         .or_else(|| settings.pointer("/all_muted"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    check("settings-mute-all", all_muted, format!("all_muted={all_muted}"));
+    check(
+        "settings-mute-all",
+        all_muted,
+        format!("all_muted={all_muted}"),
+    );
 
     // 3. 成员数 + B 单独禁言状态
     let members = rpc(
@@ -296,7 +324,11 @@ async fn main() -> BoxResult<()> {
     )
     .await?;
     let direct2_id = direct2["channel_id"].as_u64().unwrap_or(0);
-    check("direct-channel-reuse", direct2_id == direct_id, format!("before={direct_id} after={direct2_id}"));
+    check(
+        "direct-channel-reuse",
+        direct2_id == direct_id,
+        format!("before={direct_id} after={direct2_id}"),
+    );
 
     // 5. 群 last message（channel entity sync since=0）
     let sync = rpc(
@@ -332,7 +364,14 @@ async fn main() -> BoxResult<()> {
     );
 
     server2.kill_now();
-    println!("\n== hydration summary: {} ==", if failures.is_empty() { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "\n== hydration summary: {} ==",
+        if failures.is_empty() {
+            "ALL PASS"
+        } else {
+            "FAILURES"
+        }
+    );
     for f in &failures {
         println!("  - {f}");
     }

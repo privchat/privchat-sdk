@@ -514,19 +514,18 @@ async fn main() -> BoxResult<()> {
     println!("\nper-client (after restart):");
     for (i, c) in clients.iter().enumerate() {
         let recov = done_at[i].map(|t| (t - t0).as_secs_f64());
-        let first_conn = first_event_since(c, t_kill, "ConnectionStateChanged")
-            .and_then(|_| {
-                c.events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|(t, s)| {
-                        *t >= t0
-                            && s.starts_with("ConnectionStateChanged")
-                            && s.contains("to: Connected")
-                    })
-                    .map(|(t, _)| (*t - t0).as_secs_f64())
-            });
+        let first_conn = first_event_since(c, t_kill, "ConnectionStateChanged").and_then(|_| {
+            c.events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(t, s)| {
+                    *t >= t0
+                        && s.starts_with("ConnectionStateChanged")
+                        && s.contains("to: Connected")
+                })
+                .map(|(t, _)| (*t - t0).as_secs_f64())
+        });
         let started = count_events_since(c, t0, "ResumeSyncStarted");
         let completed = count_events_since(c, t0, "ResumeSyncCompleted");
         println!(

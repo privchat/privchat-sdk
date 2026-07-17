@@ -47,8 +47,8 @@ async fn main() -> BoxResult<()> {
     // ── 1) env / wiring ─────────────────────────────────────────────
     let host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let tcp_port = parse_env_u16("PRIVCHAT_TCP_PORT", 9001);
-    let route = std::env::var("PRIVCHAT_TRANSFER_ROUTE")
-        .unwrap_or_else(|_| "bot/menu/get".to_string());
+    let route =
+        std::env::var("PRIVCHAT_TRANSFER_ROUTE").unwrap_or_else(|_| "bot/menu/get".to_string());
     let body = std::env::var("PRIVCHAT_TRANSFER_BODY")
         .unwrap_or_default()
         .into_bytes();
@@ -57,8 +57,11 @@ async fn main() -> BoxResult<()> {
         .and_then(|s| s.parse::<u64>().ok());
 
     let ts = now_millis();
-    let data_dir =
-        std::env::temp_dir().join(format!("privchat-rust-transfer-{}-{}", ts, std::process::id()));
+    let data_dir = std::env::temp_dir().join(format!(
+        "privchat-rust-transfer-{}-{}",
+        ts,
+        std::process::id()
+    ));
     std::fs::create_dir_all(&data_dir)?;
 
     let sdk = PrivchatSdk::new(PrivchatConfig {
@@ -128,9 +131,7 @@ async fn main() -> BoxResult<()> {
         route,
         body.len()
     );
-    let reply = sdk
-        .transfer(channel_id, route.clone(), body, 5_000)
-        .await?;
+    let reply = sdk.transfer(channel_id, route.clone(), body, 5_000).await?;
 
     println!("--- TransferResponse ---");
     println!("  request_id  : {}", reply.request_id);
@@ -153,7 +154,11 @@ async fn main() -> BoxResult<()> {
                     .map(|b| format!("{:02x}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
-                println!("  data (hex)  : {}{}", hex, if reply.data.len() > 64 { " …" } else { "" });
+                println!(
+                    "  data (hex)  : {}{}",
+                    hex,
+                    if reply.data.len() > 64 { " …" } else { "" }
+                );
             }
         }
     }

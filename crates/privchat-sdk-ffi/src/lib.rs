@@ -1711,6 +1711,63 @@ pub struct NewMessage {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageTextEntity {
+    pub kind: String,
+    pub start: u32,
+    pub end: u32,
+    pub text: String,
+    pub value: String,
+    pub user_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageContentRef {
+    pub kind: String,
+    pub target_id: Option<String>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageContentBody {
+    pub kind: String,
+    pub text: String,
+    pub entities: Vec<MessageTextEntity>,
+    pub reply_to_message_id: Option<String>,
+    pub mentioned_user_ids: Vec<u64>,
+    pub attachment_url: Option<String>,
+    pub attachment_file_id: Option<u64>,
+    pub thumbnail_url: Option<String>,
+    pub thumbnail_file_id: Option<u64>,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
+    pub duration: Option<i32>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub coordinate_system: Option<String>,
+    pub location_name: Option<String>,
+    pub address: Option<String>,
+    pub poi_id: Option<String>,
+    pub poi_source: Option<String>,
+    pub link_url: Option<String>,
+    pub link_title: Option<String>,
+    pub link_description: Option<String>,
+    pub contact_user_id: Option<u64>,
+    pub contact_name: Option<String>,
+    pub contact_avatar_url: Option<String>,
+    pub system_template: Option<String>,
+    pub system_refs: Vec<MessageContentRef>,
+    pub money_ref_id: Option<String>,
+    pub money_title: Option<String>,
+    pub money_summary: Option<String>,
+    pub money_status: Option<String>,
+    pub money_amount_text: Option<String>,
+    pub money_scene: Option<String>,
+    pub money_type: Option<i32>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct StoredMessage {
     pub message_id: u64,
     pub server_message_id: Option<u64>,
@@ -1720,6 +1777,8 @@ pub struct StoredMessage {
     pub from_uid: u64,
     pub message_type: i32,
     pub content: String,
+    /// SDK-owned typed projection. Application/UI code consumes this field.
+    pub body: MessageContentBody,
     pub status: i32,
     pub created_at: i64,
     pub updated_at: i64,
@@ -1767,6 +1826,7 @@ pub struct StoredChannel {
     /// 最后一条消息的原始 content（TEXT = 纯文本，其他类型 = 结构化 JSON）。
     /// UI 层基于 `last_message_type` + content + i18n 自行渲染预览，**SDK 不做改写**。
     pub last_msg_content: String,
+    pub last_message_body: Option<MessageContentBody>,
     pub updated_at: i64,
     pub peer_user_id: Option<u64>,
     /// 群成员数（群会话有意义，来自 group 实体缓存；DM/未知为 0）。供群标题「(N)」。
@@ -3051,6 +3111,7 @@ fn map_upsert_channel_extra(v: UpsertChannelExtraInput) -> SdkUpsertChannelExtra
 }
 
 fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
+    let body = map_message_content(privchat_sdk::message_content::project_stored_message(&v));
     let (display_content, mut reply_to_message_id, mut mentioned_user_ids) =
         extract_envelope_fields(&v.content);
     // Inbound sync pipeline stores the plain text in `content` and the full envelope JSON
@@ -3070,6 +3131,7 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
         from_uid: v.from_uid,
         message_type: v.message_type,
         content: display_content,
+        body,
         status: v.status,
         created_at: v.created_at,
         updated_at: v.updated_at,
@@ -3083,6 +3145,68 @@ fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
         pts: v.pts,
         reply_to_message_id,
         mentioned_user_ids,
+    }
+}
+
+fn map_message_content(
+    v: privchat_sdk::message_content::MessageContentProjection,
+) -> MessageContentBody {
+    MessageContentBody {
+        kind: v.kind,
+        text: v.text,
+        entities: v
+            .entities
+            .into_iter()
+            .map(|e| MessageTextEntity {
+                kind: e.kind,
+                start: e.start,
+                end: e.end,
+                text: e.text,
+                value: e.value,
+                user_id: e.user_id,
+            })
+            .collect(),
+        reply_to_message_id: v.reply_to_message_id,
+        mentioned_user_ids: v.mentioned_user_ids,
+        attachment_url: v.attachment_url,
+        attachment_file_id: v.attachment_file_id,
+        thumbnail_url: v.thumbnail_url,
+        thumbnail_file_id: v.thumbnail_file_id,
+        file_name: v.file_name,
+        file_size: v.file_size,
+        duration: v.duration,
+        width: v.width,
+        height: v.height,
+        latitude: v.latitude,
+        longitude: v.longitude,
+        coordinate_system: v.coordinate_system,
+        location_name: v.location_name,
+        address: v.address,
+        poi_id: v.poi_id,
+        poi_source: v.poi_source,
+        link_url: v.link_url,
+        link_title: v.link_title,
+        link_description: v.link_description,
+        contact_user_id: v.contact_user_id,
+        contact_name: v.contact_name,
+        contact_avatar_url: v.contact_avatar_url,
+        system_template: v.system_template,
+        system_refs: v
+            .system_refs
+            .into_iter()
+            .map(|r| MessageContentRef {
+                kind: r.kind,
+                target_id: r.target_id,
+                text: r.text,
+            })
+            .collect(),
+        money_ref_id: v.money_ref_id,
+        money_title: v.money_title,
+        money_summary: v.money_summary,
+        money_status: v.money_status,
+        money_amount_text: v.money_amount_text,
+        money_scene: v.money_scene,
+        money_type: v.money_type,
     }
 }
 
@@ -3128,6 +3252,32 @@ fn extract_envelope_fields(raw: &str) -> (String, Option<String>, Vec<u64>) {
 }
 
 fn map_stored_channel(v: SdkStoredChannel) -> StoredChannel {
+    let last_message_body = v.last_message_type.map(|message_type| {
+        let synthetic = SdkStoredMessage {
+            message_id: v.last_local_message_id,
+            server_message_id: None,
+            local_message_id: None,
+            channel_id: v.channel_id,
+            channel_type: v.channel_type,
+            from_uid: 0,
+            message_type,
+            content: v.last_msg_content.clone(),
+            status: 2,
+            created_at: v.last_msg_timestamp,
+            updated_at: v.updated_at,
+            extra: String::new(),
+            revoked: v.last_message_is_revoked,
+            revoked_by: None,
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
+            delivered: false,
+            pts: None,
+        };
+        map_message_content(privchat_sdk::message_content::project_stored_message(
+            &synthetic,
+        ))
+    });
     StoredChannel {
         channel_id: v.channel_id,
         channel_type: v.channel_type,
@@ -3140,6 +3290,7 @@ fn map_stored_channel(v: SdkStoredChannel) -> StoredChannel {
         last_msg_timestamp: v.last_msg_timestamp,
         last_local_message_id: v.last_local_message_id,
         last_msg_content: v.last_msg_content,
+        last_message_body,
         updated_at: v.updated_at,
         peer_user_id: v.peer_user_id,
         member_count: v.member_count.max(0) as u32,

@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "msgtrans"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1644,6 +1644,7 @@ dependencies = [
  "privchat-protocol",
  "rand 0.8.5",
  "refinery",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

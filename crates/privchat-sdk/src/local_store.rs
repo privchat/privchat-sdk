@@ -29,11 +29,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Error, LoginResult, MentionInput, NewMessage, Result, SessionSnapshot, StoredBlacklistEntry,
-    StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
-    StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
-    PendingTimelineMutation, StoredUser, UnreadMentionCount, UpsertBlacklistInput,
-    UpsertChannelExtraInput,
+    Error, LoginResult, MentionInput, NewMessage, PendingTimelineMutation, Result, SessionSnapshot,
+    StoredBlacklistEntry, StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend,
+    StoredGroup, StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction,
+    StoredReminder, StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
     UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
     UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
@@ -538,7 +537,7 @@ impl LocalStore {
             K_TOKEN_EXPIRE_AT,
             i64_to_be_bytes(i64::try_from(login.expires_at).unwrap_or(i64::MAX)),
         )
-            .map_err(|e| Error::Storage(format!("save token expire_at: {e}")))?;
+        .map_err(|e| Error::Storage(format!("save token expire_at: {e}")))?;
         drop(auth);
         drop(profile);
         drop(meta);
@@ -645,7 +644,8 @@ impl LocalStore {
         expires_at: Option<u64>,
     ) -> Result<()> {
         let master_key = self.load_master_key(uid)?;
-        let blob = self.encrypt_user_blob(uid, "access_token", &master_key, access_token.as_bytes())?;
+        let blob =
+            self.encrypt_user_blob(uid, "access_token", &master_key, access_token.as_bytes())?;
         let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
         let mut batch = sled::Batch::default();
         batch.insert(K_ACCESS_TOKEN_ALG, TOKEN_ALG.as_bytes());
@@ -1422,7 +1422,10 @@ impl LocalStore {
                     media_downloaded: row.get::<_, i32>(15).unwrap_or(0) != 0,
                     thumb_status: row.get::<_, i32>(16).unwrap_or(0),
                     delivered: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                    pts: row.get::<_, Option<i64>>(18)?.filter(|&v| v > 0).map(|v| v as u64),
+                    pts: row
+                        .get::<_, Option<i64>>(18)?
+                        .filter(|&v| v > 0)
+                        .map(|v| v as u64),
                 })
             },
         )
@@ -1528,7 +1531,10 @@ impl LocalStore {
             media_downloaded: row.get::<_, i32>(15).unwrap_or(0) != 0,
             thumb_status: row.get::<_, i32>(16).unwrap_or(0),
             delivered: row.get::<_, i32>(17).unwrap_or(0) != 0,
-            pts: row.get::<_, Option<i64>>(18)?.filter(|&v| v > 0).map(|v| v as u64),
+            pts: row
+                .get::<_, Option<i64>>(18)?
+                .filter(|&v| v > 0)
+                .map(|v| v as u64),
         })
     }
 
@@ -1599,7 +1605,11 @@ impl LocalStore {
                  FROM message
                  WHERE channel_id = ?1 AND channel_type = ?2 AND server_message_id = ?3
                  LIMIT 1",
-                params![channel_id as i64, channel_type, anchor_server_message_id as i64],
+                params![
+                    channel_id as i64,
+                    channel_type,
+                    anchor_server_message_id as i64
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
@@ -1611,7 +1621,8 @@ impl LocalStore {
         // 显示排序键的严格元组比较（SQLite 无原生元组比较，手写嵌套）
         const KEY_LT: &str = "(k1 < ?4 OR (k1 = ?4 AND (k2 < ?5 OR (k2 = ?5 AND (k3 < ?6 OR (k3 = ?6 AND k4 < ?7))))))";
         const KEY_GT: &str = "(k1 > ?4 OR (k1 = ?4 AND (k2 > ?5 OR (k2 = ?5 AND (k3 > ?6 OR (k3 = ?6 AND k4 > ?7))))))";
-        let base_select = "SELECT m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
+        let base_select =
+            "SELECT m.id, m.server_message_id, m.channel_id, m.channel_type, m.from_uid, m.type,
                     m.content, m.status, m.created_at, m.updated_at, m.extra, m.local_message_id,
                     COALESCE(me.revoke, 0), me.revoker,
                     m.mime_type, m.media_downloaded, m.thumb_status,
@@ -1665,16 +1676,15 @@ impl LocalStore {
         Ok(out)
     }
 
-    pub fn update_thumb_status(
-        &self,
-        uid: &str,
-        message_id: u64,
-        thumb_status: i32,
-    ) -> Result<()> {
+    pub fn update_thumb_status(&self, uid: &str, message_id: u64, thumb_status: i32) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
             "UPDATE message SET thumb_status = ?1, updated_at = ?3 WHERE id = ?2",
-            params![thumb_status, message_id as i64, chrono::Utc::now().timestamp_millis()],
+            params![
+                thumb_status,
+                message_id as i64,
+                chrono::Utc::now().timestamp_millis()
+            ],
         )
         .map_err(|e| Error::Storage(format!("update thumb_status: {e}")))?;
         Ok(())
@@ -1690,7 +1700,11 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
             "UPDATE message SET media_downloaded = ?1, updated_at = ?3 WHERE id = ?2",
-            params![downloaded as i32, message_id as i64, chrono::Utc::now().timestamp_millis()],
+            params![
+                downloaded as i32,
+                message_id as i64,
+                chrono::Utc::now().timestamp_millis()
+            ],
         )
         .map_err(|e| Error::Storage(format!("update media_downloaded: {e}")))?;
         Ok(())
@@ -2075,8 +2089,8 @@ impl LocalStore {
                     updated_at: row.get::<_, i64>(12)?,
                     peer_user_id: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
                     member_count: row.get::<_, i64>(14)?,
-                last_message_type: None,
-                last_message_is_revoked: false,
+                    last_message_type: None,
+                    last_message_is_revoked: false,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list channels: {e}")))?;
@@ -2113,14 +2127,16 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("prepare channel identifiers: {e}")))?;
         let rows = stmt
             .query_map(
-                params![after_channel_id as i64, after_channel_type, limit.clamp(1, 500) as i64],
+                params![
+                    after_channel_id as i64,
+                    after_channel_type,
+                    limit.clamp(1, 500) as i64
+                ],
                 |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i32>(1)?)),
             )
             .map_err(|e| Error::Storage(format!("query channel identifiers: {e}")))?;
-        rows.map(|row| {
-            row.map_err(|e| Error::Storage(format!("decode channel identifier: {e}")))
-        })
-        .collect()
+        rows.map(|row| row.map_err(|e| Error::Storage(format!("decode channel identifier: {e}"))))
+            .collect()
     }
 
     /// 设置本地 channel 隐藏标记。纯本地操作，不触达服务端。
@@ -2141,17 +2157,11 @@ impl LocalStore {
     /// 本地删除 channel：标记隐藏 + 清除所有相关消息及其附属表。
     /// 不触达服务端；附件文件清理由调用方（FFI 层）负责。
     /// 返回被删除的消息列表（包含 created_at / message_id，用于定位 canonical 附件目录）。
-    pub fn delete_channel_local(
-        &self,
-        uid: &str,
-        channel_id: u64,
-    ) -> Result<Vec<StoredMessage>> {
+    pub fn delete_channel_local(&self, uid: &str, channel_id: u64) -> Result<Vec<StoredMessage>> {
         let messages = {
             let conn = self.conn_for_user(uid)?;
             let mut stmt = conn
-                .prepare(
-                    "SELECT id, created_at FROM message WHERE channel_id = ?1",
-                )
+                .prepare("SELECT id, created_at FROM message WHERE channel_id = ?1")
                 .map_err(|e| Error::Storage(format!("prepare list channel messages: {e}")))?;
             let rows = stmt
                 .query_map(params![channel_id as i64], |row| {
@@ -2180,9 +2190,7 @@ impl LocalStore {
                 .map_err(|e| Error::Storage(format!("query channel messages: {e}")))?;
             let mut out = Vec::new();
             for row in rows {
-                out.push(
-                    row.map_err(|e| Error::Storage(format!("decode channel message: {e}")))?,
-                );
+                out.push(row.map_err(|e| Error::Storage(format!("decode channel message: {e}")))?);
             }
             out
         };
@@ -2511,11 +2519,7 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
             "UPDATE user SET alias = ?2, updated_at = ?3 WHERE user_id = ?1",
-            params![
-                user_id as i64,
-                alias,
-                chrono::Utc::now().timestamp_millis()
-            ],
+            params![user_id as i64, alias, chrono::Utc::now().timestamp_millis()],
         )
         .map_err(|e| Error::Storage(format!("update_user_alias: {e}")))?;
         Ok(())
@@ -3856,7 +3860,13 @@ impl LocalStore {
                     delivered_at = excluded.delivered_at,
                     extra_version = excluded.extra_version
                  WHERE message_extra.delivered = 0",
-                params![message_id, channel_id, channel_type, delivered_at as i64, now_ms],
+                params![
+                    message_id,
+                    channel_id,
+                    channel_type,
+                    delivered_at as i64,
+                    now_ms
+                ],
             )
             .map_err(|e| Error::Storage(format!("mark_delivered upsert: {e}")))?;
         Ok((updated > 0).then_some(message_id as u64))
@@ -4241,14 +4251,17 @@ impl LocalStore {
         value: &[u8],
     ) -> Result<PendingTimelineMutation> {
         if value.len() < 18 || value[0] != 1 {
-            return Err(Error::Storage("invalid pending timeline mutation record".to_string()));
+            return Err(Error::Storage(
+                "invalid pending timeline mutation record".to_string(),
+            ));
         }
         let event_id = u64::from_be_bytes(value[1..9].try_into().map_err(|_| {
             Error::Storage("invalid pending timeline mutation event_id".to_string())
         })?);
-        let pts = u64::from_be_bytes(value[9..17].try_into().map_err(|_| {
-            Error::Storage("invalid pending timeline mutation pts".to_string())
-        })?);
+        let pts =
+            u64::from_be_bytes(value[9..17].try_into().map_err(|_| {
+                Error::Storage("invalid pending timeline mutation pts".to_string())
+            })?);
         Ok(PendingTimelineMutation {
             channel_id,
             channel_type,
@@ -4318,9 +4331,8 @@ impl LocalStore {
         let tree = self.account_tree(uid, ACCOUNT_TREE_KV)?;
         tree.remove(Self::pending_timeline_mutation_key(mutation).as_bytes())
             .map_err(|e| Error::Storage(format!("delete pending timeline mutation: {e}")))?;
-        tree.flush().map_err(|e| {
-            Error::Storage(format!("flush pending timeline mutation delete: {e}"))
-        })?;
+        tree.flush()
+            .map_err(|e| Error::Storage(format!("flush pending timeline mutation delete: {e}")))?;
         Ok(())
     }
 
@@ -4635,7 +4647,11 @@ mod tests {
         };
         store.save_login(uid, &login).expect("save login");
         let (active, entries) = store.list_local_accounts().expect("list");
-        assert_eq!(active.as_deref(), Some(uid), "active uid should match login");
+        assert_eq!(
+            active.as_deref(),
+            Some(uid),
+            "active uid should match login"
+        );
         assert!(
             entries.iter().any(|e| e.uid == uid),
             "logged-in uid should appear in entries"
@@ -5203,7 +5219,11 @@ mod tests {
             .skip(1)
             .map(|m| m.pts.map(|p| p as i64).unwrap_or(0))
             .collect();
-        assert_eq!(ptss, vec![30, 20, 10], "acked messages must order by pts DESC");
+        assert_eq!(
+            ptss,
+            vec![30, 20, 10],
+            "acked messages must order by pts DESC"
+        );
 
         // ack 回填 pts 后 pending 归位到 pts 序（40 > 30 仍在最前）
         store

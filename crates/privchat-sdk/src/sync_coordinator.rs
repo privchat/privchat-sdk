@@ -125,7 +125,10 @@ mod tests {
         let mut coordinator = SyncCoordinator::new();
         assert!(coordinator.begin(SyncRunKind::Bootstrap, 1));
         assert!(!coordinator.begin(SyncRunKind::Resume, 2));
-        assert_eq!(coordinator.snapshot().run_kind, Some(SyncRunKind::Bootstrap));
+        assert_eq!(
+            coordinator.snapshot().run_kind,
+            Some(SyncRunKind::Bootstrap)
+        );
     }
 
     #[test]

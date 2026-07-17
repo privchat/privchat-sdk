@@ -303,10 +303,7 @@ mod tests {
     fn cache_path_keyed_by_target_uid() {
         let root = Path::new("/data/users/1001");
         let p = avatar_cache_path(root, 42);
-        assert_eq!(
-            p.to_string_lossy(),
-            "/data/users/1001/avatars/users/42.img"
-        );
+        assert_eq!(p.to_string_lossy(), "/data/users/1001/avatars/users/42.img");
         // 路径只由 uid 决定，与 URL 无关 ⇒ 换头像原地覆盖同一文件；不同 uid 不同文件。
         assert_eq!(p, avatar_cache_path(root, 42));
         assert_ne!(p, avatar_cache_path(root, 43));
@@ -316,7 +313,10 @@ mod tests {
     fn prepare_avatar_center_crops_and_caps_at_480() {
         let dir = std::env::temp_dir();
         // 大图：800x600 → 中心裁 600x600 → 缩到 480x480
-        let src = dir.join(format!("privchat-avatar-test-big-{}.png", std::process::id()));
+        let src = dir.join(format!(
+            "privchat-avatar-test-big-{}.png",
+            std::process::id()
+        ));
         image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
             800,
             600,
@@ -331,7 +331,10 @@ mod tests {
         let _ = std::fs::remove_file(&out);
 
         // 小图：100x50 → 50x50，不放大
-        let src2 = dir.join(format!("privchat-avatar-test-small-{}.png", std::process::id()));
+        let src2 = dir.join(format!(
+            "privchat-avatar-test-small-{}.png",
+            std::process::id()
+        ));
         image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
             100,
             50,
@@ -346,7 +349,10 @@ mod tests {
         let _ = std::fs::remove_file(&out2);
 
         // 非法格式（非图片字节）直接 Err
-        let bad = dir.join(format!("privchat-avatar-test-bad-{}.bin", std::process::id()));
+        let bad = dir.join(format!(
+            "privchat-avatar-test-bad-{}.bin",
+            std::process::id()
+        ));
         std::fs::write(&bad, b"definitely not an image").unwrap();
         assert!(prepare_avatar_image_sync(&bad).is_err());
         let _ = std::fs::remove_file(&bad);

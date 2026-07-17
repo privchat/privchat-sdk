@@ -522,8 +522,7 @@ impl TestPhases {
                             // Some inbound paths can land the latest message before the channel
                             // preview row catches up — verify via local message history as fallback.
                             let history_ok = gmsgs.messages.last().is_some_and(|m| {
-                                (m.content == "ok!" || m.content.contains("ok!"))
-                                    && m.timestamp > 0
+                                (m.content == "ok!" || m.content.contains("ok!")) && m.timestamp > 0
                             });
                             if history_ok {
                                 metrics.rpc_successes += 1;
@@ -1985,13 +1984,12 @@ impl TestPhases {
                         payload,
                         ..
                     }) if cid == channel_id && topic.as_deref() == Some("presence_changed") => {
-                        let notification =
-                            serde_json::from_slice::<
-                                privchat_protocol::presence::PresenceChangedNotification,
-                            >(&payload)
-                            .map_err(|e| {
-                                boxed_err(format!("decode presence_changed payload failed: {e}"))
-                            })?;
+                        let notification = serde_json::from_slice::<
+                            privchat_protocol::presence::PresenceChangedNotification,
+                        >(&payload)
+                        .map_err(|e| {
+                            boxed_err(format!("decode presence_changed payload failed: {e}"))
+                        })?;
                         if notification.user_id == bob_id && !notification.snapshot.is_online {
                             break Ok(notification);
                         }
@@ -3080,10 +3078,9 @@ impl TestPhases {
             if !issue_resp.status().is_success() {
                 let status = issue_resp.status();
                 let body = issue_resp.text().await.unwrap_or_default();
-                metrics.errors.push(format!(
-                    "{} ticket issue failed: {} {}",
-                    name, status, body
-                ));
+                metrics
+                    .errors
+                    .push(format!("{} ticket issue failed: {} {}", name, status, body));
                 continue;
             }
             let ticket = match issue_resp
@@ -3718,7 +3715,10 @@ impl TestPhases {
                     .iter()
                     .take(4)
                     .map(|m| {
-                        format!("id={} from={} content={}", m.message_id, m.from_uid, m.content)
+                        format!(
+                            "id={} from={} content={}",
+                            m.message_id, m.from_uid, m.content
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(" | ");
@@ -3733,7 +3733,9 @@ impl TestPhases {
         metrics.rpc_successes += 1;
 
         let d_attempt = after.attempt.saturating_sub(before.attempt);
-        let d_success = after.success_sessions.saturating_sub(before.success_sessions);
+        let d_success = after
+            .success_sessions
+            .saturating_sub(before.success_sessions);
         let d_zero = after.zero_success.saturating_sub(before.zero_success);
         let d_offline = after.offline_enqueue.saturating_sub(before.offline_enqueue);
 
@@ -3861,9 +3863,7 @@ impl TestPhases {
                 ));
             }
         };
-        let server_message_id = seed
-            .server_message_id
-            .unwrap_or(seed.message_id);
+        let server_message_id = seed.server_message_id.unwrap_or(seed.message_id);
         metrics.rpc_successes += 1;
 
         // 4) admin 撤回这条消息
@@ -3919,9 +3919,9 @@ impl TestPhases {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         for key in ["alice", "bob"] {
             if let Err(e) = manager.refresh_local_views(key).await {
-                metrics
-                    .errors
-                    .push(format!("refresh_local_views({key}) post-revoke failed: {e}"));
+                metrics.errors.push(format!(
+                    "refresh_local_views({key}) post-revoke failed: {e}"
+                ));
             }
         }
 
@@ -4018,7 +4018,9 @@ impl TestPhases {
             .pointer("/data/accessToken")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                boxed_err(format!("admin login missing data.accessToken: {login_body}"))
+                boxed_err(format!(
+                    "admin login missing data.accessToken: {login_body}"
+                ))
             })?
             .to_string();
 
@@ -4073,10 +4075,7 @@ impl TestPhases {
             .await?;
         let menu_status = menu_resp.status();
         if !menu_status.is_success() {
-            let body: serde_json::Value = menu_resp
-                .json()
-                .await
-                .unwrap_or(serde_json::Value::Null);
+            let body: serde_json::Value = menu_resp.json().await.unwrap_or(serde_json::Value::Null);
             return Err(boxed_err(format!(
                 "bot menu set failed: status={menu_status} body={body}"
             )));
@@ -4233,8 +4232,9 @@ impl TestPhases {
                 fsync_a_sent_pending.len()
             ));
         }
-        let alice_received_pending =
-            manager.list_friend_requests("alice", false, vec![0]).await?;
+        let alice_received_pending = manager
+            .list_friend_requests("alice", false, vec![0])
+            .await?;
         metrics.rpc_calls += 1;
         let fsync_a_id = manager.user_id("fsync_a")?;
         if alice_received_pending
@@ -4272,13 +4272,11 @@ impl TestPhases {
                 .errors
                 .push("scenario.accept: fsync_a Sent[0] still has alice after accept".to_string());
         }
-        let alice_received_after =
-            manager.list_friend_requests("alice", false, vec![0]).await?;
+        let alice_received_after = manager
+            .list_friend_requests("alice", false, vec![0])
+            .await?;
         metrics.rpc_calls += 1;
-        if !alice_received_after
-            .iter()
-            .any(|f| f.user_id == fsync_a_id)
-        {
+        if !alice_received_after.iter().any(|f| f.user_id == fsync_a_id) {
             metrics.rpc_successes += 1;
         } else {
             metrics.errors.push(
@@ -4349,9 +4347,9 @@ impl TestPhases {
         if !bob_received.iter().any(|f| f.user_id == fsync_b_id) {
             metrics.rpc_successes += 1;
         } else {
-            metrics
-                .errors
-                .push("scenario.reject: bob Received[0] still shows fsync_b after reject".to_string());
+            metrics.errors.push(
+                "scenario.reject: bob Received[0] still shows fsync_b after reject".to_string(),
+            );
         }
         let bob_friends = manager.list_local_friends("bob").await?;
         metrics.rpc_calls += 1;
@@ -4375,9 +4373,7 @@ impl TestPhases {
         }
 
         let fsync_c_id = manager.user_id("fsync_c")?;
-        let _ = manager
-            .recall_friend_request("fsync_c", charlie_id)
-            .await?;
+        let _ = manager.recall_friend_request("fsync_c", charlie_id).await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4457,7 +4453,9 @@ impl TestPhases {
                     phase_name: "system-user-group-reject".to_string(),
                     success: true,
                     duration: start.elapsed(),
-                    details: "skipped: PRIVCHAT_SMOKE_SYSTEM_USER not active (set =1 on application)".to_string(),
+                    details:
+                        "skipped: PRIVCHAT_SMOKE_SYSTEM_USER not active (set =1 on application)"
+                            .to_string(),
                     metrics,
                 });
             }
@@ -4556,18 +4554,19 @@ impl TestPhases {
         }
 
         // 1) alice 开 direct channel 到 assistant
-        let resp: privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelResponse = manager
-            .rpc_typed(
-                "alice",
-                privchat_protocol::rpc::routes::channel::DIRECT_GET_OR_CREATE,
-                &privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelRequest {
-                    target_user_id: assistant_uid,
-                    source: Some("assistant-roundA".to_string()),
-                    source_id: Some("phase40".to_string()),
-                    user_id: 0,
-                },
-            )
-            .await?;
+        let resp: privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelResponse =
+            manager
+                .rpc_typed(
+                    "alice",
+                    privchat_protocol::rpc::routes::channel::DIRECT_GET_OR_CREATE,
+                    &privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelRequest {
+                        target_user_id: assistant_uid,
+                        source: Some("assistant-roundA".to_string()),
+                        source_id: Some("phase40".to_string()),
+                        user_id: 0,
+                    },
+                )
+                .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
         let channel_id = resp.channel_id;
@@ -4578,9 +4577,7 @@ impl TestPhases {
         }
 
         // 2) 记录基线：当前 channel 已有多少条 assistant-sourced 消息
-        let baseline = manager
-            .message_history("alice", channel_id, 100)
-            .await?;
+        let baseline = manager.message_history("alice", channel_id, 100).await?;
         let baseline_assistant_msgs = baseline
             .messages
             .iter()
@@ -4609,9 +4606,7 @@ impl TestPhases {
         let mut got_reply: Option<privchat_protocol::rpc::MessageHistoryItem> = None;
         for attempt in 0..20 {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let h = manager
-                .message_history("alice", channel_id, 100)
-                .await?;
+            let h = manager.message_history("alice", channel_id, 100).await?;
             let new_assistant_msgs: Vec<&privchat_protocol::rpc::MessageHistoryItem> = h
                 .messages
                 .iter()
@@ -4683,18 +4678,19 @@ impl TestPhases {
         let system_user_id = smoke_before.system_user_id;
 
         // 1) alice 开 direct channel 到 smoke system user
-        let resp: privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelResponse = manager
-            .rpc_typed(
-                "alice",
-                privchat_protocol::rpc::routes::channel::DIRECT_GET_OR_CREATE,
-                &privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelRequest {
-                    target_user_id: system_user_id,
-                    source: Some("accounts-smoke".to_string()),
-                    source_id: Some("phase39".to_string()),
-                    user_id: 0,
-                },
-            )
-            .await?;
+        let resp: privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelResponse =
+            manager
+                .rpc_typed(
+                    "alice",
+                    privchat_protocol::rpc::routes::channel::DIRECT_GET_OR_CREATE,
+                    &privchat_protocol::rpc::channel::direct::GetOrCreateDirectChannelRequest {
+                        target_user_id: system_user_id,
+                        source: Some("accounts-smoke".to_string()),
+                        source_id: Some("phase39".to_string()),
+                        user_id: 0,
+                    },
+                )
+                .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
         let channel_id = resp.channel_id;

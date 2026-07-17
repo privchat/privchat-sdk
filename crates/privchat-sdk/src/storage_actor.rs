@@ -23,9 +23,9 @@ use tokio::sync::oneshot;
 use crate::local_store::{LocalAccountEntry, LocalStore, StoragePaths, UserAvatarCacheRow};
 use crate::{
     Error, LoginResult, MentionInput, NewMessage, PendingTimelineMutation, Result, SessionSnapshot,
-    StoredBlacklistEntry, StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend, StoredGroup,
-    StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction, StoredReminder,
-    StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
+    StoredBlacklistEntry, StoredChannel, StoredChannelExtra, StoredChannelMember, StoredFriend,
+    StoredGroup, StoredGroupMember, StoredMessage, StoredMessageExtra, StoredMessageReaction,
+    StoredReminder, StoredUser, UnreadMentionCount, UpsertBlacklistInput, UpsertChannelExtraInput,
     UpsertChannelInput, UpsertChannelMemberInput, UpsertFriendInput, UpsertGroupInput,
     UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertReminderInput,
     UpsertRemoteMessageInput, UpsertRemoteMessageResult, UpsertUserInput,
@@ -1085,10 +1085,7 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn delete_message_local(
-        &self,
-        message_id: u64,
-    ) -> Result<Option<StoredMessage>> {
+    pub async fn delete_message_local(&self, message_id: u64) -> Result<Option<StoredMessage>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::DeleteMessageLocal {
@@ -2162,11 +2159,8 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             content,
             resp,
         } => {
-            with_uid!(resp, |uid| store.update_message_content_local(
-                &uid,
-                message_id,
-                &content
-            ));
+            with_uid!(resp, |uid| store
+                .update_message_content_local(&uid, message_id, &content));
         }
         StorageCmd::GetLocalMessageId { message_id, resp } => {
             with_uid!(resp, |uid| store.get_local_message_id(&uid, message_id));
@@ -2197,8 +2191,11 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             thumb_status,
             resp,
         } => {
-            with_uid!(resp, |uid| store
-                .update_thumb_status(&uid, message_id, thumb_status));
+            with_uid!(resp, |uid| store.update_thumb_status(
+                &uid,
+                message_id,
+                thumb_status
+            ));
         }
         StorageCmd::UpdateMediaDownloaded {
             message_id,
@@ -2214,8 +2211,12 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             thumb_status,
             resp,
         } => {
-            with_uid!(resp, |uid| store
-                .finalize_local_attachment(&uid, message_id, &content, thumb_status));
+            with_uid!(resp, |uid| store.finalize_local_attachment(
+                &uid,
+                message_id,
+                &content,
+                thumb_status
+            ));
         }
         StorageCmd::SetMessageRevoke {
             message_id,
@@ -2234,7 +2235,8 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             hidden,
             resp,
         } => {
-            with_uid!(resp, |uid| store.set_channel_hidden(&uid, channel_id, hidden));
+            with_uid!(resp, |uid| store
+                .set_channel_hidden(&uid, channel_id, hidden));
         }
         StorageCmd::DeleteChannelLocal { channel_id, resp } => {
             with_uid!(resp, |uid| store.delete_channel_local(&uid, channel_id));
@@ -2381,7 +2383,11 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 &local_path
             ));
         }
-        StorageCmd::UpdateUserAlias { user_id, alias, resp } => {
+        StorageCmd::UpdateUserAlias {
+            user_id,
+            alias,
+            resp,
+        } => {
             with_uid!(resp, |uid| store.update_user_alias(&uid, user_id, alias));
         }
         StorageCmd::GetUserById { user_id, resp } => {
@@ -2591,7 +2597,8 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             ));
         }
         StorageCmd::PutPendingTimelineMutation { mutation, resp } => {
-            with_uid!(resp, |uid| store.put_pending_timeline_mutation(&uid, &mutation));
+            with_uid!(resp, |uid| store
+                .put_pending_timeline_mutation(&uid, &mutation));
         }
         StorageCmd::ListPendingTimelineMutations {
             channel_id,
@@ -2607,7 +2614,8 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             ));
         }
         StorageCmd::DeletePendingTimelineMutation { mutation, resp } => {
-            with_uid!(resp, |uid| store.delete_pending_timeline_mutation(&uid, &mutation));
+            with_uid!(resp, |uid| store
+                .delete_pending_timeline_mutation(&uid, &mutation));
         }
         StorageCmd::KvPut { key, value, resp } => {
             with_uid!(resp, |uid| store.kv_put(&uid, &key, &value));

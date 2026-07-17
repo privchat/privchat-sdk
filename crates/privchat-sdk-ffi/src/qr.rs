@@ -43,8 +43,8 @@
 //! exception otherwise.
 
 use rxing::{
-    common::HybridBinarizer, qrcode::QRCodeReader, BinaryBitmap, DecodeHints,
-    Luma8LuminanceSource, Reader,
+    common::HybridBinarizer, qrcode::QRCodeReader, BinaryBitmap, DecodeHints, Luma8LuminanceSource,
+    Reader,
 };
 
 // NOTE: `QrDecodeError` and `qr_decode_luma` are re-exported / wrapped
@@ -64,9 +64,7 @@ pub enum QrDecodeError {
     /// `height == 0`, or `luma.len() != width as usize * height as usize`.
     /// This is a programming bug on the platform side (wrong plane
     /// stride / wrong rotation handling) and should surface loudly.
-    #[error(
-        "invalid luma dimensions: width={width} height={height} luma_len={luma_len}"
-    )]
+    #[error("invalid luma dimensions: width={width} height={height} luma_len={luma_len}")]
     InvalidDimensions {
         width: u32,
         height: u32,
@@ -89,10 +87,7 @@ pub fn decode_luma(
     luma: Vec<u8>,
 ) -> Result<Option<String>, QrDecodeError> {
     let expected = (width as usize).checked_mul(height as usize);
-    let valid = width > 0
-        && height > 0
-        && expected.is_some()
-        && expected.unwrap() == luma.len();
+    let valid = width > 0 && height > 0 && expected.is_some() && expected.unwrap() == luma.len();
     if !valid {
         return Err(QrDecodeError::InvalidDimensions {
             width,
@@ -194,16 +189,22 @@ pub fn encode_matrix(text: &str) -> Result<QrMatrix, QrEncodeError> {
         return Err(QrEncodeError::EmptyText);
     }
 
-    let code = ::qrcode::QrCode::with_error_correction_level(text, ::qrcode::EcLevel::M)
-        .map_err(|e| QrEncodeError::EncoderError {
-            detail: e.to_string(),
+    let code =
+        ::qrcode::QrCode::with_error_correction_level(text, ::qrcode::EcLevel::M).map_err(|e| {
+            QrEncodeError::EncoderError {
+                detail: e.to_string(),
+            }
         })?;
 
     let size_usize = code.width();
     let mut cells = Vec::with_capacity(size_usize * size_usize);
     for y in 0..size_usize {
         for x in 0..size_usize {
-            cells.push(if code[(x, y)] == ::qrcode::Color::Dark { 1 } else { 0 });
+            cells.push(if code[(x, y)] == ::qrcode::Color::Dark {
+                1
+            } else {
+                0
+            });
         }
     }
 
@@ -241,10 +242,7 @@ mod encode_tests {
 
     #[test]
     fn encode_empty_text_returns_error() {
-        assert!(matches!(
-            encode_matrix(""),
-            Err(QrEncodeError::EmptyText)
-        ));
+        assert!(matches!(encode_matrix(""), Err(QrEncodeError::EmptyText)));
     }
 
     #[test]
@@ -284,8 +282,8 @@ mod encode_tests {
             }
         }
 
-        let decoded = decode_luma(pixel_per_side as u32, pixel_per_side as u32, luma)
-            .expect("decode ok");
+        let decoded =
+            decode_luma(pixel_per_side as u32, pixel_per_side as u32, luma).expect("decode ok");
         assert_eq!(decoded.as_deref(), Some(payload));
     }
 
@@ -311,8 +309,7 @@ mod tests {
     /// through `qr_decode_luma`. Returns the decoded payload (or
     /// propagates the error).
     fn encode_to_luma(payload: &str, scale: usize, quiet: usize) -> (u32, u32, Vec<u8>) {
-        let code = QrCode::with_error_correction_level(payload, EcLevel::M)
-            .expect("encode QR");
+        let code = QrCode::with_error_correction_level(payload, EcLevel::M).expect("encode QR");
         let module_count = code.width();
         let pixel_per_side = (module_count + 2 * quiet) * scale;
         // Materialise the module matrix into a Vec<bool> first so the
@@ -359,7 +356,8 @@ mod tests {
     fn decode_login_envelope_round_trip() {
         // The exact wire-fix shape from R8.6a — privchat-web encodes
         // this JSON into the QR canvas, App scanner decodes it back.
-        let payload = r#"{"sceneId":"9f3b1234-5678-90ab-cdef-000000000001","qrToken":"qr_signed_xyz"}"#;
+        let payload =
+            r#"{"sceneId":"9f3b1234-5678-90ab-cdef-000000000001","qrToken":"qr_signed_xyz"}"#;
         let (w, h, luma) = encode_to_luma(payload, 6, 4);
         let result = decode_luma(w, h, luma).expect("decode ok");
         assert_eq!(result.as_deref(), Some(payload));
