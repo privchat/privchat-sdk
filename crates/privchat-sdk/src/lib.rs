@@ -54,11 +54,12 @@ use privchat_protocol::MessagePayloadEnvelope;
 use privchat_protocol::{
     decode_message, encode_message, AuthType, AuthorizationRequest, AuthorizationResponse,
     CanonicalTimelineEvent, ClientInfo, ContactCardMetadata, ContentMessageType, DeviceInfo,
-    DeviceType, DisconnectRequest, DisconnectResponse, ErrorCode, FlatBufferMessage, LinkMetadata,
-    LocationMetadata, MessageMetadata, MessageType, PingRequest, PongResponse, PublishRequest,
-    PublishResponse, PushBatchRequest, PushBatchResponse, PushMessageRequest, PushMessageResponse,
-    RpcRequest, RpcResponse, SendMessageRequest, SendMessageResponse, SubscribeRequest,
-    SubscribeResponse, TransferRequest, TransferResponse, CANONICAL_TIMELINE_PUSH_TOPIC_V1,
+    DeviceType, DisconnectRequest, DisconnectResponse, EntityInvalidationBatch, ErrorCode,
+    FlatBufferMessage, LinkMetadata, LocationMetadata, MessageMetadata, MessageType, PingRequest,
+    PongResponse, PublishRequest, PublishResponse, PushBatchRequest, PushBatchResponse,
+    PushMessageRequest, PushMessageResponse, RpcRequest, RpcResponse, SendMessageRequest,
+    SendMessageResponse, SubscribeRequest, SubscribeResponse, TransferRequest, TransferResponse,
+    CANONICAL_TIMELINE_PUSH_TOPIC_V1, ENTITY_INVALIDATION_PUSH_TOPIC_V1,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -4557,6 +4558,74 @@ impl State {
             .or(Some(push.from_uid))
     }
 
+    fn entity_invalidation_pull_keys(
+        push: &PushMessageRequest,
+    ) -> Result<Option<Vec<(String, Option<String>)>>> {
+        if push.topic != ENTITY_INVALIDATION_PUSH_TOPIC_V1 {
+            return Ok(None);
+        }
+        let batch: EntityInvalidationBatch = match decode_message(&push.payload) {
+            Ok(batch) => batch,
+            Err(error) => {
+                tracing::warn!(%error, "dropping malformed entity invalidation hint");
+                return Ok(Some(Vec::new()));
+            }
+        };
+        if batch.schema_version != privchat_protocol::ENTITY_INVALIDATION_SCHEMA_V1 {
+            tracing::warn!(
+                schema_version = batch.schema_version,
+                "ignoring unsupported entity invalidation schema"
+            );
+            return Ok(Some(Vec::new()));
+        }
+
+        // Multiple item hints for the same entity family collapse into one
+        // authoritative delta pull. Entity ids and mutation hints are routing
+        // metadata only; local state is never mutated from the push payload.
+        let mut pulls: HashMap<(String, Option<String>), ()> = HashMap::new();
+        for item in batch.items {
+            if !matches!(
+                item.entity_type.as_str(),
+                "friend" | "user" | "group" | "group_member" | "channel" | "channel_read_cursor"
+            ) {
+                tracing::warn!(
+                    entity_type = item.entity_type,
+                    "ignoring unsupported entity invalidation type"
+                );
+                continue;
+            }
+            pulls.insert((item.entity_type, item.scope), ());
+        }
+        Ok(Some(pulls.into_keys().collect()))
+    }
+
+    async fn apply_entity_invalidation_push(
+        &mut self,
+        push: &PushMessageRequest,
+    ) -> Result<Option<usize>> {
+        let Some(pulls) = Self::entity_invalidation_pull_keys(push)? else {
+            return Ok(None);
+        };
+
+        let mut total_applied = 0usize;
+        for (entity_type, scope) in pulls {
+            let applied = self
+                .sync_entities(entity_type.clone(), scope.clone())
+                .await?;
+            total_applied += applied;
+            self.pending_events
+                .extend(self.last_sync_entity_events.iter().cloned());
+            self.pending_events.push(SdkEvent::SyncEntitiesApplied {
+                entity_type,
+                scope,
+                queued: self.last_sync_queued,
+                applied,
+                dropped_duplicates: self.last_sync_dropped_duplicates,
+            });
+        }
+        Ok(Some(total_applied))
+    }
+
     /// Extract a delivery receipt from a push notification, if applicable.
     fn push_message_to_delivery_receipt(push: &PushMessageRequest) -> Option<(u64, i32, u64, u64)> {
         let payload_json: serde_json::Value = serde_json::from_slice(&push.payload).ok()?;
@@ -8140,7 +8209,9 @@ impl State {
                     req.channel_id, req.server_message_id, req.from_uid, req.message_type, req.payload.len()
                 );
                 }
-                if let Some(count) = self.apply_canonical_timeline_push(&req).await? {
+                if let Some(count) = self.apply_entity_invalidation_push(&req).await? {
+                    direct_applied += count;
+                } else if let Some(count) = self.apply_canonical_timeline_push(&req).await? {
                     direct_applied += count;
                 } else if let Some(peer_uid) = Self::push_message_to_friend_event(&req) {
                     // F-sync.2: 转 entity_type="friend"，让 SDK 走 entity sync
@@ -8167,7 +8238,9 @@ impl State {
                     return Ok(0);
                 }
                 for push in req.messages {
-                    if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
+                    if let Some(count) = self.apply_entity_invalidation_push(&push).await? {
+                        direct_applied += count;
+                    } else if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
                         direct_applied += count;
                     } else if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                         self.pending_events.push(SdkEvent::SyncEntityChanged {
@@ -8199,7 +8272,9 @@ impl State {
                             push.channel_id
                         );
                     }
-                    if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
+                    if let Some(count) = self.apply_entity_invalidation_push(&push).await? {
+                        direct_applied += count;
+                    } else if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
                         direct_applied += count;
                     } else if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                         self.pending_events.push(SdkEvent::SyncEntityChanged {
@@ -8226,7 +8301,11 @@ impl State {
                         );
                     }
                     for push in batch.messages {
-                        if let Some(count) = self.apply_canonical_timeline_push(&push).await? {
+                        if let Some(count) = self.apply_entity_invalidation_push(&push).await? {
+                            direct_applied += count;
+                        } else if let Some(count) =
+                            self.apply_canonical_timeline_push(&push).await?
+                        {
                             direct_applied += count;
                         } else if let Some(peer_uid) = Self::push_message_to_friend_event(&push) {
                             self.pending_events.push(SdkEvent::SyncEntityChanged {
@@ -15532,7 +15611,10 @@ mod tests {
         PresenceBatchStatusResponse, PresenceChangedNotification, PresenceSnapshot,
     };
     use privchat_protocol::rpc::sync::SyncEntityItem;
-    use privchat_protocol::{FlatBufferMessage, PushMessageRequest};
+    use privchat_protocol::{
+        EntityInvalidation, EntityInvalidationBatch, EntityMutationHint, FlatBufferMessage,
+        PushMessageRequest, ENTITY_INVALIDATION_PUSH_TOPIC_V1,
+    };
     use serde::Serialize;
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
@@ -15726,6 +15808,50 @@ mod tests {
             SessionState::LoggedIn.can(Action::Authenticate),
             Ok(SessionState::Authenticated)
         ));
+    }
+
+    #[test]
+    fn entity_invalidation_is_control_plane_and_coalesces_pull_keys() {
+        let batch = EntityInvalidationBatch::new_v1(
+            9_007_199_254_740_993,
+            vec![
+                EntityInvalidation {
+                    entity_type: "friend".to_string(),
+                    entity_id: Some("10002".to_string()),
+                    scope: None,
+                    target_version: 8,
+                    mutation_hint: EntityMutationHint::Upsert,
+                },
+                EntityInvalidation {
+                    entity_type: "friend".to_string(),
+                    entity_id: Some("10003".to_string()),
+                    scope: None,
+                    target_version: 9,
+                    mutation_hint: EntityMutationHint::Delete,
+                },
+                EntityInvalidation {
+                    entity_type: "group_member".to_string(),
+                    entity_id: Some("10004".to_string()),
+                    scope: Some("20001".to_string()),
+                    target_version: 10,
+                    mutation_hint: EntityMutationHint::Upsert,
+                },
+            ],
+            1_780_000_000_123,
+        )
+        .unwrap();
+        let push = PushMessageRequest {
+            topic: ENTITY_INVALIDATION_PUSH_TOPIC_V1.to_string(),
+            payload: batch.encode_fb().unwrap(),
+            ..PushMessageRequest::default()
+        };
+
+        let keys = State::entity_invalidation_pull_keys(&push)
+            .unwrap()
+            .expect("control push");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&("friend".to_string(), None)));
+        assert!(keys.contains(&("group_member".to_string(), Some("20001".to_string()))));
     }
 
     #[test]
