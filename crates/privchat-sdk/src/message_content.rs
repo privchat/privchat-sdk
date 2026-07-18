@@ -258,11 +258,16 @@ fn refs_at(s: &[Option<&Value>]) -> Vec<MessageContentRef> {
 fn scan_entities(text: &str, mentions: &[u64]) -> Vec<MessageTextEntity> {
     let patterns = [
         ("url", r#"https?://[^\s<>{}\[\]\"']+"#),
+        ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
         ("phone", r"(?:\+?86[- ]?)?1[3-9][0-9]{9}"),
+        ("number", r"[0-9]+"),
     ];
     let mut out = Vec::new();
     for (kind, pattern) in patterns {
         for m in Regex::new(pattern).expect("static regex").find_iter(text) {
+            if kind == "phone" && has_adjacent_digit(text, m.start(), m.end()) {
+                continue;
+            }
             out.push(entity(kind, text, m.start(), m.end(), None));
         }
     }
@@ -287,6 +292,17 @@ fn scan_entities(text: &str, mentions: &[u64]) -> Vec<MessageTextEntity> {
         }
     }
     accepted
+}
+
+fn has_adjacent_digit(text: &str, start: usize, end: usize) -> bool {
+    text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_digit())
+        || text[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
 }
 fn entity(
     kind: &str,
@@ -317,12 +333,25 @@ mod tests {
     use super::*;
     #[test]
     fn text_projection_is_typed_and_uses_utf16_offsets() {
-        let mut message: StoredMessage = serde_json::from_value(serde_json::json!({"message_id":1,"server_message_id":null,"local_message_id":null,"channel_id":1,"channel_type":1,"from_uid":2,"message_type":0,"content":"😀 @客服 https://example.com 13800138000","status":2,"created_at":1,"updated_at":1,"extra":"{\"mentioned_user_ids\":[9]}","revoked":false,"revoked_by":null,"mime_type":null,"media_downloaded":false,"thumb_status":0,"delivered":false,"pts":null})).unwrap();
+        let mut message: StoredMessage = serde_json::from_value(serde_json::json!({"message_id":1,"server_message_id":null,"local_message_id":null,"channel_id":1,"channel_type":1,"from_uid":2,"message_type":0,"content":"😀 @客服 https://example.com hi@example.com 13800138000","status":2,"created_at":1,"updated_at":1,"extra":"{\"mentioned_user_ids\":[9]}","revoked":false,"revoked_by":null,"mime_type":null,"media_downloaded":false,"thumb_status":0,"delivered":false,"pts":null})).unwrap();
         message.extra = "{\"mentioned_user_ids\":[9]}".into();
         let body = project_stored_message(&message);
         assert_eq!(body.entities[0].start, 3);
         assert_eq!(body.entities[0].user_id, Some(9));
-        assert_eq!(body.entities.len(), 3);
+        assert_eq!(body.entities.len(), 4);
+        assert_eq!(body.entities[2].kind, "email");
+        assert_eq!(body.entities[3].value, "13800138000");
+    }
+
+    #[test]
+    fn scanner_distinguishes_phone_numbers_from_other_numbers() {
+        let text = "身份证：422124195812090021\n手机号码：13684915671";
+        let entities = scan_entities(text, &[]);
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0].kind, "number");
+        assert_eq!(entities[0].text, "422124195812090021");
+        assert_eq!(entities[1].kind, "phone");
+        assert_eq!(entities[1].text, "13684915671");
     }
 
     #[test]
