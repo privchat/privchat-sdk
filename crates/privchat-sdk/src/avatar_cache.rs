@@ -79,8 +79,13 @@ pub(crate) const AVATAR_UPLOAD_EDGE: u32 = 480;
 ///    即拒，上传前报错不消耗流量）；EXIF orientation 已应用；
 /// 2. 中心裁剪为正方形；
 /// 3. 边长 >480 缩放到 480x480（≤480 保持原尺寸，不放大）；
-/// 4. 编码 PNG 写系统临时目录，返回处理后文件路径（交上传管道）。
-pub(crate) fn prepare_avatar_image_sync(src_path: &Path) -> crate::Result<PathBuf> {
+/// 4. 编码 PNG 写 `out_dir`（调用方传 SDK data_dir 下的 tmp 子目录），返回处理后
+///    文件路径（交上传管道）。
+///
+/// `out_dir` 不得用 `std::env::temp_dir()`：Android 上它是 `/data/local/tmp`，
+/// 普通 app 进程无写权限（EACCES, os error 13）——真机头像上传曾因此 100% 失败。
+/// app 沙箱内唯一保证可写的是宿主传入的 data_dir。
+pub(crate) fn prepare_avatar_image_sync(src_path: &Path, out_dir: &Path) -> crate::Result<PathBuf> {
     // 复用消息缩略图同一 decode（EXIF orientation 已应用）；actor `State` 上的
     // 无状态 helper，直接静态调用。
     let img = crate::State::decode_image_oriented(src_path)?;
@@ -103,7 +108,13 @@ pub(crate) fn prepare_avatar_image_sync(src_path: &Path) -> crate::Result<PathBu
     }
     // PNG 编码统一走 RGBA8，避免个别源色型（如 16bit）编码分歧。
     let square = image::DynamicImage::ImageRgba8(square.to_rgba8());
-    let out = std::env::temp_dir().join(format!(
+    std::fs::create_dir_all(out_dir).map_err(|e| {
+        crate::Error::Storage(format!(
+            "prepare avatar: create out dir {} failed: {e}",
+            out_dir.display()
+        ))
+    })?;
+    let out = out_dir.join(format!(
         "privchat-avatar-{}-{}.png",
         std::process::id(),
         chrono::Utc::now()
@@ -324,7 +335,7 @@ mod tests {
         ))
         .save_with_format(&src, image::ImageFormat::Png)
         .unwrap();
-        let out = prepare_avatar_image_sync(&src).unwrap();
+        let out = prepare_avatar_image_sync(&src, &dir).unwrap();
         let processed = image::open(&out).unwrap();
         assert_eq!((processed.width(), processed.height()), (480, 480));
         let _ = std::fs::remove_file(&src);
@@ -342,7 +353,7 @@ mod tests {
         ))
         .save_with_format(&src2, image::ImageFormat::Png)
         .unwrap();
-        let out2 = prepare_avatar_image_sync(&src2).unwrap();
+        let out2 = prepare_avatar_image_sync(&src2, &dir).unwrap();
         let processed2 = image::open(&out2).unwrap();
         assert_eq!((processed2.width(), processed2.height()), (50, 50));
         let _ = std::fs::remove_file(&src2);
@@ -354,7 +365,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&bad, b"definitely not an image").unwrap();
-        assert!(prepare_avatar_image_sync(&bad).is_err());
+        assert!(prepare_avatar_image_sync(&bad, &dir).is_err());
         let _ = std::fs::remove_file(&bad);
     }
 }
