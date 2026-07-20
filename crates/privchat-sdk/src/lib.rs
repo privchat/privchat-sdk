@@ -1113,6 +1113,46 @@ fn read_or_create_installation_id(
 }
 
 #[cfg(test)]
+mod payload_fallback_tests {
+    // 生产乱码事故回归（web→app 前导符号）：FlatBuffers/未知二进制 payload 在 FB+JSON 都解不了时，
+    // 绝不能 lossy-stringify 当 content 渲染（会显示不可见控制符+长度字节+正文）。对齐 TS
+    // decodePlainTextPayload 的二进制守卫：解不了的二进制 → 空 content（等 resync/升级恢复）。
+    use super::State;
+
+    #[test]
+    fn plain_text_passthrough() {
+        let text = "第一行\n\t第二行";
+        let (content, extra) = State::payload_bytes_to_message_content_and_extra(text.as_bytes());
+        assert_eq!(content, text);
+        assert!(extra.is_none());
+    }
+
+    #[test]
+    fn fb_envelope_decodes_content() {
+        let bytes = privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
+            content: "hi".to_string(),
+            ..Default::default()
+        })
+        .expect("encode");
+        let (content, _extra) = State::payload_bytes_to_message_content_and_extra(&bytes);
+        assert_eq!(content, "hi");
+    }
+
+    #[test]
+    fn undecodable_binary_yields_empty_not_mojibake() {
+        let mut bytes = privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
+            content: "大家记住一句话，天下没有白吃的苦，没有白走的路！".to_string(),
+            ..Default::default()
+        })
+        .expect("encode");
+        bytes[0] = 0xF0; bytes[1] = 0xFF; bytes[2] = 0xFF; bytes[3] = 0xFF; // 损坏 root offset → decode 失败
+        let (content, extra) = State::payload_bytes_to_message_content_and_extra(&bytes);
+        assert_eq!(content, "", "binary garbage must not be rendered as mojibake content");
+        assert!(extra.is_none());
+    }
+}
+
+#[cfg(test)]
 mod snowflake_worker_bits_tests {
     use super::read_or_create_installation_id;
 
@@ -4087,6 +4127,24 @@ impl State {
         }
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
             return Self::normalized_message_content_and_extra(&value);
+        }
+        // 二进制守卫（生产乱码事故回归；对齐 TS decodePlainTextPayload / server parse_payload）：
+        // FB+JSON 都解不了且字节含 C0 控制符（\t\n\r 除外）或非 UTF-8 = 未知二进制（多为版本偏斜下
+        // 的 FlatBuffers），绝不能 lossy 渲染成「控制符+长度字节+正文」——回退空 content，由
+        // resync/升级收敛。
+        let is_binary = match std::str::from_utf8(payload) {
+            Err(_) => true,
+            Ok(s) => s
+                .bytes()
+                .any(|b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r'),
+        };
+        if is_binary {
+            tracing::warn!(
+                len = payload.len(),
+                head = %payload.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>(),
+                "payload 既非 envelope/JSON 也非文本，按二进制丢弃 content（版本偏斜?）"
+            );
+            return (String::new(), None);
         }
         (String::from_utf8_lossy(payload).to_string(), None)
     }
@@ -13995,7 +14053,10 @@ impl PrivchatSdk {
         // 没有 Tokio runtime 上下文,spawn_blocking 会 panic「no reactor running」。
         // 头像预处理是一次性 CPU 工作(≤480 图,数十 ms),App 已在协程里调用,
         // 短暂阻塞该协程线程可接受。
-        avatar_cache::prepare_avatar_image_sync(std::path::Path::new(&src_path))
+        // 输出写 data_dir/tmp（app 沙箱内保证可写）；Android 上 std temp_dir =
+        // /data/local/tmp 无写权限，不能用（见 prepare_avatar_image_sync doc）。
+        let out_dir = std::path::Path::new(self.data_dir()).join("tmp");
+        avatar_cache::prepare_avatar_image_sync(std::path::Path::new(&src_path), &out_dir)
             .map(|p| p.to_string_lossy().to_string())
     }
 
