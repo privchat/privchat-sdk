@@ -349,6 +349,7 @@ impl MultiAccountManager {
                     message: Some("hello from accounts example".to_string()),
                     source: Some("friend".to_string()),
                     source_id: Some(to_user_id.to_string()),
+                    grant_id: None,
                     from_user_id: 0,
                 },
             )

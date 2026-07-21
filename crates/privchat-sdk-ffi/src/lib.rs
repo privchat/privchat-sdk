@@ -4838,6 +4838,7 @@ impl PrivchatClient {
                 message,
                 source,
                 source_id,
+                    grant_id: None,
                 from_user_id: 0,
             },
         )
