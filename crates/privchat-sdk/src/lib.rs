@@ -1344,7 +1344,10 @@ async fn start_inbound_task(
                         .send(Command::InboundFrame {
                             epoch,
                             biz_type,
-                            data,
+                            // msgtrans 1.0.10 起 payload 为 Bytes(零拷贝);actor 命令面
+                            // 仍是 Vec<u8>,此处物化一次。命令面整体切 Bytes 属 msgtrans
+                            // 2.0 联动改造,不在本次做。
+                            data: data.to_vec(),
                         })
                         .await
                         .is_err()
