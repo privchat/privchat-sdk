@@ -2422,7 +2422,9 @@ impl LocalStore {
                 user_type, is_deleted, channel_id, version, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
+                username=CASE
+                    WHEN excluded.username IS NULL OR excluded.username = ''
+                    THEN user.username ELSE excluded.username END,
                 nickname=excluded.nickname,
                 alias=excluded.alias,
                 avatar=excluded.avatar,
@@ -2643,6 +2645,13 @@ impl LocalStore {
             params![user_id as i64],
         )
         .map_err(|e| Error::Storage(format!("delete friend: {e}")))?;
+        // PROFILE_VISIBILITY P1: username 是好友级字段(friend 实体携带);
+        // 解除好友后清掉本地残留,公开投影不含它。
+        conn.execute(
+            "UPDATE user SET username = '' WHERE user_id = ?1",
+            params![user_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("clear unfriended username: {e}")))?;
         Ok(())
     }
 
