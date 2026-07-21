@@ -3790,8 +3790,8 @@ impl State {
             }
         };
         let opt = TransportOptions::new()
-            .with_biz_type(biz_type)
-            .with_timeout(timeout);
+            .biz_type(biz_type)
+            .timeout(timeout);
         match transport.request_with_options(payload, opt).await {
             Ok(raw) => {
                 if biz_type == MessageType::RpcRequest as u8 && rpc_logs_enabled() {
@@ -6803,8 +6803,8 @@ impl State {
             }
         };
         let options = TransportOptions::new()
-            .with_biz_type(MessageType::PingRequest as u8)
-            .with_timeout(Duration::from_secs(2));
+            .biz_type(MessageType::PingRequest as u8)
+            .timeout(Duration::from_secs(2));
         match transport
             .request_with_options(Bytes::from(payload), options)
             .await
@@ -6836,14 +6836,14 @@ impl State {
             TransportProtocol::Quic => {
                 let mut cfg = QuicClientConfig::new(&target)
                     .map_err(|e| Error::Transport(format!("quic config: {e}")))?
-                    .with_connect_timeout(timeout)
-                    .with_server_name(ep.host.clone());
+                    .connect_timeout(timeout)
+                    .server_name(ep.host.clone());
                 if quic_accept_self_signed_for_testing_enabled() {
                     warn_quic_insecure_verification_disabled_once();
                     cfg = cfg.danger_skip_verification();
                 }
                 TransportClientBuilder::new()
-                    .with_protocol(cfg)
+                    .protocol(cfg)
                     .build()
                     .await
                     .map_err(|e| Error::Transport(format!("quic build: {e}")))?
@@ -6851,9 +6851,9 @@ impl State {
             TransportProtocol::Tcp => {
                 let cfg = TcpClientConfig::new(&target)
                     .map_err(|e| Error::Transport(format!("tcp config: {e}")))?
-                    .with_connect_timeout(timeout);
+                    .connect_timeout(timeout);
                 TransportClientBuilder::new()
-                    .with_protocol(cfg)
+                    .protocol(cfg)
                     .build()
                     .await
                     .map_err(|e| Error::Transport(format!("tcp build: {e}")))?
@@ -6867,10 +6867,10 @@ impl State {
                 };
                 let cfg = WebSocketClientConfig::new(&url)
                     .map_err(|e| Error::Transport(format!("ws config: {e}")))?
-                    .with_connect_timeout(timeout)
-                    .with_verify_tls(ep.use_tls);
+                    .connect_timeout(timeout)
+                    .verify_tls(ep.use_tls);
                 TransportClientBuilder::new()
-                    .with_protocol(cfg)
+                    .protocol(cfg)
                     .build()
                     .await
                     .map_err(|e| Error::Transport(format!("ws build: {e}")))?
@@ -9235,8 +9235,8 @@ impl State {
             }
         };
         let opt = TransportOptions::new()
-            .with_biz_type(MessageType::SendMessageRequest as u8)
-            .with_timeout(timeout);
+            .biz_type(MessageType::SendMessageRequest as u8)
+            .timeout(timeout);
         let raw = transport
             .request_with_options(Bytes::from(request_data), opt)
             .await
