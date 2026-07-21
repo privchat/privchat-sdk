@@ -63,7 +63,6 @@ use privchat_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
@@ -1140,14 +1139,21 @@ mod payload_fallback_tests {
 
     #[test]
     fn undecodable_binary_yields_empty_not_mojibake() {
-        let mut bytes = privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
-            content: "大家记住一句话，天下没有白吃的苦，没有白走的路！".to_string(),
-            ..Default::default()
-        })
-        .expect("encode");
-        bytes[0] = 0xF0; bytes[1] = 0xFF; bytes[2] = 0xFF; bytes[3] = 0xFF; // 损坏 root offset → decode 失败
+        let mut bytes =
+            privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
+                content: "大家记住一句话，天下没有白吃的苦，没有白走的路！".to_string(),
+                ..Default::default()
+            })
+            .expect("encode");
+        bytes[0] = 0xF0;
+        bytes[1] = 0xFF;
+        bytes[2] = 0xFF;
+        bytes[3] = 0xFF; // 损坏 root offset → decode 失败
         let (content, extra) = State::payload_bytes_to_message_content_and_extra(&bytes);
-        assert_eq!(content, "", "binary garbage must not be rendered as mojibake content");
+        assert_eq!(
+            content, "",
+            "binary garbage must not be rendered as mojibake content"
+        );
         assert!(extra.is_none());
     }
 }
@@ -1285,7 +1291,7 @@ async fn start_inbound_task(
     // 旧帧都会被 actor loop 按 epoch 比对丢弃。
     state.inbound_epoch = state.inbound_epoch.wrapping_add(1);
     let epoch = state.inbound_epoch;
-    let Some(transport) = state.transport.as_ref() else {
+    let Some(_transport) = state.transport.as_ref() else {
         if realtime_trace_enabled() {
             eprintln!(
                 "[SDK_INBOUND_TASK_START] epoch={} ABORTED transport=None uid={:?}",
@@ -1300,11 +1306,22 @@ async fn start_inbound_task(
             epoch, state.current_uid
         );
     }
-    let mut event_rx = transport.subscribe_events();
+    let events_slot = state.transport_events.clone();
+    let current_uid_for_log = state.current_uid.clone();
     *task = Some(tokio::spawn(async move {
+        // 借用事件流。上一个 inbound task 已被 stop_inbound_task abort + await，
+        // 所以这里不会真的争锁。
+        let mut slot = events_slot.lock().await;
+        let Some(event_rx) = slot.as_mut() else {
+            eprintln!(
+                "[SDK_INBOUND_TASK_START] epoch={} ABORTED events=None uid={:?}",
+                epoch, current_uid_for_log
+            );
+            return;
+        };
         loop {
-            match event_rx.recv().await {
-                Ok(ClientEvent::MessageReceived(context)) => {
+            match event_rx.next().await {
+                Some(ClientEvent::MessageReceived(context)) => {
                     if inbound_logs_enabled() {
                         eprintln!(
                             "[SDK.inbound] message received biz_type={} len={} is_request={}",
@@ -1355,21 +1372,13 @@ async fn start_inbound_task(
                         break;
                     }
                 }
-                Ok(ClientEvent::Disconnected { .. }) => {
+                Some(ClientEvent::Disconnected { .. }) => {
                     eprintln!("[SDK.inbound] transport disconnected");
                     let _ = actor_tx.send(Command::InboundDisconnected { epoch }).await;
                     break;
                 }
-                Ok(_) => {}
-                Err(RecvError::Lagged(skipped)) => {
-                    if !SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.load(Ordering::Relaxed) {
-                        eprintln!(
-                            "[SDK.inbound] event stream lagged, skipped={} (continue)",
-                            skipped
-                        );
-                    }
-                }
-                Err(RecvError::Closed) => {
+                Some(_) => {}
+                None => {
                     eprintln!("[SDK.inbound] event stream closed");
                     break;
                 }
@@ -2773,6 +2782,13 @@ impl SessionState {
 struct State {
     config: PrivchatConfig,
     transport: Option<TransportClient>,
+    /// 该 transport 的事件流。msgtrans 的客户端事件流是单消费者、只能取一次，
+    /// 所以在建连时取走并存在这里，inbound task **借用**而不是夺走它。
+    ///
+    /// 这点很关键：token 刷新那条重连链会在**不换 transport** 的情况下重挂
+    /// inbound task，如果第一次挂载就把流拿走，第二次就再也拿不到 →
+    /// 「能发不能收」。`stop_inbound_task` 保证同一时刻只有一个任务持锁。
+    transport_events: Arc<tokio::sync::Mutex<Option<msgtrans::ClientEvents>>>,
     session_state: SessionState,
     bootstrap_completed: bool,
     sync_coordinator: SyncCoordinator,
@@ -6644,8 +6660,9 @@ impl State {
                 }
             }
             match timeout(self.timeout(), self.connect_one(&ep)).await {
-                Ok(Ok(c)) => {
+                Ok(Ok((c, events))) => {
                     self.transport = Some(c);
+                    *self.transport_events.lock().await = Some(events);
                     if actor_logs_enabled() {
                         eprintln!("[SDK.actor] connect: success");
                     }
@@ -6806,7 +6823,10 @@ impl State {
         }
     }
 
-    async fn connect_one(&self, ep: &ServerEndpoint) -> Result<TransportClient> {
+    async fn connect_one(
+        &self,
+        ep: &ServerEndpoint,
+    ) -> Result<(TransportClient, msgtrans::ClientEvents)> {
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] connect_one: begin");
         }
@@ -6824,7 +6844,6 @@ impl State {
                 }
                 TransportClientBuilder::new()
                     .with_protocol(cfg)
-                    .connect_timeout(timeout)
                     .build()
                     .await
                     .map_err(|e| Error::Transport(format!("quic build: {e}")))?
@@ -6835,7 +6854,6 @@ impl State {
                     .with_connect_timeout(timeout);
                 TransportClientBuilder::new()
                     .with_protocol(cfg)
-                    .connect_timeout(timeout)
                     .build()
                     .await
                     .map_err(|e| Error::Transport(format!("tcp build: {e}")))?
@@ -6853,12 +6871,16 @@ impl State {
                     .with_verify_tls(ep.use_tls);
                 TransportClientBuilder::new()
                     .with_protocol(cfg)
-                    .connect_timeout(timeout)
                     .build()
                     .await
                     .map_err(|e| Error::Transport(format!("ws build: {e}")))?
             }
         };
+        // 先取事件流再 connect：事件流是有界队列，连接期间的事件会排队而不是丢失。
+        let events = client
+            .events()
+            .await
+            .map_err(|e| Error::Transport(format!("events: {e}")))?;
         client
             .connect()
             .await
@@ -6866,7 +6888,7 @@ impl State {
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] connect_one: connected");
         }
-        Ok(client)
+        Ok((client, events))
     }
 
     async fn login(
@@ -10735,6 +10757,7 @@ impl PrivchatSdk {
             let mut state = State {
                 config,
                 transport: None,
+                transport_events: Arc::new(tokio::sync::Mutex::new(None)),
                 session_state: SessionState::New,
                 bootstrap_completed: saved
                     .as_ref()
@@ -15805,6 +15828,7 @@ mod tests {
         let state = State {
             config,
             transport: None,
+            transport_events: Arc::new(tokio::sync::Mutex::new(None)),
             session_state: SessionState::Authenticated,
             bootstrap_completed: true,
             sync_coordinator: SyncCoordinator::new(),
