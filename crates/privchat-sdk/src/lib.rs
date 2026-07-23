@@ -10343,10 +10343,22 @@ impl State {
             })
             .transpose()?;
 
+        // 图片消息协议必须带缩略图引用(server 校验拒绝缺失)。缩略图未产出时把
+        // 原图 file 引用为缩略图(接收端按缩略图链路下载原图渲染),与 TS SDK 一致;
+        // 视频/文件不强制。
+        let (thumbnail_file_id_u64, fallback_thumb_url) = match thumbnail_file_id_u64 {
+            Some(id) => (Some(id), None),
+            None if file_type == "image" => {
+                (Some(uploaded_file_id), Some(uploaded.file_url.clone()))
+            }
+            None => (None, None),
+        };
+
         let mut attachment_content = if let Some(thumb_file_id) = thumbnail_file_id_u64 {
             let thumbnail_url = uploaded_thumbnail
                 .as_ref()
                 .map(|v| v.file_url.clone())
+                .or(fallback_thumb_url)
                 .unwrap_or_default();
             // Scheme B：缩略图也是独立 file，接收端走 thumbnail_file_id -> file/get_url -> cek
             // 统一下载解密。**CEK 永不进消息 metadata**。thumbnail_url 仅作 legacy 明文 fallback。
