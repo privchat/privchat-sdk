@@ -10825,8 +10825,12 @@ impl PrivchatSdk {
                 // Backoff driver: fires when `next_reconnect_at` is due. When no retry
                 // is armed we pin a `pending()` so this arm is inert but keeps its type
                 // inside `select!`.
+                // New = 传输断开;Connected + 有本地账号 = token-refresh handoff 期间的
+                // 未认证保活态(见 AccessTokenRefreshNeeded 发射点)——两者都允许重试驱动。
+                let awaiting_reauth = state.session_state == SessionState::Connected
+                    && state.current_uid.is_some();
                 let retry_deadline = if state.should_auto_reconnect
-                    && state.session_state == SessionState::New
+                    && (state.session_state == SessionState::New || awaiting_reauth)
                     && state.network_hint.is_online()
                 {
                     state.next_reconnect_at
@@ -10906,7 +10910,9 @@ impl PrivchatSdk {
                     _ = &mut retry_sleep => {
                         // Retry driver: the deadline fired. Guard again because state
                         // may have changed between pin and wake.
-                        if state.session_state != SessionState::New
+                        let awaiting_reauth = state.session_state == SessionState::Connected
+                            && state.current_uid.is_some();
+                        if (state.session_state != SessionState::New && !awaiting_reauth)
                             || !state.should_auto_reconnect
                             || !state.network_hint.is_online()
                         {
@@ -11030,8 +11036,19 @@ impl PrivchatSdk {
                                             "[SDK.actor] auto_reconnect recoverable: post-fail reconnect failed; emit event but host authenticate likely InvalidState"
                                         );
                                     }
-                                    state.should_auto_reconnect = false;
-                                    state.next_reconnect_at = None;
+                                    // 活性兜底(2026-07-24 生产事故):这里曾 should_auto_reconnect=false
+                                    // 永久关闭重连,把恢复责任完全交给宿主的一次性 refresh —— 宿主那一次
+                                    // 失败(如撞上服务端发版窗口)就死锁在「网络已断开」,且唯一救活入口
+                                    // 是前台/网络回调,常亮设备永远等不到。改为降频保活:60s 一轮继续
+                                    // 探测,每轮撞 10002 会再 emit 一次事件(宿主侧 mutex 去重),无论
+                                    // 宿主死活 SDK 自身永远有心跳式重试;宿主 refresh 成功后 authenticate
+                                    // 会 reset backoff 自然接管。
+                                    state.reconnect_attempt = state.reconnect_attempt.saturating_add(1);
+                                    state.next_reconnect_at =
+                                        Some(Instant::now() + Duration::from_secs(60));
+                                    eprintln!(
+                                        "[SDK.actor] auto_reconnect: token-refresh handoff to host; keep-alive retry in 60s"
+                                    );
                                     emit_sequenced_event(
                                         &actor_event_tx,
                                         &actor_event_history,
