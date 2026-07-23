@@ -4521,7 +4521,7 @@ impl State {
         let materializes_message = entity_type == "message" && !item.deleted;
         let scope = Some(format!("{}:{}", push.channel_type, push.channel_id));
         let mut applied = self
-            .enqueue_and_apply_sync_items(entity_type, scope, vec![item])
+            .enqueue_and_apply_sync_items(entity_type, scope, vec![item], true)
             .await?;
         if materializes_message {
             applied += self
@@ -4529,6 +4529,7 @@ impl State {
                     push.channel_id,
                     i32::from(push.channel_type),
                     push.server_message_id,
+                    true,
                 )
                 .await?;
         }
@@ -6868,7 +6869,14 @@ impl State {
                 let cfg = WebSocketClientConfig::new(&url)
                     .map_err(|e| Error::Transport(format!("ws config: {e}")))?
                     .connect_timeout(timeout)
-                    .verify_tls(ep.use_tls);
+                    // msgtrans 2.0: TLS 行为改为 ClientTls 枚举(旧 verify_tls
+                    // 是从未接线的假开关);use_tls=false 的端点走 ws:// 本就
+                    // 不触发 TLS,这里映射为 Insecure 仅保语义完整。
+                    .tls(if ep.use_tls {
+                        msgtrans::ClientTls::SystemRoots
+                    } else {
+                        msgtrans::ClientTls::Insecure
+                    });
                 TransportClientBuilder::new()
                     .protocol(cfg)
                     .build()
@@ -7117,6 +7125,14 @@ impl State {
         // refresh_token 或过期时间。若该用户已有会话，只原子刷新 access_token；否则才走
         // save_login（用于外部认证首次 handshake，无 refresh_token）。
         let existing_session = self.storage.load_session(uid.clone()).await.ok().flatten();
+        if let Some(existing) = existing_session.as_ref() {
+            // 冷启动 restore：从持久化 snapshot 恢复 bootstrap_completed，与自动重连路径
+            // （restore_persisted_session）保持一致。否则每次冷启动 bootstrap_completed 停留在
+            // false → ① 本地优先读（get_channels 等）被 current_uid_required gate 拒绝，UI 只能
+            // 等网络 sync 才出会话；② 后续 run_bootstrap_sync 被迫走全量而非增量 resume。
+            // full_rebuild_required() 仍是安全网：本地 store 需重建时即便标记为 true 也会走全量。
+            self.bootstrap_completed = existing.bootstrap_completed;
+        }
         if existing_session.is_some() {
             self.storage
                 .update_access_token(uid.clone(), token_for_persist, None)
@@ -7683,6 +7699,7 @@ impl State {
         channel_id: u64,
         channel_type: i32,
         target_server_message_id: u64,
+        bump_unread_on_incoming: bool,
     ) -> Result<usize> {
         let pending = self
             .storage
@@ -7715,7 +7732,12 @@ impl State {
             let (entity_type, item) = Self::sync_item_from_difference_commit(&commit);
             let scope = Some(format!("{channel_type}:{channel_id}"));
             let count = self
-                .enqueue_and_apply_sync_items(entity_type.clone(), scope.clone(), vec![item])
+                .enqueue_and_apply_sync_items(
+                    entity_type.clone(),
+                    scope.clone(),
+                    vec![item],
+                    bump_unread_on_incoming,
+                )
                 .await?;
             self.storage
                 .delete_pending_timeline_mutation(mutation)
@@ -7783,7 +7805,12 @@ impl State {
                 let (entity_type, item) = Self::sync_item_from_difference_commit(commit);
                 let materializes_message = entity_type == "message" && !item.deleted;
                 let applied = self
-                    .enqueue_and_apply_sync_items(entity_type.clone(), scope.clone(), vec![item])
+                    .enqueue_and_apply_sync_items(
+                        entity_type.clone(),
+                        scope.clone(),
+                        vec![item],
+                        false,
+                    )
                     .await?;
                 total_applied += applied;
                 self.queue_last_sync_events(entity_type, scope.clone(), applied);
@@ -7793,6 +7820,7 @@ impl State {
                             commit.channel_id,
                             i32::from(commit.channel_type),
                             commit.server_msg_id,
+                            false,
                         )
                         .await?;
                 }
@@ -8131,11 +8159,15 @@ impl State {
             .is_some()
     }
 
+    /// [bump_unread_on_incoming]:仅真正的实时推送传 true。resume/difference 回填的
+    /// 历史消息必须传 false——它们已包含在 channel 冷启动同步的服务端未读基线里,
+    /// 再按实时消息 bump 会把未读恰好双算(2026-07-24 事故:系统消息 11→22、DM 1→2)。
     async fn enqueue_and_apply_sync_items(
         &mut self,
         entity_type: String,
         scope: Option<String>,
         items: Vec<SyncEntityItem>,
+        bump_unread_on_incoming: bool,
     ) -> Result<usize> {
         self.last_sync_entity_events.clear();
         let stats = self
@@ -8153,7 +8185,7 @@ impl State {
                     &batch.entity_type,
                     batch.scope.as_deref(),
                     &batch.items,
-                    true,
+                    bump_unread_on_incoming,
                 )
                 .await
             {
@@ -8458,7 +8490,7 @@ impl State {
             let n = message_items.len();
             let before = applied;
             applied += self
-                .enqueue_and_apply_sync_items("message".to_string(), None, message_items)
+                .enqueue_and_apply_sync_items("message".to_string(), None, message_items, true)
                 .await?;
             if realtime_trace_enabled() {
                 eprintln!(
@@ -8475,6 +8507,7 @@ impl State {
                     "channel_read_cursor".to_string(),
                     None,
                     read_cursor_items,
+                    true,
                 )
                 .await?;
         }
@@ -10529,8 +10562,9 @@ impl State {
                     .unwrap_or_default();
                 // channel_type 客户端约定：1=DM，2=群，其它=房间。
                 let inferred_name = if channel_type == 1 {
+                    // 系统会话不特判(uid 只是部署事实):名字统一走 user 实体解析链,
+                    // 这里仅留 uid 文本兜底,由上层按 username/user_type 本地化。
                     match from_uid {
-                        Some(1) => "System Message".to_string(),
                         Some(uid) if uid > 0 && uid != current_uid => uid.to_string(),
                         _ => String::new(),
                     }
@@ -17062,7 +17096,7 @@ mod tests {
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&revoke_commit);
         state
-            .enqueue_and_apply_sync_items(entity_type, Some("2:92001".to_string()), vec![item])
+            .enqueue_and_apply_sync_items(entity_type, Some("2:92001".to_string()), vec![item], true)
             .await
             .expect("apply revoke difference");
 
@@ -17088,7 +17122,7 @@ mod tests {
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&reaction_commit);
         state
-            .enqueue_and_apply_sync_items(entity_type, Some("2:92001".to_string()), vec![item])
+            .enqueue_and_apply_sync_items(entity_type, Some("2:92001".to_string()), vec![item], true)
             .await
             .expect("apply reaction difference");
 
@@ -18505,12 +18539,12 @@ mod tests {
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
         state
-            .enqueue_and_apply_sync_items(entity_type, Some("2:92500".to_string()), vec![item])
+            .enqueue_and_apply_sync_items(entity_type, Some("2:92500".to_string()), vec![item], true)
             .await
             .expect("materialize target");
         assert_eq!(
             state
-                .replay_pending_timeline_mutations(92_500, 2, target)
+                .replay_pending_timeline_mutations(92_500, 2, target, true)
                 .await
                 .expect("replay mutations"),
             2

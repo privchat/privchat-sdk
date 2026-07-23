@@ -580,6 +580,11 @@ impl LocalStore {
             i32_to_be_bytes(if completed { 1 } else { 0 }),
         )
         .map_err(|e| Error::Storage(format!("set bootstrap completed: {e}")))?;
+        // 立即 flush：bootstrap_completed 是关键持久状态——它 gate 本地优先读（get_channels 等）
+        // 并决定下次启动走增量 resume 还是全量 bootstrap。sled 默认周期刷盘（~500ms），进程被
+        // 系统杀/用户划掉会丢掉未刷的写，导致每次冷启动都退回全量同步并挡住本地渲染。
+        meta.flush()
+            .map_err(|e| Error::Storage(format!("flush bootstrap completed: {e}")))?;
         Ok(())
     }
 
@@ -1820,10 +1825,7 @@ impl LocalStore {
                                     NULLIF(u.alias, ''),
                                     NULLIF(u.nickname, ''),
                                     NULLIF(u.username, ''),
-                                    CASE
-                                        WHEN peer.peer_user_id = 1 THEN 'System Message'
-                                        ELSE CAST(peer.peer_user_id AS TEXT)
-                                    END
+                                    CAST(peer.peer_user_id AS TEXT)
                                 )
                                 FROM (
                                     SELECT COALESCE(
@@ -1841,7 +1843,7 @@ impl LocalStore {
                                 LIMIT 1
                             ),
                             CASE
-                                WHEN NULLIF(c.channel_name, '') IN ('1', '__system_1__') THEN 'System Message'
+                                WHEN NULLIF(c.channel_name, '') IN ('1', '__system_1__') THEN NULL
                                 ELSE NULLIF(c.channel_name, '')
                             END,
                             ''
@@ -1971,10 +1973,7 @@ impl LocalStore {
                                     NULLIF(u.alias, ''),
                                     NULLIF(u.nickname, ''),
                                     NULLIF(u.username, ''),
-                                    CASE
-                                        WHEN peer.peer_user_id = 1 THEN 'System Message'
-                                        ELSE CAST(peer.peer_user_id AS TEXT)
-                                    END
+                                    CAST(peer.peer_user_id AS TEXT)
                                 )
                                 FROM (
                                     SELECT COALESCE(
@@ -1992,7 +1991,7 @@ impl LocalStore {
                                 LIMIT 1
                             ),
                             CASE
-                                WHEN NULLIF(c.channel_name, '') IN ('1', '__system_1__') THEN 'System Message'
+                                WHEN NULLIF(c.channel_name, '') IN ('1', '__system_1__') THEN NULL
                                 ELSE NULLIF(c.channel_name, '')
                             END,
                             ''
