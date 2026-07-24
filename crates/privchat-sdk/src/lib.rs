@@ -3109,7 +3109,13 @@ impl State {
         // ±30% jitter：server 重启/发版后全体客户端固定序列会同秒撞门（reconnect
         // storm），随机扰动把重连压力摊开（P0-12）。
         let factor = 0.7 + rand::random::<f64>() * 0.6;
-        let delay = Duration::from_millis(((base_secs as f64) * 1000.0 * factor) as u64);
+        let mut delay = Duration::from_millis(((base_secs as f64) * 1000.0 * factor) as u64);
+        // 离线降频**在设置时**烘进绝对 deadline(不在读取时按 now 现算,否则会被 15s
+        // health_tick 反复推迟而饿死)：系统 reachability=Offline 时把探测间隔抬到 ≥60s,
+        // 省电;但仍是稳定的绝对时刻,时间一到必触发一次真实 TCP 探测,网络真回来即恢复。
+        if !self.network_hint.is_online() {
+            delay = delay.max(Duration::from_secs(60));
+        }
         self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
         self.next_reconnect_at = Some(Instant::now() + delay);
         eprintln!(
@@ -10875,16 +10881,16 @@ impl PrivchatSdk {
                 // 挂起恢复后系统常给出 Offline 假信号且再无恢复回调,若据此一票否决,
                 // 重连永不发起(2026-07-24 实测:sim 常亮整夜「网络已断开」,实际网络
                 // 通畅)。Offline 期间降频到 ≥60s 做真实连接探测,连上即翻回 Online。
+                // ⚠️ 用 next_reconnect_at 的**绝对时刻**,绝不在此按 `now` 现算 deadline。
+                // 历史 bug(2026-07-24 生产三修):OFFLINE 分支曾写 `at.max(now + 60s)`,而 15s
+                // 的 health_tick 每次醒来都重进 select! 用新的 `now` 重算这个 max → 60s 倒计时
+                // 被永久往后推(15s<60s,retry_sleep 永远等不到截止点就被下轮重置)→ 断网后
+                // **重试永不触发**,横幅永久卡「网络已断开」。离线降频改到 schedule_next_reconnect
+                // 的**设置时**烘进 next_reconnect_at(稳定绝对值),这里只做纯读取。
                 let retry_deadline = if state.should_auto_reconnect
                     && (state.session_state == SessionState::New || awaiting_reauth)
                 {
-                    if state.network_hint.is_online() {
-                        state.next_reconnect_at
-                    } else {
-                        state
-                            .next_reconnect_at
-                            .map(|at| at.max(Instant::now() + Duration::from_secs(60)))
-                    }
+                    state.next_reconnect_at
                 } else {
                     None
                 };
@@ -10905,6 +10911,36 @@ impl PrivchatSdk {
                         if state.session_state == SessionState::Shutdown {
                             continue;
                         }
+
+                        // ── 活性看门狗（2026-07-24 生产事故三修根治）──────────────────
+                        // 断网→联网后横幅永久卡「网络已断开」的架构根因:重试驱动可能走进
+                        // inert 死态——retry 守卫兜底(session 短暂非 New 时)会把
+                        // next_reconnect_at 置 None,而唯一复活入口(SetNetworkHint
+                        // offline→online)依赖 iOS reachability 的恢复回调,该回调在挂起/
+                        // 长断网后常常**根本不投递** → 驱动永不再武装 → 永久卡死。
+                        //
+                        // 修:15s health_tick 无条件充当看门狗——只要有「想在线」的会话
+                        // (should_auto_reconnect + 传输断开 New / 待重认证 Connected+uid)
+                        // 而驱动已 inert(next_reconnect_at==None),立即重新武装。这样
+                        // 恢复不再依赖任何系统回调:OFFLINE 期驱动仍每≤60s 做真实 TCP 探测,
+                        // 网络一旦真回来,下一次 try_auto_reconnect 成功即把 hint 复位并认证。
+                        // 活性看门狗:想在线(should_auto_reconnect)+ 传输断开(New)/待重认证,
+                        // 而重连驱动 inert(next_reconnect_at 空)→ 重新武装。honor should_auto_reconnect
+                        // 是必须的:手动/后台 Disconnect 也把 session 设成 New 且保留 uid,唯一区分
+                        // 「想重连」vs「显式离线」的信号就是这个标志,不能绕过。
+                        let wants_online = state.should_auto_reconnect
+                            && (matches!(state.session_state, SessionState::New)
+                                || (state.session_state == SessionState::Connected
+                                    && state.current_uid.is_some()));
+                        if wants_online && state.next_reconnect_at.is_none() {
+                            eprintln!(
+                                "[SDK.actor] liveness watchdog: retry driver inert (state={:?}, hint={:?}); re-arming reconnect",
+                                state.session_state, state.network_hint
+                            );
+                            state.reconnect_attempt = 0;
+                            state.next_reconnect_at = Some(Instant::now());
+                        }
+
                         if !state.network_hint.is_online() {
                             continue;
                         }
@@ -16116,6 +16152,50 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("typed hello")
         );
+    }
+
+    /// 回归(2026-07-24 生产三修):断网后重连驱动被「15s health_tick 反复推迟 60s
+    /// 离线 deadline」饿死 → 永久卡「网络已断开」。根治=离线降频**烘进设置时的绝对
+    /// deadline**(schedule_next_reconnect 里 delay.max(60s)),而不是读取时按 now 现算。
+    /// 本测试锁死:离线时 next_reconnect_at ≥ now+60s(稳定绝对值);在线时走正常快退避
+    /// (首次 ≤ ~2s),证明节流确实在设置时生效、且离线不会退化成读取时重算。
+    #[tokio::test(flavor = "current_thread")]
+    async fn offline_reconnect_deadline_is_baked_stable_not_recomputed() {
+        let (mut state, dir) = new_seeded_state("offline-reconnect-deadline").await;
+        state.session_state = SessionState::New;
+        state.should_auto_reconnect = true;
+
+        // 在线:首次退避基数 1s(±30% jitter),deadline 应在很近的将来(< 3s)。
+        state.network_hint = NetworkHint::Unknown;
+        state.reconnect_attempt = 0;
+        let before = Instant::now();
+        state.schedule_next_reconnect();
+        let online_at = state.next_reconnect_at.expect("armed online");
+        let online_delay = online_at.saturating_duration_since(before);
+        assert!(
+            online_delay < Duration::from_secs(3),
+            "online first retry should be prompt, got {:?}",
+            online_delay
+        );
+
+        // 离线:同样首次退避,但离线降频把 delay 抬到 ≥60s,烘进绝对 deadline。
+        state.network_hint = NetworkHint::Offline;
+        state.reconnect_attempt = 0;
+        let before = Instant::now();
+        state.schedule_next_reconnect();
+        let offline_at = state.next_reconnect_at.expect("armed offline");
+        assert!(
+            offline_at.saturating_duration_since(before) >= Duration::from_secs(60),
+            "offline retry deadline must be baked to >= now+60s"
+        );
+
+        // 关键不变量:deadline 是稳定绝对值——多次读取(模拟多次 health_tick)返回同一时刻,
+        // 绝不因「读取时 now 前进」而被推迟(旧 bug 正是每次读取 at.max(now+60s) 把它推远)。
+        let read1 = state.next_reconnect_at.expect("armed");
+        let read2 = state.next_reconnect_at.expect("armed");
+        assert_eq!(read1, read2, "next_reconnect_at must be a stable absolute instant");
+
+        drop(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
