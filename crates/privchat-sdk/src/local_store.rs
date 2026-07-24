@@ -1910,7 +1910,13 @@ impl LocalStore {
                 (SELECT NULLIF(u2.username, '') FROM \"user\" u2 WHERE u2.user_id = CASE WHEN c.channel_type = 1 THEN COALESCE(
                     c.peer_user_id,
                     CASE WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> '' THEN CAST(c.channel_name AS INTEGER) ELSE NULL END
-                ) ELSE NULL END LIMIT 1) AS peer_username
+                ) ELSE NULL END LIMIT 1) AS peer_username,
+                -- DM 对端头像:channel.avatar 常为空,真源在本地 user 实体——列表/会话页
+                -- 零网络即可渲染真实头像(local-first 缓存文件按 uid 探测也依赖它非空)。
+                (SELECT NULLIF(u2.avatar, '') FROM \"user\" u2 WHERE u2.user_id = CASE WHEN c.channel_type = 1 THEN COALESCE(
+                    c.peer_user_id,
+                    CASE WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> '' THEN CAST(c.channel_name AS INTEGER) ELSE NULL END
+                ) ELSE NULL END LIMIT 1) AS peer_avatar_url
              FROM channel c
              -- P1-17：last message 三个字段一次取齐（原来 3 个独立相关子查询各扫
              -- 一遍索引，且并发写入下可能取到不同消息）。timeline 优先语义不变。
@@ -1951,6 +1957,7 @@ impl LocalStore {
                     member_count: row.get::<_, i64>(14)?,
                     peer_user_type: row.get::<_, Option<i32>>(15)?,
                     peer_username: row.get::<_, Option<String>>(16)?,
+                    peer_avatar_url: row.get::<_, Option<String>>(17)?,
                 last_message_type: None,
                 last_message_is_revoked: false,
                 })
@@ -2067,7 +2074,11 @@ impl LocalStore {
                     (SELECT NULLIF(u2.username, '') FROM \"user\" u2 WHERE u2.user_id = CASE WHEN c.channel_type = 1 THEN COALESCE(
                         c.peer_user_id,
                         CASE WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> '' THEN CAST(c.channel_name AS INTEGER) ELSE NULL END
-                    ) ELSE NULL END LIMIT 1) AS peer_username
+                    ) ELSE NULL END LIMIT 1) AS peer_username,
+                    (SELECT NULLIF(u2.avatar, '') FROM \"user\" u2 WHERE u2.user_id = CASE WHEN c.channel_type = 1 THEN COALESCE(
+                        c.peer_user_id,
+                        CASE WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> '' THEN CAST(c.channel_name AS INTEGER) ELSE NULL END
+                    ) ELSE NULL END LIMIT 1) AS peer_avatar_url
                  FROM channel c
                  -- P1-17：last message 三个字段一次取齐（原来每行 3 个相关子查询各扫
                  -- 一遍索引，低端机上列表刷新的主要成本；且并发写入下三个子查询可能
@@ -2110,6 +2121,7 @@ impl LocalStore {
                     member_count: row.get::<_, i64>(14)?,
                     peer_user_type: row.get::<_, Option<i32>>(15)?,
                     peer_username: row.get::<_, Option<String>>(16)?,
+                    peer_avatar_url: row.get::<_, Option<String>>(17)?,
                     last_message_type: None,
                     last_message_is_revoked: false,
                 })

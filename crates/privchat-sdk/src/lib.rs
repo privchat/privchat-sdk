@@ -1639,6 +1639,9 @@ pub struct StoredChannel {
     pub peer_user_type: Option<i32>,
     /// DM 对端的 username(同上,配合语言包按 username 精确匹配)。
     pub peer_username: Option<String>,
+    /// DM 对端头像 URL(本地 user 实体在场时带出;channel.avatar 常为空,
+    /// 会话列表/聊天页零网络渲染真实头像的数据前提)。
+    pub peer_avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

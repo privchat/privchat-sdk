@@ -1840,6 +1840,8 @@ pub struct StoredChannel {
     pub peer_user_type: Option<i32>,
     /// DM 对端 username(配合语言包按 username 精确匹配)。
     pub peer_username: Option<String>,
+    /// DM 对端头像 URL(本地 user 实体带出;channel.avatar 常为空时的真源)。
+    pub peer_avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3303,6 +3305,7 @@ fn map_stored_channel(v: SdkStoredChannel) -> StoredChannel {
         last_message_is_revoked: v.last_message_is_revoked,
         peer_user_type: v.peer_user_type,
         peer_username: v.peer_username,
+        peer_avatar_url: v.peer_avatar_url,
     }
 }
 
