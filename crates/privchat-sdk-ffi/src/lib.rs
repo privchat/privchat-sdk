@@ -1835,6 +1835,11 @@ pub struct StoredChannel {
     pub last_message_type: Option<i32>,
     /// 最后一条消息是否已撤回。
     pub last_message_is_revoked: bool,
+    /// DM 对端账号类型(本地 user 实体在场时带出;None=未知)。
+    /// 显示名单点规则「userType==系统 → 按 username 查语言包」的数据前提。
+    pub peer_user_type: Option<i32>,
+    /// DM 对端 username(配合语言包按 username 精确匹配)。
+    pub peer_username: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3296,6 +3301,8 @@ fn map_stored_channel(v: SdkStoredChannel) -> StoredChannel {
         member_count: v.member_count.max(0) as u32,
         last_message_type: v.last_message_type,
         last_message_is_revoked: v.last_message_is_revoked,
+        peer_user_type: v.peer_user_type,
+        peer_username: v.peer_username,
     }
 }
 
@@ -6288,17 +6295,22 @@ impl PrivchatClient {
         })
     }
 
+    /// [source]/[source_id]:资料可见性来源(PROFILE_VISIBILITY §2.5)。必须传
+    /// **真实来源**——会话场景传 "conversation"+channel_id,好友场景传 "friend"。
+    /// 历史实现固定谎报 friend,对非好友(如系统账号 DM 对端)必被闸口拒绝。
     pub async fn account_user_detail_remote(
         &self,
         user_id: u64,
+        source: String,
+        source_id: String,
     ) -> Result<AccountUserDetailView, PrivchatFfiError> {
         let resp: AccountUserDetailResponse = rpc_call_typed(
             &self.inner,
             routes::account_user::DETAIL,
             &AccountUserDetailRequest {
                 target_user_id: user_id,
-                source: DetailSourceType::Friend.as_str().to_string(),
-                source_id: user_id.to_string(),
+                source,
+                source_id,
                 user_id: 0,
             },
         )

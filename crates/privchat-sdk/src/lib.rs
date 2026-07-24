@@ -1634,6 +1634,11 @@ pub struct StoredChannel {
     /// 群成员数（仅群会话有意义，来自 group 实体缓存；DM/未知为 0）。
     /// 供群标题「(N)」显示，不再依赖客户端九宫格成员预览缓存兜底。
     pub member_count: i64,
+    /// DM 对端的账号类型(本地 user 实体在场时带出;None=未知)。显示名单点规则
+    /// 「userType==系统 → 按 username 查语言包替换」的数据前提,零网络零二次处理。
+    pub peer_user_type: Option<i32>,
+    /// DM 对端的 username(同上,配合语言包按 username 精确匹配)。
+    pub peer_username: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10863,11 +10868,20 @@ impl PrivchatSdk {
                 // 未认证保活态(见 AccessTokenRefreshNeeded 发射点)——两者都允许重试驱动。
                 let awaiting_reauth = state.session_state == SessionState::Connected
                     && state.current_uid.is_some();
+                // 系统 reachability(network_hint)只是加速信号,不是永久闸门:模拟器/
+                // 挂起恢复后系统常给出 Offline 假信号且再无恢复回调,若据此一票否决,
+                // 重连永不发起(2026-07-24 实测:sim 常亮整夜「网络已断开」,实际网络
+                // 通畅)。Offline 期间降频到 ≥60s 做真实连接探测,连上即翻回 Online。
                 let retry_deadline = if state.should_auto_reconnect
                     && (state.session_state == SessionState::New || awaiting_reauth)
-                    && state.network_hint.is_online()
                 {
-                    state.next_reconnect_at
+                    if state.network_hint.is_online() {
+                        state.next_reconnect_at
+                    } else {
+                        state
+                            .next_reconnect_at
+                            .map(|at| at.max(Instant::now() + Duration::from_secs(60)))
+                    }
                 } else {
                     None
                 };
@@ -10948,7 +10962,6 @@ impl PrivchatSdk {
                             && state.current_uid.is_some();
                         if (state.session_state != SessionState::New && !awaiting_reauth)
                             || !state.should_auto_reconnect
-                            || !state.network_hint.is_online()
                         {
                             state.next_reconnect_at = None;
                             continue;
@@ -10962,6 +10975,12 @@ impl PrivchatSdk {
                                 state.reset_reconnect_backoff();
                                 // 握手 + 认证全通了，解除 Terminal 闸门，后续如果再过期还能再触发一次。
                                 state.auth_terminal_fired = false;
+                                // 真实连接成功是网络在线的最强证据:覆盖系统 reachability 的
+                                // Offline 假信号(否则 hint 卡 Offline 会继续压制其它路径)。
+                                if !state.network_hint.is_online() {
+                                    eprintln!("[SDK.actor] probe connected while hint=Offline; reset hint to Unknown");
+                                    state.network_hint = NetworkHint::Unknown;
+                                }
                                 eprintln!("[SDK.actor] auto_reconnect_result ok attempt=#{attempt_n}");
                                 // [硬化] 重连成功后必须：① 重启 inbound task（订阅新 transport + bump epoch）
                                 start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
