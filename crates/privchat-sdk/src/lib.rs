@@ -11188,9 +11188,17 @@ impl PrivchatSdk {
                         if actor_logs_enabled() {
                             eprintln!("[SDK.actor] loop: cmd connect");
                         }
-                        if !state.network_hint.is_online() {
-                            let _ = resp.send(Err(state.network_disconnected_error()));
-                        } else {
+                        {
+                            // ⚠️ 这里**不再**用 network_hint 做硬闸门(2026-07-25 生产事故):
+                            // 系统 reachability 断线/挂起后常卡 Offline 且不再投递恢复回调,
+                            // 据此一票否决会让宿主的「前台/网络恢复/用户点重连」全部空转。
+                            // 显式 Connect 本身就是「我要上线」的强意图信号:直接尝试,真断网
+                            // 自然失败并由重试驱动接管;成功则下方把 hint 复位(真实连接=真源)。
+                            if !state.network_hint.is_online() {
+                                eprintln!(
+                                    "[SDK.actor] connect requested while hint=Offline; attempting anyway (hint is advisory)"
+                                );
+                            }
                             // A user-driven Connect expresses the intent to stay online —
                             // enable auto-reconnect up-front so retry fires even if this
                             // first attempt fails (e.g. server temporarily down).
@@ -11247,6 +11255,12 @@ impl PrivchatSdk {
 
                             if result.is_ok() {
                                 state.reset_reconnect_backoff();
+                                // 连上了就是网络可达的铁证:复位系统 reachability 的 Offline
+                                // 假信号,否则 hint 会继续压制退避节奏与其它路径。
+                                if !state.network_hint.is_online() {
+                                    eprintln!("[SDK.actor] connect ok while hint=Offline; reset hint to Unknown");
+                                    state.network_hint = NetworkHint::Unknown;
+                                }
                                 // 用户主动 Connect 成功 = 新的登录回合。清 Terminal 闸门
                                 // 和上一轮 terminal reason，让后续 Authenticate 若再遇到
                                 // Terminal 错可以再次触发 ForcedLogout。
