@@ -1569,6 +1569,21 @@ pub struct TimelineSnapshot {
     pub from_cache: bool,
 }
 
+/// SDK-HISTORY-5：上滑加载更早历史一页的结果。[messages]=本次回填的更早消息（本地重查、
+/// 显示序 DESC）；[has_more_before]=服务端是否还有更早（来自 SDK 持久化 gap 态，UI 据此
+/// 决定是否继续上滑加载，false=到顶）。
+#[derive(Debug, Clone)]
+pub struct OlderHistoryPage {
+    pub messages: Vec<StoredMessage>,
+    pub has_more_before: bool,
+}
+
+/// per-channel 历史 gap 水位持久化态（KV `__hist_gap__:<ct>:<cid>`，§2.5.1 V1 最小契约）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistGapState {
+    has_more_before: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageCachePolicyConfig {
     pub per_channel_budget_bytes: u32,
@@ -14819,6 +14834,75 @@ impl PrivchatSdk {
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// SDK-HISTORY-5（MESSAGE_HISTORY spec §2.5 / §2.5.1）：上滑加载更早历史。
+    ///
+    /// **架构（Telegram 式，读本地 / get 只补缺口）**：聊天页渲染读本地库为真源；本地翻到
+    /// 最早时用 `message/history/get` 回填（带真实 pts，SDK-HISTORY-2 已做 upsert），再从
+    /// 本地库重查返回。**gap 水位（has_more_before）由 SDK 持久化在 KV**——已到顶的会话
+    /// 不再空打网络，部分缓存的会话据此触发回填；跨会话/重启有效。主窗口只向更早**连续**
+    /// 扩展，绝不制造/渲染不连续区间（around 孤岛由 §5 独立处理）。
+    ///
+    /// [before_server_message_id] = 当前已显示最早一条的 server_message_id（翻页游标）。
+    /// 返回本次回填的更早消息（本地重查、显示序 DESC）+ has_more_before（服务端是否还有更早）。
+    pub async fn load_older_history(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        before_server_message_id: u64,
+        limit: u32,
+    ) -> Result<OlderHistoryPage> {
+        let gap_key = format!("__hist_gap__:{channel_type}:{channel_id}");
+        // 读持久化 gap 态：不存在 → 视为未知（允许探一次）；has_more_before=false → 已到顶。
+        let persisted = self
+            .kv_get_local(gap_key.clone())
+            .await?
+            .and_then(|b| serde_json::from_slice::<HistGapState>(&b).ok());
+        if matches!(&persisted, Some(s) if !s.has_more_before) {
+            return Ok(OlderHistoryPage {
+                messages: Vec::new(),
+                has_more_before: false,
+            });
+        }
+        // 网络回填：SDK 内部按 server_message_id upsert 本地库（带真实 pts）。
+        let resp = self
+            .fetch_channel_history(
+                channel_id,
+                channel_type,
+                Some(before_server_message_id),
+                Some(limit),
+            )
+            .await?;
+        // 持久化新 gap 水位（服务端是否还有更早）。
+        let new_state = HistGapState {
+            has_more_before: resp.has_more,
+        };
+        let _ = self
+            .kv_put_local(gap_key, serde_json::to_vec(&new_state).unwrap_or_default())
+            .await;
+        // 从本地库重读更早窗口（复用规范 StoredMessage 映射）；过滤掉 anchor 及更新的。
+        let window = self
+            .list_messages_around(
+                channel_id,
+                channel_type,
+                before_server_message_id,
+                limit as usize,
+                0,
+            )
+            .await?;
+        let older: Vec<StoredMessage> = window
+            .into_iter()
+            .filter(|m| {
+                m.server_message_id
+                    .map(|id| id < before_server_message_id)
+                    .unwrap_or(false)
+            })
+            .collect();
+        Ok(OlderHistoryPage {
+            messages: older,
+            has_more_before: resp.has_more,
+        })
     }
 
     /// jump-to-message 上下文（spec §5）：before/anchor/after 完整消息已回填本地库。

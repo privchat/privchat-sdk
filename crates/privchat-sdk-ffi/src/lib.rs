@@ -1012,6 +1012,15 @@ pub struct MessageHistoryView {
     pub has_more: bool,
 }
 
+/// SDK-HISTORY-5：上滑加载更早历史一页（完整 StoredMessage，已回填本地）。
+/// [messages]=本次更早消息（本地重查、显示序 DESC）；[has_more_before]=服务端是否还有更早
+/// （来自 SDK 持久化 gap 态，UI 据此决定是否继续上滑，false=到顶）。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OlderHistoryView {
+    pub messages: Vec<StoredMessage>,
+    pub has_more_before: bool,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MessageHistoryItemView {
     pub message_id: u64,
@@ -7684,6 +7693,28 @@ impl PrivchatClient {
             .await
             .map_err(PrivchatFfiError::from)?;
         Ok(out.into_iter().map(map_stored_message).collect())
+    }
+
+    /// SDK-HISTORY-5（MESSAGE_HISTORY spec §2.5/§2.5.1）：上滑加载更早历史。
+    /// 读本地为渲染真源、`message/history/get` 只补缺口并回填本地（带真实 pts）；
+    /// gap 水位（has_more_before）由 SDK 持久化在 KV，跨会话有效。返回本次更早消息 +
+    /// has_more_before（服务端是否还有更早，false=到顶，UI 停止继续上滑加载）。
+    pub async fn load_older_history(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        before_server_message_id: u64,
+        limit: u32,
+    ) -> Result<OlderHistoryView, PrivchatFfiError> {
+        let page = self
+            .inner
+            .load_older_history(channel_id, channel_type, before_server_message_id, limit)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(OlderHistoryView {
+            messages: page.messages.into_iter().map(map_stored_message).collect(),
+            has_more_before: page.has_more_before,
+        })
     }
 
     /// 以 anchor 为轴的本地上下文窗口（显示排序；spec §5 跳转渲染原语）。
