@@ -23,10 +23,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use msgtrans::protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig};
-use msgtrans::transport::client::{TransportClient, TransportClientBuilder};
-use msgtrans::transport::TransportOptions;
 use msgtrans::ClientEvent;
+use msgtrans::TransportOptions;
+use msgtrans::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig};
+use msgtrans::{TransportClient, TransportClientBuilder};
 use privchat_protocol::message::LocalMessagePayloadEnvelope;
 use privchat_protocol::presence::{
     PresenceBatchStatusRequest, PresenceBatchStatusResponse, PresenceChangedNotification,
@@ -1320,68 +1320,82 @@ async fn start_inbound_task(
             return;
         };
         loop {
-            match event_rx.next().await {
-                Some(ClientEvent::MessageReceived(context)) => {
-                    if inbound_logs_enabled() {
-                        eprintln!(
-                            "[SDK.inbound] message received biz_type={} len={} is_request={}",
-                            context.biz_type,
-                            context.data.len(),
-                            context.is_request()
-                        );
-                    }
-                    let biz_type = context.biz_type;
-                    let data = context.data.clone();
-                    // 对 Request 类型的包回复 ACK（PushMessageResponse）
-                    if context.is_request() {
-                        let ack = PushMessageResponse {
-                            succeed: true,
-                            message: None,
-                        };
-                        if let Ok(ack_bytes) = encode_message(&ack) {
-                            context.respond(ack_bytes);
-                        }
-                    }
-                    if SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.load(Ordering::Relaxed)
-                        && matches!(
-                            MessageType::from(biz_type),
-                            MessageType::SendMessageRequest
-                                | MessageType::PushMessageRequest
-                                | MessageType::PushBatchRequest
-                                | MessageType::PublishRequest
-                        )
-                    {
-                        // The transport request has already been acknowledged.
-                        // Do not enqueue server-timeline traffic behind load-generator
-                        // RPC commands; doing so would benchmark one host's synthetic
-                        // SDK actors rather than server slow-consumer behavior.
-                        continue;
-                    }
-                    if actor_tx
-                        .send(Command::InboundFrame {
-                            epoch,
-                            biz_type,
-                            // msgtrans 1.0.10 起 payload 为 Bytes(零拷贝);actor 命令面
-                            // 仍是 Vec<u8>,此处物化一次。命令面整体切 Bytes 属 msgtrans
-                            // 2.0 联动改造,不在本次做。
-                            data: data.to_vec(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Some(ClientEvent::Disconnected { .. }) => {
-                    eprintln!("[SDK.inbound] transport disconnected");
-                    let _ = actor_tx.send(Command::InboundDisconnected { epoch }).await;
-                    break;
-                }
-                Some(_) => {}
+            let event = match event_rx.next().await {
+                Some(event) => event,
                 None => {
                     eprintln!("[SDK.inbound] event stream closed");
                     break;
                 }
+            };
+            // msgtrans 2.0 拆分了客户端事件：`Message` 是单向数据（无回复义务），
+            // `Request` 是消费式请求（必须且只能应答一次）。两者都归一到
+            // (biz_type, payload) 后走同一条 InboundFrame 入队路径。
+            let (biz_type, data): (u8, bytes::Bytes) = match event {
+                ClientEvent::Message(msg) => {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] message received biz_type={} len={}",
+                            msg.biz_type(),
+                            msg.payload().len()
+                        );
+                    }
+                    (msg.biz_type(), msg.into_payload())
+                }
+                ClientEvent::Request(req) => {
+                    if inbound_logs_enabled() {
+                        eprintln!(
+                            "[SDK.inbound] request received biz_type={} len={}",
+                            req.biz_type(),
+                            req.payload().len()
+                        );
+                    }
+                    let biz_type = req.biz_type();
+                    let payload = req.payload().clone();
+                    // 对 Request 类型的包回复传输层 ACK（PushMessageResponse）。
+                    // 用消费式 `respond_detached` 保持原有 fire-and-forget 语义，
+                    // 不阻塞 inbound 循环。
+                    let ack = PushMessageResponse {
+                        succeed: true,
+                        message: None,
+                    };
+                    if let Ok(ack_bytes) = encode_message(&ack) {
+                        req.respond_detached(ack_bytes);
+                    }
+                    (biz_type, payload)
+                }
+                ClientEvent::Disconnected { .. } => {
+                    eprintln!("[SDK.inbound] transport disconnected");
+                    let _ = actor_tx.send(Command::InboundDisconnected { epoch }).await;
+                    break;
+                }
+                _ => continue,
+            };
+            if SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.load(Ordering::Relaxed)
+                && matches!(
+                    MessageType::from(biz_type),
+                    MessageType::SendMessageRequest
+                        | MessageType::PushMessageRequest
+                        | MessageType::PushBatchRequest
+                        | MessageType::PublishRequest
+                )
+            {
+                // The transport request has already been acknowledged.
+                // Do not enqueue server-timeline traffic behind load-generator
+                // RPC commands; doing so would benchmark one host's synthetic
+                // SDK actors rather than server slow-consumer behavior.
+                continue;
+            }
+            if actor_tx
+                .send(Command::InboundFrame {
+                    epoch,
+                    biz_type,
+                    // payload 为 Bytes(零拷贝);actor 命令面仍是 Vec<u8>,此处物化一次。
+                    data: data.to_vec(),
+                })
+                .await
+                .is_err()
+            {
+                break;
             }
         }
     }));
@@ -3803,9 +3817,7 @@ impl State {
                 return Err(self.network_disconnected_error());
             }
         };
-        let opt = TransportOptions::new()
-            .biz_type(biz_type)
-            .timeout(timeout);
+        let opt = TransportOptions::new().biz_type(biz_type).timeout(timeout);
         match transport.request_with_options(payload, opt).await {
             Ok(raw) => {
                 if biz_type == MessageType::RpcRequest as u8 && rpc_logs_enabled() {
@@ -16193,7 +16205,10 @@ mod tests {
         // 绝不因「读取时 now 前进」而被推迟(旧 bug 正是每次读取 at.max(now+60s) 把它推远)。
         let read1 = state.next_reconnect_at.expect("armed");
         let read2 = state.next_reconnect_at.expect("armed");
-        assert_eq!(read1, read2, "next_reconnect_at must be a stable absolute instant");
+        assert_eq!(
+            read1, read2,
+            "next_reconnect_at must be a stable absolute instant"
+        );
 
         drop(dir);
     }
@@ -17198,7 +17213,12 @@ mod tests {
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&revoke_commit);
         state
-            .enqueue_and_apply_sync_items(entity_type, Some("2:92001".to_string()), vec![item], true)
+            .enqueue_and_apply_sync_items(
+                entity_type,
+                Some("2:92001".to_string()),
+                vec![item],
+                true,
+            )
             .await
             .expect("apply revoke difference");
 
@@ -17224,7 +17244,12 @@ mod tests {
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&reaction_commit);
         state
-            .enqueue_and_apply_sync_items(entity_type, Some("2:92001".to_string()), vec![item], true)
+            .enqueue_and_apply_sync_items(
+                entity_type,
+                Some("2:92001".to_string()),
+                vec![item],
+                true,
+            )
             .await
             .expect("apply reaction difference");
 
@@ -18641,7 +18666,12 @@ mod tests {
         };
         let (entity_type, item) = State::sync_item_from_difference_commit(&commit);
         state
-            .enqueue_and_apply_sync_items(entity_type, Some("2:92500".to_string()), vec![item], true)
+            .enqueue_and_apply_sync_items(
+                entity_type,
+                Some("2:92500".to_string()),
+                vec![item],
+                true,
+            )
             .await
             .expect("materialize target");
         assert_eq!(
