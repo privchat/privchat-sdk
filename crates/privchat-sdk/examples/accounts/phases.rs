@@ -81,9 +81,11 @@ impl TestPhases {
             let search = manager.search_users(from, &to_username).await?;
             metrics.rpc_calls += 1;
             metrics.rpc_successes += 1;
-            let to_user_id = first_user_id(&search, &to_username)?;
+            let (to_user_id, search_session_id) = first_search_hit(&search, &to_username)?;
 
-            let apply = manager.send_friend_request(from, to_user_id).await?;
+            let apply = manager
+                .send_friend_request(from, to_user_id, search_session_id)
+                .await?;
             metrics.rpc_calls += 1;
             if apply.user_id > 0 {
                 metrics.rpc_successes += 1;
@@ -617,10 +619,17 @@ impl TestPhases {
             direct,
             DIRECT_SYNC_CHANNEL_TYPE,
             "location",
+            // Non-text content types require a typed `metadata` block; a bare
+            // legacy payload is refused with "legacy location payload cannot be
+            // mapped without metadata". Field names follow LocationMetadata.
             serde_json::json!({
-                "lat": 31.2304,
-                "lng": 121.4737,
-                "name": "Shanghai"
+                "content": "Shanghai",
+                "metadata": {
+                    "latitude": 31.2304,
+                    "longitude": 121.4737,
+                    "name": "Shanghai",
+                    "address": "Shanghai, China"
+                }
             }),
         )
         .await?;
@@ -639,8 +648,10 @@ impl TestPhases {
             DIRECT_SYNC_CHANNEL_TYPE,
             "contact_card",
             serde_json::json!({
-                "user_id": manager.user_id("charlie")?,
-                "name": manager.username("charlie")?
+                "content": manager.username("charlie")?,
+                "metadata": {
+                    "user_id": manager.user_id("charlie")?
+                }
             }),
         )
         .await?;
@@ -1876,7 +1887,7 @@ impl TestPhases {
                 .push("system-notification search mismatch".to_string());
         }
 
-        let apply = manager.send_friend_request("erin", bob_id).await?;
+        let apply = manager.search_then_apply_friend("erin", "bob").await?;
         metrics.rpc_calls += 1;
         if apply.user_id > 0 {
             metrics.rpc_successes += 1;
@@ -4207,7 +4218,7 @@ impl TestPhases {
         let charlie_id = manager.user_id("charlie")?;
 
         // ---- 场景 1：accept ----
-        let _ = manager.send_friend_request("fsync_a", alice_id).await?;
+        let _ = manager.search_then_apply_friend("fsync_a", "alice").await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
@@ -4304,7 +4315,7 @@ impl TestPhases {
         }
 
         // ---- 场景 2：reject ----
-        let _ = manager.send_friend_request("fsync_b", bob_id).await?;
+        let _ = manager.search_then_apply_friend("fsync_b", "bob").await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4362,7 +4373,7 @@ impl TestPhases {
         }
 
         // ---- 场景 3：recall ----
-        let _ = manager.send_friend_request("fsync_c", charlie_id).await?;
+        let _ = manager.search_then_apply_friend("fsync_c", "charlie").await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -5124,12 +5135,23 @@ struct SmokeSystemUserLastEventDto {
 }
 
 fn first_user_id(search: &AccountSearchResponse, username: &str) -> BoxResult<u64> {
+    first_search_hit(search, username).map(|(user_id, _)| user_id)
+}
+
+/// The user id AND the `search_session_id` that proves how we found them.
+///
+/// The server's profile-visibility gate validates the claimed source: applying
+/// as a friend to someone you are not yet friends with is refused
+/// (`Forbidden: Friend source claimed but users are not friends`). A search hit
+/// carries the session id that makes `source = "search"` verifiable, which is
+/// what a real client sends after finding someone in search.
+fn first_search_hit(search: &AccountSearchResponse, username: &str) -> BoxResult<(u64, u64)> {
     search
         .users
         .iter()
         .find(|u| u.username == username)
         .or_else(|| search.users.first())
-        .map(|u| u.user_id)
+        .map(|u| (u.user_id, u.search_session_id))
         .ok_or_else(|| boxed_err(format!("search user not found: {username}")))
 }
 

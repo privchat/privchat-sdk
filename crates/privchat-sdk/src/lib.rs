@@ -2101,6 +2101,11 @@ pub enum Error {
     /// 而不是继续显示一个点了也没用的「重试」。
     #[error("attachment source missing for message {message_id}")]
     AttachmentSourceMissing { message_id: u64 },
+    /// 会话尚未鉴权（连接中 / 重连中）。这是**可重试**的时序状态，不是配置或参数错误：
+    /// 上层应等待会话就绪后重试，UI 只能显示本地化的「连接中」提示，绝不能把
+    /// `current: New` 这种内部状态名甩给用户。
+    #[error("session not ready (current: {state})")]
+    SessionNotReady { state: String },
 }
 
 /// 认证错误分层语义（spec: TOKEN_REFRESH_SPEC §2.1）。
@@ -2209,6 +2214,7 @@ impl Error {
             Error::Shutdown => error_codes::SHUTDOWN,
             Error::InvalidState(_) => error_codes::INVALID_STATE,
             Error::AttachmentSourceMissing { .. } => error_codes::ATTACHMENT_SOURCE_MISSING,
+            Error::SessionNotReady { .. } => error_codes::SESSION_NOT_READY,
             Error::Server { code, .. } => *code,
         }
     }
@@ -2225,6 +2231,7 @@ impl Error {
             Error::InvalidState(_) => ErrorCode::OperationNotAllowed as u32,
             // 专用码：UI 据此提示「源文件已不存在，请重新选择」，而不是笼统的失败。
             Error::AttachmentSourceMissing { .. } => ErrorCode::AttachmentSourceMissing as u32,
+            Error::SessionNotReady { .. } => ErrorCode::SessionNotReady as u32,
             Error::Server { code, .. } => *code,
         }
     }
@@ -3227,6 +3234,7 @@ impl State {
             Error::Shutdown => ResumeFailureClass::RetryableTemporaryError,
             // 与 resume 无关的本地附件错误：不该把它当成需要重建/重试的同步失败。
             Error::AttachmentSourceMissing { .. } => ResumeFailureClass::FatalProtocolError,
+            Error::SessionNotReady { .. } => ResumeFailureClass::RetryableTemporaryError,
             Error::InvalidState(message) => {
                 let lowered = message.to_ascii_lowercase();
                 if lowered.contains("session_ready rejected")
@@ -6277,10 +6285,11 @@ impl State {
         match self.session_state {
             SessionState::Authenticated => Ok(()),
             SessionState::Shutdown => Err(Error::Shutdown),
-            _ => Err(Error::InvalidState(format!(
-                "operation requires authenticated session (current: {:?})",
-                self.session_state
-            ))),
+            // 结构化 + 可重试：连接/重连过程中的调用不是「非法状态」，
+            // 上层据此等待并重试，UI 走本地化提示。
+            _ => Err(Error::SessionNotReady {
+                state: format!("{:?}", self.session_state),
+            }),
         }
     }
 
@@ -18707,6 +18716,35 @@ mod tests {
             );
         }
         out
+    }
+
+    /// 未鉴权（连接中/重连中）时调用业务 RPC，必须得到**结构化可重试**错误，
+    /// 而不是把 `invalid state: operation requires authenticated session (current: New)`
+    /// 这种内部状态串抛给上层（用户曾在生产界面看到英文原文）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn business_rpc_before_authentication_returns_typed_session_not_ready() {
+        let dir = unique_test_dir("session-not-ready");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let sdk = retry_test_sdk(&dir).await;
+
+        let err = sdk
+            .sync_channel(97_301, 2)
+            .await
+            .expect_err("unauthenticated session must not run business RPC");
+        match &err {
+            Error::SessionNotReady { state } => {
+                assert!(!state.is_empty(), "state label is for logs, not for UI");
+            }
+            other => panic!("expected SessionNotReady, got {other:?}"),
+        }
+        assert_eq!(
+            err.protocol_code(),
+            privchat_protocol::ErrorCode::SessionNotReady as u32
+        );
+        assert_eq!(err.sdk_code(), error_codes::SESSION_NOT_READY);
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -335,10 +335,44 @@ impl MultiAccountManager {
         .await
     }
 
+    /// Search for `to`'s username, then apply using that search as the source.
+    ///
+    /// This is the flow a real client performs, and it is the only way to get a
+    /// `search_session_id` the server will accept. Use it wherever the caller
+    /// does not already hold a search hit.
+    pub async fn search_then_apply_friend(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> BoxResult<FriendApplyResponse> {
+        let to_username = self.username(to)?;
+        let search = self.search_users(from, &to_username).await?;
+        let hit = search
+            .users
+            .iter()
+            .find(|u| u.username == to_username)
+            .or_else(|| search.users.first())
+            .ok_or_else(|| -> BoxError {
+                Box::new(std::io::Error::other(format!(
+                    "search user not found: {to_username}"
+                )))
+            })?;
+        self.send_friend_request(from, hit.user_id, hit.search_session_id)
+            .await
+    }
+
+    /// Apply to add a friend, declaring the source that the server can verify.
+    ///
+    /// `search_session_id` comes from the `account/search/query` hit that found
+    /// this user: the server checks the record belongs to this searcher, names
+    /// this target and has not expired. The old `source: "friend"` claim was
+    /// self-contradictory (claiming friendship while asking for it) and the
+    /// profile-visibility gate rejects it.
     pub async fn send_friend_request(
         &self,
         from: &str,
         to_user_id: u64,
+        search_session_id: u64,
     ) -> BoxResult<FriendApplyResponse> {
         let resp: FriendApplyCompat = self
             .rpc_typed(
@@ -347,8 +381,8 @@ impl MultiAccountManager {
                 &FriendApplyRequest {
                     target_user_id: to_user_id,
                     message: Some("hello from accounts example".to_string()),
-                    source: Some("friend".to_string()),
-                    source_id: Some(to_user_id.to_string()),
+                    source: Some("search".to_string()),
+                    source_id: Some(search_session_id.to_string()),
                     grant_id: None,
                     from_user_id: 0,
                 },

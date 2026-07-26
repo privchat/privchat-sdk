@@ -39,6 +39,8 @@ pub const SERIALIZATION_FAILURE: u32 = code(domain::SERIALIZATION, 1);
 pub const INVALID_STATE: u32 = code(domain::STATE, 1);
 /// 附件重试时本地源文件已不存在。上层据此提示「重新选择文件」，而不是泛化的失败。
 pub const ATTACHMENT_SOURCE_MISSING: u32 = code(domain::STATE, 2);
+/// 会话尚未鉴权（连接中/重连中）。可重试的时序状态，不是参数/配置错误。
+pub const SESSION_NOT_READY: u32 = code(domain::STATE, 3);
 pub const ACTOR_CLOSED: u32 = code(domain::ACTOR, 1);
 pub const SHUTDOWN: u32 = code(domain::SHUTDOWN, 1);
 pub const INTERNAL_UNKNOWN: u32 = code(domain::INTERNAL, 1);
