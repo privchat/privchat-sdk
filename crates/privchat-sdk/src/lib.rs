@@ -1560,6 +1560,19 @@ pub struct StoredMessage {
     pub pts: Option<u64>,
 }
 
+/// 出站队列可否排空的**纯判据**。
+///
+/// 刻意做成自由函数并且只接收这三个事实：签名里**没有 `NetworkHint`**，所以「系统可达性」
+/// 在类型层面就无法再混进这个决策（2026-07-26 生产事故的结构性防回归）。
+/// 可达性只允许影响探测/重试的频率，不能决定「做不做事」。
+fn outbound_queue_ready(
+    session_state: SessionState,
+    has_current_uid: bool,
+    has_transport: bool,
+) -> bool {
+    session_state == SessionState::Authenticated && has_current_uid && has_transport
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineSnapshot {
     pub messages: Vec<StoredMessage>,
@@ -6274,13 +6287,23 @@ impl State {
         Ok(local_message_id)
     }
 
+    /// 出站队列是否可以排空。
+    ///
+    /// 判据只有三条**可验证的本地事实**：会话已鉴权、有当前用户、transport 还在。
+    /// 只有鉴权完成的 session 才能发业务 RPC；Connected/LoggedIn 都可能跑在服务端未授权
+    /// 的通道上（例如重连刚握好 TCP、ConnAuth 还没回），那时 drain 只会触发 10000。
+    ///
+    /// ⚠️ **绝不能把 `network_hint` 放进来**（2026-07-26 生产事故）：系统 reachability 卡在
+    /// Offline 后，inbound 推送仍走活着的 transport 正常收消息，而出站队列因这个假闸门永远
+    /// 排不空——用户看到「能收到消息，自己发的永远停在『发送中』，既不成功也不失败」。
+    /// hint 只允许影响探测/重试的**频率**，不能决定「做不做事」。真断网时 transport 已为
+    /// None（或发送直接失败），上面三条判据自然拦住，代价可控。
     fn should_process_outbound_queue(&self) -> bool {
-        // 只有鉴权完成的 session 才能发业务 RPC；Connected/LoggedIn 都可能跑在
-        // 服务端未授权的通道上（例如重连刚握好 TCP、ConnAuth 还没回），那时 drain
-        // 只会触发 10000 Authentication required。
-        self.network_hint.is_online()
-            && self.session_state == SessionState::Authenticated
-            && self.current_uid.is_some()
+        outbound_queue_ready(
+            self.session_state,
+            self.current_uid.is_some(),
+            self.transport.is_some(),
+        )
     }
 
     async fn cleanup_tmp_dirs_if_needed(&mut self) -> Result<()> {
@@ -15919,6 +15942,7 @@ impl PrivchatSdk {
 mod tests {
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
+        outbound_queue_ready,
         group_settings_key, Action, AuthErrorKind, CanonicalTimelineEvent, ConnectionState,
         ContentMessageType, Error, ErrorCode, LoginResult, MessageCachePolicy, NetworkHint,
         NewMessage, PresenceStatus, PrivchatConfig, PrivchatSdk, ResumeEscalationScope,
@@ -16274,6 +16298,39 @@ mod tests {
     /// deadline**(schedule_next_reconnect 里 delay.max(60s)),而不是读取时按 now 现算。
     /// 本测试锁死:离线时 next_reconnect_at ≥ now+60s(稳定绝对值);在线时走正常快退避
     /// (首次 ≤ ~2s),证明节流确实在设置时生效、且离线不会退化成读取时重算。
+    /// 回归(2026-07-26 生产事故):系统 reachability 卡 Offline 后,用户**能收到消息**
+    /// (inbound 走活着的 transport,不看 hint)但**自己发的永远停在「发送中」**——因为出站
+    /// 队列的判据里混进了 `network_hint.is_online()`,假 Offline 一票否决了排空。
+    ///
+    /// 判据现在是自由函数 [`outbound_queue_ready`],签名里**根本没有 NetworkHint**,可达性
+    /// 在类型层面无法参与决策。本测试锁死真值表:已鉴权 + 有 uid + transport 在 → 必须排空,
+    /// 与任何可达性判断无关;缺任一条则不排空(未鉴权的通道 drain 只会撞 10000)。
+    #[test]
+    fn outbound_queue_readiness_ignores_reachability() {
+        // 三条事实齐备 → 必须排空。此前 hint=Offline 会让它变 false,消息永久卡「发送中」。
+        assert!(
+            outbound_queue_ready(SessionState::Authenticated, true, true),
+            "authenticated session with a live transport must drain regardless of reachability"
+        );
+
+        // 缺 transport:真断网/重连中,发不出去,等重连后再排。
+        assert!(!outbound_queue_ready(SessionState::Authenticated, true, false));
+        // 缺 uid:没有当前用户,无从发送。
+        assert!(!outbound_queue_ready(SessionState::Authenticated, false, true));
+        // 未鉴权的通道(握好 TCP 但 ConnAuth 未回)上 drain 只会撞 10000,必须等 Authenticated。
+        for st in [
+            SessionState::New,
+            SessionState::Connected,
+            SessionState::LoggedIn,
+            SessionState::Shutdown,
+        ] {
+            assert!(
+                !outbound_queue_ready(st, true, true),
+                "must not drain on unauthenticated session state {st:?}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn offline_reconnect_deadline_is_baked_stable_not_recomputed() {
         let (mut state, dir) = new_seeded_state("offline-reconnect-deadline").await;
@@ -16800,13 +16857,18 @@ mod tests {
             "expected NetworkHintChanged in replay events"
         );
 
+        // 契约变更(2026-07-24/26 三次生产事故后):可达性提示**不再短路显式 connect**。
+        // 旧断言要求「offline 时 connect 必须以『网络已断开』失败」——正是那个硬闸门让
+        // 宿主的前台恢复 / 网络回调 / 用户点重连三个入口全部空转,系统 reachability 一旦
+        // 卡在 Offline(iOS 常见,恢复回调不投递)就永远连不回来。现在 connect 一律真尝试,
+        // 成败由真实网络决定;这里断言的正是「没有被 hint 短路」。
         let err = sdk
             .connect()
             .await
-            .expect_err("connect must fail while offline");
+            .expect_err("connect fails here for lack of endpoints, not because of the hint");
         assert!(
-            err.to_string().contains(NETWORK_DISCONNECTED_MESSAGE),
-            "unexpected error: {err}"
+            !err.to_string().contains(NETWORK_DISCONNECTED_MESSAGE),
+            "connect must not be short-circuited by an Offline hint, got: {err}"
         );
     }
 
