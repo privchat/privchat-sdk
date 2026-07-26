@@ -10968,9 +10968,14 @@ impl PrivchatSdk {
                             state.next_reconnect_at = Some(Instant::now());
                         }
 
-                        if !state.network_hint.is_online() {
-                            continue;
-                        }
+                        // ⚠️ 这里曾是 `if !network_hint.is_online() { continue; }` —— 一个
+                        // 假 Offline 就把整个 tick 尾部(连接探测 / anti-entropy / **出站队列
+                        // 排空**)全部跳过。后果(2026-07-26 生产实测):inbound 推送走的是活着的
+                        // transport、不看 hint,所以**用户能正常收消息**,但自己发的消息因为
+                        // outbox 永远排不空而卡在「发送中」,既不成功也不失败。
+                        // 原则同前:reachability 只是提示,绝不做硬闸门——各操作自身的前置条件
+                        // (session_state / bootstrap_completed / 队列非空)才是真正的门槛,真断网
+                        // 时它们各自失败即可,代价只是一次廉价的探测。
 
                         // Probe live connections for silent drops (NAT/proxy timeouts).
                         // apply_transport_health will arm the reconnect driver on loss.
