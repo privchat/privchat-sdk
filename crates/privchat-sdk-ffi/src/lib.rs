@@ -3126,32 +3126,6 @@ fn map_upsert_channel_extra(v: UpsertChannelExtraInput) -> SdkUpsertChannelExtra
     }
 }
 
-/// 是否附件类消息(其发送必须经过 file queue 的上传管线)。
-fn is_attachment_message_type(message_type: i32) -> bool {
-    matches!(
-        message_type,
-        t if t == privchat_protocol::ContentMessageType::Image as i32
-            || t == privchat_protocol::ContentMessageType::Video as i32
-            || t == privchat_protocol::ContentMessageType::Voice as i32
-            || t == privchat_protocol::ContentMessageType::File as i32
-    )
-}
-
-/// 从已存消息的 content 取回可重传的本地文件路径。首发失败的附件其 content 就是
-/// 本地路径(可能带 `file://` 前缀);已上传成功的消息 content 是 caption，不是路径，
-/// 这时返回 None，由调用方按「无源文件」处理。
-fn attachment_local_path(content: &str) -> Option<String> {
-    let raw = content.strip_prefix("file://").unwrap_or(content);
-    if raw.is_empty() {
-        return None;
-    }
-    let path = std::path::Path::new(raw);
-    if path.is_absolute() && path.is_file() {
-        Some(raw.to_string())
-    } else {
-        None
-    }
-}
 
 fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
     let body = map_message_content(privchat_sdk::message_content::project_stored_message(&v));
@@ -8773,55 +8747,14 @@ impl PrivchatClient {
             .await
     }
 
+    /// 薄委托：重试编排（类型分流 / 上传阶段恢复 / 结构化错误）全部属于 Rust Core
+    /// （SDK_LAYERED spec §4.1「消息生命周期、上传下载编排、结构化错误」）。FFI 只做
+    /// 调用与错误映射，不得在此维护第二套重试状态机。
     pub async fn retry_message(&self, message_id: u64) -> Result<u64, PrivchatFfiError> {
-        let msg = self.get_message_by_id(message_id).await?.ok_or_else(|| {
-            PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                detail: format!("message not found: {message_id}"),
-            }
-        })?;
-        let payload = json_encode(
-            &RetryMessagePayloadView {
-                message_id: msg.message_id,
-                channel_id: msg.channel_id,
-                channel_type: msg.channel_type,
-                from_uid: msg.from_uid,
-                message_type: msg.message_type,
-                content: msg.content.clone(),
-                extra: msg.extra,
-            },
-            "retry_message payload",
-        )?
-        .into_bytes();
-
-        // 附件(image/video/voice/file)**绝不能**走普通队列(2026-07-26 生产阻断):
-        // 首发链路是 send_attachment_from_path → file queue → 上传 → 拿到 file_id 与
-        // typed metadata 后才发送;而重试若不分类型直接 enqueue_outbound_message,
-        // 送出去的是 SQLite 里存的**本地路径当 content、metadata 为空**的消息,服务端
-        // 必然 20006「消息类型 image 需要 metadata」——用户点多少次重试都必败。
-        // 重试因此必须回到 file queue，从「准备/上传」阶段重来。
-        if is_attachment_message_type(msg.message_type) {
-            let local_path = attachment_local_path(&msg.content).ok_or_else(|| {
-                // 没有可重传的本地文件(已清理/跨设备)：给结构化错误让上层提示重新选文件，
-                // 而不是把一条注定被拒的消息塞进普通队列反复失败。
-                PrivchatFfiError::SdkError {
-                    code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                    detail: format!(
-                        "attachment retry needs the local file; message {message_id} has no readable source path"
-                    ),
-                }
-            })?;
-            let route_key = self.to_client_endpoint().ok_or_else(|| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InternalError as u32,
-                detail: "no client endpoint configured for attachment retry".to_string(),
-            })?;
-            return self
-                .send_attachment_from_path(message_id, route_key, local_path)
-                .await
-                .map(|r| r.message_id);
-        }
-
-        self.enqueue_outbound_message(message_id, payload).await
+        self.inner
+            .retry_message(message_id)
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn search_channel(
@@ -9528,57 +9461,3 @@ extern "C" fn ffi_privchat_sdk_ffi_rust_future_complete_pointer(
     std::ptr::null_mut()
 }
 
-#[cfg(test)]
-mod attachment_retry_tests {
-    use super::{attachment_local_path, is_attachment_message_type};
-    use privchat_protocol::ContentMessageType;
-
-    /// 回归(2026-07-26 生产阻断):图片重试被塞进普通队列,发出去的是「本地路径当 content、
-    /// metadata 为空」的消息,服务端必 20006,用户点几次重试都发不出去。附件必须被识别出来
-    /// 并回到 file queue 的上传管线。
-    #[test]
-    fn attachment_types_are_recognised_for_retry_routing() {
-        for t in [
-            ContentMessageType::Image,
-            ContentMessageType::Video,
-            ContentMessageType::Voice,
-            ContentMessageType::File,
-        ] {
-            assert!(
-                is_attachment_message_type(t as i32),
-                "{t:?} must retry through the upload pipeline, never the normal queue"
-            );
-        }
-        for t in [
-            ContentMessageType::Text,
-            ContentMessageType::System,
-            ContentMessageType::RedPacket,
-            ContentMessageType::MoneyTransfer,
-        ] {
-            assert!(!is_attachment_message_type(t as i32));
-        }
-    }
-
-    #[test]
-    fn local_path_is_only_taken_from_a_real_existing_file() {
-        let mut f = std::env::temp_dir();
-        f.push(format!("privchat-retry-{}.bin", std::process::id()));
-        std::fs::write(&f, b"x").expect("write temp attachment");
-        let p = f.to_string_lossy().to_string();
-
-        // 裸绝对路径与 file:// 前缀都要能取回源文件(首发失败时 content 就是它)。
-        assert_eq!(attachment_local_path(&p).as_deref(), Some(p.as_str()));
-        assert_eq!(
-            attachment_local_path(&format!("file://{p}")).as_deref(),
-            Some(p.as_str())
-        );
-
-        // caption / 空串 / 已清理的路径都不是可重传的源文件 —— 必须返回 None,
-        // 让调用方报「需要重新选文件」而不是把注定被拒的消息再排一次队。
-        assert!(attachment_local_path("[图片]").is_none());
-        assert!(attachment_local_path("").is_none());
-        assert!(attachment_local_path("/nonexistent/privchat/payload.png").is_none());
-
-        let _ = std::fs::remove_file(&f);
-    }
-}

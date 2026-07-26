@@ -1565,6 +1565,34 @@ pub struct StoredMessage {
 /// 刻意做成自由函数并且只接收这三个事实：签名里**没有 `NetworkHint`**，所以「系统可达性」
 /// 在类型层面就无法再混进这个决策（2026-07-26 生产事故的结构性防回归）。
 /// 可达性只允许影响探测/重试的频率，不能决定「做不做事」。
+
+/// 附件类消息（其发送必须经过 file queue 的上传管线）。
+pub(crate) fn is_attachment_message_type(message_type: i32) -> bool {
+    matches!(
+        message_type,
+        t if t == privchat_protocol::ContentMessageType::Image as i32
+            || t == privchat_protocol::ContentMessageType::Video as i32
+            || t == privchat_protocol::ContentMessageType::Voice as i32
+            || t == privchat_protocol::ContentMessageType::File as i32
+    )
+}
+
+/// 从已存消息的 content 取回可重传的本地文件路径。首发失败的附件其 content 仍是本地
+/// 路径（可能带 `file://` 前缀）；已上传成功的消息 content 是 caption，不是路径，这时
+/// 返回 None，调用方按「源文件缺失」处理。
+pub(crate) fn attachment_local_path(content: &str) -> Option<String> {
+    let raw = content.strip_prefix("file://").unwrap_or(content);
+    if raw.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(raw);
+    if path.is_absolute() && path.is_file() {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
 fn outbound_queue_ready(
     session_state: SessionState,
     has_current_uid: bool,
@@ -2068,6 +2096,11 @@ pub enum Error {
     InvalidState(String),
     #[error("server error: reason_code={code} message={message}")]
     Server { code: u32, message: String },
+    /// 附件重试时本地源文件已不存在（被清理 / 该行来自另一台设备）。
+    /// 与普通失败区分开：这类重试**永远不可能成功**，UI 必须引导用户重新选择文件，
+    /// 而不是继续显示一个点了也没用的「重试」。
+    #[error("attachment source missing for message {message_id}")]
+    AttachmentSourceMissing { message_id: u64 },
 }
 
 /// 认证错误分层语义（spec: TOKEN_REFRESH_SPEC §2.1）。
@@ -2175,6 +2208,7 @@ impl Error {
             Error::ActorClosed => error_codes::ACTOR_CLOSED,
             Error::Shutdown => error_codes::SHUTDOWN,
             Error::InvalidState(_) => error_codes::INVALID_STATE,
+            Error::AttachmentSourceMissing { .. } => error_codes::ATTACHMENT_SOURCE_MISSING,
             Error::Server { code, .. } => *code,
         }
     }
@@ -2189,6 +2223,8 @@ impl Error {
             Error::ActorClosed => ErrorCode::SystemBusy as u32,
             Error::Shutdown => ErrorCode::ServiceUnavailable as u32,
             Error::InvalidState(_) => ErrorCode::OperationNotAllowed as u32,
+            // 专用码：UI 据此提示「源文件已不存在，请重新选择」，而不是笼统的失败。
+            Error::AttachmentSourceMissing { .. } => ErrorCode::AttachmentSourceMissing as u32,
             Error::Server { code, .. } => *code,
         }
     }
@@ -3189,6 +3225,8 @@ impl State {
                 Self::classify_resume_message(message, ResumeFailureClass::FullRebuildRequired)
             }
             Error::Shutdown => ResumeFailureClass::RetryableTemporaryError,
+            // 与 resume 无关的本地附件错误：不该把它当成需要重建/重试的同步失败。
+            Error::AttachmentSourceMissing { .. } => ResumeFailureClass::FatalProtocolError,
             Error::InvalidState(message) => {
                 let lowered = message.to_ascii_lowercase();
                 if lowered.contains("session_ready rejected")
@@ -10762,6 +10800,9 @@ pub struct PrivchatSdk {
     presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
     typing_throttle: Arc<StdMutex<HashMap<(u64, bool, u8), std::time::Instant>>>,
     data_dir: Arc<String>,
+    /// file queue 的路由键（构造期由 endpoint 固化）。附件首发与重试必须用同一个键，
+    /// 才会落到同一条有序队列。
+    file_route_key: Arc<Option<String>>,
     download_manager: media_download::DownloadManager,
     pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>>,
 }
@@ -10799,6 +10840,8 @@ impl PrivchatSdk {
     pub fn with_runtime(config: PrivchatConfig, runtime_provider: RuntimeProvider) -> Self {
         let configured_data_dir = config.data_dir.clone();
         let data_dir_for_self = configured_data_dir.clone();
+        // 附件 file queue 的路由键在构造期固化：首发与重试必须落到同一条有序队列。
+        let file_route_key = config.endpoints.first().map(Self::endpoint_route_key);
         let (tx, mut rx) = mpsc::channel::<Command>(64);
         let actor_cmd_tx = tx.clone();
         let (event_tx, _) = broadcast::channel::<SdkEvent>(256);
@@ -13535,6 +13578,7 @@ impl PrivchatSdk {
             presence_cache,
             typing_throttle: Arc::new(StdMutex::new(HashMap::new())),
             data_dir: Arc::new(data_dir_for_self),
+            file_route_key: Arc::new(file_route_key),
             download_manager: media_download::DownloadManager::new(),
             pending_media_jobs,
         }
@@ -14666,6 +14710,60 @@ impl PrivchatSdk {
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+
+    /// 重发一条失败的消息。**消息生命周期编排属于 Core**（SDK_LAYERED spec §4.1），
+    /// FFI 只做薄委托，不得维护第二套重试状态机。
+    ///
+    /// 分流依据是消息类型与其持久化阶段：
+    /// - 附件（image/video/voice/file）→ 回到 **file queue**，从上传阶段重来。此前不分
+    ///   类型一律进普通队列，送出去的是「本地路径当 content、metadata 为空」的消息，
+    ///   服务端必 20006，用户点多少次重试都发不出去（2026-07-26 生产阻断）。
+    /// - 其余 → 普通队列（drain 时从本地库重读消息，payload 不透明）。
+    ///
+    /// 附件源文件已不在时返回 [`Error::AttachmentSourceMissing`]，让上层提示重新选择，
+    /// 而不是排一条注定被拒的消息。
+    pub async fn retry_message(&self, message_id: u64) -> Result<u64> {
+        let msg = self
+            .get_message_by_id(message_id)
+            .await?
+            .ok_or_else(|| Error::InvalidState(format!("message not found: {message_id}")))?;
+
+        if is_attachment_message_type(msg.message_type) {
+            let path = attachment_local_path(&msg.content)
+                .ok_or(Error::AttachmentSourceMissing { message_id })?;
+            let bytes = std::fs::read(&path).map_err(|e| {
+                // 路径存在但读不出来（权限/占用）同样是「没有可重传的源」。
+                tracing::warn!(error = %e, path = %path, "attachment retry: read source failed");
+                Error::AttachmentSourceMissing { message_id }
+            })?;
+            let route_key = self.file_route_key.as_ref().clone().ok_or_else(|| {
+                Error::InvalidState("no endpoint configured for attachment retry".to_string())
+            })?;
+            let queued = self
+                .enqueue_outbound_file(message_id, route_key, bytes)
+                .await?;
+            return Ok(queued.message_id);
+        }
+
+        self.enqueue_outbound_message(message_id, Vec::new()).await
+    }
+
+    /// file queue 的路由键：同一 endpoint 的附件共享一条有序队列。
+    fn endpoint_route_key(ep: &ServerEndpoint) -> String {
+        let scheme = match ep.protocol {
+            TransportProtocol::Quic => "quic",
+            TransportProtocol::Tcp => "tcp",
+            TransportProtocol::WebSocket => {
+                if ep.use_tls {
+                    "wss"
+                } else {
+                    "ws"
+                }
+            }
+        };
+        format!("{scheme}://{}:{}", ep.host, ep.port)
     }
 
     pub async fn get_message_by_id(&self, message_id: u64) -> Result<Option<StoredMessage>> {
@@ -18546,6 +18644,201 @@ mod tests {
         );
 
         sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #4 返工：重试路由的**真路径**测试——断言消息实际落到哪条队列、payload 是什么，
+    /// 而不是只测辅助函数。生产故障正是「附件被塞进普通队列（content=本地路径、
+    /// metadata 为空）」，服务端必 20006。
+    async fn retry_test_sdk(dir: &std::path::Path) -> PrivchatSdk {
+        {
+            let store = LocalStore::open_at(dir.to_path_buf()).expect("open local store");
+            let login = LoginResult {
+                user_id: 10001,
+                token: "token".to_string(),
+                device_id: "device".to_string(),
+                refresh_token: None,
+                expires_at: 0,
+            };
+            store.save_login("10001", &login).expect("seed login");
+            store
+                .set_bootstrap_completed("10001", true)
+                .expect("seed bootstrap completed");
+        }
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        config.endpoints = vec![super::ServerEndpoint {
+            protocol: crate::TransportProtocol::Tcp,
+            host: "127.0.0.1".to_string(),
+            port: 19001,
+            path: None,
+            use_tls: false,
+        }];
+        let sdk = PrivchatSdk::new(config);
+        sdk.set_current_uid("10001".to_string())
+            .await
+            .expect("set current uid");
+        sdk
+    }
+
+    fn retry_test_message(message_type: i32, content: String) -> NewMessage {
+        NewMessage {
+            channel_id: 97201,
+            channel_type: 2,
+            from_uid: 10001,
+            message_type,
+            content,
+            searchable_word: String::new(),
+            setting: 0,
+            extra: "{}".to_string(),
+            mime_type: Some("image/jpeg".to_string()),
+            media_downloaded: true,
+            thumb_status: 0,
+        }
+    }
+
+    async fn retry_test_file_items(sdk: &PrivchatSdk) -> Vec<super::QueueMessage> {
+        let mut out = Vec::new();
+        for queue_index in 0..4 {
+            out.extend(
+                sdk.peek_outbound_files(queue_index, 16)
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_message_routes_attachment_to_file_queue_with_source_bytes() {
+        let dir = unique_test_dir("retry-attachment-file-queue");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let source = dir.join("photo.jpg");
+        std::fs::write(&source, b"jpeg-bytes-payload").expect("write source file");
+
+        let sdk = retry_test_sdk(&dir).await;
+        let message_id = sdk
+            .create_local_message(retry_test_message(
+                privchat_protocol::ContentMessageType::Image as i32,
+                format!("file://{}", source.display()),
+            ))
+            .await
+            .expect("create local attachment message");
+
+        let returned = sdk.retry_message(message_id).await.expect("retry attachment");
+        assert_eq!(returned, message_id);
+
+        let files = retry_test_file_items(&sdk).await;
+        assert_eq!(files.len(), 1, "attachment must land in the file queue");
+        assert_eq!(files[0].message_id, message_id);
+        assert_eq!(
+            files[0].payload, b"jpeg-bytes-payload",
+            "file queue payload must be the source bytes, not the path"
+        );
+        assert!(
+            sdk.peek_outbound_messages(16)
+                .await
+                .expect("peek normal queue")
+                .is_empty(),
+            "attachment must NOT enter the normal queue (that is the 20006 bug)"
+        );
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_message_routes_text_to_normal_queue() {
+        let dir = unique_test_dir("retry-text-normal-queue");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let sdk = retry_test_sdk(&dir).await;
+        let message_id = sdk
+            .create_local_message(retry_test_message(
+                privchat_protocol::ContentMessageType::Text as i32,
+                "{\"content\":\"hello\"}".to_string(),
+            ))
+            .await
+            .expect("create local text message");
+
+        sdk.retry_message(message_id).await.expect("retry text");
+
+        let normal = sdk
+            .peek_outbound_messages(16)
+            .await
+            .expect("peek normal queue");
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].message_id, message_id);
+        assert!(
+            retry_test_file_items(&sdk).await.is_empty(),
+            "text must not enter the file queue"
+        );
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_message_without_source_file_is_typed_error_and_queues_nothing() {
+        let dir = unique_test_dir("retry-attachment-missing-source");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let sdk = retry_test_sdk(&dir).await;
+        let message_id = sdk
+            .create_local_message(retry_test_message(
+                privchat_protocol::ContentMessageType::Image as i32,
+                format!("file://{}", dir.join("deleted.jpg").display()),
+            ))
+            .await
+            .expect("create local attachment message");
+
+        let err = sdk
+            .retry_message(message_id)
+            .await
+            .expect_err("missing source must fail");
+        match &err {
+            Error::AttachmentSourceMissing { message_id: id } => assert_eq!(*id, message_id),
+            other => panic!("expected AttachmentSourceMissing, got {other:?}"),
+        }
+        assert_eq!(
+            err.protocol_code(),
+            privchat_protocol::ErrorCode::AttachmentSourceMissing as u32,
+            "UI relies on the typed code to offer re-picking the file"
+        );
+        assert!(retry_test_file_items(&sdk).await.is_empty());
+        assert!(sdk
+            .peek_outbound_messages(16)
+            .await
+            .expect("peek normal queue")
+            .is_empty());
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_message_file_queue_entry_survives_restart() {
+        let dir = unique_test_dir("retry-attachment-restart");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let source = dir.join("clip.mp4");
+        std::fs::write(&source, b"video-bytes").expect("write source file");
+
+        let sdk = retry_test_sdk(&dir).await;
+        let message_id = sdk
+            .create_local_message(retry_test_message(
+                privchat_protocol::ContentMessageType::Video as i32,
+                source.display().to_string(),
+            ))
+            .await
+            .expect("create local attachment message");
+        sdk.retry_message(message_id).await.expect("retry attachment");
+        sdk.shutdown().await;
+
+        let reopened = retry_test_sdk(&dir).await;
+        let files = retry_test_file_items(&reopened).await;
+        assert_eq!(files.len(), 1, "queued retry must survive a restart");
+        assert_eq!(files[0].message_id, message_id);
+        assert_eq!(files[0].payload, b"video-bytes");
+
+        reopened.shutdown().await;
         let _ = std::fs::remove_dir_all(dir);
     }
 
