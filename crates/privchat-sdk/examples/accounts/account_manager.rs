@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1412,6 +1412,39 @@ impl MultiAccountManager {
         Ok(())
     }
 
+    /// 在指定目录上开一个**独立的 SDK 实例**，不接管 manager 里的账号。
+    ///
+    /// 进程重启在测试里就是这个：同一个 data_dir，换一个新 `PrivchatSdk`。
+    /// 内存里的一切都没了，只剩磁盘上真正提交过的东西——outbox 能不能扛住重启，
+    /// 只有这样才测得出来。`connect` 为 false 时故意保持离线，用来制造
+    /// 「已入队、尚未发送」的那段窗口。
+    pub async fn open_detached_sdk(
+        &self,
+        key: &str,
+        data_dir: &Path,
+        device_id: &str,
+    ) -> BoxResult<Arc<PrivchatSdk>> {
+        let cfg = self.account_config(key)?;
+        std::fs::create_dir_all(data_dir)?;
+        let sdk = Arc::new(PrivchatSdk::new(PrivchatConfig {
+            endpoints: self.endpoints.clone(),
+            connection_timeout_secs: 30,
+            data_dir: data_dir.to_string_lossy().to_string(),
+        }));
+        sdk.connect().await?;
+        let login = sdk
+            .login(
+                cfg.username.clone(),
+                cfg.password.clone(),
+                device_id.to_string(),
+            )
+            .await?;
+        sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
+            .await?;
+        sdk.run_bootstrap_sync().await?;
+        Ok(sdk)
+    }
+
     pub async fn verify_login_notice_persisted(
         &self,
         key: &str,
@@ -1580,7 +1613,7 @@ fn direct_key(a: &str, b: &str) -> String {
     }
 }
 
-fn pseudo_uuid_v4_like() -> String {
+pub fn pseudo_uuid_v4_like() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

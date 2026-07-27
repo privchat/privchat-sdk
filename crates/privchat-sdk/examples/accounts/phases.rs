@@ -18,7 +18,9 @@
 use std::time::Duration;
 
 use privchat_protocol::rpc::routes::sync;
-use privchat_protocol::rpc::{AccountSearchResponse, ClientSubmitResponse};
+use privchat_protocol::rpc::{
+    AccountSearchResponse, ClientSubmitResponse, FileGetUrlRequest, FileGetUrlResponse,
+};
 use serde::Deserialize;
 
 use crate::account_manager::{
@@ -4769,13 +4771,36 @@ impl TestPhases {
         }
 
         // 4. 对端各收到一次，不多不少。
-        manager.refresh_local_views("bob").await?;
-        let bob_rows = manager
-            .list_local_messages("bob", channel_id, channel_type, 200)
-            .await?;
-        for content in &contents {
-            let hits = bob_rows.iter().filter(|m| &m.content == content).count();
-            if hits != 1 {
+        //
+        // 等到条件成立而不是刷一次就断言：投递慢一点就红的测试，红了也说明不了
+        // 问题，只会训练人忽略它。**多出来的副本不等**——重复是稳定的错误状态，
+        // 再等只会把它等成超时。
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut bob_counts: Vec<(String, usize)> = Vec::new();
+        loop {
+            manager.refresh_local_views("bob").await?;
+            let bob_rows = manager
+                .list_local_messages("bob", channel_id, channel_type, 200)
+                .await?;
+            bob_counts = contents
+                .iter()
+                .map(|c| {
+                    (
+                        c.clone(),
+                        bob_rows.iter().filter(|m| &m.content == c).count(),
+                    )
+                })
+                .collect();
+            if bob_counts.iter().all(|(_, n)| *n == 1)
+                || bob_counts.iter().any(|(_, n)| *n > 1)
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        for (content, hits) in &bob_counts {
+            if *hits != 1 {
                 metrics
                     .errors
                     .push(format!("bob saw '{content}' {hits} times (want exactly 1)"));
@@ -4924,6 +4949,7 @@ impl TestPhases {
         // 对端：等到同一条 server_message_id 落到 bob 本地。
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut bob_saw = false;
+        let mut downloaded_bytes = 0usize;
         loop {
             manager.refresh_local_views("bob").await?;
             let rows = manager
@@ -4953,13 +4979,362 @@ impl TestPhases {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
+        // 「bob 那边有一条同 id 的行」离「bob 能看到这张图」还差得远。收到一条
+        // 指着 file_id=0、缺缩略图、或者根本下载不下来的附件消息，界面上就是一个
+        // 永远转圈的灰块 —— 对用户而言和没收到没区别。所以解 typed metadata 并
+        // 真的把文件拉下来。
+        if bob_saw {
+            let bob_rows = manager
+                .list_local_messages("bob", channel_id, channel_type, 200)
+                .await?;
+            let row = bob_rows
+                .iter()
+                .find(|m| m.server_message_id == Some(sent_server_message_id))
+                .expect("just asserted it is there");
+            // 附件的 typed metadata 不在 `content` 里：wire 上 content 是
+            // `[图片]` 这种显示文案，file_id/尺寸/缩略图引用走 envelope 的
+            // metadata，落到接收端的 `extra`。
+            match serde_json::from_str::<serde_json::Value>(&row.extra) {
+                Ok(envelope) => {
+                    // envelope = { content: "[图片]", metadata: {...}, ... }
+                    let meta = envelope
+                        .get("metadata")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let file_id = meta.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if file_id == 0 {
+                        metrics
+                            .errors
+                            .push("received attachment has no file_id".to_string());
+                    }
+                    // 图片协议强制带缩略图引用：缺了接收端没有可渲染的东西。
+                    let thumb_id = meta
+                        .get("thumbnail_file_id")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if thumb_id == 0 {
+                        metrics
+                            .errors
+                            .push("image attachment must carry thumbnail_file_id".to_string());
+                    }
+                    // 宽高是客户端解码原图得来的。对不上说明发的根本不是这张图，
+                    // 或者压根没解码（接收端只能拿正方形兜底渲染）。
+                    let (w, h) = (
+                        meta.get("width").and_then(|v| v.as_u64()).unwrap_or(0),
+                        meta.get("height").and_then(|v| v.as_u64()).unwrap_or(0),
+                    );
+                    if (w, h) != (96, 64) {
+                        metrics.errors.push(format!(
+                            "attachment metadata size {w}x{h}, source was 96x64"
+                        ));
+                    }
+                    if row.content.contains(&source_path.display().to_string()) {
+                        metrics
+                            .errors
+                            .push("receiver got the sender's local path".to_string());
+                    }
+
+                    // 真的下载一次：能解析出 file_id 不等于对端取得到字节。
+                    if file_id != 0 {
+                        let url: FileGetUrlResponse = manager
+                            .rpc_typed(
+                                "bob",
+                                privchat_protocol::rpc::routes::file::GET_URL,
+                                &FileGetUrlRequest {
+                                    file_id,
+                                    user_id: 0,
+                                },
+                            )
+                            .await?;
+                        metrics.rpc_calls += 1;
+                        let body = reqwest::Client::new().get(&url.file_url).send().await?;
+                        if !body.status().is_success() {
+                            metrics.errors.push(format!(
+                                "attachment download failed: status={}",
+                                body.status()
+                            ));
+                        } else {
+                            let bytes = body.bytes().await?;
+                            // 明文时逐字节相等；加密时长度会带 nonce/tag 头，
+                            // 所以只要求「非空且与 get_url 自报的大小一致」。
+                            if bytes.is_empty() {
+                                metrics
+                                    .errors
+                                    .push("downloaded attachment is empty".to_string());
+                            } else if url.encryption_version == 0
+                                && bytes.as_ref() != std::fs::read(&source_path)?.as_slice()
+                            {
+                                // 明文才能逐字节比。加密附件（enc_v=1）下载到的是
+                                // 密文，长度带 nonce/tag 头，跟源文件不等长是正常的
+                                // ——那里能断言的只有「拿得到、非空」。
+                                metrics.errors.push(format!(
+                                    "downloaded plaintext differs from source ({} vs {source_bytes} bytes)",
+                                    bytes.len()
+                                ));
+                            } else {
+                                downloaded_bytes = bytes.len();
+                                metrics.rpc_successes += 1;
+                            }
+                        }
+                    }
+                }
+                Err(e) => metrics.errors.push(format!(
+                    "received attachment metadata is not typed json: {e} | raw={:?}",
+                    &row.extra.chars().take(200).collect::<String>()
+                )),
+            }
+        }
+
         Ok(PhaseResult {
             phase_name: "outbox-attachment-e2e".to_string(),
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
             details: format!(
                 "source_bytes={source_bytes} server_message_id={sent_server_message_id} \
-                 bob_received={bob_saw}"
+                 bob_received={bob_saw} bob_downloaded_bytes={downloaded_bytes}"
+            ),
+            metrics,
+        })
+    }
+
+    /// **重启窗口** —— outbox 之所以存在，就是为了扛住这一段。
+    ///
+    /// `outbox-text-durability` 只在一个进程里跑完全程：入队、发送、ack 都没离开
+    /// 内存。真正会丢消息的地方在两次运行之间，那正是它测不到的。
+    ///
+    /// 这里用「同一个 data_dir，换一个新 `PrivchatSdk`」模拟进程重启——内存里的
+    /// 一切都没了，只剩磁盘上真正提交过的东西。两段窗口：
+    ///
+    /// A. **入队后、发送前重启**：先 authenticate 再断开（出队闸门要求已认证会话，
+    ///    断开后 drain 不会跑），入队两条，确认它们停在 outbox 里没发出去，然后
+    ///    shutdown。重开后必须自己把它们发完，且 `local_message_id` 不变——变了
+    ///    就说明这不是「续上原来那条命令」，而是新造了一条，服务端幂等也就无从
+    ///    谈起。
+    ///
+    /// B. **服务端已接受、本地 ACK 没提交**：这段窗口在外部看来就是「同一条命令
+    ///    被发了两次」。把一条已发成功的消息按原 `command_id` 重新入队再 drain，
+    ///    要求服务端返回**同一个 server_message_id**、对端仍然只有一条。做不到的
+    ///    话，每次崩在 ack 前，用户就会多收到一条重复消息。
+    pub async fn phase43_outbox_survives_restart(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let channel_id = manager
+            .cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("phase43 needs the alice<->bob direct channel"))?;
+        let channel_type = DIRECT_SYNC_CHANNEL_TYPE as i32;
+        let alice_uid = manager.user_id("alice")?;
+
+        // 同一个「设备」跨两次运行：data_dir 与 device_id 都必须保持一致，否则
+        // 重开的是另一台设备，既读不到上次的 outbox，服务端幂等键也对不上
+        // （幂等按 user+device+command 作用域，见 SYNC_SPEC §3.3.5）。
+        let device_dir = manager.base_dir.join("phase43-restart-device");
+        // 服务端要求 device_id 是 UUID；同一台「设备」两次运行必须是同一个值，
+        // 否则重开的是另一台设备，幂等键也就对不上。
+        let device_id = crate::account_manager::pseudo_uuid_v4_like();
+
+        let stamp = now_millis();
+        let contents: Vec<String> = (0..2)
+            .map(|i| format!("outbox-restart-{stamp}-{i}"))
+            .collect();
+
+        // ---- A. 入队后、发送前重启 ----
+        let first = manager
+            .open_detached_sdk("alice", &device_dir, &device_id)
+            .await?;
+        first.disconnect().await?;
+
+        let mut message_ids = Vec::new();
+        for content in &contents {
+            let message_id = first
+                .create_local_message_queued(
+                    privchat_sdk::NewMessage {
+                        channel_id,
+                        channel_type,
+                        from_uid: alice_uid,
+                        message_type: 0,
+                        content: content.clone(),
+                        searchable_word: String::new(),
+                        setting: 0,
+                        extra: String::new(),
+                        mime_type: None,
+                        media_downloaded: false,
+                        thumb_status: 0,
+                    },
+                    None,
+                    "message",
+                    Vec::new(),
+                    None,
+                )
+                .await?;
+            metrics.rpc_calls += 1;
+            message_ids.push(message_id);
+        }
+
+        // 断线时必须真的停在队列里。这条断言同时守着出队闸门：如果哪天 drain
+        // 在未连接时也跑，下面「重启后才发出去」就测不到任何东西了。
+        let queued_before = first.peek_outbound_messages(100).await?;
+        let queued_ids: Vec<u64> = queued_before.iter().map(|q| q.message_id).collect();
+        for id in &message_ids {
+            if !queued_ids.contains(id) {
+                metrics.errors.push(format!(
+                    "message {id} left the outbox while offline (nothing to resume)"
+                ));
+            }
+        }
+        let mut local_ids_before = Vec::new();
+        for id in &message_ids {
+            let row = first
+                .get_message_by_id(*id)
+                .await?
+                .ok_or_else(|| boxed_err(format!("message {id} vanished before restart")))?;
+            if row.status == 2 {
+                metrics
+                    .errors
+                    .push(format!("message {id} reported sent while disconnected"));
+            }
+            local_ids_before.push(row.local_message_id);
+        }
+
+        first.shutdown().await;
+
+        // ---- 重启：同目录、同设备、全新实例 ----
+        let second = manager
+            .open_detached_sdk("alice", &device_dir, &device_id)
+            .await?;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        let mut sent_ids: Vec<u64> = Vec::new();
+        loop {
+            sent_ids.clear();
+            for id in &message_ids {
+                if let Some(row) = second.get_message_by_id(*id).await? {
+                    if row.status == 2 && row.server_message_id.is_some_and(|v| v != 0) {
+                        sent_ids.push(*id);
+                    }
+                }
+            }
+            if sent_ids.len() == message_ids.len() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if sent_ids.len() != message_ids.len() {
+            metrics.errors.push(format!(
+                "after restart only {}/{} queued messages were sent",
+                sent_ids.len(),
+                message_ids.len()
+            ));
+        }
+        metrics.rpc_successes += sent_ids.len() as u32;
+
+        for (id, before) in message_ids.iter().zip(local_ids_before.iter()) {
+            let row = second
+                .get_message_by_id(*id)
+                .await?
+                .ok_or_else(|| boxed_err(format!("message {id} lost across restart")))?;
+            if row.local_message_id != *before {
+                metrics.errors.push(format!(
+                    "message {id} local_message_id changed across restart ({before:?} -> {:?}); \
+                     that is a new command, not a resumed one",
+                    row.local_message_id
+                ));
+            }
+        }
+
+        let leftovers = second.peek_outbound_messages(100).await?;
+        let leaked: Vec<u64> = leftovers
+            .iter()
+            .map(|q| q.message_id)
+            .filter(|id| message_ids.contains(id))
+            .collect();
+        if !leaked.is_empty() {
+            metrics
+                .errors
+                .push(format!("outbox still holds sent messages after restart: {leaked:?}"));
+        }
+
+        // ---- B. ACK 窗口：同一条命令被重放 ----
+        let replay_id = message_ids[0];
+        let replay_row = second
+            .get_message_by_id(replay_id)
+            .await?
+            .ok_or_else(|| boxed_err("replay target missing"))?;
+        let first_server_id = replay_row.server_message_id.unwrap_or(0);
+        let mut replay_server_id = first_server_id;
+        if first_server_id == 0 {
+            metrics
+                .errors
+                .push("cannot exercise the ack window without a server id".to_string());
+        } else {
+            second.enqueue_outbound_message(replay_id, Vec::new()).await?;
+            metrics.rpc_calls += 1;
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let still_queued = second
+                    .peek_outbound_messages(100)
+                    .await?
+                    .iter()
+                    .any(|q| q.message_id == replay_id);
+                if !still_queued || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let after = second
+                .get_message_by_id(replay_id)
+                .await?
+                .ok_or_else(|| boxed_err("replay target missing after replay"))?;
+            replay_server_id = after.server_message_id.unwrap_or(0);
+            if replay_server_id != first_server_id {
+                metrics.errors.push(format!(
+                    "replayed command produced a different server id ({first_server_id} -> \
+                     {replay_server_id}); a crash before ack would duplicate the message"
+                ));
+            }
+        }
+
+        second.shutdown().await;
+
+        // ---- 对端：每条恰好一次，重放的那条也不例外 ----
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut bob_counts: Vec<(String, usize)> = Vec::new();
+        loop {
+            manager.refresh_local_views("bob").await?;
+            let rows = manager
+                .list_local_messages("bob", channel_id, channel_type, 200)
+                .await?;
+            bob_counts = contents
+                .iter()
+                .map(|c| (c.clone(), rows.iter().filter(|m| &m.content == c).count()))
+                .collect();
+            if bob_counts.iter().all(|(_, n)| *n == 1)
+                || bob_counts.iter().any(|(_, n)| *n > 1)
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        for (content, hits) in &bob_counts {
+            if *hits != 1 {
+                metrics
+                    .errors
+                    .push(format!("bob saw '{content}' {hits} times (want exactly 1)"));
+            }
+        }
+
+        Ok(PhaseResult {
+            phase_name: "outbox-restart-window".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: format!(
+                "queued_offline={} sent_after_restart={} replay_server_id_stable={}",
+                message_ids.len(),
+                sent_ids.len(),
+                replay_server_id == first_server_id && first_server_id != 0
             ),
             metrics,
         })
