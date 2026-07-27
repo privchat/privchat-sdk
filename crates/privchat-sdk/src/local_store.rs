@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -230,6 +230,9 @@ pub struct LocalStore {
     account_dbs: Arc<Mutex<HashMap<String, sled::Db>>>,
     global_db: Arc<Mutex<Option<sled::Db>>>,
     sqlite_conns: Arc<Mutex<HashMap<String, Connection>>>,
+    /// 本进程已经搬过旧 sled 队列的用户。搬运本身幂等，这里只是免得每次
+    /// `ensure_user_storage` 都去扫一遍队列目录。
+    queues_migrated: Arc<Mutex<HashSet<String>>>,
 }
 
 /// A guard that returns the connection to the cache when dropped
@@ -275,6 +278,7 @@ impl LocalStore {
             account_dbs: Arc::new(Mutex::new(HashMap::new())),
             global_db: Arc::new(Mutex::new(None)),
             sqlite_conns: Arc::new(Mutex::new(HashMap::new())),
+            queues_migrated: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -418,6 +422,32 @@ impl LocalStore {
         std::fs::create_dir_all(&paths.normal_queue_path)
             .map_err(|e| Error::Storage(format!("create normal queue path: {e}")))?;
         self.init_user_db(uid, &paths.db_path)?;
+
+        // 迁移必须在任何人读 outbox 之前完成，否则从旧版本升上来的用户，
+        // sled 里那些还没发出的消息就一直没人消费——表现为几条永远「发送中」。
+        let already = {
+            let guard = self
+                .queues_migrated
+                .lock()
+                .map_err(|_| Error::Storage("queues_migrated lock poisoned".to_string()))?;
+            guard.contains(uid)
+        };
+        if !already {
+            match self.migrate_sled_queues_into_outbox(uid, &paths) {
+                Ok(moved) => {
+                    if moved > 0 {
+                        tracing::info!(uid, moved, "migrated legacy sled queue items into outbox");
+                    }
+                }
+                Err(e) => {
+                    // 不阻断启动：搬不动的项还留在 sled 里，下次再试。
+                    tracing::warn!(uid, error = %e, "legacy queue migration failed");
+                }
+            }
+            if let Ok(mut guard) = self.queues_migrated.lock() {
+                guard.insert(uid.to_string());
+            }
+        }
         Ok(paths)
     }
 
@@ -3574,14 +3604,34 @@ impl LocalStore {
         payload: &[u8],
         route_key: Option<&str>,
     ) -> Result<()> {
-        // 消息类命令：command_id 用本地 message.id 派生，天然稳定且重试不变。
-        // 非消息命令由调用方自带 command_id（`outbox_enqueue_command`）。
-        let command_id = format!("msg:{local_message_id}");
+
         let mut conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let tx = conn
             .transaction()
             .map_err(|e| Error::Storage(format!("outbox enqueue begin tx: {e}")))?;
+        // command_id 必须由**服务端可见的**幂等身份派生，也就是 Snowflake
+        // `message.local_message_id`——不是 SQLite 的 `message.id`（那只在本机
+        // 这个库里稳定，换设备/重装就没了意义）。CODEX-2 把三个 ID 分权正是
+        // 为了不再混用：id=本地行身份，local_message_id=幂等，
+        // server_message_id=网络身份。
+        let snowflake: i64 = tx
+            .query_row(
+                "SELECT local_message_id FROM message WHERE id = ?1",
+                params![local_message_id as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("outbox enqueue read identity: {e}")))?
+            .unwrap_or(0);
+        if snowflake <= 0 {
+            return Err(Error::Storage(format!(
+                "outbox enqueue: message.id={local_message_id} has no local_message_id; \
+                 refusing to mint an idempotency key the server cannot honour"
+            )));
+        }
+        let command_id = format!("msg:{snowflake}");
+
         tx.execute(
             "UPDATE message SET status = 1, updated_at = ?2 WHERE id = ?1",
             params![local_message_id as i64, now_ms],
@@ -3612,6 +3662,67 @@ impl LocalStore {
         tx.commit()
             .map_err(|e| Error::Storage(format!("outbox enqueue commit: {e}")))?;
         Ok(())
+    }
+
+    /// 把旧 sled 队列里**尚未发出**的命令搬进 SQLite outbox，一次性。
+    ///
+    /// 不做这一步，从旧版本升上来的用户，队列里那些还没发出去的消息会永远留在
+    /// sled 里没人消费——用户看到的就是几条永远「发送中」。
+    ///
+    /// 幂等：靠 `command_id` 唯一约束；重复运行不会重复入队。搬完把 sled 里的
+    /// 项删掉，避免下次启动再扫一遍。
+    ///
+    /// 接 `paths` 而不是自己去 `ensure_user_storage`：它正是被
+    /// `ensure_user_storage` 调用的，回调过去就是无限递归。
+    pub fn migrate_sled_queues_into_outbox(
+        &self,
+        uid: &str,
+        paths: &StoragePaths,
+    ) -> Result<usize> {
+        let mut moved = 0usize;
+
+        let mut drain = |db_path: &Path, command_type: &str| -> Result<()> {
+            if !db_path.exists() {
+                return Ok(());
+            }
+            let db = Self::open_db(db_path)?;
+            let mut done: Vec<[u8; 8]> = Vec::new();
+            for row in db.iter() {
+                let (k, v) = row
+                    .map_err(|e| Error::Storage(format!("legacy queue iter: {e}")))?;
+                let Ok(key) = <[u8; 8]>::try_from(k.as_ref()) else {
+                    continue;
+                };
+                let message_id = u64::from_be_bytes(key);
+                // 本地行没了就没什么可发的了。
+                if self.get_message_by_id(uid, message_id)?.is_none() {
+                    done.push(key);
+                    continue;
+                }
+                match self.outbox_enqueue(uid, message_id, command_type, 0, &v, None) {
+                    Ok(()) => {
+                        moved += 1;
+                        done.push(key);
+                    }
+                    Err(e) => {
+                        // 例如缺 local_message_id：留在 sled 里，下次再试，
+                        // 不要静默丢掉一条用户以为发出去了的消息。
+                        tracing::warn!(message_id, error = %e, "legacy queue item not migrated");
+                    }
+                }
+            }
+            for key in done {
+                let _ = db.remove(key);
+            }
+            let _ = db.flush();
+            Ok(())
+        };
+
+        drain(&paths.normal_queue_path, "message")?;
+        for file_path in &paths.file_queue_paths {
+            drain(file_path, "attachment")?;
+        }
+        Ok(moved)
     }
 
     /// 到期的出站命令，最老的先来。
@@ -3720,6 +3831,59 @@ impl LocalStore {
             params![local_message_id as i64, next_attempt_at, last_error, now_ms],
         )
         .map_err(|e| Error::Storage(format!("outbox bump retry: {e}")))?;
+        Ok(())
+    }
+
+    /// 服务端拒绝：**标记消息失败与删除命令在同一事务**。
+    ///
+    /// 分两步写的话，崩在中间要么消息显示失败但命令还在队列（下轮再发一次被拒
+    /// 的消息），要么命令没了而消息永远停在发送中。
+    pub fn outbox_reject(&self, uid: &str, local_message_id: u64, status: i64) -> Result<()> {
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("outbox reject begin tx: {e}")))?;
+        tx.execute(
+            "UPDATE message SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![local_message_id as i64, status, now_ms],
+        )
+        .map_err(|e| Error::Storage(format!("outbox reject mark message: {e}")))?;
+        tx.execute(
+            "DELETE FROM outbox WHERE message_id = ?1",
+            params![local_message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("outbox reject delete row: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("outbox reject commit: {e}")))?;
+        Ok(())
+    }
+
+    /// 自推送对账：服务端其实已收下（推送/同步先到），本地补记并清命令，同一事务。
+    pub fn outbox_reconcile_sent(
+        &self,
+        uid: &str,
+        local_message_id: u64,
+        server_message_id: u64,
+    ) -> Result<()> {
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("outbox reconcile begin tx: {e}")))?;
+        tx.execute(
+            "UPDATE message SET server_message_id = ?1, status = 2, updated_at = ?2
+             WHERE id = ?3",
+            params![server_message_id as i64, now_ms, local_message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("outbox reconcile mark sent: {e}")))?;
+        tx.execute(
+            "DELETE FROM outbox WHERE message_id = ?1",
+            params![local_message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("outbox reconcile delete row: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("outbox reconcile commit: {e}")))?;
         Ok(())
     }
 
@@ -5113,6 +5277,69 @@ mod tests {
             .outbox_enqueue(uid, id, "message", 100, b"payload", None)
             .expect("enqueue");
         id
+    }
+
+    /// 从旧版本升级：sled 队列里还没发出的命令必须被搬进 outbox。
+    ///
+    /// 不搬的话，那些消息永远没人消费——用户看到的就是几条永远「发送中」。
+    #[test]
+    fn legacy_sled_queue_items_are_migrated_into_the_outbox() {
+        let store = test_store();
+        let uid = "10003-sled-migrate";
+        let paths = store.ensure_user_storage(uid).expect("paths");
+        let input = NewMessage {
+            channel_id: 100,
+            channel_type: 1,
+            from_uid: 200,
+            message_type: 1,
+            content: "unsent when the app was upgraded".to_string(),
+            searchable_word: "x".to_string(),
+            setting: 0,
+            extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
+        };
+        let id = store
+            .create_local_message(uid, &input, 987_654)
+            .expect("create local message");
+
+        // 旧版本留下的队列项。
+        store
+            .normal_queue_push(uid, id, b"legacy-payload")
+            .expect("legacy push");
+        assert_eq!(store.normal_queue_peek(uid, 10).expect("peek").len(), 1);
+
+        let moved = store
+            .migrate_sled_queues_into_outbox(uid, &paths)
+            .expect("migrate");
+
+        assert_eq!(moved, 1);
+        let queued = store
+            .outbox_peek(uid, "message", 10, i64::MAX)
+            .expect("outbox peek");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, id);
+        assert_eq!(queued[0].3, b"legacy-payload".to_vec());
+        assert!(
+            store.normal_queue_peek(uid, 10).expect("peek after").is_empty(),
+            "搬完要清掉，别下次启动再扫一遍"
+        );
+
+        // 幂等：再跑一次不重复入队。
+        assert_eq!(
+            store
+                .migrate_sled_queues_into_outbox(uid, &paths)
+                .expect("migrate again"),
+            0
+        );
+        assert_eq!(
+            store
+                .outbox_peek(uid, "message", 10, i64::MAX)
+                .expect("peek")
+                .len(),
+            1
+        );
     }
 
     /// 确认送达是一个事务：消息变已发送、outbox 行消失，两件事一起发生。

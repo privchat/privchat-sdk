@@ -69,6 +69,13 @@ CREATE INDEX IF NOT EXISTS idx_outbox_coalesce
 -- Anything still in it describes a message the server accepted, so apply it
 -- here rather than dropping it on the floor. Migrations run before the SDK
 -- does anything, so this is the only chance to do so.
+-- 先清掉会撞唯一索引的重复行：同一个 server_message_id 可能已经由推送/同步
+-- 落成了另一条 message 行。不先删，下面的 UPDATE 会因为
+-- `server_message_id` 全局唯一索引整条迁移失败，用户升级即打不开数据库。
+DELETE FROM message
+WHERE id NOT IN (SELECT message_id FROM outbound_ack_pending)
+  AND server_message_id IN (SELECT server_message_id FROM outbound_ack_pending);
+
 UPDATE message
 SET server_message_id = (
         SELECT p.server_message_id FROM outbound_ack_pending p

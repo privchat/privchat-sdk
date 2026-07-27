@@ -219,6 +219,16 @@ enum StorageCmd {
         local_message_id: u64,
         resp: oneshot::Sender<Result<()>>,
     },
+    OutboxReject {
+        local_message_id: u64,
+        status: i64,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    OutboxReconcileSent {
+        local_message_id: u64,
+        server_message_id: u64,
+        resp: oneshot::Sender<Result<()>>,
+    },
     OutboxUpdatePayload {
         local_message_id: u64,
         payload: Vec<u8>,
@@ -1075,6 +1085,36 @@ impl StorageHandle {
         self.tx
             .send(StorageCmd::OutboxDrop {
                 local_message_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// 服务端拒绝：标记消息失败 + 删除命令，同一事务。
+    pub async fn outbox_reject(&self, local_message_id: u64, status: i64) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::OutboxReject {
+                local_message_id,
+                status,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// 自推送对账：补记已送达 + 删除命令，同一事务。
+    pub async fn outbox_reconcile_sent(
+        &self,
+        local_message_id: u64,
+        server_message_id: u64,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::OutboxReconcileSent {
+                local_message_id,
+                server_message_id,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -2345,6 +2385,24 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             resp,
         } => {
             with_uid!(resp, |uid| store.outbox_drop(&uid, local_message_id));
+        }
+        StorageCmd::OutboxReject {
+            local_message_id,
+            status,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.outbox_reject(&uid, local_message_id, status));
+        }
+        StorageCmd::OutboxReconcileSent {
+            local_message_id,
+            server_message_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.outbox_reconcile_sent(
+                &uid,
+                local_message_id,
+                server_message_id
+            ));
         }
         StorageCmd::OutboxUpdatePayload {
             local_message_id,

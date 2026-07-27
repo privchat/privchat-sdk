@@ -6481,7 +6481,12 @@ impl State {
                         .await_server_message_id(message_id, 12, Duration::from_millis(80))
                         .await
                     {
-                        let _ = self.storage.outbox_drop(message_id).await;
+                        // 补记已送达 + 清命令，同一事务：分两步写的话，崩在
+                        // 中间下一轮会把这条已经送达的消息再发一次。
+                        let _ = self
+                            .storage
+                            .outbox_reconcile_sent(message_id, server_message_id)
+                            .await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "normal".to_string(),
                             action: "dequeue_reconciled".to_string(),
@@ -6502,6 +6507,12 @@ impl State {
                             "[SDK.actor] normal queue send deferred (retryable): message_id={} error={}",
                             message_id, e
                         );
+                        // 写退避，否则这条命令下一轮立刻又被取出，变成忙循环打服务端。
+                        let next_at = self.outbox_next_attempt_at(retry_count);
+                        let _ = self
+                            .storage
+                            .outbox_bump_retry(message_id, next_at, &e.to_string())
+                            .await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "normal".to_string(),
                             action: format!("deferred:{}", e),
@@ -6514,7 +6525,8 @@ impl State {
                         "[SDK.actor] normal queue send failed: message_id={} error={}",
                         message_id, e
                     );
-                    let _ = self.storage.update_message_status(message_id, 3).await;
+                    // 标记失败 + 删命令，同一事务（见 outbox_reject）。
+                    let _ = self.storage.outbox_reject(message_id, 3).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "normal".to_string(),
                         action: "failed".to_string(),
@@ -6527,7 +6539,7 @@ impl State {
                             status: 3,
                             server_message_id: None,
                         });
-                    let _ = self.storage.outbox_drop(message_id).await;
+                    // 命令行已在 outbox_reject 的同一事务里删掉了，这里只报事件。
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "normal".to_string(),
                         action: "failed_drop".to_string(),
@@ -6625,7 +6637,10 @@ impl State {
                         .await_server_message_id(message_id, 12, Duration::from_millis(80))
                         .await
                     {
-                        let _ = self.storage.outbox_drop(message_id).await;
+                        let _ = self
+                            .storage
+                            .outbox_reconcile_sent(message_id, server_message_id)
+                            .await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
                             action: "dequeue_reconciled".to_string(),
@@ -6649,6 +6664,12 @@ impl State {
                             "[SDK.actor] file queue send deferred (retryable): queue_index={} message_id={} error={}",
                             queue_index, message_id, e
                         );
+                        // 同 normal 分支：不写退避就会忙循环。
+                        let next_at = self.outbox_next_attempt_at(retry_count);
+                        let _ = self
+                            .storage
+                            .outbox_bump_retry(message_id, next_at, &e.to_string())
+                            .await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
                             action: format!("deferred:{}", e),
@@ -6674,7 +6695,6 @@ impl State {
                             status: 3,
                             server_message_id: None,
                         });
-                    let _ = self.storage.outbox_drop(message_id).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: "failed_drop".to_string(),
