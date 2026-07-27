@@ -5799,9 +5799,9 @@ impl State {
 
                     // Auto-download thumbnail for incoming image/video messages
                     let is_image_or_video = message_type
-                        == i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(1)
+                        == i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(2)
                         || message_type
-                            == i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(4);
+                            == i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(3);
                     if is_image_or_video && !from_self {
                         if let Ok(paths) = self.storage.get_storage_paths().await {
                             let user_root = PathBuf::from(&paths.user_root);
@@ -7699,34 +7699,62 @@ impl State {
 
     /// 单条历史消息落库（SDK-HISTORY-2 核心）：status=2 + 真实 pts(=message_seq)。
     /// get/around 回填共用；upsert 的乱序回退 guard 由 order_seq 保证幂等。
+    /// history / around 响应的一条消息 → 落库入参。
+    ///
+    /// 一处定义,三条回填路径共用(store_history_item / channel hydrate /
+    /// bootstrap 内联 hydrate)。此前是三份手抄,`extra` 在其中两份里被写成空串,
+    /// 于是同一条图片消息「翻页翻到」和「hydrate 拉到」的行内容不一样——这种分叉
+    /// 只要还存在三份,就一定会再次发生。
+    fn history_item_to_upsert_input(
+        item: &MessageHistoryItem,
+        channel_type: i32,
+    ) -> UpsertRemoteMessageInput {
+        // metadata 必须进 extra,而且要和 push 路径同一个 envelope 形状:媒体消息的
+        // file_id / 宽高 / thumbnail_file_id / thumbnail_url 全在里面。丢掉它,图片行
+        // 就没有任何可下载的东西——缩略图触发点找不到 file id,判定「这条消息本来就
+        // 没有缩略图」并永久标记,气泡从此是一个灰块。
+        let extra = item
+            .metadata
+            .as_ref()
+            .map(|metadata| {
+                serde_json::json!({ "content": item.content, "metadata": metadata }).to_string()
+            })
+            .unwrap_or_default();
+        let pts = item.message_seq.unwrap_or(0);
+        UpsertRemoteMessageInput {
+            server_message_id: item.message_id,
+            local_message_id: 0,
+            channel_id: item.channel_id,
+            channel_type,
+            // history 的 timestamp 是毫秒(server message_view_json 用
+            // created_at.timestamp_millis()),即消息的发送时间。
+            timestamp: i64::try_from(item.timestamp).unwrap_or(i64::MAX),
+            from_uid: item.sender_id,
+            message_type: Self::wire_message_type_to_i32(&item.message_type),
+            content: item.content.clone(),
+            status: 2,
+            // SDK-HISTORY-2：server history 响应带 message_seq(=per-channel pts)，
+            // 回填真实值（此前落 0 导致排序权威失效）；老 server 缺字段兜底 0。
+            pts,
+            setting: 0,
+            order_seq: pts,
+            searchable_word: String::new(),
+            mime_type: Self::extract_mime_type_from_json(&item.content, &extra),
+            extra,
+        }
+    }
+
     async fn store_history_item(
         &mut self,
         item: &MessageHistoryItem,
         channel_type: i32,
     ) -> Result<u64> {
-        let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
-        let message_type = Self::wire_message_type_to_i32(&item.message_type);
-        let mime_type = Self::extract_mime_type_from_json(&item.content, "");
-        let pts = item.message_seq.unwrap_or(0);
         Ok(self
             .storage
-            .upsert_remote_message_with_result(UpsertRemoteMessageInput {
-                server_message_id: item.message_id,
-                local_message_id: 0,
-                channel_id: item.channel_id,
+            .upsert_remote_message_with_result(Self::history_item_to_upsert_input(
+                item,
                 channel_type,
-                timestamp: timestamp_ms,
-                from_uid: item.sender_id,
-                message_type,
-                content: item.content.clone(),
-                status: 2,
-                pts,
-                setting: 0,
-                order_seq: pts,
-                searchable_word: String::new(),
-                extra: String::new(),
-                mime_type,
-            })
+            ))
             .await?
             .message_id)
     }
@@ -7812,29 +7840,12 @@ impl State {
         let mut applied = 0usize;
         for item in resp.messages {
             let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
-            let message_type = Self::wire_message_type_to_i32(&item.message_type);
-            let mime_type = Self::extract_mime_type_from_json(&item.content, "");
             let message_id = self
                 .storage
-                .upsert_remote_message_with_result(UpsertRemoteMessageInput {
-                    server_message_id: item.message_id,
-                    local_message_id: 0,
-                    channel_id: item.channel_id,
-                    channel_type: normalized_channel_type,
-                    timestamp: timestamp_ms,
-                    from_uid: item.sender_id,
-                    message_type,
-                    content: item.content.clone(),
-                    status: 2,
-                    // SDK-HISTORY-2：server history 响应带 message_seq(=per-channel pts)，
-                    // 回填真实值（此前落 0 导致排序权威失效）；老 server 缺字段兜底 0。
-                    pts: item.message_seq.unwrap_or(0),
-                    setting: 0,
-                    order_seq: item.message_seq.unwrap_or(0),
-                    searchable_word: String::new(),
-                    extra: String::new(),
-                    mime_type,
-                })
+                .upsert_remote_message_with_result(Self::history_item_to_upsert_input(
+                    &item,
+                    normalized_channel_type,
+                ))
                 .await?
                 .message_id;
             let _ = self
@@ -8980,28 +8991,12 @@ impl State {
 
             for item in resp.messages {
                 let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
-                let message_type = Self::wire_message_type_to_i32(&item.message_type);
-                let mime_type = Self::extract_mime_type_from_json(&item.content, "");
                 let message_id = self
                     .storage
-                    .upsert_remote_message_with_result(UpsertRemoteMessageInput {
-                        server_message_id: item.message_id,
-                        local_message_id: 0,
-                        channel_id: item.channel_id,
-                        channel_type: normalized_channel_type,
-                        timestamp: timestamp_ms,
-                        from_uid: item.sender_id,
-                        message_type,
-                        content: item.content.clone(),
-                        status: 2,
-                        // SDK-HISTORY-2：同上，bootstrap 内联 hydrate 也回填真实 pts。
-                        pts: item.message_seq.unwrap_or(0),
-                        setting: 0,
-                        order_seq: item.message_seq.unwrap_or(0),
-                        searchable_word: String::new(),
-                        extra: String::new(),
-                        mime_type,
-                    })
+                    .upsert_remote_message_with_result(Self::history_item_to_upsert_input(
+                        &item,
+                        normalized_channel_type,
+                    ))
                     .await?
                     .message_id;
                 // Bootstrap history hydration should not bump unread —
@@ -12565,8 +12560,10 @@ impl PrivchatSdk {
                         if let Ok(ref messages) = result {
                             if let Ok(paths) = state.storage.get_storage_paths().await {
                                 let user_root = PathBuf::from(&paths.user_root);
-                                let image_type = i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(1);
-                                let video_type = i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(4);
+                                // 兜底值写的是这两个类型自己的判别值,不是随便挑的:写错的兜底一旦被
+                                // 用上,就会拿 Voice/File 去当图片匹配。
+                                let image_type = i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(2);
+                                let video_type = i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(3);
                                 for msg in messages {
                                     if (msg.message_type == image_type || msg.message_type == video_type)
                                         && msg.thumb_status == 0
@@ -16327,6 +16324,57 @@ impl PrivchatSdk {
 
 #[cfg(test)]
 mod tests {
+    /// history 回填必须把 `metadata` 带进 `extra`。
+    ///
+    /// 生产事故的回归:翻页拉回来的图片消息 extra 是空串,而 file_id /
+    /// thumbnail_file_id / thumbnail_url 全在 metadata 里。缩略图触发点因此找不到
+    /// 任何可下载的东西,判定「这条消息本来就没有缩略图」并写下 thumb_status=3 ——
+    /// 那是个终态,此后永不重试,气泡永远是灰块。实测受影响设备上五条图片行全是
+    /// extra_len=0 + thumb_status=3。
+    #[test]
+    fn history_item_carries_metadata_into_extra() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("file_id".into(), serde_json::json!(7120));
+        metadata.insert("thumbnail_file_id".into(), serde_json::json!(7119));
+        metadata.insert(
+            "thumbnail_url".into(),
+            serde_json::json!("https://example.invalid/7119.webp"),
+        );
+        let item = privchat_protocol::rpc::message::history::MessageHistoryItem {
+            message_id: 604_621_803_637_178_368,
+            channel_id: 45,
+            sender_id: 100_000_028,
+            content: "[图片]".to_string(),
+            message_type: "image".to_string(),
+            timestamp: 1_785_148_271_317,
+            message_seq: Some(14),
+            reply_to_message_id: None,
+            metadata: Some(metadata),
+            revoked: false,
+            revoked_at: None,
+            revoked_by: None,
+        };
+
+        let input = State::history_item_to_upsert_input(&item, 1);
+
+        // 落库的是发送时间,不是本机现在几点。
+        assert_eq!(input.timestamp, 1_785_148_271_317);
+        assert_eq!(input.pts, 14);
+        // 类型判别值:Image = 2。触发缩略图下载的两个点都按这个值匹配。
+        assert_eq!(input.message_type, 2);
+        // 而且 extra 里的东西必须真的能被缩略图路径找到——断言「extra 非空」是
+        // 不够的,那正是这个 bug 骗过所有人的方式。
+        assert_eq!(
+            State::extract_thumbnail_file_id(&input.extra),
+            Some(7119),
+            "缩略图下载靠这个 file_id;取不到就会被判成「没有缩略图」"
+        );
+        assert_eq!(
+            State::extract_thumbnail_url(&input.extra).as_deref(),
+            Some("https://example.invalid/7119.webp"),
+        );
+    }
+
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
         outbound_queue_ready,
