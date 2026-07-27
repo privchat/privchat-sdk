@@ -181,7 +181,7 @@ use privchat_protocol::rpc::{
 };
 use privchat_sdk::{
     ConnectionState as SdkConnectionState, ContactCardMessageInput as SdkContactCardMessageInput,
-    Error as SdkError, FileQueueRef as SdkFileQueueRef, LinkMessageInput as SdkLinkMessageInput,
+    Error as SdkError, LinkMessageInput as SdkLinkMessageInput,
     LocalAccountSummary as SdkLocalAccountSummary, LocationMessageInput as SdkLocationMessageInput,
     LoginResult as SdkLoginResult, MediaProcessOp as SdkMediaProcessOp,
     MentionInput as SdkMentionInput, NetworkHint as SdkNetworkHint, NewMessage as SdkNewMessage,
@@ -1494,7 +1494,6 @@ pub enum SdkEvent {
         kind: String,
         action: String,
         message_id: Option<u64>,
-        queue_index: Option<u64>,
     },
     TimelineUpdated {
         channel_id: u64,
@@ -1588,12 +1587,6 @@ pub struct SequencedSdkEvent {
 pub struct QueueMessage {
     pub message_id: u64,
     pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct FileQueueRef {
-    pub queue_index: u64,
-    pub message_id: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2493,12 +2486,10 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             kind,
             action,
             message_id,
-            queue_index,
         } => SdkEvent::OutboundQueueUpdated {
             kind,
             action,
             message_id,
-            queue_index: queue_index.map(|v| v as u64),
         },
         privchat_sdk::SdkEvent::TimelineUpdated {
             channel_id,
@@ -2797,13 +2788,11 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             kind,
             action,
             message_id,
-            queue_index,
         } => json!({
             "type": "outbound_queue_updated",
             "kind": kind,
             "action": action,
-            "message_id": message_id,
-            "queue_index": queue_index
+            "message_id": message_id
         }),
         SdkEvent::TimelineUpdated {
             channel_id,
@@ -2999,13 +2988,6 @@ fn map_queue_message(r: SdkQueueMessage) -> QueueMessage {
     QueueMessage {
         message_id: r.message_id,
         payload: r.payload,
-    }
-}
-
-fn map_file_queue_ref(r: SdkFileQueueRef) -> FileQueueRef {
-    FileQueueRef {
-        queue_index: r.queue_index as u64,
-        message_id: r.message_id,
     }
 }
 
@@ -7541,39 +7523,6 @@ impl PrivchatClient {
 
 
 
-    pub async fn enqueue_outbound_file(
-        &self,
-        message_id: u64,
-        route_key: String,
-        payload: Vec<u8>,
-    ) -> Result<FileQueueRef, PrivchatFfiError> {
-        if !self.send_queue_enabled.load(Ordering::Relaxed) {
-            return Err(PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                detail: "send queue disabled".to_string(),
-            });
-        }
-        if let Some(msg) = self.get_message_by_id(message_id).await? {
-            let disabled = self.disabled_channel_queues.lock().await;
-            if disabled.contains(&(msg.channel_id, msg.channel_type)) {
-                return Err(PrivchatFfiError::SdkError {
-                    code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                    detail: format!(
-                        "channel send queue disabled: channel_id={}, channel_type={}",
-                        msg.channel_id, msg.channel_type
-                    ),
-                });
-            }
-        }
-        let out = self
-            .inner
-            .enqueue_outbound_file(message_id, route_key, payload)
-            .await
-            .map_err(PrivchatFfiError::from)?;
-        Ok(map_file_queue_ref(out))
-    }
-
-
 
     pub async fn create_local_message(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
         self.inner
@@ -8731,30 +8680,6 @@ impl PrivchatClient {
             .into_iter()
             .filter(|m| m.content.to_lowercase().contains(&needle))
             .collect())
-    }
-
-    pub async fn send_attachment_bytes(
-        &self,
-        message_id: u64,
-        route_key: String,
-        payload: Vec<u8>,
-    ) -> Result<FileQueueRef, PrivchatFfiError> {
-        self.enqueue_outbound_file(message_id, route_key, payload)
-            .await
-    }
-
-    pub async fn send_attachment_from_path(
-        &self,
-        message_id: u64,
-        route_key: String,
-        path: String,
-    ) -> Result<FileQueueRef, PrivchatFfiError> {
-        let payload = std::fs::read(path).map_err(|e| PrivchatFfiError::SdkError {
-            code: privchat_protocol::ErrorCode::InternalError as u32,
-            detail: format!("read attachment failed: {e}"),
-        })?;
-        self.enqueue_outbound_file(message_id, route_key, payload)
-            .await
     }
 
     pub async fn download_attachment_to_path(

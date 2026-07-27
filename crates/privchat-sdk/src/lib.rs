@@ -554,7 +554,6 @@ pub enum SdkEvent {
         kind: String,
         action: String,
         message_id: Option<u64>,
-        queue_index: Option<usize>,
     },
     TimelineUpdated {
         channel_id: u64,
@@ -1407,12 +1406,6 @@ async fn start_inbound_task(
 pub struct QueueMessage {
     pub message_id: u64,
     pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileQueueRef {
-    pub queue_index: usize,
-    pub message_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2413,11 +2406,10 @@ enum Command {
         message_ids: Vec<u64>,
         resp: oneshot::Sender<Result<usize>>,
     },
-    EnqueueOutboundFile {
+    EnqueueOutboundAttachment {
         message_id: u64,
         route_key: String,
-        payload: Vec<u8>,
-        resp: oneshot::Sender<Result<FileQueueRef>>,
+        resp: oneshot::Sender<Result<u64>>,
     },
     PeekOutboundFiles {
         limit: usize,
@@ -6438,7 +6430,6 @@ impl State {
                         kind: "normal".to_string(),
                         action: "drop_missing".to_string(),
                         message_id: Some(message_id),
-                        queue_index: None,
                     });
                     processed += 1;
                     continue;
@@ -6470,8 +6461,7 @@ impl State {
                             kind: "normal".to_string(),
                             action: "commit_retry".to_string(),
                             message_id: Some(message_id),
-                            queue_index: None,
-                        });
+                            });
                         return Err(err);
                     }
                     let last_ts = if msg.created_at > 0 {
@@ -6494,7 +6484,6 @@ impl State {
                         kind: "normal".to_string(),
                         action: "dequeue".to_string(),
                         message_id: Some(message_id),
-                        queue_index: None,
                     });
                     self.pending_events
                         .push(SdkEvent::MessageSendStatusChanged {
@@ -6532,8 +6521,7 @@ impl State {
                             kind: "normal".to_string(),
                             action: "dequeue_reconciled".to_string(),
                             message_id: Some(message_id),
-                            queue_index: None,
-                        });
+                            });
                         self.pending_events
                             .push(SdkEvent::MessageSendStatusChanged {
                                 message_id,
@@ -6567,8 +6555,7 @@ impl State {
                             kind: "normal".to_string(),
                             action: format!("deferred:{}", e),
                             message_id: Some(message_id),
-                            queue_index: None,
-                        });
+                            });
                         break;
                     }
                     eprintln!(
@@ -6589,7 +6576,6 @@ impl State {
                         kind: "normal".to_string(),
                         action: "failed".to_string(),
                         message_id: Some(message_id),
-                        queue_index: None,
                     });
                     self.pending_events
                         .push(SdkEvent::MessageSendStatusChanged {
@@ -6602,7 +6588,6 @@ impl State {
                         kind: "normal".to_string(),
                         action: "failed_drop".to_string(),
                         message_id: Some(message_id),
-                        queue_index: None,
                     });
                     processed += 1;
                     continue;
@@ -6612,7 +6597,7 @@ impl State {
         Ok(processed)
     }
 
-    async fn drain_file_queue_once(&mut self, queue_index: usize, limit: usize) -> Result<usize> {
+    async fn drain_attachment_outbox_once(&mut self, limit: usize) -> Result<usize> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let items = self
             .storage
@@ -6622,8 +6607,7 @@ impl State {
             return Ok(0);
         }
         eprintln!(
-            "[SDK.actor] drain_file_queue_once: queue_index={} items={}",
-            queue_index,
+            "[SDK.actor] drain_attachment_outbox_once: items={}",
             items.len()
         );
         let mut processed = 0usize;
@@ -6636,7 +6620,6 @@ impl State {
                         kind: "file".to_string(),
                         action: "drop_missing".to_string(),
                         message_id: Some(message_id),
-                        queue_index: Some(queue_index),
                     });
                     processed += 1;
                     continue;
@@ -6644,7 +6627,7 @@ impl State {
             };
             let local_message_id = self.ensure_local_message_id(message_id).await?;
             eprintln!(
-                "[SDK.actor] drain_file_queue_once: processing message_id={} payload_len={} created_at={}",
+                "[SDK.actor] drain_attachment_outbox_once: processing message_id={} payload_len={} created_at={}",
                 message_id,
                 payload.len(),
                 msg.created_at
@@ -6670,15 +6653,13 @@ impl State {
                             kind: "file".to_string(),
                             action: "commit_retry".to_string(),
                             message_id: Some(message_id),
-                            queue_index: Some(queue_index),
-                        });
+                            });
                         return Err(err);
                     }
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: "dequeue".to_string(),
                         message_id: Some(message_id),
-                        queue_index: Some(queue_index),
                     });
                     self.pending_events
                         .push(SdkEvent::MessageSendStatusChanged {
@@ -6711,8 +6692,7 @@ impl State {
                             kind: "file".to_string(),
                             action: "dequeue_reconciled".to_string(),
                             message_id: Some(message_id),
-                            queue_index: Some(queue_index),
-                        });
+                            });
                         self.pending_events
                             .push(SdkEvent::MessageSendStatusChanged {
                                 message_id,
@@ -6727,8 +6707,8 @@ impl State {
                         // and stop draining — next connection / auth / enqueue trigger
                         // will retry. Don't ack, don't mark the message failed.
                         eprintln!(
-                            "[SDK.actor] file queue send deferred (retryable): queue_index={} message_id={} error={}",
-                            queue_index, message_id, e
+                            "[SDK.actor] attachment send deferred (retryable): message_id={} error={}",
+                            message_id, e
                         );
                         // 同 normal 分支：不写退避就会忙循环。
                         let next_at = self.outbox_next_attempt_at(retry_count);
@@ -6749,13 +6729,12 @@ impl State {
                             kind: "file".to_string(),
                             action: format!("deferred:{}", e),
                             message_id: Some(message_id),
-                            queue_index: Some(queue_index),
-                        });
+                            });
                         break;
                     }
                     eprintln!(
-                        "[SDK.actor] file queue send failed: queue_index={} message_id={} error={}",
-                        queue_index, message_id, e
+                        "[SDK.actor] attachment send failed: message_id={} error={}",
+                        message_id, e
                     );
                     // 标记失败 + 删命令必须同事务；只更新状态会把命令留在队列，
                     // 下一轮又发一遍一条已经被永久拒绝的附件。
@@ -6773,7 +6752,6 @@ impl State {
                         kind: "file".to_string(),
                         action: format!("failed:{}", e),
                         message_id: Some(message_id),
-                        queue_index: Some(queue_index),
                     });
                     self.pending_events
                         .push(SdkEvent::MessageSendStatusChanged {
@@ -6785,7 +6763,6 @@ impl State {
                         kind: "file".to_string(),
                         action: "failed_drop".to_string(),
                         message_id: Some(message_id),
-                        queue_index: Some(queue_index),
                     });
                     processed += 1;
                     continue;
@@ -6829,12 +6806,12 @@ impl State {
         drained += self
             .drain_normal_queue_once(OUTBOUND_DRAIN_BATCH_SIZE)
             .await?;
-        let queue_count = self.storage.file_queue_count().await.unwrap_or(0);
-        for queue_index in 0..queue_count {
-            drained += self
-                .drain_file_queue_once(queue_index, OUTBOUND_DRAIN_BATCH_SIZE)
-                .await?;
-        }
+        // 一张 outbox 表，扫一次。以前这里按 sled 分片数循环 N 遍，每遍查的却是
+        // 同一张 SQLite 表——不会重复发送（actor 串行），但是 N 倍的无效扫描，
+        // 还把没有意义的 queue_index 一路暴露到事件和 FFI 上。
+        drained += self
+            .drain_attachment_outbox_once(OUTBOUND_DRAIN_BATCH_SIZE)
+            .await?;
         Ok(drained)
     }
 
@@ -12295,8 +12272,7 @@ impl PrivchatSdk {
                                     kind: "normal".to_string(),
                                     action: "enqueue".to_string(),
                                     message_id: Some(message_id),
-                                    queue_index: None,
-                                },
+                                            },
                             );
                             emit_sequenced_event(
                                 &actor_event_tx,
@@ -12349,46 +12325,26 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
-                    Command::EnqueueOutboundFile {
+                    Command::EnqueueOutboundAttachment {
                         message_id,
                         route_key,
-                        payload,
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
-                            Ok(_) => {
-                                let q = state
-                                    .storage
-                                    .select_file_queue(route_key.clone())
-                                    .await;
-                                match q {
-                                    Ok(queue_index) => {
-                                        match state
-                                            .storage
-                                            .outbox_enqueue(
-                                                message_id,
-                                                "attachment",
-                                                0,
-                                                payload,
-                                                Some(route_key.to_string()),
-                                            )
-                                            .await
-                                        {
-                                            Ok(()) => {
-                                                Ok(FileQueueRef {
-                                                    queue_index,
-                                                    message_id,
-                                                })
-                                            }
-                                            Err(e) => Err(e),
-                                        }
-                                    }
-                                    Err(e) => Err(e),
-                                }
-                            }
+                            Ok(_) => state
+                                .storage
+                                .outbox_enqueue(
+                                    message_id,
+                                    "attachment",
+                                    0,
+                                    Vec::new(),
+                                    Some(route_key),
+                                )
+                                .await
+                                .map(|()| message_id),
                             Err(e) => Err(e),
                         };
-                        if let Ok(queue_ref) = &result {
+                        if result.is_ok() {
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -12398,7 +12354,6 @@ impl PrivchatSdk {
                                     kind: "file".to_string(),
                                     action: "enqueue".to_string(),
                                     message_id: Some(message_id),
-                                    queue_index: Some(queue_ref.queue_index),
                                 },
                             );
                             emit_sequenced_event(
@@ -14772,19 +14727,20 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn enqueue_outbound_file(
+    /// 把一条已有的附件消息重新排进 outbox（重试用）。
+    ///
+    /// payload 留空：附件字节留在托管路径上，drain 发送时自己读。
+    pub async fn enqueue_outbound_attachment(
         &self,
         message_id: u64,
         route_key: String,
-        payload: Vec<u8>,
-    ) -> Result<FileQueueRef> {
+    ) -> Result<u64> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(Command::EnqueueOutboundFile {
+            .send(Command::EnqueueOutboundAttachment {
                 message_id,
                 route_key,
-                payload,
                 resp: resp_tx,
             })
             .await
@@ -15028,18 +14984,22 @@ impl PrivchatSdk {
         if is_attachment_message_type(msg.message_type) {
             let path = attachment_local_path(&msg.content)
                 .ok_or(Error::AttachmentSourceMissing { message_id })?;
-            let bytes = std::fs::read(&path).map_err(|e| {
-                // 路径存在但读不出来（权限/占用）同样是「没有可重传的源」。
-                tracing::warn!(error = %e, path = %path, "attachment retry: read source failed");
-                Error::AttachmentSourceMissing { message_id }
-            })?;
+            // 只证明源文件此刻可读，**不把字节读进来**：drain 会在真正发送时
+            // 从这条托管路径读盘（payload 为空即走该分支）。把几十上百 MB 复制
+            // 进 outbox 的 BLOB 列，等于同一份数据存两遍，还要跟着事务一起写。
+            match std::fs::File::open(&path).and_then(|f| f.metadata()) {
+                Ok(meta) if meta.len() > 0 => {}
+                Ok(_) => return Err(Error::AttachmentSourceMissing { message_id }),
+                Err(e) => {
+                    // 路径存在但读不出来（权限/占用）同样是「没有可重传的源」。
+                    tracing::warn!(error = %e, path = %path, "attachment retry: source unreadable");
+                    return Err(Error::AttachmentSourceMissing { message_id });
+                }
+            }
             let route_key = self.file_route_key.as_ref().clone().ok_or_else(|| {
                 Error::InvalidState("no endpoint configured for attachment retry".to_string())
             })?;
-            let queued = self
-                .enqueue_outbound_file(message_id, route_key, bytes)
-                .await?;
-            return Ok(queued.message_id);
+            return self.enqueue_outbound_attachment(message_id, route_key).await;
         }
 
         self.enqueue_outbound_message(message_id, Vec::new()).await
@@ -19067,7 +19027,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn retry_message_routes_attachment_to_file_queue_with_source_bytes() {
+    async fn retry_message_routes_attachment_to_outbox_without_copying_bytes() {
         let dir = unique_test_dir("retry-attachment-file-queue");
         std::fs::create_dir_all(&dir).expect("create test dir");
         let source = dir.join("photo.jpg");
@@ -19086,11 +19046,33 @@ mod tests {
         assert_eq!(returned, message_id);
 
         let files = retry_test_file_items(&sdk).await;
-        assert_eq!(files.len(), 1, "attachment must land in the file queue");
+        assert_eq!(files.len(), 1, "attachment must land in the attachment outbox");
         assert_eq!(files[0].message_id, message_id);
+        // 早期版本把源文件字节复制进队列 payload。主发送路径
+        // (`finalize_attachment_and_enqueue`) 从来不这样做——字节留在托管路径
+        // 上，drain 发送时读盘。retry 也必须是同一套语义，否则同一张 outbox 上
+        // 挂着两种「payload 是什么」的约定，还要把上百 MB 塞进 SQLite BLOB 并
+        // 跟着事务一起写。
+        assert!(
+            files[0].payload.is_empty(),
+            "retry must not copy the attachment into the outbox row"
+        );
+        // 空 payload 只有在 drain 能从消息行拿到源文件时才成立。这条断言就是
+        // 那个前提——丢了它，空 payload 就从「按约定读盘」退化成「什么都发不出去」。
+        let row = sdk
+            .get_message_by_id(message_id)
+            .await
+            .expect("load message")
+            .expect("message exists");
+        let resolved = row
+            .content
+            .strip_prefix("file://")
+            .unwrap_or(&row.content)
+            .to_string();
         assert_eq!(
-            files[0].payload, b"jpeg-bytes-payload",
-            "file queue payload must be the source bytes, not the path"
+            std::fs::read(&resolved).expect("drain must be able to read the managed source"),
+            b"jpeg-bytes-payload",
+            "message content must still point at the bytes the drain will upload"
         );
         assert!(
             sdk.peek_outbound_messages(16)
@@ -19193,7 +19175,17 @@ mod tests {
         let files = retry_test_file_items(&reopened).await;
         assert_eq!(files.len(), 1, "queued retry must survive a restart");
         assert_eq!(files[0].message_id, message_id);
-        assert_eq!(files[0].payload, b"video-bytes");
+        assert!(files[0].payload.is_empty(), "bytes stay on disk, not in the row");
+        let row = reopened
+            .get_message_by_id(message_id)
+            .await
+            .expect("load message")
+            .expect("message exists");
+        assert_eq!(
+            std::fs::read(&row.content).expect("source must survive the restart too"),
+            b"video-bytes",
+            "an outbox row that outlives its source file is an unsendable command"
+        );
 
         reopened.shutdown().await;
         let _ = std::fs::remove_dir_all(dir);

@@ -4131,22 +4131,6 @@ impl LocalStore {
     }
 
     /// 附件上传成功后回写最终 payload（含 file_id / 尺寸），保持行不动。
-    pub fn outbox_update_payload(
-        &self,
-        uid: &str,
-        local_message_id: u64,
-        payload: &[u8],
-    ) -> Result<()> {
-        let conn = self.conn_for_user(uid)?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        conn.execute(
-            "UPDATE outbox SET payload = ?2, updated_at = ?3 WHERE message_id = ?1",
-            params![local_message_id as i64, payload, now_ms],
-        )
-        .map_err(|e| Error::Storage(format!("outbox update payload: {e}")))?;
-        Ok(())
-    }
-
     /// 回写消息 content（不动 edited_at/status，避免误标「已编辑」）。
     ///
     /// 附件发送链路用：`process_outbound_file` 上传后才解码出 width/height、拿到
@@ -4970,147 +4954,66 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("open sled db {}: {e}", path.display())))
     }
 
-    pub fn normal_queue_push(&self, uid: &str, message_id: u64, payload: &[u8]) -> Result<u64> {
-        let paths = self.ensure_user_storage(uid)?;
-        let db = Self::open_db(&paths.normal_queue_path)?;
-        let previous = db
-            .insert(message_id.to_be_bytes(), payload)
-            .map_err(|e| Error::Storage(format!("normal queue push: {e}")))?;
-        if previous.is_some() {
-            return Err(Error::Storage(format!(
-                "normal queue duplicate message_id: {message_id}"
-            )));
-        }
-        db.flush()
-            .map_err(|e| Error::Storage(format!("normal queue flush: {e}")))?;
-        Ok(message_id)
-    }
-
-    pub fn normal_queue_peek(&self, uid: &str, limit: usize) -> Result<Vec<(u64, Vec<u8>)>> {
-        let paths = self.ensure_user_storage(uid)?;
-        let db = Self::open_db(&paths.normal_queue_path)?;
-        let mut out = Vec::new();
-        for row in db.iter().take(limit) {
-            let (k, v) = row.map_err(|e| Error::Storage(format!("normal queue iter: {e}")))?;
-            if let Ok(arr) = <[u8; 8]>::try_from(k.as_ref()) {
-                out.push((u64::from_be_bytes(arr), v.to_vec()));
-            }
-        }
-        Ok(out)
-    }
-
-    pub fn normal_queue_ack(&self, uid: &str, message_ids: &[u64]) -> Result<usize> {
-        let paths = self.ensure_user_storage(uid)?;
-        let db = Self::open_db(&paths.normal_queue_path)?;
-        let mut removed = 0usize;
-        for message_id in message_ids {
-            let gone = db
-                .remove(message_id.to_be_bytes())
-                .map_err(|e| Error::Storage(format!("normal queue ack: {e}")))?;
-            if gone.is_some() {
-                removed += 1;
-            }
-        }
-        db.flush()
-            .map_err(|e| Error::Storage(format!("normal queue flush: {e}")))?;
-        Ok(removed)
-    }
-
-    pub fn file_queue_count(&self, uid: &str) -> Result<usize> {
-        let paths = self.ensure_user_storage(uid)?;
-        Ok(paths.file_queue_paths.len())
-    }
-
-    pub fn select_file_queue(&self, uid: &str, route_key: &str) -> Result<usize> {
-        let n = self.file_queue_count(uid)?;
-        if n == 0 {
-            return Err(Error::Storage("no file queue configured".to_string()));
-        }
-        let mut hash: usize = 0;
-        for b in route_key.as_bytes() {
-            hash = hash.wrapping_mul(16777619) ^ (*b as usize);
-        }
-        Ok(hash % n)
-    }
-
-    pub fn file_queue_push(
+    /// 旧 sled 出站队列的读写口 —— **只给测试造旧数据用**。
+    ///
+    /// 生产代码里已经没有这条路了：命令都在 SQLite `outbox`，升级后唯一还会
+    /// 碰 sled 队列的是 `migrate_sled_queues_into_outbox`，而它直接开 db 文件，
+    /// 不经过这里。把这几个方法留在 `LocalStore` 的公开表面上，等于给新代码留
+    /// 了一条「再写一次旧队列」的入口——那正是一个数据库两套真相的老问题。
+    #[cfg(test)]
+    pub(crate) fn test_seed_legacy_queue(
         &self,
         uid: &str,
-        queue_index: usize,
+        kind: LegacyQueueKind,
         message_id: u64,
         payload: &[u8],
-    ) -> Result<u64> {
+    ) -> Result<()> {
         let paths = self.ensure_user_storage(uid)?;
-        let path = paths
-            .file_queue_paths
-            .get(queue_index)
-            .ok_or_else(|| Error::Storage(format!("invalid file queue index: {queue_index}")))?;
-        let db = Self::open_db(path)?;
-        let previous = db
-            .insert(message_id.to_be_bytes(), payload)
-            .map_err(|e| Error::Storage(format!("file queue push: {e}")))?;
-        if previous.is_some() {
-            return Err(Error::Storage(format!(
-                "file queue duplicate message_id: {message_id}"
-            )));
-        }
+        let db = Self::open_db(self.legacy_queue_path(&paths, kind))?;
+        db.insert(message_id.to_be_bytes(), payload)
+            .map_err(|e| Error::Storage(format!("seed legacy queue: {e}")))?;
         db.flush()
-            .map_err(|e| Error::Storage(format!("file queue flush: {e}")))?;
-        Ok(message_id)
+            .map_err(|e| Error::Storage(format!("seed legacy queue flush: {e}")))?;
+        Ok(())
     }
 
-    pub fn file_queue_peek(
-        &self,
-        uid: &str,
-        queue_index: usize,
-        limit: usize,
-    ) -> Result<Vec<(u64, Vec<u8>)>> {
+    #[cfg(test)]
+    pub(crate) fn test_legacy_queue_len(&self, uid: &str, kind: LegacyQueueKind) -> Result<usize> {
         let paths = self.ensure_user_storage(uid)?;
-        let path = paths
-            .file_queue_paths
-            .get(queue_index)
-            .ok_or_else(|| Error::Storage(format!("invalid file queue index: {queue_index}")))?;
-        let db = Self::open_db(path)?;
-        let mut out = Vec::new();
-        for row in db.iter().take(limit) {
-            let (k, v) = row.map_err(|e| Error::Storage(format!("file queue iter: {e}")))?;
-            if let Ok(arr) = <[u8; 8]>::try_from(k.as_ref()) {
-                out.push((u64::from_be_bytes(arr), v.to_vec()));
-            }
+        let path = self.legacy_queue_path(&paths, kind);
+        if !path.exists() {
+            return Ok(0);
         }
-        Ok(out)
+        Ok(Self::open_db(path)?.len())
     }
 
-    pub fn file_queue_ack(
+    #[cfg(test)]
+    fn legacy_queue_path<'a>(
         &self,
-        uid: &str,
-        queue_index: usize,
-        message_ids: &[u64],
-    ) -> Result<usize> {
-        let paths = self.ensure_user_storage(uid)?;
-        let path = paths
-            .file_queue_paths
-            .get(queue_index)
-            .ok_or_else(|| Error::Storage(format!("invalid file queue index: {queue_index}")))?;
-        let db = Self::open_db(path)?;
-        let mut removed = 0usize;
-        for message_id in message_ids {
-            let gone = db
-                .remove(message_id.to_be_bytes())
-                .map_err(|e| Error::Storage(format!("file queue ack: {e}")))?;
-            if gone.is_some() {
-                removed += 1;
-            }
+        paths: &'a StoragePaths,
+        kind: LegacyQueueKind,
+    ) -> &'a Path {
+        match kind {
+            LegacyQueueKind::Normal => paths.normal_queue_path.as_path(),
+            LegacyQueueKind::File => paths
+                .file_queue_paths
+                .first()
+                .expect("legacy file queue path"),
         }
-        db.flush()
-            .map_err(|e| Error::Storage(format!("file queue flush: {e}")))?;
-        Ok(removed)
     }
+}
+
+/// 旧队列种类，仅测试用（见 `test_seed_legacy_queue`）。
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LegacyQueueKind {
+    Normal,
+    File,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{get_string, LocalStore, GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID};
+    use super::{get_string, LegacyQueueKind, LocalStore, GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID};
     use crate::{
         LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
         UpsertChannelInput, UpsertGroupInput, UpsertRemoteMessageInput,
@@ -5389,49 +5292,7 @@ mod tests {
         assert_eq!(remain, 0);
     }
 
-    #[test]
-    fn normal_queue_roundtrip() {
-        let store = test_store();
-        let uid = "10001";
-        let a = store.normal_queue_push(uid, 101, b"a").expect("push a");
-        let b = store.normal_queue_push(uid, 102, b"b").expect("push b");
-        assert!(a < b);
-        let peek = store.normal_queue_peek(uid, 10).expect("peek");
-        assert_eq!(peek.len(), 2);
-        assert_eq!(peek[0].0, a);
-        assert_eq!(peek[1].0, b);
-        assert_eq!(peek[0].1, b"a");
-        assert_eq!(peek[1].1, b"b");
-        let removed = store.normal_queue_ack(uid, &[a]).expect("ack");
-        assert_eq!(removed, 1);
-        let left = store.normal_queue_peek(uid, 10).expect("peek left");
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].0, b);
-    }
 
-    #[test]
-    fn file_queue_roundtrip() {
-        let store = test_store();
-        let uid = "10002";
-        let qidx = store
-            .select_file_queue(uid, "image:file.jpg")
-            .expect("select queue");
-        let message_id = store
-            .file_queue_push(uid, qidx, 201, b"payload")
-            .expect("file push");
-        let peek = store.file_queue_peek(uid, qidx, 10).expect("file peek");
-        assert_eq!(peek.len(), 1);
-        assert_eq!(peek[0].0, message_id);
-        assert_eq!(peek[0].1, b"payload");
-        let removed = store
-            .file_queue_ack(uid, qidx, &[message_id])
-            .expect("file ack");
-        assert_eq!(removed, 1);
-        let left = store
-            .file_queue_peek(uid, qidx, 10)
-            .expect("file peek left");
-        assert!(left.is_empty());
-    }
 
     #[test]
     fn message_lifecycle_uses_message_id_pk() {
@@ -5538,9 +5399,14 @@ mod tests {
 
         // 旧版本留下的队列项。
         store
-            .normal_queue_push(uid, id, b"legacy-payload")
+            .test_seed_legacy_queue(uid, LegacyQueueKind::Normal, id, b"legacy-payload")
             .expect("legacy push");
-        assert_eq!(store.normal_queue_peek(uid, 10).expect("peek").len(), 1);
+        assert_eq!(
+            store
+                .test_legacy_queue_len(uid, LegacyQueueKind::Normal)
+                .expect("len"),
+            1
+        );
 
         let outcome = store
             .migrate_sled_queues_into_outbox(uid, &paths)
@@ -5554,8 +5420,11 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].0, id);
         assert_eq!(queued[0].3, b"legacy-payload".to_vec());
-        assert!(
-            store.normal_queue_peek(uid, 10).expect("peek after").is_empty(),
+        assert_eq!(
+            store
+                .test_legacy_queue_len(uid, LegacyQueueKind::Normal)
+                .expect("len after"),
+            0,
             "搬完要清掉，别下次启动再扫一遍"
         );
 
@@ -5829,7 +5698,7 @@ mod tests {
             .create_local_message(uid, &input, 0)
             .expect("create without snowflake");
         store
-            .normal_queue_push(uid, bad, b"stuck")
+            .test_seed_legacy_queue(uid, LegacyQueueKind::Normal, bad, b"stuck")
             .expect("legacy push");
 
         let outcome = store
@@ -5841,8 +5710,11 @@ mod tests {
         assert_eq!(outcome.moved, 0);
         assert_eq!(outcome.quarantined, 1);
         assert_eq!(outcome.remaining, 0, "永久坏项不该被当作可重试");
-        assert!(
-            store.normal_queue_peek(uid, 10).expect("peek").is_empty(),
+        assert_eq!(
+            store
+                .test_legacy_queue_len(uid, LegacyQueueKind::Normal)
+                .expect("len"),
+            0,
             "隔离后必须从旧队列移除，否则每次访问存储都要重扫一遍"
         );
         let row = store

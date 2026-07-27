@@ -81,13 +81,6 @@ enum StorageCmd {
         uid: String,
         resp: oneshot::Sender<Result<()>>,
     },
-    SelectFileQueue {
-        route_key: String,
-        resp: oneshot::Sender<Result<usize>>,
-    },
-    FileQueueCount {
-        resp: oneshot::Sender<Result<usize>>,
-    },
     CreateLocalMessage {
         local_message_id: u64,
         input: NewMessage,
@@ -676,25 +669,6 @@ impl StorageHandle {
 
 
 
-
-    pub async fn select_file_queue(&self, route_key: String) -> Result<usize> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::SelectFileQueue {
-                route_key,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
-
-    pub async fn file_queue_count(&self) -> Result<usize> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::FileQueueCount { resp: resp_tx })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
 
 
 
@@ -2083,12 +2057,6 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::FlushUser { uid, resp } => {
             let _ = resp.send(store.flush_user(&uid));
-        }
-        StorageCmd::SelectFileQueue { route_key, resp } => {
-            with_uid!(resp, |uid| store.select_file_queue(&uid, &route_key));
-        }
-        StorageCmd::FileQueueCount { resp } => {
-            with_uid!(resp, |uid| store.file_queue_count(&uid));
         }
         StorageCmd::CreateLocalMessage {
             local_message_id,
