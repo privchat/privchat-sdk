@@ -81,40 +81,11 @@ enum StorageCmd {
         uid: String,
         resp: oneshot::Sender<Result<()>>,
     },
-    NormalQueuePush {
-        message_id: u64,
-        payload: Vec<u8>,
-        resp: oneshot::Sender<Result<u64>>,
-    },
-    NormalQueuePeek {
-        limit: usize,
-        resp: oneshot::Sender<Result<Vec<(u64, Vec<u8>)>>>,
-    },
-    NormalQueueAck {
-        message_ids: Vec<u64>,
-        resp: oneshot::Sender<Result<usize>>,
-    },
     SelectFileQueue {
         route_key: String,
         resp: oneshot::Sender<Result<usize>>,
     },
     FileQueueCount {
-        resp: oneshot::Sender<Result<usize>>,
-    },
-    FileQueuePush {
-        queue_index: usize,
-        message_id: u64,
-        payload: Vec<u8>,
-        resp: oneshot::Sender<Result<u64>>,
-    },
-    FileQueuePeek {
-        queue_index: usize,
-        limit: usize,
-        resp: oneshot::Sender<Result<Vec<(u64, Vec<u8>)>>>,
-    },
-    FileQueueAck {
-        queue_index: usize,
-        message_ids: Vec<u64>,
         resp: oneshot::Sender<Result<usize>>,
     },
     CreateLocalMessage {
@@ -235,11 +206,6 @@ enum StorageCmd {
     OutboxReconcileSent {
         local_message_id: u64,
         server_message_id: u64,
-        resp: oneshot::Sender<Result<()>>,
-    },
-    OutboxUpdatePayload {
-        local_message_id: u64,
-        payload: Vec<u8>,
         resp: oneshot::Sender<Result<()>>,
     },
     UpdateLocalMessageId {
@@ -708,39 +674,8 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn normal_queue_push(&self, message_id: u64, payload: Vec<u8>) -> Result<u64> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::NormalQueuePush {
-                message_id,
-                payload,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
 
-    pub async fn normal_queue_peek(&self, limit: usize) -> Result<Vec<(u64, Vec<u8>)>> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::NormalQueuePeek {
-                limit,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
 
-    pub async fn normal_queue_ack(&self, message_ids: Vec<u64>) -> Result<usize> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::NormalQueueAck {
-                message_ids,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
 
     pub async fn select_file_queue(&self, route_key: String) -> Result<usize> {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -761,51 +696,8 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn file_queue_push(
-        &self,
-        queue_index: usize,
-        message_id: u64,
-        payload: Vec<u8>,
-    ) -> Result<u64> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::FileQueuePush {
-                queue_index,
-                message_id,
-                payload,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
 
-    pub async fn file_queue_peek(
-        &self,
-        queue_index: usize,
-        limit: usize,
-    ) -> Result<Vec<(u64, Vec<u8>)>> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::FileQueuePeek {
-                queue_index,
-                limit,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
 
-    pub async fn file_queue_ack(&self, queue_index: usize, message_ids: Vec<u64>) -> Result<usize> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::FileQueueAck {
-                queue_index,
-                message_ids,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
 
     pub async fn create_local_message(
         &self,
@@ -1160,21 +1052,6 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn outbox_update_payload(
-        &self,
-        local_message_id: u64,
-        payload: Vec<u8>,
-    ) -> Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(StorageCmd::OutboxUpdatePayload {
-                local_message_id,
-                payload,
-                resp: resp_tx,
-            })
-            .map_err(|_| Error::ActorClosed)?;
-        resp_rx.await.map_err(|_| Error::ActorClosed)?
-    }
 
     pub async fn update_message_content(&self, message_id: u64, content: &str) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -2207,56 +2084,11 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         StorageCmd::FlushUser { uid, resp } => {
             let _ = resp.send(store.flush_user(&uid));
         }
-        StorageCmd::NormalQueuePush {
-            message_id,
-            payload,
-            resp,
-        } => {
-            with_uid!(resp, |uid| store
-                .normal_queue_push(&uid, message_id, &payload));
-        }
-        StorageCmd::NormalQueuePeek { limit, resp } => {
-            with_uid!(resp, |uid| store.normal_queue_peek(&uid, limit));
-        }
-        StorageCmd::NormalQueueAck { message_ids, resp } => {
-            with_uid!(resp, |uid| store.normal_queue_ack(&uid, &message_ids));
-        }
         StorageCmd::SelectFileQueue { route_key, resp } => {
             with_uid!(resp, |uid| store.select_file_queue(&uid, &route_key));
         }
         StorageCmd::FileQueueCount { resp } => {
             with_uid!(resp, |uid| store.file_queue_count(&uid));
-        }
-        StorageCmd::FileQueuePush {
-            queue_index,
-            message_id,
-            payload,
-            resp,
-        } => {
-            with_uid!(resp, |uid| store.file_queue_push(
-                &uid,
-                queue_index,
-                message_id,
-                &payload
-            ));
-        }
-        StorageCmd::FileQueuePeek {
-            queue_index,
-            limit,
-            resp,
-        } => {
-            with_uid!(resp, |uid| store.file_queue_peek(&uid, queue_index, limit));
-        }
-        StorageCmd::FileQueueAck {
-            queue_index,
-            message_ids,
-            resp,
-        } => {
-            with_uid!(resp, |uid| store.file_queue_ack(
-                &uid,
-                queue_index,
-                &message_ids
-            ));
         }
         StorageCmd::CreateLocalMessage {
             local_message_id,
@@ -2481,17 +2313,6 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 &uid,
                 local_message_id,
                 server_message_id
-            ));
-        }
-        StorageCmd::OutboxUpdatePayload {
-            local_message_id,
-            payload,
-            resp,
-        } => {
-            with_uid!(resp, |uid| store.outbox_update_payload(
-                &uid,
-                local_message_id,
-                &payload
             ));
         }
         StorageCmd::UpdateLocalMessageId {

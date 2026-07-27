@@ -7318,34 +7318,6 @@ impl PrivchatClient {
         Ok(resp)
     }
 
-    pub async fn enqueue_outbound_message(
-        &self,
-        message_id: u64,
-        payload: Vec<u8>,
-    ) -> Result<u64, PrivchatFfiError> {
-        if !self.send_queue_enabled.load(Ordering::Relaxed) {
-            return Err(PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                detail: "send queue disabled".to_string(),
-            });
-        }
-        if let Some(msg) = self.get_message_by_id(message_id).await? {
-            let disabled = self.disabled_channel_queues.lock().await;
-            if disabled.contains(&(msg.channel_id, msg.channel_type)) {
-                return Err(PrivchatFfiError::SdkError {
-                    code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                    detail: format!(
-                        "channel send queue disabled: channel_id={}, channel_type={}",
-                        msg.channel_id, msg.channel_type
-                    ),
-                });
-            }
-        }
-        self.inner
-            .enqueue_outbound_message(message_id, payload)
-            .await
-            .map_err(PrivchatFfiError::from)
-    }
 
     pub async fn send_queue_set_enabled(&self, enabled: bool) -> Result<(), PrivchatFfiError> {
         self.send_queue_enabled.store(enabled, Ordering::Relaxed);
@@ -7567,29 +7539,7 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
-    pub async fn peek_outbound_messages(
-        &self,
-        limit: u64,
-    ) -> Result<Vec<QueueMessage>, PrivchatFfiError> {
-        let items = self
-            .inner
-            .peek_outbound_messages(limit as usize)
-            .await
-            .map_err(PrivchatFfiError::from)?;
-        Ok(items.into_iter().map(map_queue_message).collect())
-    }
 
-    pub async fn ack_outbound_messages(
-        &self,
-        message_ids: Vec<u64>,
-    ) -> Result<u64, PrivchatFfiError> {
-        let removed = self
-            .inner
-            .ack_outbound_messages(message_ids)
-            .await
-            .map_err(PrivchatFfiError::from)?;
-        Ok(removed as u64)
-    }
 
     pub async fn enqueue_outbound_file(
         &self,
@@ -7623,31 +7573,7 @@ impl PrivchatClient {
         Ok(map_file_queue_ref(out))
     }
 
-    pub async fn peek_outbound_files(
-        &self,
-        queue_index: u64,
-        limit: u64,
-    ) -> Result<Vec<QueueMessage>, PrivchatFfiError> {
-        let items = self
-            .inner
-            .peek_outbound_files(queue_index as usize, limit as usize)
-            .await
-            .map_err(PrivchatFfiError::from)?;
-        Ok(items.into_iter().map(map_queue_message).collect())
-    }
 
-    pub async fn ack_outbound_files(
-        &self,
-        queue_index: u64,
-        message_ids: Vec<u64>,
-    ) -> Result<u64, PrivchatFfiError> {
-        let removed = self
-            .inner
-            .ack_outbound_files(queue_index as usize, message_ids)
-            .await
-            .map_err(PrivchatFfiError::from)?;
-        Ok(removed as u64)
-    }
 
     pub async fn create_local_message(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
         self.inner
