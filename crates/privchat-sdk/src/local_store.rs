@@ -5897,6 +5897,115 @@ mod tests {
     }
 
     #[test]
+    /// 显示排序:与 TypeScript SDK 用同一批乱序输入,顺序必须一致。
+    ///
+    /// 对照的 TS 用例在
+    /// `privchat-sdk-typescript/tests/cache/display-order.test.ts`,fixture
+    /// 逐条对应。故意挑的都是**按 timestamp 排就会错**的情况:乱序到达、
+    /// 时间戳相同、以及发送方时钟倒退。两端各自按
+    /// SDK_ENTITY_MODEL_SPEC §2.6.2 的元组排,结果才会是同一个;任何一端偷偷
+    /// 用 timestamp,这个测试和它的 TS 对照就会分叉。
+    #[test]
+    fn display_order_matches_the_typescript_fixture() {
+        let store = test_store();
+        let uid = "10099";
+        let channel_id = 900u64;
+
+        // (server_message_id, pts, timestamp, label) —— 与 TS fixture 同序同值。
+        let shuffled: [(u64, u64, i64, &str); 6] = [
+            (30, 30, 5_000, "r30"),
+            (10, 10, 9_000, "r10"),
+            (20, 20, 1_000, "r20"),
+            (40, 40, 7_000, "t-same-a"),
+            (41, 41, 7_000, "t-same-b"),
+            // 时钟倒退的发送方:timestamp 最小,pts 最大。
+            (50, 50, 1, "t-backwards"),
+        ];
+        for (smid, pts, ts, label) in shuffled {
+            store
+                .upsert_remote_message_with_result(
+                    uid,
+                    &UpsertRemoteMessageInput {
+                        server_message_id: smid,
+                        local_message_id: 0,
+                        channel_id,
+                        channel_type: 1,
+                        timestamp: ts,
+                        from_uid: 9,
+                        message_type: 0,
+                        content: label.to_string(),
+                        status: 2,
+                        pts: pts as i64,
+                        setting: 0,
+                        order_seq: pts as i64,
+                        searchable_word: String::new(),
+                        extra: "{}".to_string(),
+                        mime_type: None,
+                    },
+                )
+                .expect("upsert");
+        }
+
+        // 未确认的本地消息:没有 server_message_id,排在最新端。
+        store
+            .create_local_message(
+                uid,
+                &NewMessage {
+                    channel_id,
+                    channel_type: 1,
+                    from_uid: 9,
+                    message_type: 0,
+                    content: "p-pending".to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: "{}".to_string(),
+                    mime_type: None,
+                    media_downloaded: false,
+                    thumb_status: 0,
+                },
+                987_654_321,
+            )
+            .expect("create pending");
+
+        // list_messages 返回 DESC,反转成与 TS 一样的升序。
+        let mut rows = store
+            .list_messages(uid, channel_id, 1, 50, 0)
+            .expect("list messages");
+        rows.reverse();
+        let order: Vec<String> = rows.into_iter().map(|m| m.content).collect();
+
+        assert_eq!(
+            order,
+            vec![
+                "r10".to_string(),
+                "r20".to_string(),
+                "r30".to_string(),
+                "t-same-a".to_string(),
+                "t-same-b".to_string(),
+                "t-backwards".to_string(),
+                "p-pending".to_string(),
+            ],
+            "Rust 顺序必须与 TS display-order.test.ts 的 EXPECTED 完全一致"
+        );
+
+        // 这批输入按 timestamp 排会得到另一个顺序 —— 若两者相同,这个测试就
+        // 什么也没证明。
+        let mut by_ts: Vec<&str> = shuffled.iter().map(|(_, _, _, l)| *l).collect();
+        by_ts.sort_by_key(|l| {
+            shuffled
+                .iter()
+                .find(|(_, _, _, x)| x == l)
+                .map(|(_, _, ts, _)| *ts)
+                .unwrap_or(0)
+        });
+        assert_ne!(
+            by_ts,
+            vec!["r10", "r20", "r30", "t-same-a", "t-same-b", "t-backwards"],
+            "fixture 必须是 timestamp 排序会排错的那种"
+        );
+    }
+
+    #[test]
     fn upsert_remote_message_is_idempotent_by_server_message_id() {
         let store = test_store();
         let uid = "10004";
