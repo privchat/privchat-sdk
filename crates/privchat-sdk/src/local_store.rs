@@ -5896,7 +5896,6 @@ mod tests {
         assert_eq!(all[0].server_message_id, Some(900001));
     }
 
-    #[test]
     /// 显示排序:与 TypeScript SDK 用同一批乱序输入,顺序必须一致。
     ///
     /// 对照的 TS 用例在
@@ -5905,23 +5904,40 @@ mod tests {
     /// 时间戳相同、以及发送方时钟倒退。两端各自按
     /// SDK_ENTITY_MODEL_SPEC §2.6.2 的元组排,结果才会是同一个;任何一端偷偷
     /// 用 timestamp,这个测试和它的 TS 对照就会分叉。
+    ///
+    /// **fixture 是同一个文件**,不是两份手抄:两份数据只会一直相等到有人改了
+    /// 其中一份。
     #[test]
     fn display_order_matches_the_typescript_fixture() {
+        let raw = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../privchat-docs/fixtures/display-order.json"),
+        )
+        .expect("read shared display-order fixture");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&raw).expect("parse shared fixture");
+
         let store = test_store();
         let uid = "10099";
-        let channel_id = 900u64;
+        let channel_id = fixture["channel_id"].as_u64().expect("channel_id");
+        let channel_type = fixture["channel_type"].as_i64().expect("channel_type") as i32;
+        let from_uid = fixture["from_uid"].as_u64().expect("from_uid");
 
-        // (server_message_id, pts, timestamp, label) —— 与 TS fixture 同序同值。
-        let shuffled: [(u64, u64, i64, &str); 6] = [
-            (30, 30, 5_000, "r30"),
-            (10, 10, 9_000, "r10"),
-            (20, 20, 1_000, "r20"),
-            (40, 40, 7_000, "t-same-a"),
-            (41, 41, 7_000, "t-same-b"),
-            // 时钟倒退的发送方:timestamp 最小,pts 最大。
-            (50, 50, 1, "t-backwards"),
-        ];
-        for (smid, pts, ts, label) in shuffled {
+        let shuffled: Vec<(u64, u64, i64, String)> = fixture["confirmed"]
+            .as_array()
+            .expect("confirmed")
+            .iter()
+            .map(|m| {
+                (
+                    m["server_message_id"].as_u64().expect("smid"),
+                    m["pts"].as_u64().expect("pts"),
+                    m["timestamp"].as_i64().expect("ts"),
+                    m["label"].as_str().expect("label").to_string(),
+                )
+            })
+            .collect();
+
+        for (smid, pts, ts, label) in &shuffled {
+            let (smid, pts, ts, label) = (*smid, *pts, *ts, label.as_str());
             store
                 .upsert_remote_message_with_result(
                     uid,
@@ -5929,9 +5945,9 @@ mod tests {
                         server_message_id: smid,
                         local_message_id: 0,
                         channel_id,
-                        channel_type: 1,
+                        channel_type,
                         timestamp: ts,
-                        from_uid: 9,
+                        from_uid,
                         message_type: 0,
                         content: label.to_string(),
                         status: 2,
@@ -5947,15 +5963,16 @@ mod tests {
         }
 
         // 未确认的本地消息:没有 server_message_id,排在最新端。
+        let pending = &fixture["pending"][0];
         store
             .create_local_message(
                 uid,
                 &NewMessage {
                     channel_id,
-                    channel_type: 1,
-                    from_uid: 9,
+                    channel_type,
+                    from_uid,
                     message_type: 0,
-                    content: "p-pending".to_string(),
+                    content: pending["label"].as_str().expect("label").to_string(),
                     searchable_word: String::new(),
                     setting: 0,
                     extra: "{}".to_string(),
@@ -5963,44 +5980,36 @@ mod tests {
                     media_downloaded: false,
                     thumb_status: 0,
                 },
-                987_654_321,
+                pending["local_message_id"].as_u64().expect("lmid"),
             )
             .expect("create pending");
 
         // list_messages 返回 DESC,反转成与 TS 一样的升序。
         let mut rows = store
-            .list_messages(uid, channel_id, 1, 50, 0)
+            .list_messages(uid, channel_id, channel_type, 50, 0)
             .expect("list messages");
         rows.reverse();
         let order: Vec<String> = rows.into_iter().map(|m| m.content).collect();
 
+        let expected: Vec<String> = fixture["expected_order"]
+            .as_array()
+            .expect("expected_order")
+            .iter()
+            .map(|v| v.as_str().expect("label").to_string())
+            .collect();
         assert_eq!(
-            order,
-            vec![
-                "r10".to_string(),
-                "r20".to_string(),
-                "r30".to_string(),
-                "t-same-a".to_string(),
-                "t-same-b".to_string(),
-                "t-backwards".to_string(),
-                "p-pending".to_string(),
-            ],
-            "Rust 顺序必须与 TS display-order.test.ts 的 EXPECTED 完全一致"
+            order, expected,
+            "Rust 顺序必须与共享 fixture 的 expected_order 完全一致"
         );
 
         // 这批输入按 timestamp 排会得到另一个顺序 —— 若两者相同,这个测试就
         // 什么也没证明。
-        let mut by_ts: Vec<&str> = shuffled.iter().map(|(_, _, _, l)| *l).collect();
-        by_ts.sort_by_key(|l| {
-            shuffled
-                .iter()
-                .find(|(_, _, _, x)| x == l)
-                .map(|(_, _, ts, _)| *ts)
-                .unwrap_or(0)
-        });
+        let mut by_ts = shuffled.clone();
+        by_ts.sort_by_key(|(_, _, ts, _)| *ts);
+        let by_ts: Vec<String> = by_ts.into_iter().map(|(_, _, _, l)| l).collect();
         assert_ne!(
             by_ts,
-            vec!["r10", "r20", "r30", "t-same-a", "t-same-b", "t-backwards"],
+            expected[..expected.len() - 1].to_vec(),
             "fixture 必须是 timestamp 排序会排错的那种"
         );
     }

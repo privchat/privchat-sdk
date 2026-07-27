@@ -271,34 +271,11 @@ async fn main() {
         eprintln!("[basic] invalid storage paths");
         std::process::exit(17);
     }
-    let message_id = match client
-        .enqueue_outbound_message(
-            message_id,
-            b"{\"kind\":\"text\",\"body\":\"hello\"}".to_vec(),
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[basic] enqueue failed: {e}");
-            std::process::exit(8);
-        }
-    };
-    let items = match client.peek_outbound_messages(10).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[basic] peek failed: {e}");
-            std::process::exit(9);
-        }
-    };
-    if !items.iter().any(|m| m.message_id == message_id) {
-        eprintln!("[basic] queue missing message_id={message_id}");
-        std::process::exit(10);
-    }
-    if let Err(e) = client.ack_outbound_messages(vec![message_id]).await {
-        eprintln!("[basic] ack failed: {e}");
-        std::process::exit(11);
-    }
+    // 原先这里 smoke 的是 enqueue/peek/ack 三个旧 sled 队列 API。它们随
+    // Command-First outbox 一起下线了（消息与命令同事务写入，由 SDK 内部驱动，
+    // 不再有「先入队再由宿主 ack」这一步），FFI 也不再导出对应方法。这里不补一个
+    // 形似的替身：没有对应能力时，一个假装还在 smoke 队列的调用比不 smoke 更糟。
+    // 发送链路的持久性由 accounts example 的 phase41–43 覆盖。
 
     eprintln!("[basic] ok user_id={}", login.user_id);
     let connected = match client.is_connected().await {
