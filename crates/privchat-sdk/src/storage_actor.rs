@@ -277,6 +277,14 @@ enum StorageCmd {
         downloaded: bool,
         resp: oneshot::Sender<Result<()>>,
     },
+    FinalizeAttachmentAndEnqueue {
+        message_id: u64,
+        content: String,
+        thumb_status: i32,
+        route_key: String,
+        payload: Vec<u8>,
+        resp: oneshot::Sender<Result<(u64, i32)>>,
+    },
     FinalizeLocalAttachment {
         message_id: u64,
         content: String,
@@ -1273,6 +1281,29 @@ impl StorageHandle {
                 message_id,
                 content,
                 thumb_status,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// 附件定稿 + 入队命令，同一事务。见 `LocalStore::finalize_attachment_and_enqueue`。
+    pub async fn finalize_attachment_and_enqueue(
+        &self,
+        message_id: u64,
+        content: String,
+        thumb_status: i32,
+        route_key: String,
+        payload: Vec<u8>,
+    ) -> Result<(u64, i32)> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::FinalizeAttachmentAndEnqueue {
+                message_id,
+                content,
+                thumb_status,
+                route_key,
+                payload,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -2524,6 +2555,23 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         } => {
             with_uid!(resp, |uid| store
                 .update_media_downloaded(&uid, message_id, downloaded));
+        }
+        StorageCmd::FinalizeAttachmentAndEnqueue {
+            message_id,
+            content,
+            thumb_status,
+            route_key,
+            payload,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.finalize_attachment_and_enqueue(
+                &uid,
+                message_id,
+                &content,
+                thumb_status,
+                &route_key,
+                &payload
+            ));
         }
         StorageCmd::FinalizeLocalAttachment {
             message_id,

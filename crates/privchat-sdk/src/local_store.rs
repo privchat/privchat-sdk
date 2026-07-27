@@ -240,7 +240,10 @@ pub struct LocalStore {
 #[derive(Debug, Clone, Copy)]
 pub struct SledQueueMigration {
     pub moved: usize,
+    /// 瞬时失败、留在旧队列等本进程后续重试的项。
     pub remaining: usize,
+    /// 永久坏项：已从旧队列移除，对应消息标为本地失败。计数用于 telemetry。
+    pub quarantined: usize,
 }
 
 /// A guard that returns the connection to the cache when dropped
@@ -1873,6 +1876,88 @@ impl LocalStore {
             |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i32>(1)?)),
         )
         .map_err(|e| Error::Storage(format!("lookup finalized message channel: {e}")))
+    }
+
+    /// 附件定稿 + 入队出站命令，**一个事务**。
+    ///
+    /// 定稿与入队分两步的话，中间失败（或进程被杀）就留下一条已完成、界面上
+    /// 也已显示、却没有任何命令负责发送的附件消息。Kotlin 侧的 catch 删除是
+    /// 清理手段，不是一致性保证——崩溃时它根本不会执行。
+    ///
+    /// 返回 `(channel_id, channel_type)`，与 `finalize_local_attachment` 一致。
+    pub fn finalize_attachment_and_enqueue(
+        &self,
+        uid: &str,
+        message_id: u64,
+        content: &str,
+        thumb_status: i32,
+        route_key: &str,
+        payload: &[u8],
+    ) -> Result<(u64, i32)> {
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("finalize+enqueue begin tx: {e}")))?;
+
+        let (channel_id, channel_type, snowflake): (u64, i32, i64) = tx
+            .query_row(
+                "SELECT channel_id, channel_type, local_message_id
+                 FROM message WHERE id = ?1",
+                params![message_id as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Storage(format!("finalize+enqueue lookup message: {e}")))?;
+        if snowflake <= 0 {
+            return Err(Error::Storage(format!(
+                "finalize+enqueue: message.id={message_id} has no local_message_id; \
+                 refusing to mint an idempotency key the server cannot honour"
+            )));
+        }
+
+        tx.execute(
+            "UPDATE message
+                SET content = ?1,
+                    thumb_status = ?2,
+                    media_downloaded = 1,
+                    status = 1,
+                    updated_at = ?3
+              WHERE id = ?4",
+            params![content, thumb_status, now_ms, message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("finalize+enqueue update message: {e}")))?;
+
+        tx.execute(
+            "INSERT INTO outbox
+                 (command_id, command_type, message_id, channel_id, payload, route_key,
+                  status, retry_count, next_attempt_at, created_at, updated_at)
+             VALUES (?1, 'attachment', ?2, ?3, ?4, ?5, 'pending', 0, 0, ?6, ?6)
+             ON CONFLICT(command_id) DO UPDATE SET
+                 payload = excluded.payload,
+                 route_key = excluded.route_key,
+                 status = 'pending',
+                 next_attempt_at = 0,
+                 updated_at = excluded.updated_at",
+            params![
+                format!("msg:{snowflake}"),
+                message_id as i64,
+                channel_id as i64,
+                payload,
+                route_key,
+                now_ms
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("finalize+enqueue insert command: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("finalize+enqueue commit: {e}")))?;
+        Ok((channel_id, channel_type))
     }
 
     pub fn max_message_pts(&self, uid: &str, channel_id: u64, channel_type: i32) -> Result<u64> {
@@ -3782,35 +3867,65 @@ impl LocalStore {
     ) -> Result<SledQueueMigration> {
         let mut moved = 0usize;
         let mut remaining = 0usize;
+        let mut quarantined = 0usize;
 
         let mut drain = |db_path: &Path, command_type: &str| -> Result<()> {
             if !db_path.exists() {
                 return Ok(());
             }
             let db = Self::open_db(db_path)?;
-            let mut done: Vec<[u8; 8]> = Vec::new();
+            let mut done: Vec<Vec<u8>> = Vec::new();
             for row in db.iter() {
                 let (k, v) = row
                     .map_err(|e| Error::Storage(format!("legacy queue iter: {e}")))?;
                 let Ok(key) = <[u8; 8]>::try_from(k.as_ref()) else {
+                    // 不是 8 字节的键说明这条记录本身就坏了，重试一万次也还是
+                    // 坏的。丢掉并计数，不能既不搬走也不删除——那会被当成
+                    // 「搬完了」，或者每次启动都重新扫一遍。
+                    quarantined += 1;
+                    tracing::warn!(
+                        key_len = k.len(),
+                        "legacy queue key is not a message id; discarding"
+                    );
+                    done.push(k.to_vec());
                     continue;
                 };
                 let message_id = u64::from_be_bytes(key);
                 // 本地行没了就没什么可发的了。
                 if self.get_message_by_id(uid, message_id)?.is_none() {
-                    done.push(key);
+                    done.push(k.to_vec());
                     continue;
                 }
                 match self.outbox_enqueue(uid, message_id, command_type, 0, &v, None) {
                     Ok(()) => {
                         moved += 1;
-                        done.push(key);
+                        done.push(k.to_vec());
                     }
                     Err(e) => {
-                        // 例如缺 local_message_id：留在 sled 里，下次再试，
-                        // 不要静默丢掉一条用户以为发出去了的消息。
-                        remaining += 1;
-                        tracing::warn!(message_id, error = %e, "legacy queue item not migrated");
+                        // 区分两类失败：
+                        //   永久（缺 local_message_id、消息行本身不可用）——重试
+                        //     多少次都一样。隔离它：把消息标成本地失败，丢掉命令，
+                        //     否则每次 ensure_user_storage 都要重扫一遍、重打一次
+                        //     日志，形成 I/O 与日志风暴。
+                        //   瞬时（磁盘忙等）——留在原地，本进程后续继续搬。
+                        let permanent = format!("{e}").contains("local_message_id");
+                        if permanent {
+                            quarantined += 1;
+                            tracing::warn!(
+                                message_id,
+                                error = %e,
+                                "legacy queue item cannot be migrated; marking the message failed"
+                            );
+                            let _ = self.update_message_status(uid, message_id, 3);
+                            done.push(k.to_vec());
+                        } else {
+                            remaining += 1;
+                            tracing::warn!(
+                                message_id,
+                                error = %e,
+                                "legacy queue item not migrated; will retry"
+                            );
+                        }
                     }
                 }
             }
@@ -3825,7 +3940,11 @@ impl LocalStore {
         for file_path in &paths.file_queue_paths {
             drain(file_path, "attachment")?;
         }
-        Ok(SledQueueMigration { moved, remaining })
+        Ok(SledQueueMigration {
+            moved,
+            remaining,
+            quarantined,
+        })
     }
 
     /// 到期的出站命令，最老的先来。
@@ -5503,123 +5622,101 @@ mod tests {
         );
     }
 
-    /// 升级迁移把重复行删掉之前，必须把附属数据改指到保留行。
+    /// 升级迁移：真实跑一遍 refinery，验证重复 server_message_id 的附属数据
+    /// 被正确合并/改指，而不是随重复行一起消失，也不因唯一索引冲突而炸掉。
     ///
-    /// 直接删就是丢 reaction / extra / mention / reminder。
+    /// 用**真实 runner**而不是复制 SQL：复制出来的副本会和迁移文件各自演化，
+    /// 最后测的是副本、不是要发布的东西。
     #[test]
-    fn ack_pending_migration_repoints_attachments_before_deleting_duplicates() {
-        // 迁移是 SQL，这里直接在一个库上重放它的关键步骤，验证引用被改指、
-        // 重复行被删、保留行拿到 server_message_id。
-        let store = test_store();
-        let uid = "10003-migrate-refs";
-        let conn = store.conn_for_user(uid).expect("conn");
+    fn real_migration_merges_duplicate_message_attachments() {
+        use rusqlite::Connection;
+
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-mig-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db_path = dir.join("legacy.db");
+        let mut conn = Connection::open(&db_path).expect("open");
+        // 先升到**上一版**为止：这就是升级前用户手上的库形态，补偿表还在，
+        // outbox 还没出现。
+        super::embedded::migrations::runner()
+            .set_target(refinery::Target::Version(20_260_727_120_000))
+            .run(&mut conn)
+            .expect("migrate to the pre-outbox version");
+
+        // 保留行（待确认）与同步补进来的重复行，各自都有 reaction / extra，
+        // 且 reaction 完全相同 —— 直接 UPDATE 会撞唯一索引。
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS outbound_ack_pending (
-                 message_id INTEGER PRIMARY KEY,
-                 server_message_id INTEGER NOT NULL,
-                 message_seq INTEGER NOT NULL,
-                 attempts INTEGER NOT NULL DEFAULT 0,
-                 last_error TEXT,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );",
-        )
-        .expect("create legacy table");
-        drop(conn);
+            "INSERT INTO message (id, server_message_id, channel_id, channel_type, from_uid,
+                                  type, content, status, created_at, updated_at,
+                                  searchable_word, local_message_id, setting, extra)
+             VALUES (1, NULL, 100, 1, 200, 1, 'keep', 1, 0, 0, 'k', 777001, 0, '{}'),
+                    (2, 900123, 100, 1, 200, 1, 'dup', 2, 0, 0, 'k', 0, 0, '{}');
 
-        let input = NewMessage {
-            channel_id: 100,
-            channel_type: 1,
-            from_uid: 200,
-            message_type: 1,
-            content: "keep me".to_string(),
-            searchable_word: "k".to_string(),
-            setting: 0,
-            extra: "{}".to_string(),
-            mime_type: None,
-            media_downloaded: false,
-            thumb_status: 0,
-        };
-        let keep = store
-            .create_local_message(uid, &input, 777_001)
-            .expect("keep row");
-        let dup = store
-            .upsert_remote_message_with_result(
-                uid,
-                &UpsertRemoteMessageInput {
-                    server_message_id: 900_123,
-                    local_message_id: 0,
-                    channel_id: 100,
-                    channel_type: 1,
-                    timestamp: 1_700_000_000_000,
-                    from_uid: 200,
-                    message_type: 1,
-                    content: "duplicate from sync".to_string(),
-                    status: 2,
-                    searchable_word: "k".to_string(),
-                    setting: 0,
-                    pts: 5,
-                    order_seq: 5,
-                    extra: "{}".to_string(),
-                    mime_type: None,
-                },
-            )
-            .expect("dup row")
-            .message_id;
-        assert_ne!(keep, dup);
-
-        let conn = store.conn_for_user(uid).expect("conn");
-        conn.execute(
-            "INSERT INTO outbound_ack_pending
+             INSERT INTO outbound_ack_pending
                  (message_id, server_message_id, message_seq, created_at, updated_at)
-             VALUES (?1, 900123, 5, 0, 0)",
-            params![keep as i64],
+             VALUES (1, 900123, 5, 0, 0);
+
+             INSERT INTO message_reaction (message_id, uid, emoji, created_at)
+             VALUES (1, 200, '👍', 0), (2, 200, '👍', 0), (2, 300, '🎉', 0);
+
+             INSERT INTO message_extra (message_id, extra_version, readed)
+             VALUES (1, 5, 0), (2, 9, 1);",
         )
-        .expect("legacy ack row");
-        // reaction 挂在重复行上——迁移必须把它改指到保留行。
-        conn.execute(
-            "INSERT INTO message_reaction (message_id, uid, emoji, created_at)
-             VALUES (?1, 200, '👍', 0)",
-            params![dup as i64],
-        )
-        .expect("reaction on duplicate");
+        .expect("seed conflicting data");
 
-        // 迁移的关键步骤。
-        conn.execute_batch(
-            "CREATE TEMP TABLE _ack_dup AS
-             SELECT p.message_id AS keep_id, m.id AS drop_id
-             FROM outbound_ack_pending p
-             JOIN message m ON m.server_message_id = p.server_message_id
-             WHERE m.id != p.message_id;
+        // 真实 runner 升到最新：旧实现会因唯一索引冲突整体失败，用户升级即
+        // 打不开数据库。
+        super::embedded::migrations::runner()
+            .run(&mut conn)
+            .expect("upgrade across conflicting attachments");
 
-             UPDATE message_reaction
-             SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_reaction.message_id)
-             WHERE message_id IN (SELECT drop_id FROM _ack_dup);
-
-             DELETE FROM message WHERE id IN (SELECT drop_id FROM _ack_dup);
-             DROP TABLE _ack_dup;",
-        )
-        .expect("run migration steps");
-
-        let reaction_owner: i64 = conn
+        let keep_reactions: i64 = conn
             .query_row(
-                "SELECT message_id FROM message_reaction WHERE emoji = '👍'",
+                "SELECT COUNT(*) FROM message_reaction WHERE message_id = 1",
                 [],
-                |row| row.get(0),
+                |r| r.get(0),
             )
-            .expect("reaction still there");
+            .expect("count reactions");
         assert_eq!(
-            reaction_owner as u64, keep,
-            "reaction 必须改指到保留行，而不是随重复行一起消失"
+            keep_reactions, 2,
+            "相同的 reaction 合并成一条，副本独有的那条改指过来"
         );
+
+        let extra_version: i64 = conn
+            .query_row(
+                "SELECT extra_version FROM message_extra WHERE message_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("extra survived");
+        assert_eq!(extra_version, 9, "message_extra 取版本更新的那份");
+
+        let dup_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message WHERE id = 2", [], |r| r.get(0))
+            .expect("count dup");
+        assert_eq!(dup_left, 0, "重复行最后才删");
+
+        let server_id: i64 = conn
+            .query_row(
+                "SELECT server_message_id FROM message WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("keep row");
+        assert_eq!(server_id, 900123, "待确认的 ack 被落实到保留行");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 搬不动的项必须留在旧队列并被报告，不能算作「搬完了」。
+    /// 永久坏项必须隔离（消息标失败 + 移出旧队列），瞬时失败才留待重试。
     ///
-    /// 记为完成的话，这几条消息要等用户重启 App 才有人再管——而它们正是用户
-    /// 以为已经发出去的消息。
+    /// 留在队列里的话，每次 `ensure_user_storage` 都要重扫、重失败、重打日志。
     #[test]
-    fn partial_sled_migration_reports_remaining_items() {
+    fn permanently_bad_sled_items_are_quarantined_not_retried_forever() {
         let store = test_store();
         let uid = "10003-sled-partial";
         let paths = store.ensure_user_storage(uid).expect("paths");
@@ -5650,13 +5747,20 @@ mod tests {
             .migrate_sled_queues_into_outbox(uid, &paths)
             .expect("migrate");
 
+        // 缺 local_message_id 是**永久**错误：重试多少次都一样，所以隔离，
+        // 而不是留在队列里每次启动重扫、重打日志。
         assert_eq!(outcome.moved, 0);
-        assert_eq!(outcome.remaining, 1, "必须报出来，不能当作搬完");
-        assert_eq!(
-            store.normal_queue_peek(uid, 10).expect("peek").len(),
-            1,
-            "搬不动就留在旧队列，别静默丢掉"
+        assert_eq!(outcome.quarantined, 1);
+        assert_eq!(outcome.remaining, 0, "永久坏项不该被当作可重试");
+        assert!(
+            store.normal_queue_peek(uid, 10).expect("peek").is_empty(),
+            "隔离后必须从旧队列移除，否则每次访问存储都要重扫一遍"
         );
+        let row = store
+            .get_message_by_id(uid, bad)
+            .expect("load")
+            .expect("exists");
+        assert_eq!(row.status, 3, "用户要看到它失败了，而不是永远发送中");
     }
 
     /// 确认送达是一个事务：消息变已发送、outbox 行消失，两件事一起发生。

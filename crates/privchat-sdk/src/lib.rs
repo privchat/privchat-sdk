@@ -2532,6 +2532,15 @@ enum Command {
         thumb_status: i32,
         resp: oneshot::Sender<Result<()>>,
     },
+    /// 附件定稿 + 入队命令，同一 SQLite 事务；提交成功后才发 UI 事件。
+    FinalizeAttachmentAndEnqueue {
+        message_id: u64,
+        content: String,
+        thumb_status: i32,
+        route_key: String,
+        payload: Vec<u8>,
+        resp: oneshot::Sender<Result<()>>,
+    },
     /// INSERT a local outbound attachment row WITHOUT emitting any event.
     /// Caller must follow up with `FinalizeLocalAttachment` once files are written,
     /// which is the single event the UI observes for this message.
@@ -12885,6 +12894,69 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::FinalizeAttachmentAndEnqueue {
+                        message_id,
+                        content,
+                        thumb_status,
+                        route_key,
+                        payload,
+                        resp,
+                    } => {
+                        let result = match state.current_uid_required() {
+                            Ok(_) => {
+                                state
+                                    .storage
+                                    .finalize_attachment_and_enqueue(
+                                        message_id,
+                                        content,
+                                        thumb_status,
+                                        route_key,
+                                        payload,
+                                    )
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        // 事务提交后才发事件：失败时不该出现一条「已完成、没人发」
+                        // 的附件消息。
+                        match result {
+                            Ok((channel_id, channel_type)) => {
+                                state.invalidate_channel_cache_with_reason(
+                                    channel_id,
+                                    channel_type,
+                                    "finalize_attachment_and_enqueue",
+                                );
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::TimelineUpdated {
+                                        channel_id,
+                                        channel_type,
+                                        message_id,
+                                        reason: "local_create".to_string(),
+                                    },
+                                );
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::MessageSendStatusChanged {
+                                        message_id,
+                                        status: 1,
+                                        server_message_id: None,
+                                    },
+                                );
+                                let _ = actor_cmd_tx.try_send(Command::KickOutboundDrain);
+                                let _ = resp.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                            }
+                        }
+                    }
                     Command::FinalizeLocalAttachment {
                         message_id,
                         content,
@@ -15392,6 +15464,34 @@ impl PrivchatSdk {
                 message_id,
                 content,
                 thumb_status,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 附件定稿 + 入队命令，**一个事务**。
+    ///
+    /// 附件链路应当用它，而不是 `finalize_local_attachment` + `send_attachment_*`：
+    /// 后者是两步，中间崩溃会留下一条已完成、已显示、却没人负责发送的附件。
+    pub async fn finalize_attachment_and_enqueue(
+        &self,
+        message_id: u64,
+        content: String,
+        thumb_status: i32,
+        route_key: String,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::FinalizeAttachmentAndEnqueue {
+                message_id,
+                content,
+                thumb_status,
+                route_key,
+                payload,
                 resp: resp_tx,
             })
             .await

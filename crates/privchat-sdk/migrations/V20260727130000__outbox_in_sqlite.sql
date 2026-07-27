@@ -83,18 +83,64 @@ FROM outbound_ack_pending p
 JOIN message m ON m.server_message_id = p.server_message_id
 WHERE m.id != p.message_id;
 
-UPDATE message_reaction
-SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_reaction.message_id)
-WHERE message_id IN (SELECT drop_id FROM _ack_dup);
+-- 改指之前先合并：这几张表都有唯一索引
+--   message_extra(message_id)
+--   message_reaction(message_id, uid, emoji)
+--   mention(message_id, mentioned_user_id)
+-- 保留行与重复行如果各有一条对应记录，直接 UPDATE 会撞唯一键，整条迁移失败
+-- ——用户升级即打不开数据库。所以：先删掉「保留行已经有了」的那些副本记录，
+-- 剩下的才改指过去。
 
+-- message_extra：一条消息一行，按 extra_version 取新的那份。
+DELETE FROM message_extra
+WHERE message_id IN (SELECT drop_id FROM _ack_dup)
+  AND EXISTS (
+      SELECT 1 FROM message_extra keep
+      JOIN _ack_dup d ON d.keep_id = keep.message_id
+      WHERE d.drop_id = message_extra.message_id
+        AND keep.extra_version >= message_extra.extra_version
+  );
+-- 副本更新则反过来删掉保留行那份，让副本改指过去。
+DELETE FROM message_extra
+WHERE message_id IN (SELECT keep_id FROM _ack_dup)
+  AND EXISTS (
+      SELECT 1 FROM message_extra drop_row
+      JOIN _ack_dup d ON d.drop_id = drop_row.message_id
+      WHERE d.keep_id = message_extra.message_id
+        AND drop_row.extra_version > message_extra.extra_version
+  );
 UPDATE message_extra
 SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_extra.message_id)
 WHERE message_id IN (SELECT drop_id FROM _ack_dup);
 
+-- reaction / mention 是集合语义：同一个 (目标, 用户, 值) 重复就是同一件事，
+-- 保留行已有就丢弃副本那条。
+DELETE FROM message_reaction
+WHERE message_id IN (SELECT drop_id FROM _ack_dup)
+  AND EXISTS (
+      SELECT 1 FROM message_reaction keep
+      JOIN _ack_dup d ON d.keep_id = keep.message_id
+      WHERE d.drop_id = message_reaction.message_id
+        AND keep.uid = message_reaction.uid
+        AND keep.emoji = message_reaction.emoji
+  );
+UPDATE message_reaction
+SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_reaction.message_id)
+WHERE message_id IN (SELECT drop_id FROM _ack_dup);
+
+DELETE FROM mention
+WHERE message_id IN (SELECT drop_id FROM _ack_dup)
+  AND EXISTS (
+      SELECT 1 FROM mention keep
+      JOIN _ack_dup d ON d.keep_id = keep.message_id
+      WHERE d.drop_id = mention.message_id
+        AND keep.mentioned_user_id = mention.mentioned_user_id
+  );
 UPDATE mention
 SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = mention.message_id)
 WHERE message_id IN (SELECT drop_id FROM _ack_dup);
 
+-- reminder 没有 (message_id, *) 唯一索引，直接改指。
 UPDATE reminder
 SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = reminder.message_id)
 WHERE message_id IN (SELECT drop_id FROM _ack_dup);

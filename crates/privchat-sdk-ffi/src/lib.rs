@@ -7405,21 +7405,19 @@ impl PrivchatClient {
             media_downloaded: false,
             thumb_status: 0,
         });
-        let message_id = self
-            .inner
-            .create_local_message_with_id(input, local_message_id)
+        // 建消息与入队命令必须是一个事务。分两步做的话，第二步失败就留下
+        // 一条「幽灵消息」：界面上永远发送中，却没有命令负责把它发出去。
+        self.inner
+            .create_local_message_queued(input, local_message_id, "message", Vec::new(), None)
             .await
-            .map_err(PrivchatFfiError::from)?;
-        self.enqueue_outbound_message(message_id, Vec::new())
-            .await?;
-        Ok(message_id)
+            .map_err(PrivchatFfiError::from)
     }
 
     async fn enqueue_local_message(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
-        let message_id = self.create_local_message(input).await?;
-        self.enqueue_outbound_message(message_id, Vec::new())
-            .await?;
-        Ok(message_id)
+        self.inner
+            .create_local_message_queued(map_new_message(input), None, "message", Vec::new(), None)
+            .await
+            .map_err(PrivchatFfiError::from)
     }
 
     pub async fn send_message(
@@ -7880,6 +7878,26 @@ impl PrivchatClient {
     ) -> Result<(), PrivchatFfiError> {
         self.inner
             .finalize_local_attachment(message_id, content, thumb_status)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// 附件定稿 + 入队，同一事务。取代 finalize + enqueue 两步调用。
+    pub async fn finalize_attachment_and_enqueue(
+        &self,
+        message_id: u64,
+        content: String,
+        thumb_status: i32,
+        route_key: String,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .finalize_attachment_and_enqueue(
+                message_id,
+                content,
+                thumb_status,
+                route_key,
+                Vec::new(),
+            )
             .await
             .map_err(PrivchatFfiError::from)
     }
