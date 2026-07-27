@@ -189,6 +189,28 @@ enum StorageCmd {
         message_seq: u32,
         resp: oneshot::Sender<Result<()>>,
     },
+    RecordOutboundAckPending {
+        message_id: u64,
+        server_message_id: u64,
+        message_seq: u32,
+        last_error: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    ListOutboundAckPending {
+        limit: usize,
+        resp: oneshot::Sender<Result<Vec<(u64, u64, u32, i64)>>>,
+    },
+    ReplayOutboundAck {
+        message_id: u64,
+        server_message_id: u64,
+        message_seq: u32,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    BumpOutboundAckAttempt {
+        message_id: u64,
+        last_error: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
     UpdateLocalMessageId {
         message_id: u64,
         local_message_id: u64,
@@ -950,6 +972,77 @@ impl StorageHandle {
                 message_id,
                 server_message_id,
                 message_seq,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// 记录「服务端已接受、本地未落库」的确认（P0：恢复依据不能随队列项一起丢）。
+    pub async fn record_outbound_ack_pending(
+        &self,
+        message_id: u64,
+        server_message_id: u64,
+        message_seq: u32,
+        last_error: &str,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::RecordOutboundAckPending {
+                message_id,
+                server_message_id,
+                message_seq,
+                last_error: last_error.to_string(),
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// `(message_id, server_message_id, message_seq, attempts)`，最老的先来。
+    pub async fn list_outbound_ack_pending(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64, u32, i64)>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::ListOutboundAckPending {
+                limit,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// 纯本地重放：标记已发送 + 删除待确认行，同一事务。绝不重新上行。
+    pub async fn replay_outbound_ack(
+        &self,
+        message_id: u64,
+        server_message_id: u64,
+        message_seq: u32,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::ReplayOutboundAck {
+                message_id,
+                server_message_id,
+                message_seq,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn bump_outbound_ack_attempt(
+        &self,
+        message_id: u64,
+        last_error: &str,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::BumpOutboundAckAttempt {
+                message_id,
+                last_error: last_error.to_string(),
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -2141,6 +2234,48 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 message_id,
                 server_message_id,
                 message_seq
+            ));
+        }
+        StorageCmd::RecordOutboundAckPending {
+            message_id,
+            server_message_id,
+            message_seq,
+            last_error,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.record_outbound_ack_pending(
+                &uid,
+                message_id,
+                server_message_id,
+                message_seq,
+                &last_error
+            ));
+        }
+        StorageCmd::ListOutboundAckPending { limit, resp } => {
+            with_uid!(resp, |uid| store.list_outbound_ack_pending(&uid, limit));
+        }
+        StorageCmd::ReplayOutboundAck {
+            message_id,
+            server_message_id,
+            message_seq,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.replay_outbound_ack(
+                &uid,
+                message_id,
+                server_message_id,
+                message_seq
+            ));
+        }
+        StorageCmd::BumpOutboundAckAttempt {
+            message_id,
+            last_error,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.bump_outbound_ack_attempt(
+                &uid,
+                message_id,
+                &last_error
             ));
         }
         StorageCmd::UpdateLocalMessageId {

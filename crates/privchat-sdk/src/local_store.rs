@@ -3560,6 +3560,152 @@ impl LocalStore {
         Ok(())
     }
 
+    /// 记录「服务端已接受、本地未落库」的确认。
+    ///
+    /// 出队用的 sled 队列和 SQLite 消息表不可能同事务，所以 `direct_send_message`
+    /// 成功而 `mark_message_sent` 失败这个窗口一定存在。此前的做法是把队列项直接
+    /// ack 掉（避免重发），代价是**恢复依据一起丢了**：重启后没人知道 server id，
+    /// 那条消息永远停在「发送中」。
+    ///
+    /// 这里把 ack 落到与 `message` 同库的表里，于是重放是纯本地事务，永远不需要
+    /// 再上行——消息已经在服务端了，重发只能依赖服务端幂等记录，而那不是永久的。
+    pub fn record_outbound_ack_pending(
+        &self,
+        uid: &str,
+        message_id: u64,
+        server_message_id: u64,
+        message_seq: u32,
+        last_error: &str,
+    ) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO outbound_ack_pending
+                 (message_id, server_message_id, message_seq, attempts, last_error,
+                  created_at, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?5)
+             ON CONFLICT(message_id) DO UPDATE SET
+                 server_message_id = excluded.server_message_id,
+                 message_seq = excluded.message_seq,
+                 last_error = excluded.last_error,
+                 updated_at = excluded.updated_at",
+            params![
+                message_id as i64,
+                server_message_id as i64,
+                message_seq as i64,
+                last_error,
+                now_ms
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("record outbound ack pending: {e}")))?;
+        Ok(())
+    }
+
+    /// 待重放的确认，最老的先来。
+    pub fn list_outbound_ack_pending(
+        &self,
+        uid: &str,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64, u32, i64)>> {
+        let conn = self.conn_for_user(uid)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT message_id, server_message_id, message_seq, attempts
+                 FROM outbound_ack_pending
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Storage(format!("list outbound ack pending: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u32,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| Error::Storage(format!("list outbound ack pending map: {e}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(format!("list outbound ack pending collect: {e}")))?;
+        Ok(rows)
+    }
+
+    /// 重放一条待确认：**标记已发送与删除待确认行在同一事务**。
+    ///
+    /// 分成两步写会重新打开崩溃窗口——正是这个表要消灭的那个窗口。
+    pub fn replay_outbound_ack(
+        &self,
+        uid: &str,
+        message_id: u64,
+        server_message_id: u64,
+        message_seq: u32,
+    ) -> Result<()> {
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("replay ack begin tx: {e}")))?;
+        tx.execute(
+            "DELETE FROM message WHERE server_message_id = ?1 AND id != ?2",
+            params![server_message_id as i64, message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("replay ack dedupe: {e}")))?;
+        let updated = tx
+            .execute(
+                "UPDATE message
+                 SET server_message_id = ?1, status = 2, updated_at = ?2,
+                     pts = ?4, order_seq = ?4
+                 WHERE id = ?3",
+                params![
+                    server_message_id as i64,
+                    now_ms,
+                    message_id as i64,
+                    message_seq as i64
+                ],
+            )
+            .map_err(|e| Error::Storage(format!("replay ack update: {e}")))?;
+        if updated == 0 {
+            // 本地行不在了（清库/换设备）。消息在服务端，历史同步会带回来，
+            // 这条待确认已经没有意义 —— 删掉，别让它永久重试。
+            tx.execute(
+                "DELETE FROM outbound_ack_pending WHERE message_id = ?1",
+                params![message_id as i64],
+            )
+            .map_err(|e| Error::Storage(format!("replay ack drop orphan: {e}")))?;
+            tx.commit()
+                .map_err(|e| Error::Storage(format!("replay ack commit orphan: {e}")))?;
+            return Ok(());
+        }
+        tx.execute(
+            "DELETE FROM outbound_ack_pending WHERE message_id = ?1",
+            params![message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("replay ack clear: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("replay ack commit: {e}")))?;
+        Ok(())
+    }
+
+    /// 重放失败：记一次尝试，保留行。**没有「放弃并重发」这个出口**——消息已送达。
+    pub fn bump_outbound_ack_attempt(
+        &self,
+        uid: &str,
+        message_id: u64,
+        last_error: &str,
+    ) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE outbound_ack_pending
+             SET attempts = attempts + 1, last_error = ?2, updated_at = ?3
+             WHERE message_id = ?1",
+            params![message_id as i64, last_error, now_ms],
+        )
+        .map_err(|e| Error::Storage(format!("bump outbound ack attempt: {e}")))?;
+        Ok(())
+    }
+
     /// 回写消息 content（不动 edited_at/status，避免误标「已编辑」）。
     ///
     /// 附件发送链路用：`process_outbound_file` 上传后才解码出 width/height、拿到
@@ -4898,6 +5044,107 @@ mod tests {
         assert_eq!(revoked.content, "消息已撤回");
         assert!(revoked.revoked);
         assert_eq!(revoked.revoked_by, Some(30001));
+    }
+
+    /// 服务端已接受、本地未落库时的恢复依据必须持久化。
+    ///
+    /// 队列（sled）与消息表（SQLite）不可能同事务，`direct_send_message` 成功而
+    /// `mark_message_sent` 失败这个窗口一定存在。旧写法在那里把队列项直接删掉，
+    /// 恢复依据一起没了：重启后没人知道 server id，消息永远停在「发送中」。
+    #[test]
+    fn pending_ack_survives_restart_and_replays_locally() {
+        let store = test_store();
+        let uid = "10003-ack-pending";
+        let input = NewMessage {
+            channel_id: 100,
+            channel_type: 1,
+            from_uid: 200,
+            message_type: 1,
+            content: "hello".to_string(),
+            searchable_word: "hello".to_string(),
+            setting: 0,
+            extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
+        };
+        let local_id = store
+            .create_local_message(uid, &input, 123456)
+            .expect("create local message");
+
+        // 发送成功但本地提交失败的那一刻。
+        store
+            .record_outbound_ack_pending(uid, local_id, 900_777, 42, "disk full")
+            .expect("record pending ack");
+
+        // 重启：唯一留下的就是这张表。
+        let pending = store
+            .list_outbound_ack_pending(uid, 10)
+            .expect("list pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, local_id);
+        assert_eq!(pending[0].1, 900_777);
+        assert_eq!(pending[0].2, 42);
+
+        // 纯本地重放，不需要任何网络。
+        store
+            .replay_outbound_ack(uid, local_id, 900_777, 42)
+            .expect("replay");
+
+        let row = store
+            .get_message_by_id(uid, local_id)
+            .expect("load message")
+            .expect("message exists");
+        assert_eq!(row.server_message_id, Some(900_777));
+        assert_eq!(row.status, 2, "must no longer read as sending");
+        assert_eq!(row.pts, Some(42));
+        assert!(
+            store
+                .list_outbound_ack_pending(uid, 10)
+                .expect("list after replay")
+                .is_empty(),
+            "replay must clear the row in the same transaction"
+        );
+    }
+
+    /// 重放失败不得把行丢掉——消息在服务端，只有本地还没收敛。
+    #[test]
+    fn failed_ack_replay_keeps_the_recovery_record() {
+        let store = test_store();
+        let uid = "10003-ack-retry";
+        store
+            .record_outbound_ack_pending(uid, 555, 900_888, 7, "boom")
+            .expect("record");
+
+        store
+            .bump_outbound_ack_attempt(uid, 555, "still broken")
+            .expect("bump");
+
+        let pending = store.list_outbound_ack_pending(uid, 10).expect("list");
+        assert_eq!(pending.len(), 1, "the record must survive a failed attempt");
+        assert_eq!(pending[0].3, 1, "attempts counted");
+    }
+
+    /// 本地行已经不在（清库/换设备）时，待确认行不能永久重试。
+    #[test]
+    fn orphan_pending_ack_is_dropped_instead_of_retrying_forever() {
+        let store = test_store();
+        let uid = "10003-ack-orphan";
+        store
+            .record_outbound_ack_pending(uid, 4242, 900_999, 9, "gone")
+            .expect("record");
+
+        store
+            .replay_outbound_ack(uid, 4242, 900_999, 9)
+            .expect("replay against a missing local row must not error");
+
+        assert!(
+            store
+                .list_outbound_ack_pending(uid, 10)
+                .expect("list")
+                .is_empty(),
+            "history sync brings the message back; the record has no purpose left"
+        );
     }
 
     #[test]

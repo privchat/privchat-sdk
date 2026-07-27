@@ -6426,11 +6426,31 @@ impl State {
                         .mark_message_sent(message_id, resp.server_message_id, resp.message_seq)
                         .await
                     {
-                        // Server has accepted this message; ack queue item to avoid duplicate sends.
+                        // 服务端已经接受了这条消息。队列项必须移除——留着下轮会重发，
+                        // 而重发只能指望服务端幂等记录，那不是永久的。但**恢复依据不能
+                        // 跟着一起丢**：把 ack 落到 outbound_ack_pending，重放就是一次
+                        // 纯本地事务，不需要再上行。旧写法只 ack 不记录，重启后没人知道
+                        // server id，那条消息永远停在「发送中」。
+                        if let Err(rec_err) = self
+                            .storage
+                            .record_outbound_ack_pending(
+                                message_id,
+                                resp.server_message_id,
+                                resp.message_seq,
+                                &err.to_string(),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                message_id,
+                                error = %rec_err,
+                                "failed to persist ack recovery record; message may show as sending"
+                            );
+                        }
                         let _ = self.storage.normal_queue_ack(vec![message_id]).await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "normal".to_string(),
-                            action: "commit_failed".to_string(),
+                            action: "ack_pending".to_string(),
                             message_id: Some(message_id),
                             queue_index: None,
                         });
@@ -6581,14 +6601,31 @@ impl State {
                         .mark_message_sent(message_id, resp.server_message_id, resp.message_seq)
                         .await
                     {
-                        // Server has accepted this message; ack queue item to avoid duplicate sends.
+                        // 附件与普通消息共用同一套 ack 恢复语义（见 normal 分支注释）：
+                        // 图片已经在服务端了，丢掉恢复依据会让它永远显示发送中。
+                        if let Err(rec_err) = self
+                            .storage
+                            .record_outbound_ack_pending(
+                                message_id,
+                                resp.server_message_id,
+                                resp.message_seq,
+                                &err.to_string(),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                message_id,
+                                error = %rec_err,
+                                "failed to persist ack recovery record; message may show as sending"
+                            );
+                        }
                         let _ = self
                             .storage
                             .file_queue_ack(queue_index, vec![message_id])
                             .await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
-                            action: "commit_failed".to_string(),
+                            action: "ack_pending".to_string(),
                             message_id: Some(message_id),
                             queue_index: Some(queue_index),
                         });
@@ -6708,11 +6745,61 @@ impl State {
         None
     }
 
-    async fn drain_outbound_queues(&mut self) -> Result<usize> {
-        if !self.should_process_outbound_queue() {
-            return Ok(0);
+    /// 重放「服务端已接受、本地未落库」的确认。
+    ///
+    /// **不联网**：消息已经在服务端，这里只补本地那一半。因此它先于连接闸门执行，
+    /// 离线启动也能收敛——否则一条已送达的消息会一直显示「发送中」，直到网络恢复。
+    ///
+    /// 没有「重试到头就重发」的出口：重发只能指望服务端幂等记录，而那不是永久的，
+    /// 过期的那天用户就会看到自己的消息发了两遍。
+    async fn replay_pending_acks(&mut self) -> Result<usize> {
+        let pending = match self.storage.list_outbound_ack_pending(64).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %err, "list pending acks failed");
+                return Ok(0);
+            }
+        };
+        let mut replayed = 0usize;
+        for (message_id, server_message_id, message_seq, attempts) in pending {
+            match self
+                .storage
+                .replay_outbound_ack(message_id, server_message_id, message_seq)
+                .await
+            {
+                Ok(()) => {
+                    replayed += 1;
+                    self.pending_events.push(SdkEvent::OutboundQueueUpdated {
+                        kind: "normal".to_string(),
+                        action: "ack_replayed".to_string(),
+                        message_id: Some(message_id),
+                        queue_index: None,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        message_id,
+                        attempts,
+                        error = %err,
+                        "pending ack replay failed; message IS delivered, will retry locally"
+                    );
+                    let _ = self
+                        .storage
+                        .bump_outbound_ack_attempt(message_id, &err.to_string())
+                        .await;
+                }
+            }
         }
-        let mut drained = 0usize;
+        Ok(replayed)
+    }
+
+    async fn drain_outbound_queues(&mut self) -> Result<usize> {
+        // 先补本地。这一段不需要连接，放在闸门之前。
+        let replayed = self.replay_pending_acks().await.unwrap_or(0);
+        if !self.should_process_outbound_queue() {
+            return Ok(replayed);
+        }
+        let mut drained = replayed;
         drained += self
             .drain_normal_queue_once(OUTBOUND_DRAIN_BATCH_SIZE)
             .await?;
