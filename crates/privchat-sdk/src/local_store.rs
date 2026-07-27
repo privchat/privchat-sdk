@@ -3574,6 +3574,9 @@ impl LocalStore {
         payload: &[u8],
         route_key: Option<&str>,
     ) -> Result<()> {
+        // 消息类命令：command_id 用本地 message.id 派生，天然稳定且重试不变。
+        // 非消息命令由调用方自带 command_id（`outbox_enqueue_command`）。
+        let command_id = format!("msg:{local_message_id}");
         let mut conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let tx = conn
@@ -3586,18 +3589,19 @@ impl LocalStore {
         .map_err(|e| Error::Storage(format!("outbox enqueue mark sending: {e}")))?;
         tx.execute(
             "INSERT INTO outbox
-                 (local_message_id, command_type, channel_id, payload, route_key,
+                 (command_id, command_type, message_id, channel_id, payload, route_key,
                   status, retry_count, next_attempt_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, 0, ?6, ?6)
-             ON CONFLICT(local_message_id) DO UPDATE SET
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, 0, ?7, ?7)
+             ON CONFLICT(command_id) DO UPDATE SET
                  payload = excluded.payload,
                  route_key = excluded.route_key,
                  status = 'pending',
                  next_attempt_at = 0,
                  updated_at = excluded.updated_at",
             params![
-                local_message_id as i64,
+                command_id,
                 command_type,
+                local_message_id as i64,
                 channel_id as i64,
                 payload,
                 route_key,
@@ -3622,9 +3626,10 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         let mut stmt = conn
             .prepare(
-                "SELECT local_message_id, command_type, channel_id, payload, route_key, retry_count
+                "SELECT message_id, command_type, channel_id, payload, route_key, retry_count
                  FROM outbox
                  WHERE command_type = ?1 AND status = 'pending' AND next_attempt_at <= ?2
+                   AND message_id IS NOT NULL
                  ORDER BY created_at ASC, id ASC
                  LIMIT ?3",
             )
@@ -3688,7 +3693,7 @@ impl LocalStore {
             )));
         }
         tx.execute(
-            "DELETE FROM outbox WHERE local_message_id = ?1",
+            "DELETE FROM outbox WHERE message_id = ?1",
             params![local_message_id as i64],
         )
         .map_err(|e| Error::Storage(format!("outbox ack delete row: {e}")))?;
@@ -3711,7 +3716,7 @@ impl LocalStore {
             "UPDATE outbox
              SET retry_count = retry_count + 1, next_attempt_at = ?2,
                  last_error = ?3, updated_at = ?4
-             WHERE local_message_id = ?1",
+             WHERE message_id = ?1",
             params![local_message_id as i64, next_attempt_at, last_error, now_ms],
         )
         .map_err(|e| Error::Storage(format!("outbox bump retry: {e}")))?;
@@ -3722,7 +3727,7 @@ impl LocalStore {
     pub fn outbox_drop(&self, uid: &str, local_message_id: u64) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         conn.execute(
-            "DELETE FROM outbox WHERE local_message_id = ?1",
+            "DELETE FROM outbox WHERE message_id = ?1",
             params![local_message_id as i64],
         )
         .map_err(|e| Error::Storage(format!("outbox drop: {e}")))?;
@@ -3739,7 +3744,7 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         conn.execute(
-            "UPDATE outbox SET payload = ?2, updated_at = ?3 WHERE local_message_id = ?1",
+            "UPDATE outbox SET payload = ?2, updated_at = ?3 WHERE message_id = ?1",
             params![local_message_id as i64, payload, now_ms],
         )
         .map_err(|e| Error::Storage(format!("outbox update payload: {e}")))?;

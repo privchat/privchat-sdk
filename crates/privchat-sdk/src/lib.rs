@@ -16968,7 +16968,20 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn network_hint_offline_emits_event_and_blocks_connect() {
-        let sdk = PrivchatSdk::new(PrivchatConfig::default());
+        // 指向一个确定关闭的端口。默认配置指的是 127.0.0.1:9001——开发机上
+        // 常常真的有服务在听，于是这条用例的结果取决于那个服务当时回什么
+        // （实测过：本机有服务时它连得上，靠认证被拒才「通过」）。断言的是
+        // 「hint 没有短路 connect」，不该依赖环境里有没有人监听。
+        let mut config = PrivchatConfig::default();
+        config.endpoints = vec![super::ServerEndpoint {
+            protocol: super::TransportProtocol::Tcp,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            path: None,
+            use_tls: false,
+        }];
+        config.connection_timeout_secs = 1;
+        let sdk = PrivchatSdk::new(config);
         let baseline = sdk.last_event_sequence_id();
 
         sdk.set_network_hint(NetworkHint::Offline)

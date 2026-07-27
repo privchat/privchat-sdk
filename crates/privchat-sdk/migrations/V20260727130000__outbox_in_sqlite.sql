@@ -1,4 +1,5 @@
--- Outbox lives in the same database as `message` (MESSAGE_SPEC §8.3).
+-- Client Command Outbox (SYNC_SPEC §3.3): every durable network mutation,
+-- in the same database as `message`.
 --
 -- Previously the outbound queue was a separate sled store. Two engines cannot
 -- share a transaction, so "server accepted the message" and "local row says
@@ -20,14 +21,29 @@
 -- single storage actor. (The TypeScript SDK does need leases — several
 -- browser tabs share one account database — but that is a property of the
 -- browser, not of this design.)
+-- This is the queue for EVERY durable network mutation, not just messages:
+-- moment likes, comments, reactions, edits, revokes, friend changes, channel
+-- settings. Sending a message is one `command_type` among them. A
+-- message-shaped table would have to be rebuilt the moment the first
+-- non-message command needs offline retry.
 CREATE TABLE IF NOT EXISTS outbox (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    -- Local `message.id`. Unique: one outbound command per message.
-    local_message_id  INTEGER UNIQUE NOT NULL,
-    -- 'message' | 'attachment'. Attachments differ only in needing an upload
-    -- before the send, not in their durability rules.
+    -- Stable idempotency id for one logical operation. Unchanged across
+    -- retries, sent to the server, which dedupes on
+    -- (user_id, device_id, command_id).
+    command_id        TEXT UNIQUE NOT NULL,
     command_type      TEXT NOT NULL,
-    channel_id        INTEGER NOT NULL,
+    -- Message-class commands only; NULL for plain RPC commands.
+    message_id        INTEGER,
+    -- Optional: collapse repeated state changes for the same target while
+    -- they are still unsent. like -> unlike -> like leaves one row.
+    -- Distinct from command_id: that one stops the SERVER repeating work,
+    -- this one stops the CLIENT sending work it has already superseded.
+    coalesce_key      TEXT,
+    -- Optional: commands for the same entity must go out in order.
+    ordering_key      TEXT,
+    channel_id        INTEGER,
+    -- typed protocol bytes; never hand-rolled JSON.
     payload           BLOB NOT NULL,
     -- Attachment upload routing (was the sled file-queue index).
     route_key         TEXT,
@@ -41,6 +57,10 @@ CREATE TABLE IF NOT EXISTS outbox (
 
 CREATE INDEX IF NOT EXISTS idx_outbox_due
     ON outbox (status, next_attempt_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_message
+    ON outbox (message_id) WHERE message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_outbox_coalesce
+    ON outbox (coalesce_key) WHERE coalesce_key IS NOT NULL;
 
 -- Retire the compensation table this design makes unnecessary. A second place
 -- that can hold "this message was really sent" is exactly what the single
