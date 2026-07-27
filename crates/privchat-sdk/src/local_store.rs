@@ -5738,10 +5738,10 @@ mod tests {
 
     /// 附件的发送字节来自 SDK 托管的本地文件，**不是**存进 outbox 的 payload。
     ///
-    /// 新链路入队时 payload 是空的（把几十 MB 复制进 SQLite 只是同一份数据存两
-    /// 遍）。drain 必须能从 `message.content` 的路径读出来——上一版本不能，于是
-    /// 每一条新附件都会被「payload is empty」判死。这条测试就是为了让那个错误
-    /// 不再有机会溜过去。
+    /// 覆盖范围有限，别高估它：只验证到「命令不带字节 + 路径可读」这一层，
+    /// **没有**走 `process_outbound_file`。真正锁住那个 P0（空 payload 被判死）
+    /// 需要能注入上传/transport 的出队测试——当前 drain 要求已认证会话，测试里
+    /// 没有假 transport 就根本不会执行，写出来只会是一条永远绿的空转断言。
     #[test]
     fn attachment_command_carries_no_bytes_and_the_file_is_read_from_disk() {
         let store = test_store();

@@ -10191,7 +10191,9 @@ impl State {
                 .content
                 .strip_prefix("file://")
                 .unwrap_or(&message.content);
-            std::fs::read(path).map_err(|e| {
+            // 异步读：单 actor 跑着收消息、同步和事件发布，几十上百 MB 的
+            // 附件用同步读会把这些一起卡住。
+            tokio::fs::read(path).await.map_err(|e| {
                 Error::InvalidState(format!("attachment source unreadable at {path}: {e}"))
             })?
         } else {
