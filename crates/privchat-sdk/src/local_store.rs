@@ -1215,6 +1215,7 @@ impl LocalStore {
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
                      server_message_id = ?15,
+                     created_at = ?18,
                      mime_type = COALESCE(?17, mime_type)
                  WHERE id = ?16",
                 params![
@@ -1235,6 +1236,10 @@ impl LocalStore {
                     input.server_message_id as i64,
                     row_id,
                     input.mime_type,
+                    // Same rule on the update path: a row first seen through a
+                    // push and re-seen through history must end up holding the
+                    // send time, not whichever arrival happened to write last.
+                    Self::sent_at_ms(input.timestamp, now_ms),
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
@@ -1293,7 +1298,7 @@ impl LocalStore {
                 server_message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
                 content, status, created_at, updated_at, searchable_word, local_message_id,
                 setting, order_seq, extra, mime_type
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?17, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 input.server_message_id as i64,
                 input.pts,
@@ -1311,6 +1316,15 @@ impl LocalStore {
                 input.order_seq,
                 input.extra,
                 input.mime_type,
+                // created_at is WHEN THE MESSAGE WAS SENT, not when this device
+                // stored it. Writing `now` here silently replaced every
+                // backfilled message's real time with the moment of the
+                // backfill: a conversation paged in today came back stamped
+                // today, and since that is the field the clients read, display
+                // and order by, a month of history collapsed onto one minute
+                // and landed after messages that are genuinely newer.
+                // `updated_at` stays local — that one really is about this row.
+                Self::sent_at_ms(input.timestamp, now_ms),
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
@@ -1417,6 +1431,7 @@ impl LocalStore {
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
                      server_message_id = ?15,
+                     created_at = ?18,
                      mime_type = COALESCE(?17, mime_type)
                  WHERE id = ?16",
                 params![
@@ -1437,6 +1452,10 @@ impl LocalStore {
                     input.server_message_id as i64,
                     row_id,
                     input.mime_type,
+                    // Same rule on the update path: a row first seen through a
+                    // push and re-seen through history must end up holding the
+                    // send time, not whichever arrival happened to write last.
+                    Self::sent_at_ms(input.timestamp, now_ms),
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
@@ -1493,7 +1512,7 @@ impl LocalStore {
                 server_message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
                 content, status, created_at, updated_at, searchable_word, local_message_id,
                 setting, order_seq, extra, mime_type
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?17, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 input.server_message_id as i64,
                 input.pts,
@@ -1511,6 +1530,15 @@ impl LocalStore {
                 input.order_seq,
                 input.extra,
                 input.mime_type,
+                // created_at is WHEN THE MESSAGE WAS SENT, not when this device
+                // stored it. Writing `now` here silently replaced every
+                // backfilled message's real time with the moment of the
+                // backfill: a conversation paged in today came back stamped
+                // today, and since that is the field the clients read, display
+                // and order by, a month of history collapsed onto one minute
+                // and landed after messages that are genuinely newer.
+                // `updated_at` stays local — that one really is about this row.
+                Self::sent_at_ms(input.timestamp, now_ms),
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
@@ -4798,6 +4826,27 @@ impl LocalStore {
         Ok(())
     }
 
+    /// The send time to persist, in milliseconds.
+    ///
+    /// Guards the one thing a caller can get wrong here that no reader can
+    /// detect afterwards: a seconds-resolution value. The wire carries both —
+    /// `PushMessageRequest.timestamp` is a u32 of seconds (a millisecond epoch
+    /// does not fit in u32 at all), while history and sync carry milliseconds —
+    /// and a seconds value stored as milliseconds lands in 1970, which puts a
+    /// message received today before the entire conversation. The threshold is
+    /// 10^11 ms = 1973: every real millisecond timestamp is above it and every
+    /// plausible seconds one is below.
+    fn sent_at_ms(timestamp: i64, fallback_ms: i64) -> i64 {
+        const MIN_PLAUSIBLE_MS: i64 = 100_000_000_000;
+        match timestamp {
+            t if t >= MIN_PLAUSIBLE_MS => t,
+            t if t > 0 => t.saturating_mul(1_000),
+            // No usable time at all: local arrival is a worse answer than the
+            // real one, but a far better one than 1970.
+            _ => fallback_ms,
+        }
+    }
+
     fn derive_encryption_key(uid: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"privchat_sdk_encryption_key_v1");
@@ -5894,6 +5943,62 @@ mod tests {
         assert_eq!(all.len(), 1, "duplicate server row should be merged");
         assert_eq!(all[0].message_id, local_id);
         assert_eq!(all[0].server_message_id, Some(900001));
+    }
+
+    /// 回填的历史必须带着**发送时间**落库,而不是「本机什么时候存的」。
+    ///
+    /// 生产事故的回归:上滑翻页把几周前的消息在今天补进来,created_at 被写成 now(),
+    /// 而 created_at 正是客户端读取、显示、并且(当时)排序用的字段——于是一个月的历史
+    /// 全部塌到同一分钟,还排到了真正更新的消息后面。
+    ///
+    /// 单位一并锁死:push 走秒(u32 装不下毫秒纪元),history/sync 走毫秒;两种混进同一
+    /// 列,新消息就会比老消息小 1000 倍。
+    #[test]
+    fn remote_message_keeps_its_send_time_not_its_arrival_time() {
+        let store = test_store();
+        let uid = "700";
+        let sent_at_ms = 1_700_000_000_000i64; // 2023-11-14,绝不是"现在"
+        let mk = |smid: u64, pts: i64, timestamp: i64| UpsertRemoteMessageInput {
+            server_message_id: smid,
+            local_message_id: 0,
+            channel_id: 45,
+            channel_type: 1,
+            timestamp,
+            from_uid: 800,
+            message_type: 1,
+            content: format!("m{smid}"),
+            status: 2,
+            searchable_word: String::new(),
+            setting: 0,
+            pts,
+            order_seq: pts,
+            extra: "{}".to_string(),
+            mime_type: None,
+        };
+
+        store
+            .upsert_remote_message_with_result(uid, &mk(910001, 1, sent_at_ms))
+            .expect("insert history row");
+        // 同一条消息再被回填一次:更新路径同样必须落发送时间。
+        store
+            .upsert_remote_message_with_result(uid, &mk(910001, 1, sent_at_ms))
+            .expect("re-upsert history row");
+        // push 路径:调用方给的是**秒**。
+        store
+            .upsert_remote_message_with_result(uid, &mk(910002, 2, sent_at_ms / 1000))
+            .expect("insert push row");
+
+        let rows = store
+            .list_messages(uid, 45, 1, 10, 0)
+            .expect("list messages");
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(
+                row.created_at, sent_at_ms,
+                "created_at 必须是发送时间(毫秒),实际 {}",
+                row.created_at
+            );
+        }
     }
 
     /// 显示排序:与 TypeScript SDK 用同一批乱序输入,顺序必须一致。

@@ -4588,7 +4588,13 @@ impl State {
             push.local_message_id,
             push.channel_id,
             i32::from(push.channel_type),
-            i64::from(push.timestamp),
+            // `push.timestamp` is SECONDS (protocol/push.fbs: `timestamp : uint`
+            // — a u32 cannot hold a millisecond epoch at all). Everything below
+            // this line, and every other write path into `message`, is
+            // milliseconds. Passing it through raw put realtime rows a factor of
+            // 1000 below history rows in the same table, so the newest messages
+            // compared as the oldest.
+            i64::from(push.timestamp).saturating_mul(1_000),
             push.from_uid,
             i32::try_from(push.message_type).unwrap_or(0),
             content,
