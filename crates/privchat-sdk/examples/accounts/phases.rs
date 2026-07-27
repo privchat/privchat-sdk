@@ -579,22 +579,20 @@ impl TestPhases {
                 .push("upload token response missing token/upload_url".to_string());
         }
 
-        if !token.file_id.is_empty() && token.file_id != "unknown-file-id" {
-            let callback = manager
-                .file_upload_callback("alice", &token.file_id, "uploaded")
-                .await?;
-            metrics.rpc_calls += 1;
-            if callback {
-                metrics.rpc_successes += 1;
-            } else {
-                metrics
-                    .errors
-                    .push("file upload callback returned false".to_string());
-            }
+        // 发 token 时文件还没落盘，server 按契约返回空 `file_id`
+        // (`rpc/file/request_upload_token.rs`)。这里以前挂着一段
+        // `if !file_id.is_empty() { …callback… }`，看着像在测回调，实际永远
+        // 不进——空转分支比没有分支更糟，它让覆盖率报表撒谎。真正的
+        // 上传→callback→附件消息全链在 `outbox-attachment-e2e`。
+        if !token.file_id.is_empty() {
+            metrics.errors.push(format!(
+                "request_upload_token must not mint a file_id yet, got '{}'",
+                token.file_id
+            ));
         }
 
         Ok(PhaseResult {
-            phase_name: "file-upload".to_string(),
+            phase_name: "file-upload-token".to_string(),
             success: metrics.errors.is_empty(),
             duration: start.elapsed(),
             details: format!("file_id={}", token.file_id),
@@ -4653,6 +4651,315 @@ impl TestPhases {
                  sent_msg_id={sent_msg_id} reply_id={} reply_len={}",
                 reply.message_id,
                 reply.content.len()
+            ),
+            metrics,
+        })
+    }
+
+    /// **Outbox 文本durability** —— SYNC_SPEC §3.3 Client Command Outbox。
+    ///
+    /// 这套 suite 之前的所有发送 phase 走的都是 `manager.send_text()`，也就是
+    /// 直接打 `sync/submit` RPC —— 它压根不经过 outbox。换句话说：客户端真正
+    /// 用来发消息的那条路径（本地落库 → outbox → drain → ack → 删 outbox 行），
+    /// 在 40 个 phase 里一次都没被跑过。产品代码里最容易在崩溃/重连时出错的
+    /// 一段，恰好是测试覆盖为零的一段。
+    ///
+    /// 这个 phase 走真实路径，断言四件事：
+    ///   1. 入队即可见：`create_local_message_queued` 返回后消息立刻在本地
+    ///      时间线上（乐观 UI 的前提）。
+    ///   2. 最终一致：每条都收敛到 status=2 且带非零 server_message_id。
+    ///   3. **outbox 不泄漏**：全部 ack 后队列必须空。留下的行 = 重启后重发。
+    ///   4. 对端不重复：bob 侧每条内容恰好出现一次。
+    pub async fn phase41_outbox_text_durability(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let channel_id = manager
+            .cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("phase41 needs the alice<->bob direct channel"))?;
+        let channel_type = DIRECT_SYNC_CHANNEL_TYPE as i32;
+        let alice = manager.sdk("alice")?;
+        let alice_uid = manager.user_id("alice")?;
+
+        let stamp = now_millis();
+        let contents: Vec<String> = (0..3)
+            .map(|i| format!("outbox-durability-{stamp}-{i}"))
+            .collect();
+
+        let mut message_ids = Vec::new();
+        for content in &contents {
+            let message_id = alice
+                .create_local_message_queued(
+                    privchat_sdk::NewMessage {
+                        channel_id,
+                        channel_type,
+                        from_uid: alice_uid,
+                        message_type: 0,
+                        content: content.clone(),
+                        searchable_word: String::new(),
+                        setting: 0,
+                        extra: String::new(),
+                        mime_type: None,
+                        media_downloaded: false,
+                        thumb_status: 0,
+                    },
+                    None,
+                    "message",
+                    Vec::new(),
+                    None,
+                )
+                .await?;
+            metrics.rpc_calls += 1;
+            message_ids.push(message_id);
+        }
+
+        // 1. 入队即可见 —— 不等网络。
+        let local_now = manager
+            .list_local_messages("alice", channel_id, channel_type, 100)
+            .await?;
+        for content in &contents {
+            if !local_now.iter().any(|m| &m.content == content) {
+                metrics
+                    .errors
+                    .push(format!("enqueued message not visible locally: {content}"));
+            }
+        }
+
+        // 2. 最终一致 —— 轮询到全部 sent，而不是睡固定时长。
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut sent_server_ids: Vec<u64> = Vec::new();
+        loop {
+            let rows = manager
+                .list_local_messages("alice", channel_id, channel_type, 200)
+                .await?;
+            sent_server_ids = message_ids
+                .iter()
+                .filter_map(|id| rows.iter().find(|m| m.message_id == *id))
+                .filter(|m| m.status == 2)
+                .filter_map(|m| m.server_message_id.filter(|id| *id != 0))
+                .collect();
+            if sent_server_ids.len() == message_ids.len() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                metrics.errors.push(format!(
+                    "only {}/{} outbox messages reached status=sent within 20s",
+                    sent_server_ids.len(),
+                    message_ids.len()
+                ));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        metrics.rpc_successes += sent_server_ids.len() as u32;
+
+        // 3. outbox 不泄漏。
+        let leftovers = alice.peek_outbound_messages(100).await?;
+        let leaked: Vec<u64> = leftovers
+            .iter()
+            .map(|q| q.message_id)
+            .filter(|id| message_ids.contains(id))
+            .collect();
+        if !leaked.is_empty() {
+            metrics.errors.push(format!(
+                "outbox still holds acked messages (would resend after restart): {leaked:?}"
+            ));
+        }
+
+        // 4. 对端各收到一次，不多不少。
+        manager.refresh_local_views("bob").await?;
+        let bob_rows = manager
+            .list_local_messages("bob", channel_id, channel_type, 200)
+            .await?;
+        for content in &contents {
+            let hits = bob_rows.iter().filter(|m| &m.content == content).count();
+            if hits != 1 {
+                metrics
+                    .errors
+                    .push(format!("bob saw '{content}' {hits} times (want exactly 1)"));
+            }
+        }
+
+        Ok(PhaseResult {
+            phase_name: "outbox-text-durability".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: format!(
+                "enqueued={} sent={} outbox_leaked={}",
+                message_ids.len(),
+                sent_server_ids.len(),
+                leaked.len()
+            ),
+            metrics,
+        })
+    }
+
+    /// **附件端到端** —— 真图片、真上传、真 outbox。
+    ///
+    /// phase9 (`file-upload`) 只申请了一个 upload token 就收工：server 在发
+    /// token 阶段按设计返回空 `file_id`，于是 callback 那半段被 `if !file_id
+    /// .is_empty()` 静默跳过，附件链路实际零覆盖。真正会出事的地方全在它后面
+    /// ——缩略图生成、两次上传、file_id 解析、附件消息协议、drain 里的空
+    /// payload 从托管路径读盘。
+    ///
+    /// 这里走产品路径：`create_local_attachment_placeholder` +
+    /// `finalize_attachment_and_enqueue`（同一事务），payload 传空，逼 drain
+    /// 去读磁盘上的真文件；然后等 status=sent，并要求 bob 侧收到一条 image
+    /// 消息。附件 outbox 同样必须清空。
+    pub async fn phase42_outbox_attachment_e2e(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let channel_id = manager
+            .cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("phase42 needs the alice<->bob direct channel"))?;
+        let channel_type = DIRECT_SYNC_CHANNEL_TYPE as i32;
+        let alice = manager.sdk("alice")?;
+        let alice_uid = manager.user_id("alice")?;
+
+        // 真 PNG：缩略图那步会真的去解码它，1x1 占位或随机字节过不了。
+        let source_path = manager.base_dir.join("phase42-attachment.png");
+        let img = image::RgbImage::from_fn(96, 64, |x, y| {
+            image::Rgb([(x * 2) as u8, (y * 3) as u8, 160])
+        });
+        image::DynamicImage::ImageRgb8(img).save(&source_path)?;
+        let source_bytes = std::fs::metadata(&source_path)?.len();
+
+        let image_type = privchat_protocol::message::ContentMessageType::Image as i32;
+        let message_id = alice
+            .create_local_attachment_placeholder(
+                privchat_sdk::NewMessage {
+                    channel_id,
+                    channel_type,
+                    from_uid: alice_uid,
+                    message_type: image_type,
+                    content: source_path.display().to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: String::new(),
+                    mime_type: Some("image/png".to_string()),
+                    media_downloaded: true,
+                    thumb_status: 0,
+                },
+                None,
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+
+        // payload 传空 = 生产路径：字节留在托管文件里，drain 自己去读。
+        alice
+            .finalize_attachment_and_enqueue(
+                message_id,
+                source_path.display().to_string(),
+                0,
+                "image".to_string(),
+                Vec::new(),
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let mut sent: Option<privchat_sdk::StoredMessage> = None;
+        let mut last_status = -1;
+        loop {
+            let rows = manager
+                .list_local_messages("alice", channel_id, channel_type, 200)
+                .await?;
+            if let Some(row) = rows.iter().find(|m| m.message_id == message_id) {
+                last_status = row.status;
+                if row.status == 2 && row.server_message_id.is_some_and(|id| id != 0) {
+                    sent = Some(row.clone());
+                    break;
+                }
+                // 3 = failed：不用等满 40s，直接把服务端/上传的错误暴露出来。
+                if row.status == 3 {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let sent = match sent {
+            Some(row) => {
+                metrics.rpc_successes += 1;
+                row
+            }
+            None => {
+                metrics.errors.push(format!(
+                    "attachment message {message_id} never reached sent (last status={last_status})"
+                ));
+                return Ok(PhaseResult {
+                    phase_name: "outbox-attachment-e2e".to_string(),
+                    success: false,
+                    duration: start.elapsed(),
+                    details: format!("source_bytes={source_bytes} last_status={last_status}"),
+                    metrics,
+                });
+            }
+        };
+
+        // 发送成功后 content 必须已经从本地路径换成服务端附件描述：
+        // 还留着 file:// / 绝对路径 = 对端拿到的是一条打不开的消息。
+        if sent.content.contains(&source_path.display().to_string()) {
+            metrics.errors.push(
+                "sent attachment content still points at the local source path".to_string(),
+            );
+        }
+
+        let leftovers = alice.peek_outbound_files(100).await?;
+        let sent_server_message_id = sent.server_message_id.unwrap_or(0);
+        if leftovers.iter().any(|q| q.message_id == message_id) {
+            metrics
+                .errors
+                .push("attachment outbox row survived a successful send".to_string());
+        }
+
+        // 对端：等到同一条 server_message_id 落到 bob 本地。
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut bob_saw = false;
+        loop {
+            manager.refresh_local_views("bob").await?;
+            let rows = manager
+                .list_local_messages("bob", channel_id, channel_type, 200)
+                .await?;
+            let hits = rows
+                .iter()
+                .filter(|m| m.server_message_id == Some(sent_server_message_id))
+                .count();
+            if hits > 1 {
+                metrics.errors.push(format!(
+                    "bob has {hits} copies of attachment server_message_id={sent_server_message_id}"
+                ));
+                bob_saw = true;
+                break;
+            }
+            if hits == 1 {
+                bob_saw = true;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                metrics.errors.push(format!(
+                    "bob never received attachment server_message_id={sent_server_message_id}"
+                ));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        Ok(PhaseResult {
+            phase_name: "outbox-attachment-e2e".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: format!(
+                "source_bytes={source_bytes} server_message_id={sent_server_message_id} \
+                 bob_received={bob_saw}"
             ),
             metrics,
         })

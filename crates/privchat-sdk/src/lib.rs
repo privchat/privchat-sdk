@@ -2420,12 +2420,10 @@ enum Command {
         resp: oneshot::Sender<Result<FileQueueRef>>,
     },
     PeekOutboundFiles {
-        queue_index: usize,
         limit: usize,
         resp: oneshot::Sender<Result<Vec<QueueMessage>>>,
     },
     AckOutboundFiles {
-        queue_index: usize,
         message_ids: Vec<u64>,
         resp: oneshot::Sender<Result<usize>>,
     },
@@ -12418,15 +12416,8 @@ impl PrivchatSdk {
                         }
                         let _ = resp.send(result);
                     }
-                    Command::PeekOutboundFiles {
-                        queue_index,
-                        limit,
-                        resp,
-                    } => {
+                    Command::PeekOutboundFiles { limit, resp } => {
                         let result = match state.current_uid_required() {
-                            // 命令都在 outbox 里；queue_index 只是历史上的
-                            // 分片编号，第 0 片返回全部附件命令即可。
-                            Ok(_) if queue_index > 0 => Ok(Vec::new()),
                             Ok(_) => state
                                 .storage
                                 .outbox_peek("attachment", limit, i64::MAX)
@@ -12444,11 +12435,7 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
-                    Command::AckOutboundFiles {
-                        queue_index,
-                        message_ids,
-                        resp,
-                    } => {
+                    Command::AckOutboundFiles { message_ids, resp } => {
                         let result = match state.current_uid_required() {
                             Ok(_) => {
                                 let mut removed = 0usize;
@@ -14805,16 +14792,11 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn peek_outbound_files(
-        &self,
-        queue_index: usize,
-        limit: usize,
-    ) -> Result<Vec<QueueMessage>> {
+    pub async fn peek_outbound_files(&self, limit: usize) -> Result<Vec<QueueMessage>> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::PeekOutboundFiles {
-                queue_index,
                 limit,
                 resp: resp_tx,
             })
@@ -14823,16 +14805,11 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn ack_outbound_files(
-        &self,
-        queue_index: usize,
-        message_ids: Vec<u64>,
-    ) -> Result<usize> {
+    pub async fn ack_outbound_files(&self, message_ids: Vec<u64>) -> Result<usize> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::AckOutboundFiles {
-                queue_index,
                 message_ids,
                 resp: resp_tx,
             })
@@ -19057,15 +19034,7 @@ mod tests {
     }
 
     async fn retry_test_file_items(sdk: &PrivchatSdk) -> Vec<super::QueueMessage> {
-        let mut out = Vec::new();
-        for queue_index in 0..4 {
-            out.extend(
-                sdk.peek_outbound_files(queue_index, 16)
-                    .await
-                    .unwrap_or_default(),
-            );
-        }
-        out
+        sdk.peek_outbound_files(64).await.unwrap_or_default()
     }
 
     /// 未鉴权（连接中/重连中）时调用业务 RPC，必须得到**结构化可重试**错误，

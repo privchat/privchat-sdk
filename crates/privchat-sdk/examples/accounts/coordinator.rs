@@ -114,6 +114,10 @@ impl TestCoordinator {
             .await;
         self.run_phase(TestPhases::phase40_assistant_echo_loop(manager).await)
             .await;
+        self.run_phase(TestPhases::phase41_outbox_text_durability(manager).await)
+            .await;
+        self.run_phase(TestPhases::phase42_outbox_attachment_e2e(manager).await)
+            .await;
         Ok(())
     }
 
