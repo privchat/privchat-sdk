@@ -235,6 +235,14 @@ pub struct LocalStore {
     queues_migrated: Arc<Mutex<HashSet<String>>>,
 }
 
+/// 旧 sled 队列搬运的结果。`remaining > 0` 表示还有项没搬走，本进程后续
+/// 触发必须继续尝试——记为完成会把它们晾到下次重启。
+#[derive(Debug, Clone, Copy)]
+pub struct SledQueueMigration {
+    pub moved: usize,
+    pub remaining: usize,
+}
+
 /// A guard that returns the connection to the cache when dropped
 pub struct ConnGuard<'a> {
     conn: Option<Connection>,
@@ -433,19 +441,34 @@ impl LocalStore {
             guard.contains(uid)
         };
         if !already {
+            // 只有**确认旧队列已空**才记为完成。部分失败（比如某条缺
+            // local_message_id）时不记，本进程后续任何一次触发都会继续搬——
+            // 否则那几条消息要等到用户重启 App 才有人管。
             match self.migrate_sled_queues_into_outbox(uid, &paths) {
-                Ok(moved) => {
-                    if moved > 0 {
-                        tracing::info!(uid, moved, "migrated legacy sled queue items into outbox");
+                Ok(outcome) => {
+                    if outcome.moved > 0 {
+                        tracing::info!(
+                            uid,
+                            moved = outcome.moved,
+                            "migrated legacy sled queue items into outbox"
+                        );
+                    }
+                    if outcome.remaining == 0 {
+                        if let Ok(mut guard) = self.queues_migrated.lock() {
+                            guard.insert(uid.to_string());
+                        }
+                    } else {
+                        tracing::warn!(
+                            uid,
+                            remaining = outcome.remaining,
+                            "legacy queue partially migrated; will retry in this process"
+                        );
                     }
                 }
                 Err(e) => {
-                    // 不阻断启动：搬不动的项还留在 sled 里，下次再试。
+                    // 不阻断启动，也不标记完成——下次触发继续试。
                     tracing::warn!(uid, error = %e, "legacy queue migration failed");
                 }
-            }
-            if let Ok(mut guard) = self.queues_migrated.lock() {
-                guard.insert(uid.to_string());
             }
         }
         Ok(paths)
@@ -1068,6 +1091,84 @@ impl LocalStore {
         )
         .map_err(|e| Error::Storage(format!("insert message: {e}")))?;
         Ok(conn.last_insert_rowid() as u64)
+    }
+
+    /// 建消息 + 入队出站命令，**一个事务**（MESSAGE_SPEC §8.2 / SYNC_SPEC §3.3）。
+    ///
+    /// 分两步做的话，第二步失败就留下一条「幽灵消息」：UI 上永远显示发送中，
+    /// 却没有任何命令负责把它发出去。事务要么两者都有，要么什么都没有——调用方
+    /// 拿到错误即可，界面上不会出现这条消息。
+    ///
+    /// 返回 `message.id`。
+    pub fn create_local_message_queued(
+        &self,
+        uid: &str,
+        input: &NewMessage,
+        local_message_id: u64,
+        command_type: &str,
+        payload: &[u8],
+        route_key: Option<&str>,
+    ) -> Result<u64> {
+        if local_message_id == 0 {
+            return Err(Error::Storage(
+                "create_local_message_queued: local_message_id (snowflake) is required; \
+                 it is the identity the server dedupes on"
+                    .to_string(),
+            ));
+        }
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("create+enqueue begin tx: {e}")))?;
+        tx.execute(
+            "INSERT INTO message (
+                server_message_id, channel_id, channel_type, from_uid, type, content,
+                status, created_at, updated_at, searchable_word, local_message_id, setting, extra,
+                mime_type, media_downloaded, thumb_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                Option::<i64>::None,
+                input.channel_id as i64,
+                input.channel_type,
+                input.from_uid as i64,
+                input.message_type,
+                input.content,
+                // 直接就是「发送中」：命令在同一事务里落库，这个状态从第一刻起
+                // 就是真的。
+                1_i32,
+                now_ms,
+                now_ms,
+                input.searchable_word,
+                local_message_id as i64,
+                input.setting,
+                input.extra,
+                input.mime_type,
+                input.media_downloaded as i32,
+                input.thumb_status,
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("create+enqueue insert message: {e}")))?;
+        let message_id = tx.last_insert_rowid() as u64;
+        tx.execute(
+            "INSERT INTO outbox
+                 (command_id, command_type, message_id, channel_id, payload, route_key,
+                  status, retry_count, next_attempt_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, 0, ?7, ?7)",
+            params![
+                format!("msg:{local_message_id}"),
+                command_type,
+                message_id as i64,
+                input.channel_id as i64,
+                payload,
+                route_key,
+                now_ms
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("create+enqueue insert command: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("create+enqueue commit: {e}")))?;
+        Ok(message_id)
     }
 
     pub fn upsert_remote_message_with_result(
@@ -3678,8 +3779,9 @@ impl LocalStore {
         &self,
         uid: &str,
         paths: &StoragePaths,
-    ) -> Result<usize> {
+    ) -> Result<SledQueueMigration> {
         let mut moved = 0usize;
+        let mut remaining = 0usize;
 
         let mut drain = |db_path: &Path, command_type: &str| -> Result<()> {
             if !db_path.exists() {
@@ -3707,6 +3809,7 @@ impl LocalStore {
                     Err(e) => {
                         // 例如缺 local_message_id：留在 sled 里，下次再试，
                         // 不要静默丢掉一条用户以为发出去了的消息。
+                        remaining += 1;
                         tracing::warn!(message_id, error = %e, "legacy queue item not migrated");
                     }
                 }
@@ -3722,7 +3825,7 @@ impl LocalStore {
         for file_path in &paths.file_queue_paths {
             drain(file_path, "attachment")?;
         }
-        Ok(moved)
+        Ok(SledQueueMigration { moved, remaining })
     }
 
     /// 到期的出站命令，最老的先来。
@@ -5310,11 +5413,12 @@ mod tests {
             .expect("legacy push");
         assert_eq!(store.normal_queue_peek(uid, 10).expect("peek").len(), 1);
 
-        let moved = store
+        let outcome = store
             .migrate_sled_queues_into_outbox(uid, &paths)
             .expect("migrate");
 
-        assert_eq!(moved, 1);
+        assert_eq!(outcome.moved, 1);
+        assert_eq!(outcome.remaining, 0);
         let queued = store
             .outbox_peek(uid, "message", 10, i64::MAX)
             .expect("outbox peek");
@@ -5330,7 +5434,8 @@ mod tests {
         assert_eq!(
             store
                 .migrate_sled_queues_into_outbox(uid, &paths)
-                .expect("migrate again"),
+                .expect("migrate again")
+                .moved,
             0
         );
         assert_eq!(
@@ -5339,6 +5444,218 @@ mod tests {
                 .expect("peek")
                 .len(),
             1
+        );
+    }
+
+    /// 建消息与入队命令是一个事务：命令写不进去，消息也不能留下。
+    ///
+    /// 否则就是「幽灵消息」——UI 上永远发送中，却没有任何命令负责发送它。
+    #[test]
+    fn message_and_command_are_created_together_or_not_at_all() {
+        let store = test_store();
+        let uid = "10003-atomic-create";
+        let input = NewMessage {
+            channel_id: 100,
+            channel_type: 1,
+            from_uid: 200,
+            message_type: 1,
+            content: "hello".to_string(),
+            searchable_word: "hello".to_string(),
+            setting: 0,
+            extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
+        };
+
+        let id = store
+            .create_local_message_queued(uid, &input, 555_001, "message", b"payload", None)
+            .expect("create+enqueue");
+
+        let row = store
+            .get_message_by_id(uid, id)
+            .expect("load")
+            .expect("exists");
+        assert_eq!(row.status, 1, "命令已落库，所以「发送中」从第一刻起就是真的");
+        let queued = store
+            .outbox_peek(uid, "message", 10, i64::MAX)
+            .expect("peek");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, id);
+
+        // 第二条复用同一个 snowflake：命令的 command_id 唯一约束会让整个事务
+        // 回滚——消息也不该留下来。
+        let before = store
+            .list_messages(uid, 100, 1, 100, 0)
+            .expect("list before")
+            .len();
+        let err = store
+            .create_local_message_queued(uid, &input, 555_001, "message", b"payload", None)
+            .unwrap_err();
+        assert!(format!("{err}").contains("command"), "应当是命令写入失败: {err}");
+        assert_eq!(
+            store
+                .list_messages(uid, 100, 1, 100, 0)
+                .expect("list after")
+                .len(),
+            before,
+            "命令写失败时不得留下消息行"
+        );
+    }
+
+    /// 升级迁移把重复行删掉之前，必须把附属数据改指到保留行。
+    ///
+    /// 直接删就是丢 reaction / extra / mention / reminder。
+    #[test]
+    fn ack_pending_migration_repoints_attachments_before_deleting_duplicates() {
+        // 迁移是 SQL，这里直接在一个库上重放它的关键步骤，验证引用被改指、
+        // 重复行被删、保留行拿到 server_message_id。
+        let store = test_store();
+        let uid = "10003-migrate-refs";
+        let conn = store.conn_for_user(uid).expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS outbound_ack_pending (
+                 message_id INTEGER PRIMARY KEY,
+                 server_message_id INTEGER NOT NULL,
+                 message_seq INTEGER NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );",
+        )
+        .expect("create legacy table");
+        drop(conn);
+
+        let input = NewMessage {
+            channel_id: 100,
+            channel_type: 1,
+            from_uid: 200,
+            message_type: 1,
+            content: "keep me".to_string(),
+            searchable_word: "k".to_string(),
+            setting: 0,
+            extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
+        };
+        let keep = store
+            .create_local_message(uid, &input, 777_001)
+            .expect("keep row");
+        let dup = store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 900_123,
+                    local_message_id: 0,
+                    channel_id: 100,
+                    channel_type: 1,
+                    timestamp: 1_700_000_000_000,
+                    from_uid: 200,
+                    message_type: 1,
+                    content: "duplicate from sync".to_string(),
+                    status: 2,
+                    searchable_word: "k".to_string(),
+                    setting: 0,
+                    pts: 5,
+                    order_seq: 5,
+                    extra: "{}".to_string(),
+                    mime_type: None,
+                },
+            )
+            .expect("dup row")
+            .message_id;
+        assert_ne!(keep, dup);
+
+        let conn = store.conn_for_user(uid).expect("conn");
+        conn.execute(
+            "INSERT INTO outbound_ack_pending
+                 (message_id, server_message_id, message_seq, created_at, updated_at)
+             VALUES (?1, 900123, 5, 0, 0)",
+            params![keep as i64],
+        )
+        .expect("legacy ack row");
+        // reaction 挂在重复行上——迁移必须把它改指到保留行。
+        conn.execute(
+            "INSERT INTO message_reaction (message_id, uid, emoji, created_at)
+             VALUES (?1, 200, '👍', 0)",
+            params![dup as i64],
+        )
+        .expect("reaction on duplicate");
+
+        // 迁移的关键步骤。
+        conn.execute_batch(
+            "CREATE TEMP TABLE _ack_dup AS
+             SELECT p.message_id AS keep_id, m.id AS drop_id
+             FROM outbound_ack_pending p
+             JOIN message m ON m.server_message_id = p.server_message_id
+             WHERE m.id != p.message_id;
+
+             UPDATE message_reaction
+             SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_reaction.message_id)
+             WHERE message_id IN (SELECT drop_id FROM _ack_dup);
+
+             DELETE FROM message WHERE id IN (SELECT drop_id FROM _ack_dup);
+             DROP TABLE _ack_dup;",
+        )
+        .expect("run migration steps");
+
+        let reaction_owner: i64 = conn
+            .query_row(
+                "SELECT message_id FROM message_reaction WHERE emoji = '👍'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reaction still there");
+        assert_eq!(
+            reaction_owner as u64, keep,
+            "reaction 必须改指到保留行，而不是随重复行一起消失"
+        );
+    }
+
+    /// 搬不动的项必须留在旧队列并被报告，不能算作「搬完了」。
+    ///
+    /// 记为完成的话，这几条消息要等用户重启 App 才有人再管——而它们正是用户
+    /// 以为已经发出去的消息。
+    #[test]
+    fn partial_sled_migration_reports_remaining_items() {
+        let store = test_store();
+        let uid = "10003-sled-partial";
+        let paths = store.ensure_user_storage(uid).expect("paths");
+
+        // 一条搬不动的：本地消息存在，但没有 Snowflake local_message_id，
+        // 入队会被拒（否则会铸一个服务端不认的幂等键）。
+        let input = NewMessage {
+            channel_id: 100,
+            channel_type: 1,
+            from_uid: 200,
+            message_type: 1,
+            content: "no snowflake".to_string(),
+            searchable_word: "x".to_string(),
+            setting: 0,
+            extra: "{}".to_string(),
+            mime_type: None,
+            media_downloaded: false,
+            thumb_status: 0,
+        };
+        let bad = store
+            .create_local_message(uid, &input, 0)
+            .expect("create without snowflake");
+        store
+            .normal_queue_push(uid, bad, b"stuck")
+            .expect("legacy push");
+
+        let outcome = store
+            .migrate_sled_queues_into_outbox(uid, &paths)
+            .expect("migrate");
+
+        assert_eq!(outcome.moved, 0);
+        assert_eq!(outcome.remaining, 1, "必须报出来，不能当作搬完");
+        assert_eq!(
+            store.normal_queue_peek(uid, 10).expect("peek").len(),
+            1,
+            "搬不动就留在旧队列，别静默丢掉"
         );
     }
 

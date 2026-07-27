@@ -40,8 +40,6 @@ CREATE TABLE IF NOT EXISTS outbox (
     -- Distinct from command_id: that one stops the SERVER repeating work,
     -- this one stops the CLIENT sending work it has already superseded.
     coalesce_key      TEXT,
-    -- Optional: commands for the same entity must go out in order.
-    ordering_key      TEXT,
     channel_id        INTEGER,
     -- typed protocol bytes; never hand-rolled JSON.
     payload           BLOB NOT NULL,
@@ -69,12 +67,41 @@ CREATE INDEX IF NOT EXISTS idx_outbox_coalesce
 -- Anything still in it describes a message the server accepted, so apply it
 -- here rather than dropping it on the floor. Migrations run before the SDK
 -- does anything, so this is the only chance to do so.
--- 先清掉会撞唯一索引的重复行：同一个 server_message_id 可能已经由推送/同步
--- 落成了另一条 message 行。不先删，下面的 UPDATE 会因为
--- `server_message_id` 全局唯一索引整条迁移失败，用户升级即打不开数据库。
-DELETE FROM message
-WHERE id NOT IN (SELECT message_id FROM outbound_ack_pending)
-  AND server_message_id IN (SELECT server_message_id FROM outbound_ack_pending);
+-- 同一个 server_message_id 可能已经由推送/同步落成了另一条 message 行。直接
+-- UPDATE 会撞 server_message_id 全局唯一索引，整条迁移失败——用户升级即打不开
+-- 数据库。所以先处理重复行。
+--
+-- 保留的 canonical 行是待确认的那条（`outbound_ack_pending.message_id`）：它是
+-- 用户在本机看到的那条，reply/草稿等本地引用都指着它。重复行是同步补进来的
+-- 副本。
+--
+-- 但**不能直接删副本**：reaction / extra / mention / reminder 都按 message.id
+-- 关联在副本上，删了就是丢数据。先把这些引用改指到保留行，再删。
+CREATE TEMP TABLE IF NOT EXISTS _ack_dup AS
+SELECT p.message_id AS keep_id, m.id AS drop_id
+FROM outbound_ack_pending p
+JOIN message m ON m.server_message_id = p.server_message_id
+WHERE m.id != p.message_id;
+
+UPDATE message_reaction
+SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_reaction.message_id)
+WHERE message_id IN (SELECT drop_id FROM _ack_dup);
+
+UPDATE message_extra
+SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_extra.message_id)
+WHERE message_id IN (SELECT drop_id FROM _ack_dup);
+
+UPDATE mention
+SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = mention.message_id)
+WHERE message_id IN (SELECT drop_id FROM _ack_dup);
+
+UPDATE reminder
+SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = reminder.message_id)
+WHERE message_id IN (SELECT drop_id FROM _ack_dup);
+
+DELETE FROM message WHERE id IN (SELECT drop_id FROM _ack_dup);
+
+DROP TABLE IF EXISTS _ack_dup;
 
 UPDATE message
 SET server_message_id = (

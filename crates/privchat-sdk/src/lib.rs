@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use msgtrans::ClientEvent;
-use msgtrans::TransportOptions;
+// msgtrans 2.0 把 TransportOptions 拆成了 SendOptions / RequestOptions
+// （上游 54da0b0）。这三处都是请求-响应，用 RequestOptions；构造器同名。
+use msgtrans::RequestOptions;
 use msgtrans::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig};
 use msgtrans::{TransportClient, TransportClientBuilder};
 use privchat_protocol::message::LocalMessagePayloadEnvelope;
@@ -2424,6 +2426,15 @@ enum Command {
         local_message_id: Option<u64>,
         resp: oneshot::Sender<Result<u64>>,
     },
+    /// 建消息 + 入队命令，同一 SQLite 事务；提交成功后才发 UI 事件。
+    CreateLocalMessageQueued {
+        input: NewMessage,
+        local_message_id: Option<u64>,
+        command_type: String,
+        payload: Vec<u8>,
+        route_key: Option<String>,
+        resp: oneshot::Sender<Result<u64>>,
+    },
     GetMessageById {
         message_id: u64,
         resp: oneshot::Sender<Result<Option<StoredMessage>>>,
@@ -3891,7 +3902,7 @@ impl State {
                 return Err(self.network_disconnected_error());
             }
         };
-        let opt = TransportOptions::new().biz_type(biz_type).timeout(timeout);
+        let opt = RequestOptions::new().biz_type(biz_type).timeout(timeout);
         match transport.request_with_options(payload, opt).await {
             Ok(raw) => {
                 if biz_type == MessageType::RpcRequest as u8 && rpc_logs_enabled() {
@@ -6483,10 +6494,21 @@ impl State {
                     {
                         // 补记已送达 + 清命令，同一事务：分两步写的话，崩在
                         // 中间下一轮会把这条已经送达的消息再发一次。
-                        let _ = self
+                        //
+                        // 事务失败就不发 Sent：命令还在队列里，UI 说「已发送」
+                        // 而队列随后又发一次，是最难查的一类重复。
+                        if let Err(commit_err) = self
                             .storage
                             .outbox_reconcile_sent(message_id, server_message_id)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                message_id,
+                                error = %commit_err,
+                                "reconciliation not committed; not publishing Sent"
+                            );
+                            break;
+                        }
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "normal".to_string(),
                             action: "dequeue_reconciled".to_string(),
@@ -6509,10 +6531,19 @@ impl State {
                         );
                         // 写退避，否则这条命令下一轮立刻又被取出，变成忙循环打服务端。
                         let next_at = self.outbox_next_attempt_at(retry_count);
-                        let _ = self
+                        if let Err(backoff_err) = self
                             .storage
                             .outbox_bump_retry(message_id, next_at, &e.to_string())
-                            .await;
+                            .await
+                        {
+                            // 不是终态，不阻断；但必须可见——退避没写进去
+                            // 就意味着下一轮会立刻重试。
+                            tracing::warn!(
+                                message_id,
+                                error = %backoff_err,
+                                "backoff not persisted; the command may retry immediately"
+                            );
+                        }
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "normal".to_string(),
                             action: format!("deferred:{}", e),
@@ -6525,8 +6556,16 @@ impl State {
                         "[SDK.actor] normal queue send failed: message_id={} error={}",
                         message_id, e
                     );
-                    // 标记失败 + 删命令，同一事务（见 outbox_reject）。
-                    let _ = self.storage.outbox_reject(message_id, 3).await;
+                    // 标记失败 + 删命令，同一事务（见 outbox_reject）。事务没提交
+                    // 就什么都别发：命令还在队列里，这条消息并没有「结束」。
+                    if let Err(commit_err) = self.storage.outbox_reject(message_id, 3).await {
+                        tracing::warn!(
+                            message_id,
+                            error = %commit_err,
+                            "reject not committed; leaving the command queued"
+                        );
+                        break;
+                    }
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "normal".to_string(),
                         action: "failed".to_string(),
@@ -6637,10 +6676,18 @@ impl State {
                         .await_server_message_id(message_id, 12, Duration::from_millis(80))
                         .await
                     {
-                        let _ = self
+                        if let Err(commit_err) = self
                             .storage
                             .outbox_reconcile_sent(message_id, server_message_id)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                message_id,
+                                error = %commit_err,
+                                "reconciliation not committed; not publishing Sent"
+                            );
+                            break;
+                        }
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
                             action: "dequeue_reconciled".to_string(),
@@ -6666,10 +6713,19 @@ impl State {
                         );
                         // 同 normal 分支：不写退避就会忙循环。
                         let next_at = self.outbox_next_attempt_at(retry_count);
-                        let _ = self
+                        if let Err(backoff_err) = self
                             .storage
                             .outbox_bump_retry(message_id, next_at, &e.to_string())
-                            .await;
+                            .await
+                        {
+                            // 不是终态，不阻断；但必须可见——退避没写进去
+                            // 就意味着下一轮会立刻重试。
+                            tracing::warn!(
+                                message_id,
+                                error = %backoff_err,
+                                "backoff not persisted; the command may retry immediately"
+                            );
+                        }
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
                             action: format!("deferred:{}", e),
@@ -6682,7 +6738,18 @@ impl State {
                         "[SDK.actor] file queue send failed: queue_index={} message_id={} error={}",
                         queue_index, message_id, e
                     );
-                    let _ = self.storage.update_message_status(message_id, 3).await;
+                    // 标记失败 + 删命令必须同事务；只更新状态会把命令留在队列，
+                    // 下一轮又发一遍一条已经被永久拒绝的附件。
+                    if let Err(commit_err) = self.storage.outbox_reject(message_id, 3).await {
+                        // 事务没提交：命令还在，状态也没变。这才是真实状态，
+                        // 不能发终态事件——发了 UI 就以为结束了。
+                        tracing::warn!(
+                            message_id,
+                            error = %commit_err,
+                            "attachment reject not committed; leaving the command queued"
+                        );
+                        break;
+                    }
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: format!("failed:{}", e),
@@ -6941,7 +7008,7 @@ impl State {
                 return false;
             }
         };
-        let options = TransportOptions::new()
+        let options = RequestOptions::new()
             .biz_type(MessageType::PingRequest as u8)
             .timeout(Duration::from_secs(2));
         match transport
@@ -9405,7 +9472,7 @@ impl State {
                 return Err(self.network_disconnected_error());
             }
         };
-        let opt = TransportOptions::new()
+        let opt = RequestOptions::new()
             .biz_type(MessageType::SendMessageRequest as u8)
             .timeout(timeout);
         let raw = transport
@@ -12362,6 +12429,75 @@ impl PrivchatSdk {
                             let _ = state.drain_outbound_queues().await;
                         }
                     }
+                    Command::CreateLocalMessageQueued {
+                        input,
+                        local_message_id,
+                        command_type,
+                        payload,
+                        route_key,
+                        resp,
+                    } => {
+                        let channel_id = input.channel_id;
+                        let channel_type = input.channel_type;
+                        let result = match state.current_uid_required() {
+                            Ok(_) => {
+                                let lid = match local_message_id {
+                                    Some(id) => Ok(id),
+                                    None => state.next_local_message_id(),
+                                };
+                                match lid {
+                                    Ok(local_message_id) => {
+                                        state
+                                            .storage
+                                            .create_local_message_queued(
+                                                input,
+                                                local_message_id,
+                                                &command_type,
+                                                payload,
+                                                route_key,
+                                            )
+                                            .await
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(e) => Err(e),
+                        };
+                        // 事务提交之后才发事件：失败时界面上不该出现这条消息，
+                        // 更不该出现一条没有命令负责发送的「发送中」。
+                        if let Ok(message_id) = result {
+                            state.invalidate_channel_cache_with_reason(
+                                channel_id,
+                                channel_type,
+                                "create_local_message_queued",
+                            );
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::TimelineUpdated {
+                                    channel_id,
+                                    channel_type,
+                                    message_id,
+                                    reason: "local_create".to_string(),
+                                },
+                            );
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::MessageSendStatusChanged {
+                                    message_id,
+                                    status: 1,
+                                    server_message_id: None,
+                                },
+                            );
+                            let _ = actor_cmd_tx.try_send(Command::KickOutboundDrain);
+                        }
+                        let _ = resp.send(result);
+                    }
                     Command::CreateLocalMessage { input, local_message_id, resp } => {
                         let channel_id = input.channel_id;
                         let channel_type = input.channel_type;
@@ -14721,8 +14857,10 @@ impl PrivchatSdk {
         let extra = serde_json::to_string(&envelope).map_err(|e| {
             Error::Serialization(format!("encode structured message envelope: {e}"))
         })?;
-        let message_id = self
-            .create_local_message(NewMessage {
+        // 建消息与入队命令是一个事务：分开做的话第二步失败就留下一条
+        // 「幽灵消息」——UI 永远显示发送中，却没有命令负责把它发出去。
+        self.create_local_message_queued(
+            NewMessage {
                 channel_id,
                 channel_type,
                 from_uid,
@@ -14734,11 +14872,41 @@ impl PrivchatSdk {
                 mime_type: None,
                 media_downloaded: false,
                 thumb_status: 0,
+            },
+            None,
+            "message",
+            Vec::new(),
+            None,
+        )
+        .await
+    }
+
+    /// 建消息并入队出站命令，**一个事务**（MESSAGE_SPEC §8.2）。
+    ///
+    /// 发送入口应当用它，而不是 `create_local_message` + `enqueue_outbound_*`：
+    /// 后者是两个事务，第二步失败会留下永远发送中的幽灵消息。
+    pub async fn create_local_message_queued(
+        &self,
+        input: NewMessage,
+        local_message_id: Option<u64>,
+        command_type: &str,
+        payload: Vec<u8>,
+        route_key: Option<String>,
+    ) -> Result<u64> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::CreateLocalMessageQueued {
+                input,
+                local_message_id,
+                command_type: command_type.to_string(),
+                payload,
+                route_key,
+                resp: resp_tx,
             })
-            .await?;
-        self.enqueue_outbound_message(message_id, Vec::new())
-            .await?;
-        Ok(message_id)
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
     pub async fn create_local_message_with_id(

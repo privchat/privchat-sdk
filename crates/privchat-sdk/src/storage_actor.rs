@@ -189,6 +189,14 @@ enum StorageCmd {
         message_seq: u32,
         resp: oneshot::Sender<Result<()>>,
     },
+    CreateLocalMessageQueued {
+        input: NewMessage,
+        local_message_id: u64,
+        command_type: String,
+        payload: Vec<u8>,
+        route_key: Option<String>,
+        resp: oneshot::Sender<Result<u64>>,
+    },
     OutboxEnqueue {
         local_message_id: u64,
         command_type: String,
@@ -995,6 +1003,29 @@ impl StorageHandle {
                 message_id,
                 server_message_id,
                 message_seq,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// 建消息 + 入队命令，同一事务。避免「幽灵消息」：UI 有、命令没有。
+    pub async fn create_local_message_queued(
+        &self,
+        input: NewMessage,
+        local_message_id: u64,
+        command_type: &str,
+        payload: Vec<u8>,
+        route_key: Option<String>,
+    ) -> Result<u64> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::CreateLocalMessageQueued {
+                input,
+                local_message_id,
+                command_type: command_type.to_string(),
+                payload,
+                route_key,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -2322,6 +2353,23 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 message_id,
                 server_message_id,
                 message_seq
+            ));
+        }
+        StorageCmd::CreateLocalMessageQueued {
+            input,
+            local_message_id,
+            command_type,
+            payload,
+            route_key,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.create_local_message_queued(
+                &uid,
+                &input,
+                local_message_id,
+                &command_type,
+                &payload,
+                route_key.as_deref()
             ));
         }
         StorageCmd::OutboxEnqueue {
