@@ -113,8 +113,33 @@ UPDATE message_extra
 SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_extra.message_id)
 WHERE message_id IN (SELECT drop_id FROM _ack_dup);
 
--- reaction / mention 是集合语义：同一个 (目标, 用户, 值) 重复就是同一件事，
--- 保留行已有就丢弃副本那条。
+-- reaction：同一个 (消息, 用户, emoji) 是同一件事，但两边可能停在**不同版本**
+-- 上（seq / is_deleted）。只保留 keep 那份会把更新的状态丢掉，甚至让一个已经
+-- 撤销的 reaction 复活。所以先把 keep 那份对齐到更高的 seq，再删副本。
+UPDATE message_reaction
+SET seq = (
+        SELECT drop_row.seq FROM message_reaction drop_row
+        JOIN _ack_dup d ON d.drop_id = drop_row.message_id
+        WHERE d.keep_id = message_reaction.message_id
+          AND drop_row.uid = message_reaction.uid
+          AND drop_row.emoji = message_reaction.emoji
+    ),
+    is_deleted = (
+        SELECT drop_row.is_deleted FROM message_reaction drop_row
+        JOIN _ack_dup d ON d.drop_id = drop_row.message_id
+        WHERE d.keep_id = message_reaction.message_id
+          AND drop_row.uid = message_reaction.uid
+          AND drop_row.emoji = message_reaction.emoji
+    )
+WHERE message_id IN (SELECT keep_id FROM _ack_dup)
+  AND EXISTS (
+      SELECT 1 FROM message_reaction drop_row
+      JOIN _ack_dup d ON d.drop_id = drop_row.message_id
+      WHERE d.keep_id = message_reaction.message_id
+        AND drop_row.uid = message_reaction.uid
+        AND drop_row.emoji = message_reaction.emoji
+        AND COALESCE(drop_row.seq, 0) > COALESCE(message_reaction.seq, 0)
+  );
 DELETE FROM message_reaction
 WHERE message_id IN (SELECT drop_id FROM _ack_dup)
   AND EXISTS (
@@ -128,6 +153,17 @@ UPDATE message_reaction
 SET message_id = (SELECT keep_id FROM _ack_dup WHERE drop_id = message_reaction.message_id)
 WHERE message_id IN (SELECT drop_id FROM _ack_dup);
 
+-- mention：已读是单调的，任一边读过就算读过。
+UPDATE mention
+SET is_read = 1
+WHERE message_id IN (SELECT keep_id FROM _ack_dup)
+  AND EXISTS (
+      SELECT 1 FROM mention drop_row
+      JOIN _ack_dup d ON d.drop_id = drop_row.message_id
+      WHERE d.keep_id = mention.message_id
+        AND drop_row.mentioned_user_id = mention.mentioned_user_id
+        AND drop_row.is_read = 1
+  );
 DELETE FROM mention
 WHERE message_id IN (SELECT drop_id FROM _ack_dup)
   AND EXISTS (

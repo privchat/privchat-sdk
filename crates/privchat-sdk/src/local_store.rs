@@ -1113,11 +1113,7 @@ impl LocalStore {
         route_key: Option<&str>,
     ) -> Result<u64> {
         if local_message_id == 0 {
-            return Err(Error::Storage(
-                "create_local_message_queued: local_message_id (snowflake) is required; \
-                 it is the identity the server dedupes on"
-                    .to_string(),
-            ));
+            return Err(Error::MissingLocalMessageId { message_id: 0 });
         }
         let mut conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1915,10 +1911,7 @@ impl LocalStore {
             )
             .map_err(|e| Error::Storage(format!("finalize+enqueue lookup message: {e}")))?;
         if snowflake <= 0 {
-            return Err(Error::Storage(format!(
-                "finalize+enqueue: message.id={message_id} has no local_message_id; \
-                 refusing to mint an idempotency key the server cannot honour"
-            )));
+            return Err(Error::MissingLocalMessageId { message_id });
         }
 
         tx.execute(
@@ -3811,10 +3804,9 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("outbox enqueue read identity: {e}")))?
             .unwrap_or(0);
         if snowflake <= 0 {
-            return Err(Error::Storage(format!(
-                "outbox enqueue: message.id={local_message_id} has no local_message_id; \
-                 refusing to mint an idempotency key the server cannot honour"
-            )));
+            return Err(Error::MissingLocalMessageId {
+                message_id: local_message_id,
+            });
         }
         let command_id = format!("msg:{snowflake}");
 
@@ -3908,16 +3900,29 @@ impl LocalStore {
                         //     否则每次 ensure_user_storage 都要重扫一遍、重打一次
                         //     日志，形成 I/O 与日志风暴。
                         //   瞬时（磁盘忙等）——留在原地，本进程后续继续搬。
-                        let permanent = format!("{e}").contains("local_message_id");
-                        if permanent {
-                            quarantined += 1;
-                            tracing::warn!(
-                                message_id,
-                                error = %e,
-                                "legacy queue item cannot be migrated; marking the message failed"
-                            );
-                            let _ = self.update_message_status(uid, message_id, 3);
-                            done.push(k.to_vec());
+                        if matches!(e, Error::MissingLocalMessageId { .. }) {
+                            // 永久错误。隔离它——但**只有把消息标成失败真的落库了
+                            // 才能删命令**：状态写失败还删命令的话，唯一的发送依据
+                            // 没了，消息却还显示发送中，这是不可恢复的丢失。
+                            match self.update_message_status(uid, message_id, 3) {
+                                Ok(()) => {
+                                    quarantined += 1;
+                                    tracing::warn!(
+                                        message_id,
+                                        error = %e,
+                                        "legacy queue item cannot be migrated; message marked failed"
+                                    );
+                                    done.push(k.to_vec());
+                                }
+                                Err(status_err) => {
+                                    remaining += 1;
+                                    tracing::warn!(
+                                        message_id,
+                                        error = %status_err,
+                                        "could not mark the message failed; keeping the legacy command"
+                                    );
+                                }
+                            }
                         } else {
                             remaining += 1;
                             tracing::warn!(
@@ -3930,9 +3935,14 @@ impl LocalStore {
                 }
             }
             for key in done {
-                let _ = db.remove(key);
+                if let Err(e) = db.remove(&key) {
+                    // 删不掉就还在，下轮会重扫；计入 remaining 而不是假装搬完。
+                    remaining += 1;
+                    tracing::warn!(error = %e, "legacy queue remove failed");
+                }
             }
-            let _ = db.flush();
+            db.flush()
+                .map_err(|e| Error::Storage(format!("legacy queue flush: {e}")))?;
             Ok(())
         };
 
@@ -5659,8 +5669,12 @@ mod tests {
                  (message_id, server_message_id, message_seq, created_at, updated_at)
              VALUES (1, 900123, 5, 0, 0);
 
-             INSERT INTO message_reaction (message_id, uid, emoji, created_at)
-             VALUES (1, 200, '👍', 0), (2, 200, '👍', 0), (2, 300, '🎉', 0);
+             -- 同一个 (消息,用户,emoji) 两边都有，但副本版本更新且已撤销：
+             -- 合并必须取新的那份状态，不能让旧的「未撤销」留下来。
+             INSERT INTO message_reaction (message_id, uid, emoji, seq, is_deleted, created_at)
+             VALUES (1, 200, '👍', 1, 0, 0),
+                    (2, 200, '👍', 7, 1, 0),
+                    (2, 300, '🎉', 3, 0, 0);
 
              INSERT INTO message_extra (message_id, extra_version, readed)
              VALUES (1, 5, 0), (2, 9, 1);",
@@ -5684,6 +5698,16 @@ mod tests {
             keep_reactions, 2,
             "相同的 reaction 合并成一条，副本独有的那条改指过来"
         );
+        let (seq, is_deleted): (i64, i64) = conn
+            .query_row(
+                "SELECT seq, is_deleted FROM message_reaction
+                 WHERE message_id = 1 AND uid = 200 AND emoji = '👍'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("merged reaction");
+        assert_eq!(seq, 7, "合并要取版本更新的那份");
+        assert_eq!(is_deleted, 1, "不能让已撤销的 reaction 复活");
 
         let extra_version: i64 = conn
             .query_row(
@@ -5709,6 +5733,71 @@ mod tests {
         assert_eq!(server_id, 900123, "待确认的 ack 被落实到保留行");
 
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 附件的发送字节来自 SDK 托管的本地文件，**不是**存进 outbox 的 payload。
+    ///
+    /// 新链路入队时 payload 是空的（把几十 MB 复制进 SQLite 只是同一份数据存两
+    /// 遍）。drain 必须能从 `message.content` 的路径读出来——上一版本不能，于是
+    /// 每一条新附件都会被「payload is empty」判死。这条测试就是为了让那个错误
+    /// 不再有机会溜过去。
+    #[test]
+    fn attachment_command_carries_no_bytes_and_the_file_is_read_from_disk() {
+        let store = test_store();
+        let uid = "10003-attachment-drain";
+
+        let dir = std::env::temp_dir().join(format!("privchat-att-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let file_path = dir.join("photo.jpg");
+        std::fs::write(&file_path, b"real image bytes").expect("write source");
+        let content = format!("file://{}", file_path.display());
+
+        let placeholder = store
+            .create_local_message(
+                uid,
+                &NewMessage {
+                    channel_id: 100,
+                    channel_type: 1,
+                    from_uid: 200,
+                    message_type: 2,
+                    content: "placeholder".to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: "{}".to_string(),
+                    mime_type: Some("image/jpeg".to_string()),
+                    media_downloaded: false,
+                    thumb_status: 0,
+                },
+                888_001,
+            )
+            .expect("placeholder");
+
+        store
+            .finalize_attachment_and_enqueue(uid, placeholder, &content, 1, "endpoint-a", &[])
+            .expect("finalize+enqueue");
+
+        let queued = store
+            .outbox_peek(uid, "attachment", 10, i64::MAX)
+            .expect("peek");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, placeholder);
+        assert!(
+            queued[0].3.is_empty(),
+            "命令里不该带文件字节——那是把同一份数据存两遍"
+        );
+        assert_eq!(queued[0].4.as_deref(), Some("endpoint-a"));
+
+        // drain 读得到真实字节：路径存在 message.content 里，重启之后依然有效。
+        let row = store
+            .get_message_by_id(uid, placeholder)
+            .expect("load")
+            .expect("exists");
+        let path = row.content.strip_prefix("file://").unwrap_or(&row.content);
+        let bytes = std::fs::read(path).expect("attachment source must be readable from the row");
+        assert_eq!(bytes, b"real image bytes");
+        assert_eq!(row.status, 1, "定稿即发送中");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

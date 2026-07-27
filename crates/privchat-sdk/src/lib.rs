@@ -2086,6 +2086,13 @@ pub enum Error {
     Serialization(String),
     #[error("storage error: {0}")]
     Storage(String),
+    /// 消息行没有 Snowflake `local_message_id`，因此无法生成服务端认可的幂等
+    /// 键。**永久错误**：重试多少次都一样，调用方应隔离而不是重试。
+    ///
+    /// 单独成一个变体而不是靠错误文案判断——文案一改，数据处理策略就跟着变，
+    /// 那是把用户数据押在一句话上。
+    #[error("message {message_id} has no local_message_id; cannot mint an idempotency key")]
+    MissingLocalMessageId { message_id: u64 },
     #[error("sdk not connected")]
     NotConnected,
     #[error("auth failed: {0}")]
@@ -2210,6 +2217,7 @@ impl Error {
             Error::Transport(_) => error_codes::TRANSPORT_FAILURE,
             Error::Serialization(_) => error_codes::SERIALIZATION_FAILURE,
             Error::Storage(_) => error_codes::STORAGE_FAILURE,
+            Error::MissingLocalMessageId { .. } => error_codes::STORAGE_FAILURE,
             Error::NotConnected => error_codes::NETWORK_DISCONNECTED,
             Error::Auth(_) => error_codes::AUTH_FAILURE,
             Error::ActorClosed => error_codes::ACTOR_CLOSED,
@@ -2226,6 +2234,7 @@ impl Error {
             Error::Transport(_) => ErrorCode::NetworkError as u32,
             Error::Serialization(_) => ErrorCode::DecodingError as u32,
             Error::Storage(_) => ErrorCode::DatabaseError as u32,
+            Error::MissingLocalMessageId { .. } => ErrorCode::DatabaseError as u32,
             Error::NotConnected => ErrorCode::SessionNotFound as u32,
             Error::Auth(_) => ErrorCode::InvalidToken as u32,
             Error::ActorClosed => ErrorCode::SystemBusy as u32,
@@ -3247,7 +3256,10 @@ impl State {
                 ResumeFailureClass::RetryableTemporaryError
             }
             Error::Serialization(_) => ResumeFailureClass::FatalProtocolError,
-            Error::Storage(_) => ResumeFailureClass::FullRebuildRequired,
+            // 本地行缺幂等身份：重试或重连都救不回来，只能重建本地状态。
+            Error::Storage(_) | Error::MissingLocalMessageId { .. } => {
+                ResumeFailureClass::FullRebuildRequired
+            }
             Error::Auth(message) => {
                 Self::classify_resume_message(message, ResumeFailureClass::FullRebuildRequired)
             }
@@ -10169,6 +10181,22 @@ impl State {
         local_message_id: u64,
         payload: Vec<u8>,
     ) -> Result<SendMessageResponse> {
+        // 命令里不带文件字节。附件由 SDK 托管在本地，`message.content` 就是它的
+        // 路径——把几十上百 MB 复制进 SQLite 只是同一份数据存两遍，还要跟着事务
+        // 一起写。空 payload 因此是**正常情况**：从托管路径读。
+        //
+        // 旧 sled 队列里的项内嵌了字节，搬过来后仍然带着，按原样发。
+        let payload = if payload.is_empty() {
+            let path = message
+                .content
+                .strip_prefix("file://")
+                .unwrap_or(&message.content);
+            std::fs::read(path).map_err(|e| {
+                Error::InvalidState(format!("attachment source unreadable at {path}: {e}"))
+            })?
+        } else {
+            payload
+        };
         if payload.is_empty() {
             return Err(Error::InvalidState(
                 "attachment payload is empty".to_string(),
