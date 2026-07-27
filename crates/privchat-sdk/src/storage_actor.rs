@@ -189,26 +189,39 @@ enum StorageCmd {
         message_seq: u32,
         resp: oneshot::Sender<Result<()>>,
     },
-    RecordOutboundAckPending {
-        message_id: u64,
-        server_message_id: u64,
-        message_seq: u32,
-        last_error: String,
+    OutboxEnqueue {
+        local_message_id: u64,
+        command_type: String,
+        channel_id: u64,
+        payload: Vec<u8>,
+        route_key: Option<String>,
         resp: oneshot::Sender<Result<()>>,
     },
-    ListOutboundAckPending {
+    OutboxPeek {
+        command_type: String,
         limit: usize,
-        resp: oneshot::Sender<Result<Vec<(u64, u64, u32, i64)>>>,
+        now_ms: i64,
+        resp: oneshot::Sender<Result<Vec<(u64, String, u64, Vec<u8>, Option<String>, i64)>>>,
     },
-    ReplayOutboundAck {
-        message_id: u64,
+    OutboxAckSent {
+        local_message_id: u64,
         server_message_id: u64,
         message_seq: u32,
         resp: oneshot::Sender<Result<()>>,
     },
-    BumpOutboundAckAttempt {
-        message_id: u64,
+    OutboxBumpRetry {
+        local_message_id: u64,
+        next_attempt_at: i64,
         last_error: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    OutboxDrop {
+        local_message_id: u64,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    OutboxUpdatePayload {
+        local_message_id: u64,
+        payload: Vec<u8>,
         resp: oneshot::Sender<Result<()>>,
     },
     UpdateLocalMessageId {
@@ -978,53 +991,59 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    /// 记录「服务端已接受、本地未落库」的确认（P0：恢复依据不能随队列项一起丢）。
-    pub async fn record_outbound_ack_pending(
+    /// 入队出站命令（置发送中 + 写 outbox，同一事务）。MESSAGE_SPEC §8.3。
+    pub async fn outbox_enqueue(
         &self,
-        message_id: u64,
-        server_message_id: u64,
-        message_seq: u32,
-        last_error: &str,
+        local_message_id: u64,
+        command_type: &str,
+        channel_id: u64,
+        payload: Vec<u8>,
+        route_key: Option<String>,
     ) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::RecordOutboundAckPending {
-                message_id,
-                server_message_id,
-                message_seq,
-                last_error: last_error.to_string(),
+            .send(StorageCmd::OutboxEnqueue {
+                local_message_id,
+                command_type: command_type.to_string(),
+                channel_id,
+                payload,
+                route_key,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    /// `(message_id, server_message_id, message_seq, attempts)`，最老的先来。
-    pub async fn list_outbound_ack_pending(
+    /// `(local_message_id, command_type, channel_id, payload, route_key, retry_count)`
+    pub async fn outbox_peek(
         &self,
+        command_type: &str,
         limit: usize,
-    ) -> Result<Vec<(u64, u64, u32, i64)>> {
+        now_ms: i64,
+    ) -> Result<Vec<(u64, String, u64, Vec<u8>, Option<String>, i64)>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::ListOutboundAckPending {
+            .send(StorageCmd::OutboxPeek {
+                command_type: command_type.to_string(),
                 limit,
+                now_ms,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    /// 纯本地重放：标记已发送 + 删除待确认行，同一事务。绝不重新上行。
-    pub async fn replay_outbound_ack(
+    /// 确认送达：更新消息 + 删除 outbox 行，同一事务。失败即整体回滚。
+    pub async fn outbox_ack_sent(
         &self,
-        message_id: u64,
+        local_message_id: u64,
         server_message_id: u64,
         message_seq: u32,
     ) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::ReplayOutboundAck {
-                message_id,
+            .send(StorageCmd::OutboxAckSent {
+                local_message_id,
                 server_message_id,
                 message_seq,
                 resp: resp_tx,
@@ -1033,16 +1052,45 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn bump_outbound_ack_attempt(
+    pub async fn outbox_bump_retry(
         &self,
-        message_id: u64,
+        local_message_id: u64,
+        next_attempt_at: i64,
         last_error: &str,
     ) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::BumpOutboundAckAttempt {
-                message_id,
+            .send(StorageCmd::OutboxBumpRetry {
+                local_message_id,
+                next_attempt_at,
                 last_error: last_error.to_string(),
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn outbox_drop(&self, local_message_id: u64) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::OutboxDrop {
+                local_message_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn outbox_update_payload(
+        &self,
+        local_message_id: u64,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::OutboxUpdatePayload {
+                local_message_id,
+                payload,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -2236,46 +2284,77 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
                 message_seq
             ));
         }
-        StorageCmd::RecordOutboundAckPending {
-            message_id,
-            server_message_id,
-            message_seq,
-            last_error,
+        StorageCmd::OutboxEnqueue {
+            local_message_id,
+            command_type,
+            channel_id,
+            payload,
+            route_key,
             resp,
         } => {
-            with_uid!(resp, |uid| store.record_outbound_ack_pending(
+            with_uid!(resp, |uid| store.outbox_enqueue(
                 &uid,
-                message_id,
-                server_message_id,
-                message_seq,
-                &last_error
+                local_message_id,
+                &command_type,
+                channel_id,
+                &payload,
+                route_key.as_deref()
             ));
         }
-        StorageCmd::ListOutboundAckPending { limit, resp } => {
-            with_uid!(resp, |uid| store.list_outbound_ack_pending(&uid, limit));
+        StorageCmd::OutboxPeek {
+            command_type,
+            limit,
+            now_ms,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.outbox_peek(
+                &uid,
+                &command_type,
+                limit,
+                now_ms
+            ));
         }
-        StorageCmd::ReplayOutboundAck {
-            message_id,
+        StorageCmd::OutboxAckSent {
+            local_message_id,
             server_message_id,
             message_seq,
             resp,
         } => {
-            with_uid!(resp, |uid| store.replay_outbound_ack(
+            with_uid!(resp, |uid| store.outbox_ack_sent(
                 &uid,
-                message_id,
+                local_message_id,
                 server_message_id,
                 message_seq
             ));
         }
-        StorageCmd::BumpOutboundAckAttempt {
-            message_id,
+        StorageCmd::OutboxBumpRetry {
+            local_message_id,
+            next_attempt_at,
             last_error,
             resp,
         } => {
-            with_uid!(resp, |uid| store.bump_outbound_ack_attempt(
+            with_uid!(resp, |uid| store.outbox_bump_retry(
                 &uid,
-                message_id,
+                local_message_id,
+                next_attempt_at,
                 &last_error
+            ));
+        }
+        StorageCmd::OutboxDrop {
+            local_message_id,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.outbox_drop(&uid, local_message_id));
+        }
+        StorageCmd::OutboxUpdatePayload {
+            local_message_id,
+            payload,
+            resp,
+        } => {
+            with_uid!(resp, |uid| store.outbox_update_payload(
+                &uid,
+                local_message_id,
+                &payload
             ));
         }
         StorageCmd::UpdateLocalMessageId {

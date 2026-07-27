@@ -6393,16 +6393,17 @@ impl State {
     }
 
     async fn drain_normal_queue_once(&mut self, limit: usize) -> Result<usize> {
-        let items = self.storage.normal_queue_peek(limit).await?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let items = self.storage.outbox_peek("message", limit, now_ms).await?;
         if items.is_empty() {
             return Ok(0);
         }
         let mut processed = 0usize;
-        for (message_id, _payload) in items {
+        for (message_id, _cmd_type, _channel_id, _payload, _route_key, retry_count) in items {
             let msg = match self.storage.get_message_by_id(message_id).await? {
                 Some(v) => v,
                 None => {
-                    let _ = self.storage.normal_queue_ack(vec![message_id]).await;
+                    let _ = self.storage.outbox_drop(message_id).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "normal".to_string(),
                         action: "drop_missing".to_string(),
@@ -6421,42 +6422,28 @@ impl State {
             )?;
             match self.direct_send_message(send_req).await {
                 Ok(resp) => {
+                    // 更新消息与删除 outbox 行是一个事务（MESSAGE_SPEC §8.3）。
+                    // 失败即整体回滚：outbox 行原样还在，下一轮用同一个
+                    // local_message_id 重试，服务端按幂等返回同样的结果。没有
+                    // 「服务端已收、本地永远发送中」这个窗口可言。
                     if let Err(err) = self
                         .storage
-                        .mark_message_sent(message_id, resp.server_message_id, resp.message_seq)
+                        .outbox_ack_sent(message_id, resp.server_message_id, resp.message_seq)
                         .await
                     {
-                        // 服务端已经接受了这条消息。队列项必须移除——留着下轮会重发，
-                        // 而重发只能指望服务端幂等记录，那不是永久的。但**恢复依据不能
-                        // 跟着一起丢**：把 ack 落到 outbound_ack_pending，重放就是一次
-                        // 纯本地事务，不需要再上行。旧写法只 ack 不记录，重启后没人知道
-                        // server id，那条消息永远停在「发送中」。
-                        if let Err(rec_err) = self
+                        let next_at = self.outbox_next_attempt_at(retry_count);
+                        let _ = self
                             .storage
-                            .record_outbound_ack_pending(
-                                message_id,
-                                resp.server_message_id,
-                                resp.message_seq,
-                                &err.to_string(),
-                            )
-                            .await
-                        {
-                            tracing::error!(
-                                message_id,
-                                error = %rec_err,
-                                "failed to persist ack recovery record; message may show as sending"
-                            );
-                        }
-                        let _ = self.storage.normal_queue_ack(vec![message_id]).await;
+                            .outbox_bump_retry(message_id, next_at, &err.to_string())
+                            .await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "normal".to_string(),
-                            action: "ack_pending".to_string(),
+                            action: "commit_retry".to_string(),
                             message_id: Some(message_id),
                             queue_index: None,
                         });
                         return Err(err);
                     }
-                    let _ = self.storage.normal_queue_ack(vec![message_id]).await;
                     let last_ts = if msg.created_at > 0 {
                         msg.created_at
                     } else {
@@ -6494,7 +6481,7 @@ impl State {
                         .await_server_message_id(message_id, 12, Duration::from_millis(80))
                         .await
                     {
-                        let _ = self.storage.normal_queue_ack(vec![message_id]).await;
+                        let _ = self.storage.outbox_drop(message_id).await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "normal".to_string(),
                             action: "dequeue_reconciled".to_string(),
@@ -6540,7 +6527,7 @@ impl State {
                             status: 3,
                             server_message_id: None,
                         });
-                    let _ = self.storage.normal_queue_ack(vec![message_id]).await;
+                    let _ = self.storage.outbox_drop(message_id).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "normal".to_string(),
                         action: "failed_drop".to_string(),
@@ -6556,7 +6543,11 @@ impl State {
     }
 
     async fn drain_file_queue_once(&mut self, queue_index: usize, limit: usize) -> Result<usize> {
-        let items = self.storage.file_queue_peek(queue_index, limit).await?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let items = self
+            .storage
+            .outbox_peek("attachment", limit, now_ms)
+            .await?;
         if items.is_empty() {
             return Ok(0);
         }
@@ -6566,14 +6557,11 @@ impl State {
             items.len()
         );
         let mut processed = 0usize;
-        for (message_id, payload) in items {
+        for (message_id, _cmd_type, _channel_id, payload, _route_key, retry_count) in items {
             let msg = match self.storage.get_message_by_id(message_id).await? {
                 Some(v) => v,
                 None => {
-                    let _ = self
-                        .storage
-                        .file_queue_ack(queue_index, vec![message_id])
-                        .await;
+                    let _ = self.storage.outbox_drop(message_id).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: "drop_missing".to_string(),
@@ -6596,45 +6584,26 @@ impl State {
                 .await
             {
                 Ok(resp) => {
+                    // 附件与普通消息共用同一套持久化规则（见 normal 分支注释）：
+                    // 一个事务里更新消息并删除 outbox 行，失败就整体回滚。
                     if let Err(err) = self
                         .storage
-                        .mark_message_sent(message_id, resp.server_message_id, resp.message_seq)
+                        .outbox_ack_sent(message_id, resp.server_message_id, resp.message_seq)
                         .await
                     {
-                        // 附件与普通消息共用同一套 ack 恢复语义（见 normal 分支注释）：
-                        // 图片已经在服务端了，丢掉恢复依据会让它永远显示发送中。
-                        if let Err(rec_err) = self
-                            .storage
-                            .record_outbound_ack_pending(
-                                message_id,
-                                resp.server_message_id,
-                                resp.message_seq,
-                                &err.to_string(),
-                            )
-                            .await
-                        {
-                            tracing::error!(
-                                message_id,
-                                error = %rec_err,
-                                "failed to persist ack recovery record; message may show as sending"
-                            );
-                        }
+                        let next_at = self.outbox_next_attempt_at(retry_count);
                         let _ = self
                             .storage
-                            .file_queue_ack(queue_index, vec![message_id])
+                            .outbox_bump_retry(message_id, next_at, &err.to_string())
                             .await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
-                            action: "ack_pending".to_string(),
+                            action: "commit_retry".to_string(),
                             message_id: Some(message_id),
                             queue_index: Some(queue_index),
                         });
                         return Err(err);
                     }
-                    let _ = self
-                        .storage
-                        .file_queue_ack(queue_index, vec![message_id])
-                        .await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: "dequeue".to_string(),
@@ -6656,10 +6625,7 @@ impl State {
                         .await_server_message_id(message_id, 12, Duration::from_millis(80))
                         .await
                     {
-                        let _ = self
-                            .storage
-                            .file_queue_ack(queue_index, vec![message_id])
-                            .await;
+                        let _ = self.storage.outbox_drop(message_id).await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
                             action: "dequeue_reconciled".to_string(),
@@ -6708,10 +6674,7 @@ impl State {
                             status: 3,
                             server_message_id: None,
                         });
-                    let _ = self
-                        .storage
-                        .file_queue_ack(queue_index, vec![message_id])
-                        .await;
+                    let _ = self.storage.outbox_drop(message_id).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: "failed_drop".to_string(),
@@ -6745,61 +6708,18 @@ impl State {
         None
     }
 
-    /// 重放「服务端已接受、本地未落库」的确认。
-    ///
-    /// **不联网**：消息已经在服务端，这里只补本地那一半。因此它先于连接闸门执行，
-    /// 离线启动也能收敛——否则一条已送达的消息会一直显示「发送中」，直到网络恢复。
-    ///
-    /// 没有「重试到头就重发」的出口：重发只能指望服务端幂等记录，而那不是永久的，
-    /// 过期的那天用户就会看到自己的消息发了两遍。
-    async fn replay_pending_acks(&mut self) -> Result<usize> {
-        let pending = match self.storage.list_outbound_ack_pending(64).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(error = %err, "list pending acks failed");
-                return Ok(0);
-            }
-        };
-        let mut replayed = 0usize;
-        for (message_id, server_message_id, message_seq, attempts) in pending {
-            match self
-                .storage
-                .replay_outbound_ack(message_id, server_message_id, message_seq)
-                .await
-            {
-                Ok(()) => {
-                    replayed += 1;
-                    self.pending_events.push(SdkEvent::OutboundQueueUpdated {
-                        kind: "normal".to_string(),
-                        action: "ack_replayed".to_string(),
-                        message_id: Some(message_id),
-                        queue_index: None,
-                    });
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        message_id,
-                        attempts,
-                        error = %err,
-                        "pending ack replay failed; message IS delivered, will retry locally"
-                    );
-                    let _ = self
-                        .storage
-                        .bump_outbound_ack_attempt(message_id, &err.to_string())
-                        .await;
-                }
-            }
-        }
-        Ok(replayed)
+    /// 重试退避：1s, 2s, 4s, 8s, 16s（MESSAGE_SPEC §8.4）。
+    fn outbox_next_attempt_at(&self, retry_count: i64) -> i64 {
+        let step = retry_count.clamp(0, 4) as u32;
+        let delay_ms = 1000i64 * (1i64 << step);
+        chrono::Utc::now().timestamp_millis() + delay_ms
     }
 
     async fn drain_outbound_queues(&mut self) -> Result<usize> {
-        // 先补本地。这一段不需要连接，放在闸门之前。
-        let replayed = self.replay_pending_acks().await.unwrap_or(0);
         if !self.should_process_outbound_queue() {
-            return Ok(replayed);
+            return Ok(0);
         }
-        let mut drained = replayed;
+        let mut drained = 0usize;
         drained += self
             .drain_normal_queue_once(OUTBOUND_DRAIN_BATCH_SIZE)
             .await?;
@@ -12229,18 +12149,14 @@ impl PrivchatSdk {
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
+                            // 置发送中 + 写 outbox 在同一事务里（MESSAGE_SPEC §8.3）：
+                            // 不会出现「消息说在发、队列里却没有」。
                             Ok(_) => match state
                                 .storage
-                                .normal_queue_push(message_id, payload)
+                                .outbox_enqueue(message_id, "message", 0, payload, None)
                                 .await
                             {
-                                Ok(pushed_id) => {
-                                    let _ = state
-                                        .storage
-                                        .update_message_status(message_id, 1)
-                                        .await;
-                                    Ok(pushed_id)
-                                }
+                                Ok(()) => Ok(message_id),
                                 Err(e) => Err(e),
                             },
                             Err(e) => Err(e),
@@ -12278,12 +12194,12 @@ impl PrivchatSdk {
                             Ok(_) => {
                                 state
                                     .storage
-                                    .normal_queue_peek(limit)
+                                    .outbox_peek("message", limit, i64::MAX)
                                     .await
                                     .map(|items| {
                                         items
                                             .into_iter()
-                                            .map(|(message_id, payload)| QueueMessage {
+                                            .map(|(message_id, _t, _c, payload, _r, _n)| QueueMessage {
                                                 message_id,
                                                 payload,
                                             })
@@ -12296,7 +12212,15 @@ impl PrivchatSdk {
                     }
                     Command::AckOutboundMessages { message_ids, resp } => {
                         let result = match state.current_uid_required() {
-                            Ok(_) => state.storage.normal_queue_ack(message_ids).await,
+                            Ok(_) => {
+                                let mut removed = 0usize;
+                                for id in message_ids {
+                                    if state.storage.outbox_drop(id).await.is_ok() {
+                                        removed += 1;
+                                    }
+                                }
+                                Ok(removed)
+                            }
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -12311,23 +12235,25 @@ impl PrivchatSdk {
                             Ok(_) => {
                                 let q = state
                                     .storage
-                                    .select_file_queue(route_key)
+                                    .select_file_queue(route_key.clone())
                                     .await;
                                 match q {
                                     Ok(queue_index) => {
                                         match state
                                             .storage
-                                            .file_queue_push(queue_index, message_id, payload)
+                                            .outbox_enqueue(
+                                                message_id,
+                                                "attachment",
+                                                0,
+                                                payload,
+                                                Some(route_key.to_string()),
+                                            )
                                             .await
                                         {
-                                            Ok(file_msg_id) => {
-                                                let _ = state
-                                                    .storage
-                                                    .update_message_status(message_id, 1)
-                                                    .await;
+                                            Ok(()) => {
                                                 Ok(FileQueueRef {
                                                     queue_index,
-                                                    message_id: file_msg_id,
+                                                    message_id,
                                                 })
                                             }
                                             Err(e) => Err(e),
@@ -12372,14 +12298,17 @@ impl PrivchatSdk {
                         resp,
                     } => {
                         let result = match state.current_uid_required() {
+                            // 命令都在 outbox 里；queue_index 只是历史上的
+                            // 分片编号，第 0 片返回全部附件命令即可。
+                            Ok(_) if queue_index > 0 => Ok(Vec::new()),
                             Ok(_) => state
                                 .storage
-                                .file_queue_peek(queue_index, limit)
+                                .outbox_peek("attachment", limit, i64::MAX)
                                 .await
                                 .map(|items| {
                                     items
                                         .into_iter()
-                                        .map(|(message_id, payload)| QueueMessage {
+                                        .map(|(message_id, _t, _c, payload, _r, _n)| QueueMessage {
                                             message_id,
                                             payload,
                                         })
@@ -12396,10 +12325,13 @@ impl PrivchatSdk {
                     } => {
                         let result = match state.current_uid_required() {
                             Ok(_) => {
-                                state
-                                    .storage
-                                    .file_queue_ack(queue_index, message_ids)
-                                    .await
+                                let mut removed = 0usize;
+                                for id in message_ids {
+                                    if state.storage.outbox_drop(id).await.is_ok() {
+                                        removed += 1;
+                                    }
+                                }
+                                Ok(removed)
                             }
                             Err(e) => Err(e),
                         };

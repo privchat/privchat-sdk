@@ -3560,84 +3560,101 @@ impl LocalStore {
         Ok(())
     }
 
-    /// 记录「服务端已接受、本地未落库」的确认。
+    /// 入队一条出站命令：**置为发送中与写入 outbox 在同一事务**。
     ///
-    /// 出队用的 sled 队列和 SQLite 消息表不可能同事务，所以 `direct_send_message`
-    /// 成功而 `mark_message_sent` 失败这个窗口一定存在。此前的做法是把队列项直接
-    /// ack 掉（避免重发），代价是**恢复依据一起丢了**：重启后没人知道 server id，
-    /// 那条消息永远停在「发送中」。
-    ///
-    /// 这里把 ack 落到与 `message` 同库的表里，于是重放是纯本地事务，永远不需要
-    /// 再上行——消息已经在服务端了，重发只能依赖服务端幂等记录，而那不是永久的。
-    pub fn record_outbound_ack_pending(
+    /// MESSAGE_SPEC §8.3。`message` 与 outbox 同库，所以「本地已记录要发这条」
+    /// 是一个原子事实；事务失败就两者都没有，调用方收到错误即可，不存在
+    /// 「消息说在发、队列里却没有」这种中间态。
+    pub fn outbox_enqueue(
         &self,
         uid: &str,
-        message_id: u64,
-        server_message_id: u64,
-        message_seq: u32,
-        last_error: &str,
+        local_message_id: u64,
+        command_type: &str,
+        channel_id: u64,
+        payload: &[u8],
+        route_key: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn_for_user(uid)?;
+        let mut conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
-        conn.execute(
-            "INSERT INTO outbound_ack_pending
-                 (message_id, server_message_id, message_seq, attempts, last_error,
-                  created_at, updated_at)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?5)
-             ON CONFLICT(message_id) DO UPDATE SET
-                 server_message_id = excluded.server_message_id,
-                 message_seq = excluded.message_seq,
-                 last_error = excluded.last_error,
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("outbox enqueue begin tx: {e}")))?;
+        tx.execute(
+            "UPDATE message SET status = 1, updated_at = ?2 WHERE id = ?1",
+            params![local_message_id as i64, now_ms],
+        )
+        .map_err(|e| Error::Storage(format!("outbox enqueue mark sending: {e}")))?;
+        tx.execute(
+            "INSERT INTO outbox
+                 (local_message_id, command_type, channel_id, payload, route_key,
+                  status, retry_count, next_attempt_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, 0, ?6, ?6)
+             ON CONFLICT(local_message_id) DO UPDATE SET
+                 payload = excluded.payload,
+                 route_key = excluded.route_key,
+                 status = 'pending',
+                 next_attempt_at = 0,
                  updated_at = excluded.updated_at",
             params![
-                message_id as i64,
-                server_message_id as i64,
-                message_seq as i64,
-                last_error,
+                local_message_id as i64,
+                command_type,
+                channel_id as i64,
+                payload,
+                route_key,
                 now_ms
             ],
         )
-        .map_err(|e| Error::Storage(format!("record outbound ack pending: {e}")))?;
+        .map_err(|e| Error::Storage(format!("outbox enqueue insert: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("outbox enqueue commit: {e}")))?;
         Ok(())
     }
 
-    /// 待重放的确认，最老的先来。
-    pub fn list_outbound_ack_pending(
+    /// 到期的出站命令，最老的先来。
+    /// `(local_message_id, command_type, channel_id, payload, route_key, retry_count)`
+    pub fn outbox_peek(
         &self,
         uid: &str,
+        command_type: &str,
         limit: usize,
-    ) -> Result<Vec<(u64, u64, u32, i64)>> {
+        now_ms: i64,
+    ) -> Result<Vec<(u64, String, u64, Vec<u8>, Option<String>, i64)>> {
         let conn = self.conn_for_user(uid)?;
         let mut stmt = conn
             .prepare(
-                "SELECT message_id, server_message_id, message_seq, attempts
-                 FROM outbound_ack_pending
-                 ORDER BY created_at ASC
-                 LIMIT ?1",
+                "SELECT local_message_id, command_type, channel_id, payload, route_key, retry_count
+                 FROM outbox
+                 WHERE command_type = ?1 AND status = 'pending' AND next_attempt_at <= ?2
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT ?3",
             )
-            .map_err(|e| Error::Storage(format!("list outbound ack pending: {e}")))?;
+            .map_err(|e| Error::Storage(format!("outbox peek prepare: {e}")))?;
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
+            .query_map(params![command_type, now_ms, limit as i64], |row| {
                 Ok((
                     row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u32,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
-            .map_err(|e| Error::Storage(format!("list outbound ack pending map: {e}")))?
+            .map_err(|e| Error::Storage(format!("outbox peek query: {e}")))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Storage(format!("list outbound ack pending collect: {e}")))?;
+            .map_err(|e| Error::Storage(format!("outbox peek collect: {e}")))?;
         Ok(rows)
     }
 
-    /// 重放一条待确认：**标记已发送与删除待确认行在同一事务**。
+    /// 确认送达：**更新消息与删除 outbox 行在同一事务**。
     ///
-    /// 分成两步写会重新打开崩溃窗口——正是这个表要消灭的那个窗口。
-    pub fn replay_outbound_ack(
+    /// 这是整个设计的要点。两件事一起提交，所以不存在「服务端有、本地没有」
+    /// 或「本地已发、队列还在」的窗口：事务失败就整体回滚，outbox 行原样还在，
+    /// 重试沿用同一个 `local_message_id`，服务端按幂等返回同样的结果。
+    pub fn outbox_ack_sent(
         &self,
         uid: &str,
-        message_id: u64,
+        local_message_id: u64,
         server_message_id: u64,
         message_seq: u32,
     ) -> Result<()> {
@@ -3645,12 +3662,12 @@ impl LocalStore {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let tx = conn
             .transaction()
-            .map_err(|e| Error::Storage(format!("replay ack begin tx: {e}")))?;
+            .map_err(|e| Error::Storage(format!("outbox ack begin tx: {e}")))?;
         tx.execute(
             "DELETE FROM message WHERE server_message_id = ?1 AND id != ?2",
-            params![server_message_id as i64, message_id as i64],
+            params![server_message_id as i64, local_message_id as i64],
         )
-        .map_err(|e| Error::Storage(format!("replay ack dedupe: {e}")))?;
+        .map_err(|e| Error::Storage(format!("outbox ack dedupe: {e}")))?;
         let updated = tx
             .execute(
                 "UPDATE message
@@ -3660,49 +3677,72 @@ impl LocalStore {
                 params![
                     server_message_id as i64,
                     now_ms,
-                    message_id as i64,
+                    local_message_id as i64,
                     message_seq as i64
                 ],
             )
-            .map_err(|e| Error::Storage(format!("replay ack update: {e}")))?;
+            .map_err(|e| Error::Storage(format!("outbox ack update message: {e}")))?;
         if updated == 0 {
-            // 本地行不在了（清库/换设备）。消息在服务端，历史同步会带回来，
-            // 这条待确认已经没有意义 —— 删掉，别让它永久重试。
-            tx.execute(
-                "DELETE FROM outbound_ack_pending WHERE message_id = ?1",
-                params![message_id as i64],
-            )
-            .map_err(|e| Error::Storage(format!("replay ack drop orphan: {e}")))?;
-            tx.commit()
-                .map_err(|e| Error::Storage(format!("replay ack commit orphan: {e}")))?;
-            return Ok(());
+            return Err(Error::Storage(format!(
+                "outbox ack failed: message.id={local_message_id} not found"
+            )));
         }
         tx.execute(
-            "DELETE FROM outbound_ack_pending WHERE message_id = ?1",
-            params![message_id as i64],
+            "DELETE FROM outbox WHERE local_message_id = ?1",
+            params![local_message_id as i64],
         )
-        .map_err(|e| Error::Storage(format!("replay ack clear: {e}")))?;
+        .map_err(|e| Error::Storage(format!("outbox ack delete row: {e}")))?;
         tx.commit()
-            .map_err(|e| Error::Storage(format!("replay ack commit: {e}")))?;
+            .map_err(|e| Error::Storage(format!("outbox ack commit: {e}")))?;
         Ok(())
     }
 
-    /// 重放失败：记一次尝试，保留行。**没有「放弃并重发」这个出口**——消息已送达。
-    pub fn bump_outbound_ack_attempt(
+    /// 发送失败：记一次重试与下次时间。行保留。
+    pub fn outbox_bump_retry(
         &self,
         uid: &str,
-        message_id: u64,
+        local_message_id: u64,
+        next_attempt_at: i64,
         last_error: &str,
     ) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         conn.execute(
-            "UPDATE outbound_ack_pending
-             SET attempts = attempts + 1, last_error = ?2, updated_at = ?3
-             WHERE message_id = ?1",
-            params![message_id as i64, last_error, now_ms],
+            "UPDATE outbox
+             SET retry_count = retry_count + 1, next_attempt_at = ?2,
+                 last_error = ?3, updated_at = ?4
+             WHERE local_message_id = ?1",
+            params![local_message_id as i64, next_attempt_at, last_error, now_ms],
         )
-        .map_err(|e| Error::Storage(format!("bump outbound ack attempt: {e}")))?;
+        .map_err(|e| Error::Storage(format!("outbox bump retry: {e}")))?;
+        Ok(())
+    }
+
+    /// 丢弃一条出站命令（本地消息已不存在、或被服务端拒绝）。
+    pub fn outbox_drop(&self, uid: &str, local_message_id: u64) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        conn.execute(
+            "DELETE FROM outbox WHERE local_message_id = ?1",
+            params![local_message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("outbox drop: {e}")))?;
+        Ok(())
+    }
+
+    /// 附件上传成功后回写最终 payload（含 file_id / 尺寸），保持行不动。
+    pub fn outbox_update_payload(
+        &self,
+        uid: &str,
+        local_message_id: u64,
+        payload: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE outbox SET payload = ?2, updated_at = ?3 WHERE local_message_id = ?1",
+            params![local_message_id as i64, payload, now_ms],
+        )
+        .map_err(|e| Error::Storage(format!("outbox update payload: {e}")))?;
         Ok(())
     }
 
@@ -5046,15 +5086,8 @@ mod tests {
         assert_eq!(revoked.revoked_by, Some(30001));
     }
 
-    /// 服务端已接受、本地未落库时的恢复依据必须持久化。
-    ///
-    /// 队列（sled）与消息表（SQLite）不可能同事务，`direct_send_message` 成功而
-    /// `mark_message_sent` 失败这个窗口一定存在。旧写法在那里把队列项直接删掉，
-    /// 恢复依据一起没了：重启后没人知道 server id，消息永远停在「发送中」。
-    #[test]
-    fn pending_ack_survives_restart_and_replays_locally() {
-        let store = test_store();
-        let uid = "10003-ack-pending";
+    /// 建一条本地消息并入队，返回 message.id。
+    fn seed_outbound(store: &LocalStore, uid: &str) -> u64 {
         let input = NewMessage {
             channel_id: 100,
             channel_type: 1,
@@ -5068,82 +5101,125 @@ mod tests {
             media_downloaded: false,
             thumb_status: 0,
         };
-        let local_id = store
+        let id = store
             .create_local_message(uid, &input, 123456)
             .expect("create local message");
-
-        // 发送成功但本地提交失败的那一刻。
         store
-            .record_outbound_ack_pending(uid, local_id, 900_777, 42, "disk full")
-            .expect("record pending ack");
+            .outbox_enqueue(uid, id, "message", 100, b"payload", None)
+            .expect("enqueue");
+        id
+    }
 
-        // 重启：唯一留下的就是这张表。
-        let pending = store
-            .list_outbound_ack_pending(uid, 10)
-            .expect("list pending");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].0, local_id);
-        assert_eq!(pending[0].1, 900_777);
-        assert_eq!(pending[0].2, 42);
+    /// 确认送达是一个事务：消息变已发送、outbox 行消失，两件事一起发生。
+    ///
+    /// 这正是把队列从 sled 搬进同一个 SQLite 换来的东西——跨引擎时它们不可能
+    /// 一起提交，中间崩溃就要么永远「发送中」、要么再发一遍。
+    #[test]
+    fn ack_marks_sent_and_clears_outbox_in_one_transaction() {
+        let store = test_store();
+        let uid = "10003-outbox-ack";
+        let id = seed_outbound(&store, uid);
 
-        // 纯本地重放，不需要任何网络。
+        let queued = store
+            .outbox_peek(uid, "message", 10, i64::MAX)
+            .expect("peek");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, id);
+
         store
-            .replay_outbound_ack(uid, local_id, 900_777, 42)
-            .expect("replay");
+            .outbox_ack_sent(uid, id, 900_777, 42)
+            .expect("ack");
 
         let row = store
-            .get_message_by_id(uid, local_id)
-            .expect("load message")
-            .expect("message exists");
+            .get_message_by_id(uid, id)
+            .expect("load")
+            .expect("exists");
         assert_eq!(row.server_message_id, Some(900_777));
-        assert_eq!(row.status, 2, "must no longer read as sending");
+        assert_eq!(row.status, 2, "must not read as sending");
         assert_eq!(row.pts, Some(42));
         assert!(
             store
-                .list_outbound_ack_pending(uid, 10)
-                .expect("list after replay")
+                .outbox_peek(uid, "message", 10, i64::MAX)
+                .expect("peek after")
                 .is_empty(),
-            "replay must clear the row in the same transaction"
+            "the outbox row goes away with the same commit"
         );
     }
 
-    /// 重放失败不得把行丢掉——消息在服务端，只有本地还没收敛。
+    /// 确认失败即整体回滚：outbox 行原样还在，消息仍是发送中。
+    ///
+    /// 于是重试沿用同一个 local_message_id，服务端按幂等返回同样结果——不需要
+    /// 补偿表，也不需要重放 actor。
     #[test]
-    fn failed_ack_replay_keeps_the_recovery_record() {
+    fn failed_ack_rolls_back_and_leaves_the_command_queued() {
         let store = test_store();
-        let uid = "10003-ack-retry";
-        store
-            .record_outbound_ack_pending(uid, 555, 900_888, 7, "boom")
-            .expect("record");
+        let uid = "10003-outbox-rollback";
+        let id = seed_outbound(&store, uid);
 
+        // 本地消息行不见了（这里用删除模拟事务内更新失败）。
         store
-            .bump_outbound_ack_attempt(uid, 555, "still broken")
-            .expect("bump");
+            .delete_message_local(uid, id)
+            .expect("delete message row");
+        let err = store.outbox_ack_sent(uid, id, 900_888, 7).unwrap_err();
+        assert!(format!("{err}").contains("not found"));
 
-        let pending = store.list_outbound_ack_pending(uid, 10).expect("list");
-        assert_eq!(pending.len(), 1, "the record must survive a failed attempt");
-        assert_eq!(pending[0].3, 1, "attempts counted");
+        let still_queued = store
+            .outbox_peek(uid, "message", 10, i64::MAX)
+            .expect("peek");
+        assert_eq!(
+            still_queued.len(),
+            1,
+            "a failed ack must not consume the command"
+        );
+        assert_eq!(still_queued[0].0, id);
     }
 
-    /// 本地行已经不在（清库/换设备）时，待确认行不能永久重试。
+    /// 入队是原子的：消息置为发送中与 outbox 行一起出现。
     #[test]
-    fn orphan_pending_ack_is_dropped_instead_of_retrying_forever() {
+    fn enqueue_marks_sending_and_writes_the_command_together() {
         let store = test_store();
-        let uid = "10003-ack-orphan";
-        store
-            .record_outbound_ack_pending(uid, 4242, 900_999, 9, "gone")
-            .expect("record");
+        let uid = "10003-outbox-enqueue";
+        let id = seed_outbound(&store, uid);
+
+        let row = store
+            .get_message_by_id(uid, id)
+            .expect("load")
+            .expect("exists");
+        assert_eq!(row.status, 1, "sending");
+        assert_eq!(
+            store
+                .outbox_peek(uid, "message", 10, i64::MAX)
+                .expect("peek")
+                .len(),
+            1
+        );
+    }
+
+    /// 重试退避写在行上，未到点不会被取出。
+    #[test]
+    fn retry_backoff_holds_the_command_until_it_is_due() {
+        let store = test_store();
+        let uid = "10003-outbox-backoff";
+        let id = seed_outbound(&store, uid);
+        let due_at = chrono::Utc::now().timestamp_millis() + 60_000;
 
         store
-            .replay_outbound_ack(uid, 4242, 900_999, 9)
-            .expect("replay against a missing local row must not error");
+            .outbox_bump_retry(uid, id, due_at, "transport down")
+            .expect("bump");
 
         assert!(
             store
-                .list_outbound_ack_pending(uid, 10)
-                .expect("list")
+                .outbox_peek(uid, "message", 10, due_at - 1)
+                .expect("peek before due")
                 .is_empty(),
-            "history sync brings the message back; the record has no purpose left"
+            "not due yet"
+        );
+        assert_eq!(
+            store
+                .outbox_peek(uid, "message", 10, due_at)
+                .expect("peek at due")
+                .len(),
+            1
         );
     }
 
