@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -71,6 +71,13 @@ use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 /// 一次读取最多顺带修几条:repair 走网络,不能让打开会话变成一次批量拉取。
 /// 没修完的下次读取继续。
 const REPAIR_BATCH_LIMIT: usize = 5;
+/// 队列上限。排不下的留给下一次读取重新发现——损坏是从数据本身发现的,不会丢。
+const REPAIR_QUEUE_LIMIT: usize = 64;
+/// 单条 repair 的超时。卡住的请求不该拖住整个 tick。
+const REPAIR_TIMEOUT_MS: u64 = 15_000;
+/// 退避基数与最大指数(2^6 × 2s ≈ 2 分钟封顶)。
+const REPAIR_BACKOFF_BASE_MS: u64 = 2_000;
+const REPAIR_BACKOFF_MAX_SHIFT: u32 = 6;
 
 pub mod attachment_crypto;
 pub mod canonical_inbound;
@@ -2982,6 +2989,19 @@ struct State {
     /// 宿主通过 `PrivchatSdk::submit_media_job_result` 直接（不经 actor cmd）
     /// 取出并触发。
     pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>>,
+    /// 投影 repair 队列（MESSAGE_PROJECTION_SPEC §2.4）。
+    ///
+    /// key = (channel_type, channel_id, server_message_id)：**singleflight**。
+    /// 同一条消息在多次读取里被反复发现损坏是常态（打开会话、上滑、切回来），
+    /// 每次都发一遍 around 就是拿用户的流量和服务端的配额换同一个答案。
+    ///
+    /// 不落库，这是有意的：repair 状态没有独立价值，重启后从损坏的投影本身就能
+    /// 重新发现。为它建一张表是过度设计。
+    repair_queue: VecDeque<(i32, u64, u64)>,
+    /// 已排队/已修过的 key，用于 singleflight 去重。
+    repair_seen: HashSet<(i32, u64, u64)>,
+    /// 失败后的退避到期时间与次数：离线时不空转，恢复后由下一次读取重新发现。
+    repair_backoff: HashMap<(i32, u64, u64), (u32, std::time::Instant)>,
     /// AVATAR_CACHE_SPEC P1: user 头像本地缓存管理器（in-flight/verified 去重）。
     avatar_cache: avatar_cache::AvatarCacheManager,
 }
@@ -7829,6 +7849,113 @@ impl State {
         Ok(resp)
     }
 
+    /// 把一条损坏的投影排进 repair 队列。**立即返回，不发网络。**
+    ///
+    /// 调用它的是读路径（打开会话、上滑翻页）——那里绝不能等一串 around 请求：
+    /// 坏数据还没修好之前会话就先卡住，用户付出的代价比问题本身大。真正的修复由
+    /// actor 的 repair tick 取队列执行。
+    ///
+    /// 三道闸门，少一道就会变成「每次读都打一遍服务端」：
+    /// - **singleflight**：`repair_seen` 保证同一条消息只排一次。反复读到同一条坏行
+    ///   是常态（打开、上滑、切回来），每次都发请求是拿用户流量换同一个答案。
+    /// - **有界**：队列超过上限就丢弃，留给下一次读取重新发现——堆积没有意义，
+    ///   因为损坏是从数据本身发现的，不会丢。
+    /// - **退避**：失败多半是离线或服务端不稳，退避期内直接跳过。不需要额外的
+    ///   「网络恢复唤醒」：读路径本身就是唤醒信号。
+    fn enqueue_projection_repair(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+    ) {
+        let key = (channel_type, channel_id, server_message_id);
+        if let Some((_, until)) = self.repair_backoff.get(&key) {
+            if std::time::Instant::now() < *until {
+                return;
+            }
+        }
+        if !self.repair_seen.insert(key) {
+            return;
+        }
+        if self.repair_queue.len() >= REPAIR_QUEUE_LIMIT {
+            self.repair_seen.remove(&key);
+            return;
+        }
+        self.repair_queue.push_back(key);
+    }
+
+    /// 处理一批排队的 repair。由 actor tick 调用，每次最多 [`REPAIR_BATCH_LIMIT`] 条。
+    ///
+    /// 修好后**只发一次** TimelineUpdated：投影是原地更新的，message.id 不变、
+    /// 未读不动、cursor 不动 —— repair 不是「收到新消息」。
+    async fn drain_projection_repairs(&mut self) {
+        for _ in 0..REPAIR_BATCH_LIMIT {
+            let Some(key) = self.repair_queue.pop_front() else {
+                return;
+            };
+            let (channel_type, channel_id, server_message_id) = key;
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(REPAIR_TIMEOUT_MS),
+                self.repair_message_projection(channel_id, channel_type, server_message_id),
+            )
+            .await;
+            self.repair_seen.remove(&key);
+
+            match outcome {
+                Ok(Ok(Some(message_id))) => {
+                    self.repair_backoff.remove(&key);
+                    self.invalidate_channel_cache_with_reason(
+                        channel_id,
+                        channel_type,
+                        "repair_message_projection",
+                    );
+                    if let (Some(tx), Some(history), Some(seq)) = (
+                        self.event_tx.as_ref(),
+                        self.event_history.as_ref(),
+                        self.event_seq.as_ref(),
+                    ) {
+                        emit_sequenced_event(
+                            tx,
+                            history,
+                            seq,
+                            self.event_history_limit,
+                            SdkEvent::TimelineUpdated {
+                                channel_id,
+                                channel_type,
+                                message_id,
+                                reason: "message_projection_repaired".to_string(),
+                            },
+                        );
+                    }
+                }
+                // 服务端也没有这条：不是可重试失败，别再排它。
+                Ok(Ok(None)) => {
+                    self.repair_backoff.remove(&key);
+                }
+                Ok(Err(e)) => self.note_repair_failure(key, &e.to_string()),
+                Err(_) => self.note_repair_failure(key, "repair timed out"),
+            }
+        }
+    }
+
+    fn note_repair_failure(&mut self, key: (i32, u64, u64), reason: &str) {
+        let attempts = self.repair_backoff.get(&key).map(|(n, _)| *n).unwrap_or(0) + 1;
+        let delay = REPAIR_BACKOFF_BASE_MS
+            .saturating_mul(1u64 << attempts.min(REPAIR_BACKOFF_MAX_SHIFT));
+        self.repair_backoff.insert(
+            key,
+            (attempts, std::time::Instant::now() + Duration::from_millis(delay)),
+        );
+        tracing::warn!(
+            server_message_id = key.2,
+            channel_id = key.1,
+            attempts,
+            delay_ms = delay,
+            reason,
+            "投影 repair 失败,退避后由下一次读取重新发现"
+        );
+    }
+
     /// 按 `server_message_id` 定向修复一条投影损坏的消息。
     ///
     /// 「投影损坏」指本地这一行是某条旧代码或半截写入留下的:metadata 丢了(图片
@@ -11169,10 +11296,16 @@ impl PrivchatSdk {
                 event_seq: Some(actor_event_seq.clone()),
                 event_history_limit: event_history_limit,
                 pending_media_jobs: actor_pending_media_jobs,
+                repair_queue: VecDeque::new(),
+                repair_seen: HashSet::new(),
+                repair_backoff: HashMap::new(),
                 avatar_cache: avatar_cache::AvatarCacheManager::default(),
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut health_tick = interval(Duration::from_secs(15));
+            // repair tick 比 health tick 快:损坏的图片/顺序应当尽快自愈,但仍然是
+            // **后台**节奏——读路径只入队,一次 tick 最多处理 REPAIR_BATCH_LIMIT 条。
+            let mut repair_tick = interval(Duration::from_secs(2));
             health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 // Backoff driver: fires when `next_reconnect_at` is due. When no retry
@@ -11212,6 +11345,14 @@ impl PrivchatSdk {
                 tokio::pin!(retry_sleep);
 
                 tokio::select! {
+                    _ = repair_tick.tick() => {
+                        if state.session_state != SessionState::Shutdown
+                            && !state.repair_queue.is_empty()
+                        {
+                            state.drain_projection_repairs().await;
+                        }
+                        continue;
+                    }
                     _ = health_tick.tick() => {
                         if state.session_state == SessionState::Shutdown {
                             continue;
@@ -12650,80 +12791,48 @@ impl PrivchatSdk {
                                 .map(|snapshot| snapshot.messages),
                             Err(e) => Err(e),
                         };
-                        // 自动 repair 触发点（MESSAGE_PROJECTION_SPEC §2.4）：读时发现
-                        // 投影损坏就按 server_message_id 定向修，不删会话历史。
+                        // 自动 repair（MESSAGE_PROJECTION_SPEC §2.4）:读时**发现**,
+                        // 后台**修**。
                         //
-                        // 判据只取「本地无法自愈、且服务端一定能补」的三种：媒体行没有
+                        // 这里只做检测和入队,一次网络都不发:打开会话是交互路径,
+                        // 让它等一串 around 请求,坏数据没修好之前会话先卡住,用户
+                        // 付出的代价比问题本身大。队列那边负责 singleflight、有界
+                        // 并发、超时与退避,修好后单独发一次 TimelineUpdated。
+                        //
+                        // 判据只取「本地无法自愈、且服务端一定能补」的三种:媒体行没有
                         // metadata（图片永远加载不出来）、已确认行缺 pts（排序无权威）、
                         // 时间戳落在毫秒纪元之前（单位写错的旧行）。文本行缺 metadata 是
-                        // 正常的，不在其列。
+                        // 正常的,不在其列。
                         if let Ok(ref messages) = result {
                             let image_type =
                                 i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(2);
                             let video_type =
                                 i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(3);
-                            let damaged: Vec<u64> = messages
-                                .iter()
-                                .filter(|m| {
-                                    let smid = m.server_message_id.unwrap_or(0);
-                                    if smid == 0 {
-                                        return false; // 还没上服务端的本地行，不是投影损坏
-                                    }
-                                    let is_media =
-                                        m.message_type == image_type || m.message_type == video_type;
-                                    let media_without_metadata = is_media
-                                        && !crate::canonical_inbound::CanonicalInboundMessage::
-                                            from_sync_entity(
-                                                0, 0, 0, 1, 0, 0,
-                                                String::new(),
-                                                m.extra.clone(),
-                                                0, 0,
-                                            )
-                                            .has_metadata();
-                                    let missing_pts = m.pts.unwrap_or(0) <= 0;
-                                    let bad_timestamp = m.created_at > 0
-                                        && m.created_at < 100_000_000_000;
-                                    media_without_metadata || missing_pts || bad_timestamp
-                                })
-                                .filter_map(|m| m.server_message_id)
-                                .take(REPAIR_BATCH_LIMIT)
-                                .collect();
-                            for server_message_id in damaged {
-                                match state
-                                    .repair_message_projection(
+                            for m in messages {
+                                let smid = m.server_message_id.unwrap_or(0);
+                                if smid == 0 {
+                                    continue; // 还没上服务端的本地行,不是投影损坏
+                                }
+                                let is_media =
+                                    m.message_type == image_type || m.message_type == video_type;
+                                let media_without_metadata = is_media
+                                    && !crate::canonical_inbound::CanonicalInboundMessage::
+                                        from_sync_entity(
+                                            0, 0, 0, 1, 0, 0,
+                                            String::new(),
+                                            m.extra.clone(),
+                                            0, 0,
+                                        )
+                                        .has_metadata();
+                                let missing_pts = m.pts.unwrap_or(0) <= 0;
+                                let bad_timestamp =
+                                    m.created_at > 0 && m.created_at < 100_000_000_000;
+                                if media_without_metadata || missing_pts || bad_timestamp {
+                                    state.enqueue_projection_repair(
                                         channel_id,
                                         channel_type,
-                                        server_message_id,
-                                    )
-                                    .await
-                                {
-                                    Ok(Some(message_id)) => {
-                                        if let (Some(tx), Some(history), Some(seq)) = (
-                                            state.event_tx.as_ref(),
-                                            state.event_history.as_ref(),
-                                            state.event_seq.as_ref(),
-                                        ) {
-                                            emit_sequenced_event(
-                                                tx,
-                                                history,
-                                                seq,
-                                                state.event_history_limit,
-                                                SdkEvent::TimelineUpdated {
-                                                    channel_id,
-                                                    channel_type,
-                                                    message_id,
-                                                    reason: "message_projection_repaired"
-                                                        .to_string(),
-                                                },
-                                            );
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => tracing::warn!(
-                                        server_message_id,
-                                        error = %e,
-                                        "定向 repair 失败,下次读取再试"
-                                    ),
+                                        smid,
+                                    );
                                 }
                             }
                         }
@@ -16815,6 +16924,9 @@ mod tests {
             pending_media_jobs: Arc::new(StdMutex::new(HashMap::new())),
             active_subscriptions: HashMap::new(),
             avatar_cache: crate::avatar_cache::AvatarCacheManager::default(),
+            repair_queue: std::collections::VecDeque::new(),
+            repair_seen: std::collections::HashSet::new(),
+            repair_backoff: std::collections::HashMap::new(),
         };
         (state, dir)
     }

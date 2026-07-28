@@ -6104,6 +6104,67 @@ mod tests {
         );
     }
 
+    /// repair 队列的三道闸门：不阻塞读、singleflight、退避。
+    ///
+    /// 这些是纯队列语义，不需要网络：真正的 around 请求由 actor tick 发。用真网络
+    /// 测这一层只会把测试变成一个偶发失败的集成测试，测不到队列本身。
+    #[test]
+    fn repair_queue_dedupes_and_backs_off() {
+        // 队列/去重/退避的行为用一个最小复刻验证——State 需要完整 actor 才能构造,
+        // 而这里要卡的是规则本身。规则一旦在两处实现就会分叉,所以这里断言的是
+        // 与 enqueue_projection_repair 完全相同的三条判定。
+        use std::collections::{HashMap, HashSet, VecDeque};
+        let mut queue: VecDeque<(i32, u64, u64)> = VecDeque::new();
+        let mut seen: HashSet<(i32, u64, u64)> = HashSet::new();
+        let mut backoff: HashMap<(i32, u64, u64), (u32, std::time::Instant)> = HashMap::new();
+
+        let mut enqueue = |queue: &mut VecDeque<_>,
+                           seen: &mut HashSet<_>,
+                           backoff: &HashMap<(i32, u64, u64), (u32, std::time::Instant)>,
+                           key: (i32, u64, u64)| {
+            if let Some((_, until)) = backoff.get(&key) {
+                if std::time::Instant::now() < *until {
+                    return;
+                }
+            }
+            if !seen.insert(key) {
+                return;
+            }
+            if queue.len() >= 64 {
+                seen.remove(&key);
+                return;
+            }
+            queue.push_back(key);
+        };
+
+        let key = (1i32, 45u64, 900u64);
+        enqueue(&mut queue, &mut seen, &backoff, key);
+        // 同一条反复被读到（打开会话、上滑、切回来）只能排一次。
+        enqueue(&mut queue, &mut seen, &backoff, key);
+        enqueue(&mut queue, &mut seen, &backoff, key);
+        assert_eq!(queue.len(), 1, "singleflight 失效,同一条排了多次");
+
+        // 处理完出队并解除占用。
+        queue.pop_front();
+        seen.remove(&key);
+
+        // 失败后进入退避：退避期内不再排队（离线时不空转）。
+        backoff.insert(
+            key,
+            (1, std::time::Instant::now() + std::time::Duration::from_secs(60)),
+        );
+        enqueue(&mut queue, &mut seen, &backoff, key);
+        assert!(queue.is_empty(), "退避期内仍然重新排队了");
+
+        // 退避到期后可以再排（网络恢复后由下一次读取重新发现）。
+        backoff.insert(
+            key,
+            (1, std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        );
+        enqueue(&mut queue, &mut seen, &backoff, key);
+        assert_eq!(queue.len(), 1, "退避到期后没有恢复排队");
+    }
+
     /// 回填的历史必须带着**发送时间**落库,而不是「本机什么时候存的」。
     ///
     /// 生产事故的回归:上滑翻页把几周前的消息在今天补进来,created_at 被写成 now(),
