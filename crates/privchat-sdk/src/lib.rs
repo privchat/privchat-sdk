@@ -14484,12 +14484,61 @@ impl PrivchatSdk {
                                 );
                                 state.storage.update_thumb_status(msg.message_id, 0).await?;
                             }
+
+                            // 当年那次事故丢的不只是状态，还有 `extra` 本身——metadata
+                            // 没写进去，所以本地这条消息里根本没有 thumbnail_file_id。
+                            // 只把状态改回 0 是修了「允许重试」却没给它可重试的东西：
+                            // 下一步照样解析不出 file_id，用户看到的还是灰块。
+                            //
+                            // 所以先按 server_message_id 定向重取这条消息的投影，把
+                            // metadata 补回本地，再重读一次拿修好的 extra。
+                            // 只在 extra 确实没有缩略图字段时才走这一趟网络：正常消息
+                            // 一次都不会多花。
+                            let msg = if State::extract_thumbnail_file_id(&msg.extra).is_none() {
+                                match msg.server_message_id {
+                                    Some(server_id) if server_id != 0 => {
+                                        let repaired = state
+                                            .repair_message_projection(
+                                                msg.channel_id,
+                                                msg.channel_type,
+                                                server_id,
+                                            )
+                                            .await;
+                                        if let Err(e) = &repaired {
+                                            tracing::warn!(
+                                                message_id = msg.message_id,
+                                                error = %e,
+                                                "缩略图修复：定向重取投影失败，这一轮放弃"
+                                            );
+                                        }
+                                        // 重读：上面那趟把 metadata 写回了本地，手里这份
+                                        // 还是修复前的旧值。
+                                        match state.storage.get_message_by_id(message_id).await? {
+                                            Some(fresh) => fresh,
+                                            None => return Ok(()),
+                                        }
+                                    }
+                                    // 没有 server_message_id 就无从定向重取（本地草稿 /
+                                    // 从未落到服务端）。没有缩略图可下，直接收工。
+                                    _ => return Ok(()),
+                                }
+                            } else {
+                                msg
+                            };
+
                             let paths = state.storage.get_storage_paths().await?;
                             let user_root = PathBuf::from(&paths.user_root);
-                            let ticket = match State::extract_thumbnail_file_id(&msg.extra) {
-                                Some(tid) => state.resolve_thumbnail_ticket(tid).await,
-                                None => None,
+                            let Some(thumbnail_file_id) = State::extract_thumbnail_file_id(&msg.extra)
+                            else {
+                                // 修完投影仍然没有缩略图字段 = 这条消息确实没有缩略图。
+                                // 这才是 3 该表达的意思，现在有依据写它了。
+                                tracing::info!(
+                                    message_id = msg.message_id,
+                                    "修复投影后仍无缩略图字段：这条消息确实没有缩略图"
+                                );
+                                return Ok(());
                             };
+                            let ticket = state.resolve_thumbnail_ticket(thumbnail_file_id).await;
                             State::spawn_auto_download_thumbnail(
                                 &msg.extra,
                                 ticket,
