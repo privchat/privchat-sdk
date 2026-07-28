@@ -2085,6 +2085,15 @@ pub struct LocalAccountSummary {
     pub created_at: i64,
     pub last_login_at: i64,
     pub is_active: bool,
+    /// 展示名（nickname）。切换账号列表的首选标题。
+    pub display_name: Option<String>,
+    /// username。展示优先级：display_name > username > uid。
+    /// uid 是协议标识，只在前两者都没有时才允许露出来。
+    pub username: Option<String>,
+    /// 上次使用的登录方式（"BUILTIN" / "PLATFORM"）。
+    pub login_mode: Option<String>,
+    /// 上次登录填的标识（账密=username，短信=手机号），供重新登录时回填。
+    pub login_identifier: Option<String>,
 }
 
 #[derive(thiserror::Error, Debug, Clone, Serialize, Deserialize)]
@@ -2801,6 +2810,18 @@ enum Command {
     },
     SetCurrentUid {
         uid: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    SwitchLocalAccount {
+        uid: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    SetLocalAccountDisplayName {
+        uid: String,
+        display_name: Option<String>,
+        username: Option<String>,
+        login_mode: Option<String>,
+        login_identifier: Option<String>,
         resp: oneshot::Sender<Result<()>>,
     },
     WipeCurrentUserFull {
@@ -3895,6 +3916,50 @@ impl State {
             has_more_before,
             from_cache: false,
         })
+    }
+
+    /// 切账号 / 换会话时必须归零的**全部**会话作用域状态。
+    ///
+    /// 这份清单就是 2026-07-28 那个真机 bug 的教训：当时的「切换」只改了
+    /// `current_uid` 和 `bootstrap_completed`，旧 transport、旧 inbound task、旧
+    /// 订阅、旧缓存原地不动，于是旧账号的失败被解释成新账号的状态，失败与重连
+    /// 互相触发，5 次/秒、CPU 50%、消息发不出去。
+    ///
+    /// 新增任何会话作用域字段都要在这里补一行；漏一行就是下一次同样的 bug。
+    /// 注意顺序：先撤销自动重连意图，再推进 epoch 作废在途帧，最后清数据——
+    /// 反过来做的话，清完的结构会被仍在运行的旧任务重新写脏。
+    fn reset_session_scoped_state(&mut self, now_ms: i64) {
+        self.should_auto_reconnect = false;
+        self.reset_reconnect_backoff();
+        self.auth_terminal_fired = false;
+        self.last_terminal_reason = None;
+
+        // epoch 推进 = 旧 inbound 遗留在 mpsc 里的帧全部作废（丢弃判据见 State.inbound_epoch）。
+        self.inbound_epoch = self.inbound_epoch.wrapping_add(1);
+        self.last_resume_synced = None;
+        self.pending_prelogin_inbound_frames.clear();
+
+        self.sync_coordinator.reset(now_ms);
+
+        self.active_subscriptions.clear();
+        self.clear_presence_cache();
+        self.room_seen_msg_ids.clear();
+
+        self.channel_message_cache.clear();
+        self.channel_cache_generation.clear();
+        self.channel_cache_lru.clear();
+        self.channel_cache_total_bytes = 0;
+        self.cache_hit_count = 0;
+        self.cache_miss_count = 0;
+
+        self.repair_queue.clear();
+        self.repair_seen.clear();
+        self.repair_backoff.clear();
+
+        self.last_sync_queued = 0;
+        self.last_sync_dropped_duplicates = 0;
+        self.last_sync_entity_events.clear();
+        self.pending_events.clear();
     }
 
     fn set_message_cache_policy(&mut self, policy: MessageCachePolicy) {
@@ -9095,9 +9160,17 @@ impl State {
             SyncRunKind::Bootstrap
         };
         let now_ms = chrono::Utc::now().timestamp_millis();
-        if !self.sync_coordinator.begin(kind, now_ms) {
+        // 退避/合并/终态都在协调器里判定。sync 有多个触发源（重连成功、connect
+        // 成功、token 刷新后重认证、显式命令），它们只有共同经过这一道闸门才收
+        // 敛得住——在任何单个调用点 sleep 都会被下一个触发源绕开。
+        if let Err(rejection) = self.sync_coordinator.begin(kind, now_ms) {
+            if actor_logs_enabled() {
+                eprintln!("[SDK.actor] ensure_synced skipped: {rejection:?}");
+            }
             return Ok(());
         }
+        // 这一轮属于哪个账号/会话世代。切账号会 bump 它。
+        let generation = self.sync_coordinator.generation();
         emit(SdkEvent::SyncStateChanged {
             state: self.sync_coordinator.snapshot(),
         });
@@ -9106,6 +9179,20 @@ impl State {
             SyncRunKind::Bootstrap => self.execute_bootstrap_sync().await,
             SyncRunKind::Resume => self.execute_resume_sync().await,
         };
+
+        // 跑的过程中账号被切走了：这一轮的结果属于**上一个** owner，既不能写进
+        // 协调器（会污染新账号的 attempt/退避/终态），也不能发事件（UI 会拿旧账号
+        // 的同步结果去更新新账号）。静默丢弃，新账号自己的那一轮会照常跑。
+        if self.sync_coordinator.generation() != generation {
+            if actor_logs_enabled() {
+                eprintln!(
+                    "[SDK.actor] ensure_synced result dropped: generation {generation} -> {} (account switched mid-flight)",
+                    self.sync_coordinator.generation()
+                );
+            }
+            return Ok(());
+        }
+
         let now_ms = chrono::Utc::now().timestamp_millis();
         match &result {
             Ok(()) => self.sync_coordinator.complete(kind, now_ms),
@@ -11855,6 +11942,9 @@ impl PrivchatSdk {
                             // arm will wake up on the zero-delay deadline.
                             eprintln!("[SDK.actor] network_hint offline->online: reset backoff, arming immediate retry");
                             state.mark_reconnect_ready_now();
+                            // sync 的退避同理：它等的是「有希望重试的时刻」，网络刚
+                            // 回来正是那个时刻，再让用户干等剩余退避是把节流用错地方。
+                            state.sync_coordinator.note_network_available();
                         }
                         let _ = resp.send(Ok(()));
                     }
@@ -13988,6 +14078,10 @@ impl PrivchatSdk {
                                         uid: entry.uid,
                                         created_at: entry.created_at,
                                         last_login_at: entry.last_login_at,
+                                        display_name: entry.display_name.clone(),
+                                        username: entry.username.clone(),
+                                        login_mode: entry.login_mode.clone(),
+                                        login_identifier: entry.login_identifier.clone(),
                                     })
                                     .collect::<Vec<_>>()
                             },
@@ -13995,7 +14089,22 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::SetCurrentUid { uid, resp } => {
-                        let result = match state.storage.list_local_accounts().await {
+                        // 只能在「还没有活跃会话」时用来选定账号。对一个正在运行的
+                        // actor 改 uid 不等于切换账号：transport / inbound / 订阅 /
+                        // 缓存 全都还属于上一个账号，改完就是跨账号状态污染。
+                        // 活跃会话要换账号走 SwitchLocalAccount。
+                        let result = if matches!(
+                            state.session_state,
+                            SessionState::Connected
+                                | SessionState::LoggedIn
+                                | SessionState::Authenticated
+                        ) {
+                            Err(Error::InvalidState(
+                                "set_current_uid on an active session; use switch_local_account"
+                                    .to_string(),
+                            ))
+                        } else {
+                            match state.storage.list_local_accounts().await {
                             Ok((_, entries)) => {
                                 if !entries.iter().any(|entry| entry.uid == uid) {
                                     Err(Error::InvalidState(format!(
@@ -14017,8 +14126,98 @@ impl PrivchatSdk {
                                     }
                                 }
                             }
-                            Err(e) => Err(e),
+                                Err(e) => Err(e),
+                            }
                         };
+                        let _ = resp.send(result);
+                    }
+                    // 原子账号切换：停旧会话 → 作废在途 → 清会话作用域状态 →
+                    // 装载新账号。全程在这一个命令里完成，App 不再拼接
+                    // setCurrentUid + shutdown + quickEnter 这三步——那三步之间
+                    // 的窗口正是跨账号污染的来源。
+                    Command::SwitchLocalAccount { uid, resp } => {
+                        if actor_logs_enabled() {
+                            eprintln!("[SDK.actor] loop: cmd switch_local_account uid={uid}");
+                        }
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let from_state = state.session_state.as_connection_state();
+                        let result = match state.storage.list_local_accounts().await {
+                            Err(e) => Err(e),
+                            Ok((_, entries)) => {
+                                if !entries.iter().any(|entry| entry.uid == uid) {
+                                    Err(Error::InvalidState(format!(
+                                        "local account not found: {uid}"
+                                    )))
+                                } else {
+                                    // ① 先停旧会话：撤销重连意图 → 停 inbound → 断 transport。
+                                    //    reset_session_scoped_state 已把 should_auto_reconnect
+                                    //    置 false，所以这里断开不会被自动重连拉回来。
+                                    state.reset_session_scoped_state(now_ms);
+                                    stop_inbound_task(&mut inbound_task).await;
+                                    if let Err(e) = state.disconnect().await {
+                                        // 断开失败不阻断切换：目标是不再使用这条 transport，
+                                        // 而它已经被丢弃（state.transport = None）。
+                                        eprintln!(
+                                            "[SDK.actor] switch_local_account: disconnect old session failed: {e}"
+                                        );
+                                    }
+                                    state.transport = None;
+
+                                    // ② 装载新账号的存储上下文与会话快照。
+                                    let saved = state.storage.save_current_uid(uid.clone()).await;
+                                    let loaded = state.storage.load_session(uid.clone()).await;
+                                    match (saved, loaded) {
+                                        (Ok(()), Ok(snapshot)) => {
+                                            state.current_uid = Some(uid.clone());
+                                            state.bootstrap_completed = snapshot
+                                                .map(|s| s.bootstrap_completed)
+                                                .unwrap_or(false);
+                                            state.session_state = SessionState::New;
+                                            Ok(())
+                                        }
+                                        (Err(e), _) => Err(e),
+                                        (_, Err(e)) => Err(e),
+                                    }
+                                }
+                            }
+                        };
+                        // ③ 只在成功后发一次状态事件。失败不发：否则 UI 会收到一个
+                        //    「切过去了」的假象，而实际仍停在旧账号。
+                        if result.is_ok() {
+                            let to_state = state.session_state.as_connection_state();
+                            if from_state != to_state {
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::ConnectionStateChanged {
+                                        from: from_state,
+                                        to: to_state,
+                                    },
+                                );
+                            }
+                        }
+                        let _ = resp.send(result);
+                    }
+                    Command::SetLocalAccountDisplayName {
+                        uid,
+                        display_name,
+                        username,
+                        login_mode,
+                        login_identifier,
+                        resp,
+                    } => {
+                        let result = state
+                            .storage
+                            .save_account_display_name(
+                                uid,
+                                display_name,
+                                username,
+                                login_mode,
+                                login_identifier,
+                            )
+                            .await;
                         let _ = resp.send(result);
                     }
                     Command::WipeCurrentUserFull { resp } => {
@@ -16662,6 +16861,52 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    /// 原子切换本地账号。
+    ///
+    /// 停旧会话（inbound / transport / 订阅 / 缓存 / sync 协调器）并装载新账号，
+    /// 全部在一个 actor 命令内完成。调用方**不要**再自己拼
+    /// `set_current_uid` + `shutdown` + 重新登录：那几步之间存在一个窗口，旧会话
+    /// 仍在跑而 uid 已经指向新账号，旧账号的事件会被当成新账号的状态处理。
+    ///
+    /// 返回后 session 处于 `New`，由调用方发起新账号的连接流程。
+    pub async fn switch_local_account(&self, uid: String) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SwitchLocalAccount { uid, resp: resp_tx })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 记录某个本地账号的展示名，供「切换账号」列表渲染。
+    ///
+    /// 必须显式写：每个账号的资料只存在自己的库里，当前账号读不到别人的，
+    /// 不冗余这一份，列表就只能显示 uid。
+    pub async fn set_local_account_display_name(
+        &self,
+        uid: String,
+        display_name: Option<String>,
+        username: Option<String>,
+        login_mode: Option<String>,
+        login_identifier: Option<String>,
+    ) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetLocalAccountDisplayName {
+                uid,
+                display_name,
+                username,
+                login_mode,
+                login_identifier,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
     pub async fn wipe_current_user_full(&self) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -16929,6 +17174,183 @@ mod tests {
             repair_backoff: std::collections::HashMap::new(),
         };
         (state, dir)
+    }
+
+    use crate::sync_coordinator::{SyncPhase, SyncRunKind};
+
+    // ==================== 账号切换：会话作用域隔离 ====================
+    //
+    // 2026-07-28 真机 P0 的回归门禁。当时的「切换」只改 current_uid +
+    // bootstrap_completed，旧会话原地不动，于是旧账号的失败被解释成新账号的状态。
+    // 下面几条盯的就是「切完之后，属于上一个 owner 的东西一样都不许留下」。
+
+    /// 切账号必须推进 inbound epoch —— 这是丢弃旧账号在途帧的唯一判据。
+    ///
+    /// 没有它，A 的迟到 push 会在 B 已经是 current_uid 时落库，直接写进 B 的会话。
+    #[tokio::test(flavor = "current_thread")]
+    async fn switching_accounts_invalidates_in_flight_inbound_frames() {
+        let (mut state, _dir) = new_seeded_state("switch-epoch").await;
+        state.inbound_epoch = 7;
+        let stale_epoch = state.inbound_epoch;
+
+        state.reset_session_scoped_state(1_000);
+
+        assert_ne!(
+            state.inbound_epoch, stale_epoch,
+            "epoch 没推进：A 的在途帧会被当成 B 的消息"
+        );
+        // actor loop 的丢弃判据就是这个不等式。
+        assert!(stale_epoch != state.inbound_epoch);
+    }
+
+    /// A 的同步失败不得把 B 拖进重连：切换会撤销自动重连意图并清空退避。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_sync_cannot_drive_reconnect_after_switching_to_b() {
+        let (mut state, _dir) = new_seeded_state("switch-no-reconnect").await;
+        // A 正在重连 + sync 已经失败进了退避。
+        state.should_auto_reconnect = true;
+        state.reconnect_attempt = 5;
+        state.sync_coordinator.begin(SyncRunKind::Resume, 0).unwrap();
+        state.sync_coordinator.fail(
+            SyncRunKind::Resume,
+            false,
+            Some(9),
+            "transport error: disconnected".to_string(),
+            0,
+        );
+
+        state.reset_session_scoped_state(1_000);
+
+        assert!(
+            !state.should_auto_reconnect,
+            "切换后仍开着自动重连：A 的失败会继续驱动 B 的重连"
+        );
+        assert_eq!(state.reconnect_attempt, 0);
+        assert_eq!(state.sync_coordinator.snapshot().phase, SyncPhase::Idle);
+        assert_eq!(state.sync_coordinator.snapshot().attempt, 0);
+    }
+
+    /// 切回来必须能**立刻**开跑，不继承上一个账号的退避/终态。
+    ///
+    /// 真机那次正是这里：切回 A 之后必须杀进程才能恢复。
+    #[tokio::test(flavor = "current_thread")]
+    async fn switching_back_can_sync_immediately_without_a_cold_start() {
+        let (mut state, _dir) = new_seeded_state("switch-back").await;
+        // 上一个账号留下一个终态失败 + 一段退避。
+        state.sync_coordinator.begin(SyncRunKind::Resume, 0).unwrap();
+        state.sync_coordinator.fail(
+            SyncRunKind::Resume,
+            true,
+            Some(10_002),
+            "token expired".to_string(),
+            0,
+        );
+
+        state.reset_session_scoped_state(1_000);
+
+        assert!(
+            state.sync_coordinator.begin(SyncRunKind::Bootstrap, 1_001).is_ok(),
+            "切回来还被上一个账号的终态/退避挡着 —— 只能靠冷启动恢复"
+        );
+    }
+
+    /// 会话作用域数据全部归零：订阅、presence、消息缓存、room 去重、repair 队列。
+    ///
+    /// 逐项断言而不是只看一两个：这份清单本身就是修复内容，漏一项就是下一次串号。
+    #[tokio::test(flavor = "current_thread")]
+    async fn switching_clears_every_session_scoped_structure() {
+        let (mut state, _dir) = new_seeded_state("switch-clear").await;
+        state.active_subscriptions.insert((45, 1), Some("tok".into()));
+        state.update_presence_cache(&[]);
+        state
+            .room_seen_msg_ids
+            .insert(45, VecDeque::from(vec![604_621_803_637_178_368]));
+        state.channel_cache_total_bytes = 4096;
+        state.cache_hit_count = 12;
+        state.repair_queue.push_back((1, 45, 604_621_803_637_178_368));
+        state.repair_seen.insert((1, 45, 604_621_803_637_178_368));
+        state
+            .repair_backoff
+            .insert((1, 45, 1), (3, std::time::Instant::now()));
+        state.pending_prelogin_inbound_frames.push((7, vec![1, 2, 3]));
+        state.last_resume_synced = Some((7, Instant::now()));
+        state.last_sync_queued = 9;
+        state.pending_events.push(SdkEvent::SyncStateChanged {
+            state: state.sync_coordinator.snapshot(),
+        });
+
+        state.reset_session_scoped_state(1_000);
+
+        assert!(state.active_subscriptions.is_empty(), "订阅未清");
+        assert!(state.room_seen_msg_ids.is_empty(), "room 去重表未清");
+        assert!(state.channel_message_cache.is_empty(), "消息缓存未清");
+        assert_eq!(state.channel_cache_total_bytes, 0, "缓存字节数未清");
+        assert_eq!(state.cache_hit_count, 0, "缓存计数未清");
+        assert!(state.repair_queue.is_empty(), "repair 队列未清");
+        assert!(state.repair_seen.is_empty(), "repair singleflight 未清");
+        assert!(state.repair_backoff.is_empty(), "repair 退避未清");
+        assert!(
+            state.pending_prelogin_inbound_frames.is_empty(),
+            "登录前缓冲帧未清：会被 replay 进新账号"
+        );
+        assert!(state.last_resume_synced.is_none(), "resume 水位未清");
+        assert_eq!(state.last_sync_queued, 0);
+        assert!(state.pending_events.is_empty(), "待发事件未清");
+        assert!(state.last_terminal_reason.is_none());
+        assert!(!state.auth_terminal_fired);
+    }
+
+    /// 连续切 10 次：每一次都必须换代且不残留。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ten_consecutive_switches_stay_isolated() {
+        let (mut state, _dir) = new_seeded_state("switch-ten").await;
+        let mut epochs = Vec::new();
+        let mut generations = Vec::new();
+
+        for round in 0..10_i64 {
+            // 每一轮都先脏起来，模拟这个账号跑过一段。
+            state.active_subscriptions.insert((round as u64, 1), None);
+            state.repair_seen.insert((1, round as u64, 1));
+            state.should_auto_reconnect = true;
+
+            state.reset_session_scoped_state(round * 1_000);
+
+            epochs.push(state.inbound_epoch);
+            generations.push(state.sync_coordinator.generation());
+            assert!(state.active_subscriptions.is_empty(), "第 {round} 轮订阅残留");
+            assert!(state.repair_seen.is_empty(), "第 {round} 轮 repair 残留");
+            assert!(!state.should_auto_reconnect, "第 {round} 轮仍开着自动重连");
+        }
+
+        // 全程严格递增 = 每一次切换都是新的一代，旧代的东西一律作废。
+        assert!(
+            epochs.windows(2).all(|w| w[1] != w[0]),
+            "epoch 未逐轮推进: {epochs:?}"
+        );
+        assert!(
+            generations.windows(2).all(|w| w[1] == w[0] + 1),
+            "sync 世代未逐轮推进: {generations:?}"
+        );
+    }
+
+    /// 上一个 owner 的同步结果不得回写。
+    ///
+    /// `ensure_synced` 在 await 前后各取一次 generation，不相等就整轮丢弃——
+    /// 这里断言的就是那个判据在切换后成立。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_sync_result_is_dropped_after_the_owner_changed() {
+        let (mut state, _dir) = new_seeded_state("switch-stale-result").await;
+        state.sync_coordinator.begin(SyncRunKind::Resume, 0).unwrap();
+        let generation_at_start = state.sync_coordinator.generation();
+
+        // sync 还在 await 里，账号被切走。
+        state.reset_session_scoped_state(1_000);
+
+        assert_ne!(
+            state.sync_coordinator.generation(),
+            generation_at_start,
+            "世代没变 → 旧 owner 的结果会被当成新账号的同步结果写回去"
+        );
     }
 
     #[test]

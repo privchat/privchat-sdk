@@ -99,6 +99,17 @@ pub struct LocalAccountEntry {
     pub uid: String,
     pub created_at: i64,
     pub last_login_at: i64,
+    /// 该账号的展示名（nickname）。**跨账号读不到对方的资料库**，所以这份显示名
+    /// 必须冗余在全局账号注册表里，否则切换账号列表只能退化成 uid。
+    pub display_name: Option<String>,
+    /// 该账号的 username，展示优先级低于 nickname、高于 uid。
+    pub username: Option<String>,
+    /// 该账号上次使用的登录方式（如 "BUILTIN" / "PLATFORM"）。
+    pub login_mode: Option<String>,
+    /// 该账号上次登录时填的标识：账密模式是 username，短信模式是手机号。
+    /// 会话失效需要重新登录时用它回填表单——让用户重打一遍自己刚用过的账号
+    /// 是没有必要的摩擦。
+    pub login_identifier: Option<String>,
 }
 
 #[cfg(unix)]
@@ -756,6 +767,55 @@ impl LocalStore {
         format!("acct/{uid}/created_at")
     }
 
+    fn k_acct_display_name(uid: &str) -> String {
+        format!("acct/{uid}/display_name")
+    }
+
+    fn k_acct_username(uid: &str) -> String {
+        format!("acct/{uid}/username")
+    }
+
+    /// 记录某个本地账号的展示名，供切换账号列表使用。
+    ///
+    /// 写在**全局**账号树而不是该账号自己的库里：列表要在当前账号的上下文中渲染
+    /// 所有账号，而每个账号的资料只存在自己的库里，跨账号读不到——不冗余这一份，
+    /// 列表就只能显示 uid。空串按「没有」处理，不覆盖已有值为空。
+    fn k_acct_login_mode(uid: &str) -> String {
+        format!("acct/{uid}/login_mode")
+    }
+
+    fn k_acct_login_identifier(uid: &str) -> String {
+        format!("acct/{uid}/login_identifier")
+    }
+
+    pub fn save_account_display_name(
+        &self,
+        uid: &str,
+        display_name: Option<&str>,
+        username: Option<&str>,
+        login_mode: Option<&str>,
+        login_identifier: Option<&str>,
+    ) -> Result<()> {
+        let global_db = self.open_global_db()?;
+        let accounts = global_db
+            .open_tree(GLOBAL_TREE_ACCOUNTS)
+            .map_err(|e| Error::Storage(format!("open accounts tree: {e}")))?;
+        for (key, value) in [
+            (Self::k_acct_display_name(uid), display_name),
+            (Self::k_acct_username(uid), username),
+            (Self::k_acct_login_mode(uid), login_mode),
+            (Self::k_acct_login_identifier(uid), login_identifier),
+        ] {
+            let trimmed = value.map(str::trim).filter(|v| !v.is_empty());
+            if let Some(v) = trimmed {
+                accounts
+                    .insert(key.as_bytes(), v.as_bytes())
+                    .map_err(|e| Error::Storage(format!("write account display name: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
     fn load_bootstrap_completed(&self, uid: &str) -> Result<bool> {
         let meta = self.account_tree(uid, ACCOUNT_TREE_META)?;
         if let Some(v) = meta
@@ -1033,10 +1093,22 @@ impl LocalStore {
                 }
                 None => last_login_at,
             };
+            let read_text = |key: String| -> Result<Option<String>> {
+                Ok(accounts
+                    .get(key.as_bytes())
+                    .map_err(|e| Error::Storage(format!("read account text: {e}")))?
+                    .and_then(|raw| String::from_utf8(raw.to_vec()).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()))
+            };
             out.push(LocalAccountEntry {
                 uid: uid.to_string(),
                 created_at,
                 last_login_at,
+                display_name: read_text(Self::k_acct_display_name(uid))?,
+                username: read_text(Self::k_acct_username(uid))?,
+                login_mode: read_text(Self::k_acct_login_mode(uid))?,
+                login_identifier: read_text(Self::k_acct_login_identifier(uid))?,
             });
         }
         out.sort_by(|a, b| {

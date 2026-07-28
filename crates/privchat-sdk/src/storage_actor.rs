@@ -67,6 +67,14 @@ enum StorageCmd {
         uid: String,
         resp: oneshot::Sender<Result<()>>,
     },
+    SaveAccountDisplayName {
+        uid: String,
+        display_name: Option<String>,
+        username: Option<String>,
+        login_mode: Option<String>,
+        login_identifier: Option<String>,
+        resp: oneshot::Sender<Result<()>>,
+    },
     ClearCurrentUid {
         resp: oneshot::Sender<Result<()>>,
     },
@@ -631,6 +639,28 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::SaveCurrentUid { uid, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn save_account_display_name(
+        &self,
+        uid: String,
+        display_name: Option<String>,
+        username: Option<String>,
+        login_mode: Option<String>,
+        login_identifier: Option<String>,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::SaveAccountDisplayName {
+                uid,
+                display_name,
+                username,
+                login_mode,
+                login_identifier,
+                resp: resp_tx,
+            })
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
@@ -2045,6 +2075,22 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::SaveCurrentUid { uid, resp } => {
             let _ = resp.send(store.save_current_uid(&uid));
+        }
+        StorageCmd::SaveAccountDisplayName {
+            uid,
+            display_name,
+            username,
+            login_mode,
+            login_identifier,
+            resp,
+        } => {
+            let _ = resp.send(store.save_account_display_name(
+                &uid,
+                display_name.as_deref(),
+                username.as_deref(),
+                login_mode.as_deref(),
+                login_identifier.as_deref(),
+            ));
         }
         StorageCmd::ClearCurrentUid { resp } => {
             let _ = resp.send(store.clear_current_uid());

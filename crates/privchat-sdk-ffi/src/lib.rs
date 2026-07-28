@@ -2156,6 +2156,14 @@ pub struct LocalAccountSummary {
     pub created_at: i64,
     pub last_login_at: i64,
     pub is_active: bool,
+    /// 展示优先级：display_name > username > uid。
+    /// uid 是协议标识，只有前两者都缺失时才允许出现在界面上。
+    pub display_name: Option<String>,
+    pub username: Option<String>,
+    /// 上次使用的登录方式（"BUILTIN" / "PLATFORM"）。
+    pub login_mode: Option<String>,
+    /// 上次登录填的标识，供会话失效后回填登录表单。
+    pub login_identifier: Option<String>,
 }
 
 fn map_protocol(p: TransportProtocol) -> SdkProtocol {
@@ -3632,6 +3640,10 @@ fn map_local_account_summary(v: SdkLocalAccountSummary) -> LocalAccountSummary {
         created_at: v.created_at,
         last_login_at: v.last_login_at,
         is_active: v.is_active,
+        display_name: v.display_name,
+        username: v.username,
+        login_mode: v.login_mode,
+        login_identifier: v.login_identifier,
     }
 }
 
@@ -8405,6 +8417,38 @@ impl PrivchatClient {
     pub async fn set_current_uid(&self, uid: String) -> Result<(), PrivchatFfiError> {
         self.inner
             .set_current_uid(uid)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// 原子切换本地账号。见 `privchat_sdk::PrivchatSdk::switch_local_account`。
+    ///
+    /// 宿主不要再自己拼 set_current_uid + shutdown + 重新登录：那几步之间旧会话
+    /// 仍在跑而 uid 已指向新账号，旧账号的事件会被当成新账号的状态。
+    pub async fn switch_local_account(&self, uid: String) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .switch_local_account(uid)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// 记录某个本地账号的展示名，供切换账号列表渲染（见 SDK 同名方法）。
+    pub async fn set_local_account_display_name(
+        &self,
+        uid: String,
+        display_name: Option<String>,
+        username: Option<String>,
+        login_mode: Option<String>,
+        login_identifier: Option<String>,
+    ) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .set_local_account_display_name(
+                uid,
+                display_name,
+                username,
+                login_mode,
+                login_identifier,
+            )
             .await
             .map_err(PrivchatFfiError::from)
     }
