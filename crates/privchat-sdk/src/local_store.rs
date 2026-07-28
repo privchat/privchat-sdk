@@ -1223,10 +1223,18 @@ impl LocalStore {
                      --   * 其余 → 采用新值。
                      -- 「跨秒就让最后到达者覆盖」是错的:最后到达恰恰是最没有权威性
                      -- 的属性;真要改一条已确认消息的时间,只能走显式的定向 repair。
+                     -- 按**存下来的精度**合并，不猜数值形状（见 migration
+                     -- V20260728110000）。低精度永不覆盖高精度；同精度但值不同
+                     -- 说明某一端数据坏了，普通 replay 不覆盖，只保留先到的。
                      created_at = CASE
                          WHEN created_at <= 0 THEN ?18
-                         WHEN ?19 = 0 AND created_at % 1000 <> 0 THEN created_at
-                         ELSE ?18
+                         WHEN ?19 = 1 AND created_at_precision = 0 THEN ?18
+                         ELSE created_at
+                     END,
+                     created_at_precision = CASE
+                         WHEN created_at <= 0 THEN ?19
+                         WHEN ?19 = 1 AND created_at_precision = 0 THEN 1
+                         ELSE created_at_precision
                      END,
                      mime_type = COALESCE(?17, mime_type)
                  WHERE id = ?16",
@@ -1252,9 +1260,14 @@ impl LocalStore {
                     // push and re-seen through history must end up holding the
                     // send time, not whichever arrival happened to write last.
                     Self::sent_at_ms(input.timestamp, now_ms),
-                    // 1 = 毫秒精度,0 = 秒精度(只可能来自 push)。见上面 created_at
-                    // 的 CASE:精度决定谁覆盖谁,到达顺序不决定任何事。
-                    i32::from(Self::is_millisecond_precision(input.timestamp)),
+                    // 1 = 毫秒精度,0 = 秒精度(只可能来自 push)。**由来源适配器给**,
+                    // 不看数值量级:adapter 已经把秒乘成毫秒了,再看量级只会一律判成
+                    // 毫秒,精度信息就丢了——那正是「history 的 .317 被后到的 push
+                    // 改回 .000」能复活的路径。
+                    i32::from(matches!(
+                        input.timestamp_precision,
+                        crate::canonical_inbound::TimePrecision::Milliseconds
+                    )),
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
@@ -1312,8 +1325,8 @@ impl LocalStore {
             "INSERT INTO message (
                 server_message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
                 content, status, created_at, updated_at, searchable_word, local_message_id,
-                setting, order_seq, extra, mime_type
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?17, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                setting, order_seq, extra, mime_type, created_at_precision
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?17, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18)",
             params![
                 input.server_message_id as i64,
                 input.pts,
@@ -1340,6 +1353,10 @@ impl LocalStore {
                 // and landed after messages that are genuinely newer.
                 // `updated_at` stays local — that one really is about this row.
                 Self::sent_at_ms(input.timestamp, now_ms),
+                i32::from(matches!(
+                    input.timestamp_precision,
+                    crate::canonical_inbound::TimePrecision::Milliseconds
+                )),
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
@@ -1454,10 +1471,18 @@ impl LocalStore {
                      --   * 其余 → 采用新值。
                      -- 「跨秒就让最后到达者覆盖」是错的:最后到达恰恰是最没有权威性
                      -- 的属性;真要改一条已确认消息的时间,只能走显式的定向 repair。
+                     -- 按**存下来的精度**合并，不猜数值形状（见 migration
+                     -- V20260728110000）。低精度永不覆盖高精度；同精度但值不同
+                     -- 说明某一端数据坏了，普通 replay 不覆盖，只保留先到的。
                      created_at = CASE
                          WHEN created_at <= 0 THEN ?18
-                         WHEN ?19 = 0 AND created_at % 1000 <> 0 THEN created_at
-                         ELSE ?18
+                         WHEN ?19 = 1 AND created_at_precision = 0 THEN ?18
+                         ELSE created_at
+                     END,
+                     created_at_precision = CASE
+                         WHEN created_at <= 0 THEN ?19
+                         WHEN ?19 = 1 AND created_at_precision = 0 THEN 1
+                         ELSE created_at_precision
                      END,
                      mime_type = COALESCE(?17, mime_type)
                  WHERE id = ?16",
@@ -1483,9 +1508,14 @@ impl LocalStore {
                     // push and re-seen through history must end up holding the
                     // send time, not whichever arrival happened to write last.
                     Self::sent_at_ms(input.timestamp, now_ms),
-                    // 1 = 毫秒精度,0 = 秒精度(只可能来自 push)。见上面 created_at
-                    // 的 CASE:精度决定谁覆盖谁,到达顺序不决定任何事。
-                    i32::from(Self::is_millisecond_precision(input.timestamp)),
+                    // 1 = 毫秒精度,0 = 秒精度(只可能来自 push)。**由来源适配器给**,
+                    // 不看数值量级:adapter 已经把秒乘成毫秒了,再看量级只会一律判成
+                    // 毫秒,精度信息就丢了——那正是「history 的 .317 被后到的 push
+                    // 改回 .000」能复活的路径。
+                    i32::from(matches!(
+                        input.timestamp_precision,
+                        crate::canonical_inbound::TimePrecision::Milliseconds
+                    )),
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
@@ -1541,8 +1571,8 @@ impl LocalStore {
             "INSERT INTO message (
                 server_message_id, pts, channel_id, channel_type, timestamp, from_uid, type,
                 content, status, created_at, updated_at, searchable_word, local_message_id,
-                setting, order_seq, extra, mime_type
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?17, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                setting, order_seq, extra, mime_type, created_at_precision
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?17, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18)",
             params![
                 input.server_message_id as i64,
                 input.pts,
@@ -1569,6 +1599,10 @@ impl LocalStore {
                 // and landed after messages that are genuinely newer.
                 // `updated_at` stays local — that one really is about this row.
                 Self::sent_at_ms(input.timestamp, now_ms),
+                i32::from(matches!(
+                    input.timestamp_precision,
+                    crate::canonical_inbound::TimePrecision::Milliseconds
+                )),
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
@@ -4856,14 +4890,6 @@ impl LocalStore {
         Ok(())
     }
 
-    /// 调用方给的时间戳是不是毫秒精度。
-    ///
-    /// 判据是量级,不是「看起来像不像整秒」——真实发送时间正好落在整秒上完全可能,
-    /// 拿数值形状去猜精度会误判。
-    fn is_millisecond_precision(timestamp: i64) -> bool {
-        timestamp >= 100_000_000_000
-    }
-
     /// The send time to persist, in milliseconds.
     ///
     /// Guards the one thing a caller can get wrong here that no reader can
@@ -5964,6 +5990,7 @@ mod tests {
                     pts: 1,
                     order_seq: 1,
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -5983,22 +6010,24 @@ mod tests {
         assert_eq!(all[0].server_message_id, Some(900001));
     }
 
-    /// push 的秒精度不得把 history 已经落下的毫秒值改粗。
+    /// 低精度来源不得把高精度的发送时间改粗——两个方向、跨秒也一样。
     ///
-    /// 同一条消息经常两条路都来一遍(翻页拿到 .317,随后 push 到 .000)。若后到的
-    /// 低精度值直接覆盖,同一条消息的时间戳会随「最后一条到达的路径」抖动,而且
-    /// 抖动方向不确定——排序元组第 2 位是 pts 不受影响,但显示时间会来回跳。
+    /// 精度**由来源适配器显式给**，不从数值反推：adapter 早就把 push 的秒乘成了
+    /// 毫秒，到这一层再看量级只会一律判成毫秒，精度信息就丢了。这个测试自己也
+    /// 必须显式给精度，否则它测的就是「量级猜测」而不是真实规则。
     #[test]
     fn a_push_second_never_degrades_a_millisecond_send_time() {
+        use crate::canonical_inbound::TimePrecision;
         let store = test_store();
         let uid = "701";
         let precise = 1_785_148_271_317i64;
-        let mk = |timestamp: i64| UpsertRemoteMessageInput {
+        let mk = |timestamp: i64, precision: TimePrecision| UpsertRemoteMessageInput {
             server_message_id: 920001,
             local_message_id: 0,
             channel_id: 46,
             channel_type: 1,
             timestamp,
+            timestamp_precision: precision,
             from_uid: 800,
             message_type: 2,
             content: "[图片]".to_string(),
@@ -6010,40 +6039,68 @@ mod tests {
             extra: "{}".to_string(),
             mime_type: None,
         };
+        let created_at = || {
+            store
+                .list_messages(uid, 46, 1, 10, 0)
+                .expect("list")
+                .first()
+                .expect("row")
+                .created_at
+        };
 
-        // history 先到(毫秒)。
+        // history 先到（毫秒）。
         store
-            .upsert_remote_message_with_result(uid, &mk(precise))
+            .upsert_remote_message_with_result(uid, &mk(precise, TimePrecision::Milliseconds))
             .expect("history upsert");
-        // push 后到,同一秒但只有秒精度。
+        // push 后到：adapter 已把秒归一成毫秒，但精度仍是 Seconds。同一秒。
         store
-            .upsert_remote_message_with_result(uid, &mk(precise / 1000))
+            .upsert_remote_message_with_result(
+                uid,
+                &mk(precise / 1000 * 1000, TimePrecision::Seconds),
+            )
             .expect("push upsert");
+        assert_eq!(created_at(), precise, "秒精度的 push 把毫秒值改粗了");
 
-        let rows = store.list_messages(uid, 46, 1, 10, 0).expect("list");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].created_at, precise,
-            "秒精度的 push 把毫秒值改粗了"
-        );
-
-        // 另一条毫秒来源(history 重放)可以覆盖:同精度,以新值为准。
-        let corrected = precise + 5_000;
+        // 同精度但值不同 = 某一端数据坏了。发送时间在服务端是不变量,普通 replay
+        // 不许覆盖(只保留先到的);要改只能走显式的定向 repair。
         store
-            .upsert_remote_message_with_result(uid, &mk(corrected))
-            .expect("later upsert");
-        let rows = store.list_messages(uid, 46, 1, 10, 0).expect("list again");
-        assert_eq!(rows[0].created_at, corrected);
+            .upsert_remote_message_with_result(
+                uid,
+                &mk(precise + 5_000, TimePrecision::Milliseconds),
+            )
+            .expect("conflicting upsert");
+        assert_eq!(created_at(), precise, "同精度冲突时被后到的值覆盖了");
 
-        // 但秒精度的 push 即使跨秒也不许覆盖毫秒值——「最后到达者获胜」正是要
-        // 去掉的规则:最后到达是最没有权威性的属性。
+        // 秒精度即使**跨秒**也不许覆盖毫秒值。「最后到达者获胜」正是要去掉的规则:
+        // 最后到达是最没有权威性的属性。
         store
-            .upsert_remote_message_with_result(uid, &mk(corrected / 1000 + 60))
+            .upsert_remote_message_with_result(
+                uid,
+                &mk(precise / 1000 * 1000 + 60_000, TimePrecision::Seconds),
+            )
             .expect("stale push upsert");
-        let rows = store.list_messages(uid, 46, 1, 10, 0).expect("list third");
+        assert_eq!(created_at(), precise, "秒精度来源跨秒覆盖了毫秒值");
+
+        // 反向:本地是秒精度时,毫秒来源**应当**升级它。
+        let store2 = test_store();
+        store2
+            .upsert_remote_message_with_result(
+                "702",
+                &mk(precise / 1000 * 1000, TimePrecision::Seconds),
+            )
+            .expect("push first");
+        store2
+            .upsert_remote_message_with_result("702", &mk(precise, TimePrecision::Milliseconds))
+            .expect("history upgrade");
         assert_eq!(
-            rows[0].created_at, corrected,
-            "秒精度来源跨秒覆盖了毫秒值"
+            store2
+                .list_messages("702", 46, 1, 10, 0)
+                .expect("list")
+                .first()
+                .expect("row")
+                .created_at,
+            precise,
+            "毫秒来源没有升级秒精度的值"
         );
     }
 
@@ -6075,6 +6132,7 @@ mod tests {
             pts,
             order_seq: pts,
             extra: "{}".to_string(),
+            timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             mime_type: None,
         };
 
@@ -6163,6 +6221,7 @@ mod tests {
                         order_seq: pts as i64,
                         searchable_word: String::new(),
                         extra: "{}".to_string(),
+                        timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                         mime_type: None,
                     },
                 )
@@ -6244,6 +6303,7 @@ mod tests {
                     order_seq: 100,
                     searchable_word: "first".to_string(),
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6274,6 +6334,7 @@ mod tests {
                     order_seq: 101,
                     searchable_word: "updated".to_string(),
                     extra: "{\"k\":1}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6337,6 +6398,7 @@ mod tests {
                     order_seq: 100,
                     searchable_word: "pending".to_string(),
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6366,6 +6428,7 @@ mod tests {
                     order_seq: 101,
                     searchable_word: "other".to_string(),
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6424,6 +6487,7 @@ mod tests {
                         searchable_word: String::new(),
                         extra: String::new(),
                         mime_type: None,
+                        timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     },
                 )
                 .expect("upsert");
@@ -6486,6 +6550,7 @@ mod tests {
                         searchable_word: String::new(),
                         extra: String::new(),
                         mime_type: None,
+                        timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     },
                 )
                 .expect("upsert remote message");
@@ -6566,6 +6631,7 @@ mod tests {
                     order_seq: 300,
                     searchable_word: "newer".to_string(),
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6590,6 +6656,7 @@ mod tests {
                     order_seq: 200,
                     searchable_word: "older".to_string(),
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6668,6 +6735,7 @@ mod tests {
                     pts: 100,
                     order_seq: 100,
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6690,6 +6758,7 @@ mod tests {
                     pts: 101,
                     order_seq: 101,
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6795,6 +6864,7 @@ mod tests {
                     pts: 10,
                     order_seq: 10,
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6818,6 +6888,7 @@ mod tests {
                     pts: 20,
                     order_seq: 20,
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6841,6 +6912,7 @@ mod tests {
                     pts: 30,
                     order_seq: 30,
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -6864,6 +6936,7 @@ mod tests {
                     pts: 40,
                     order_seq: 40,
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -7043,6 +7116,7 @@ mod tests {
                     searchable_word: "self-message".to_string(),
                     setting: 0,
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )
@@ -7162,6 +7236,7 @@ mod tests {
                     order_seq: 12,
                     searchable_word: "fresh local message".to_string(),
                     extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
                 },
             )

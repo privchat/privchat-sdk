@@ -30,6 +30,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::UpsertRemoteMessageInput;
 
+/// 时间戳精度。wire 上两种都有，合并时必须知道手里这个是哪种。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TimePrecision {
+    /// `PushMessageRequest.timestamp`（u32 秒）。
+    Seconds,
+    /// history / sync（毫秒）。缺省取这一档:绝大多数写入路径都是毫秒,而把毫秒
+    /// 误标成秒会让它被任何来源覆盖(更危险的方向)。
+    #[default]
+    Milliseconds,
+}
+
 /// 一条服务端消息的规范形态。所有来源适配到这里，投影只从这里出去。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalInboundMessage {
@@ -53,6 +64,10 @@ pub struct CanonicalInboundMessage {
     pub pts: i64,
     /// **发送时间，毫秒**。适配器负责把秒的来源乘到毫秒，读取方不再猜。
     pub sent_at_ms: i64,
+    /// 这个时间戳**原本**的精度。归一之后数值上已看不出来了，所以必须显式带着走:
+    /// 合并两条来源时靠它决定谁覆盖谁，靠数值形状去猜是猜不准的（真实发送时间正好
+    /// 落在整秒上完全可能）。
+    pub sent_at_precision: TimePrecision,
     pub revoked: bool,
 }
 
@@ -231,6 +246,7 @@ impl CanonicalInboundMessage {
             order_seq: self.pts,
             searchable_word: String::new(),
             extra: self.extra.clone(),
+            timestamp_precision: self.sent_at_precision,
             mime_type,
         }
     }
@@ -267,6 +283,7 @@ impl CanonicalInboundMessage {
             // server 侧是 created_at.timestamp_millis()，已是毫秒；仍过一次归一，
             // 因为「这条路径是毫秒」属于对端实现，不该是本地的隐含假设。
             sent_at_ms: normalize_sent_at_ms(i64::try_from(item.timestamp).unwrap_or(i64::MAX)),
+            sent_at_precision: TimePrecision::Milliseconds,
             revoked: item.revoked,
         }
     }
@@ -299,6 +316,7 @@ impl CanonicalInboundMessage {
             extra,
             pts,
             sent_at_ms: normalize_sent_at_ms(timestamp),
+            sent_at_precision: TimePrecision::Milliseconds,
             revoked: false,
         }
     }
@@ -331,6 +349,8 @@ impl CanonicalInboundMessage {
             extra,
             pts: message_seq,
             sent_at_ms: normalize_sent_at_ms(timestamp_secs),
+            // push 是**秒**——这一位就是它与其他来源的唯一真实差异。
+            sent_at_precision: TimePrecision::Seconds,
             revoked: false,
         }
     }
@@ -517,6 +537,7 @@ mod tests {
             extra,
             pts: 1,
             sent_at_ms: 1_785_148_271_317,
+            sent_at_precision: TimePrecision::Milliseconds,
             revoked: false,
         };
 
@@ -567,6 +588,7 @@ mod tests {
             ),
             pts: 14,
             sent_at_ms: 1_785_148_271_317,
+            sent_at_precision: TimePrecision::Milliseconds,
             revoked: false,
         };
         let without = CanonicalInboundMessage {

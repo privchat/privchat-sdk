@@ -1513,6 +1513,10 @@ pub struct UpsertRemoteMessageInput {
     pub channel_id: u64,
     pub channel_type: i32,
     pub timestamp: i64,
+    /// `timestamp` 原本的精度。**必须由来源适配器给**，不能靠数值量级反推:
+    /// adapter 已经把秒乘成毫秒了,到这里再看量级只会一律判成毫秒,精度信息就丢了
+    /// ——那正是「history 的 .317 被后到的 push 改成 .000」能复活的路径。
+    pub timestamp_precision: crate::canonical_inbound::TimePrecision,
     pub from_uid: u64,
     pub message_type: i32,
     pub content: String,
@@ -18038,6 +18042,7 @@ mod tests {
                 searchable_word: "hello".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
             .expect("seed remote message");
@@ -18176,6 +18181,7 @@ mod tests {
                 searchable_word: "m1".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
             .expect("seed m1");
@@ -18197,6 +18203,7 @@ mod tests {
                 searchable_word: "m2".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
             .expect("seed m2");
@@ -18218,6 +18225,7 @@ mod tests {
                 searchable_word: "m3".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
             .expect("seed m3");
@@ -18325,6 +18333,7 @@ mod tests {
                     searchable_word: format!("m{pts}"),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 })
                 .await
                 .expect("seed message");
@@ -18427,6 +18436,7 @@ mod tests {
                     searchable_word: format!("m{pts}"),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 })
                 .await
                 .expect("seed message");
@@ -18671,6 +18681,7 @@ mod tests {
                 searchable_word: "peer".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
             .expect("seed peer message");
@@ -18692,6 +18703,7 @@ mod tests {
                 searchable_word: "self".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
             .expect("seed self message");
@@ -18869,6 +18881,7 @@ mod tests {
                     searchable_word: "materialized message".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
             .expect("seed materialized message");
@@ -19167,6 +19180,7 @@ mod tests {
                     searchable_word: "cursor message 1".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
             .expect("seed message one");
@@ -19189,6 +19203,7 @@ mod tests {
                     searchable_word: "cursor message 2".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
             .expect("seed message two");
@@ -19537,6 +19552,7 @@ mod tests {
                     searchable_word: "revoke target".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
             .expect("seed message");
@@ -19621,6 +19637,7 @@ mod tests {
                     searchable_word: "reaction target".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
             .expect("seed message");
