@@ -87,7 +87,7 @@ impl SyncCoordinator {
         self.generation
     }
 
-    #[cfg(test)]
+    /// 下一次允许开跑的绝对时刻（epoch ms）。actor 据此建定时器唤醒。
     pub(crate) fn next_retry_at_ms(&self) -> Option<i64> {
         self.next_retry_at_ms
     }

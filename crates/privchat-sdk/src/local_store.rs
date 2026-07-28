@@ -674,6 +674,21 @@ impl LocalStore {
         Ok(Some(legacy))
     }
 
+    /// 测试用故障注入：把某账号的 access token 密文写坏，使 `load_session` 报错。
+    ///
+    /// 用来验证「切换账号在任何 IO 失败时都不能留下半切换状态」——这条不变量只有
+    /// 让加载真的失败才测得到，光传一个不存在的 uid 走的是更早的校验分支，
+    /// 修复前后都会提前返回，抓不到回归。
+    #[cfg(test)]
+    pub(crate) fn corrupt_session_for_test(&self, uid: &str) -> Result<()> {
+        let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
+        auth.insert(K_ACCESS_TOKEN_ENC, &b"not-a-valid-ciphertext"[..])
+            .map_err(|e| Error::Storage(format!("corrupt access token: {e}")))?;
+        auth.flush()
+            .map_err(|e| Error::Storage(format!("flush corrupted auth: {e}")))?;
+        Ok(())
+    }
+
     pub fn clear_session(&self, uid: &str) -> Result<()> {
         let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
         auth.remove(K_ACCESS_TOKEN_ENC)
