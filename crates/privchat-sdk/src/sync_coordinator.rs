@@ -204,6 +204,19 @@ impl SyncCoordinator {
         };
     }
 
+    /// 宿主显式要求同步（不是自动触发）：解除退避窗口。
+    ///
+    /// 退避是用来压住**自动**重试的空转的；宿主主动调用是新信息——「我现在就要这个」，
+    /// 跟网络刚恢复同一性质。不解除的话，一次失败排下的窗口会把紧接着的显式调用一起
+    /// 吞掉，而调用方还拿到一个 Ok。
+    ///
+    /// 终态不在此列：那等的不是时间，是重新登录/换账号这样的显式动作。
+    pub(crate) fn note_explicit_request(&mut self) {
+        if self.snapshot.phase != SyncPhase::FailedTerminal {
+            self.next_retry_at_ms = None;
+        }
+    }
+
     /// 换账号 / 换会话：清空一切并 bump 世代。
     pub(crate) fn reset(&mut self, now_ms: i64) {
         self.generation = self.generation.wrapping_add(1);
@@ -421,5 +434,35 @@ mod tests {
             "被打断的一轮把 attempt/退避留给了下一个账号"
         );
         assert_eq!(c.snapshot().phase, SyncPhase::Idle);
+    }
+
+    #[test]
+    fn an_explicit_request_is_not_swallowed_by_a_backoff_window() {
+        let mut c = SyncCoordinator::new();
+        assert!(c.begin(SyncRunKind::Bootstrap, 0).is_ok());
+        c.fail(SyncRunKind::Bootstrap, false, None, "boom".into(), 0);
+        // 退避窗口内：自动触发理应被挡。
+        assert!(matches!(
+            c.begin(SyncRunKind::Bootstrap, 10),
+            Err(SyncBeginRejection::Backoff { .. })
+        ));
+        // 宿主显式要求：必须放行，否则调用方拿到 Ok 却什么都没发生。
+        c.note_explicit_request();
+        assert!(
+            c.begin(SyncRunKind::Bootstrap, 10).is_ok(),
+            "显式 bootstrap 被退避窗口吞掉了"
+        );
+    }
+
+    #[test]
+    fn an_explicit_request_does_not_override_a_terminal_failure() {
+        let mut c = SyncCoordinator::new();
+        assert!(c.begin(SyncRunKind::Resume, 0).is_ok());
+        c.fail(SyncRunKind::Resume, true, Some(10002), "auth".into(), 0);
+        c.note_explicit_request();
+        assert!(
+            matches!(c.begin(SyncRunKind::Resume, 10), Err(SyncBeginRejection::Terminal)),
+            "终态等的是重新登录，不是再喊一遍"
+        );
     }
 }

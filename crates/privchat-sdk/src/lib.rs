@@ -2995,12 +2995,24 @@ struct State {
     message_cache_policy: MessageCachePolicy,
     channel_message_cache: HashMap<ChannelCacheKey, ChannelMessageCache>,
     channel_cache_generation: HashMap<ChannelCacheKey, u64>,
-    /// 「有账号切换在排队」的信号。
+    /// 「有账号切换在排队」——用计数器表达，不用裸信号。
     ///
-    /// actor 在 ensure_synced 里内联 await 整轮同步，期间不处理命令——所以一次很慢
-    /// 的同步会把切换一起堵住（用户点了切换，界面十几秒没反应）。切换 API 在把命令
-    /// 投进队列**之前**先按响这个铃，正在跑的那一轮同步据此让出。
-    switch_interrupt: Arc<tokio::sync::Notify>,
+    /// actor 在 ensure_synced 里内联 await 整轮同步，期间不处理命令，所以一次很慢的
+    /// 同步会把切换一起堵住（用户点了切换，界面十几秒没反应）。
+    ///
+    /// 为什么是计数器而不是 `Notify::notify_waiters()`：后者只唤醒**此刻已经在等**的
+    /// 人，切换请求恰好落在「这一轮同步还没开始 await」的窗口里，那一声就永久丢了，
+    /// 慢同步照样把切换堵死。计数器是持久状态：请求数 > 已处理数就是「有切换在排队」，
+    /// 什么时候看都算数。Notify 只负责把睡着的 actor 叫醒，不承担记忆。
+    switch_requested: Arc<AtomicU64>,
+    switch_processed: Arc<AtomicU64>,
+    switch_wakeup: Arc<tokio::sync::Notify>,
+    /// 测试专用：让一轮同步「跑很久」，用来驱动真实的让出路径。
+    ///
+    /// 没有它就只能测纯函数——而这里要证的恰恰是 select/放弃/世代守卫在**真的
+    /// ensure_synced 里**成立。设成 None 时零开销、行为完全不变。
+    #[cfg(test)]
+    sync_stall_for_test: Option<Duration>,
     channel_cache_lru: VecDeque<ChannelCacheKey>,
     channel_cache_total_bytes: usize,
     cache_debug_log: bool,
@@ -9154,7 +9166,41 @@ impl State {
         Ok(())
     }
 
-    async fn ensure_synced<F>(&mut self, mut emit: F) -> Result<()>
+    /// 有没有「已请求但还没被 actor 处理」的账号切换。
+    fn switch_is_pending(&self) -> bool {
+        self.switch_requested.load(Ordering::SeqCst) > self.switch_processed.load(Ordering::SeqCst)
+    }
+
+    /// 等到有账号切换排队为止。
+    ///
+    /// 先注册唤醒、再读计数器：顺序反了就会漏掉「读完之后、注册之前」那一瞬间到达的
+    /// 请求——正是裸 `notify_waiters()` 丢信号的那个窗口。注册在前，那一声必然落在
+    /// 已注册的等待者身上；而即使它仍然落空，循环回来重读计数器也能看到事实。
+    async fn wait_for_switch_request(
+        requested: Arc<AtomicU64>,
+        processed: Arc<AtomicU64>,
+        wakeup: Arc<tokio::sync::Notify>,
+    ) {
+        loop {
+            let notified = wakeup.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if requested.load(Ordering::SeqCst) > processed.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// 跑一轮同步（如果闸门允许）。
+    ///
+    /// 返回值是**这一轮到底跑没跑**。以前它返回 `Result<()>`，被闸门挡掉时也是 Ok——
+    /// 调用方无从分辨「同步完成了」和「什么都没发生」，于是 `run_bootstrap_sync` 会
+    /// 在 bootstrap 根本没跑的情况下报成功，接着每一个 local-first 操作都失败。
+    ///
+    /// `explicit` = 宿主主动要求（不是自动触发）。它能解除退避窗口：退避压的是自动
+    /// 重试的空转，不该把用户点下的那一次也一起吞掉。
+    async fn ensure_synced_inner<F>(&mut self, explicit: bool, mut emit: F) -> Result<bool>
     where
         F: FnMut(SdkEvent),
     {
@@ -9164,12 +9210,24 @@ impl State {
             ));
         }
 
+        // 已经有切换在排队就根本别开这一轮：开了也是马上让出，白白把闸门开关一遍。
+        if self.switch_is_pending() {
+            if actor_logs_enabled() {
+                eprintln!("[SDK.actor] ensure_synced skipped: an account switch is pending");
+            }
+            return Ok(false);
+        }
+
         let kind = if self.bootstrap_completed && !self.full_rebuild_required().await {
             SyncRunKind::Resume
         } else {
             SyncRunKind::Bootstrap
         };
         let now_ms = chrono::Utc::now().timestamp_millis();
+        if explicit {
+            // 宿主主动要的这一次不该被上一次失败排下的退避窗口吞掉。
+            self.sync_coordinator.note_explicit_request();
+        }
         // 退避/合并/终态都在协调器里判定。sync 有多个触发源（重连成功、connect
         // 成功、token 刷新后重认证、显式命令），它们只有共同经过这一道闸门才收
         // 敛得住——在任何单个调用点 sleep 都会被下一个触发源绕开。
@@ -9177,7 +9235,7 @@ impl State {
             if actor_logs_enabled() {
                 eprintln!("[SDK.actor] ensure_synced skipped: {rejection:?}");
             }
-            return Ok(());
+            return Ok(false);
         }
         // 这一轮属于哪个账号/会话世代。切账号会 bump 它。
         let generation = self.sync_coordinator.generation();
@@ -9188,11 +9246,18 @@ impl State {
         // 同步跑起来，同时盯着「有账号切换在排队」这个铃。actor 在这里内联 await，
         // 期间不处理命令——不盯着的话，一次卡住的同步会把切换一起堵死，用户点了
         // 切换要等十几秒才有反应。铃响就让出：这一轮的结果已经不属于任何人了。
-        let interrupt = self.switch_interrupt.clone();
         let result = tokio::select! {
             biased;
-            _ = interrupt.notified() => None,
+            _ = Self::wait_for_switch_request(
+                self.switch_requested.clone(),
+                self.switch_processed.clone(),
+                self.switch_wakeup.clone(),
+            ) => None,
             r = async {
+                #[cfg(test)]
+                if let Some(stall) = self.sync_stall_for_test {
+                    tokio::time::sleep(stall).await;
+                }
                 match kind {
                     SyncRunKind::Bootstrap => self.execute_bootstrap_sync().await,
                     SyncRunKind::Resume => self.execute_resume_sync().await,
@@ -9208,7 +9273,7 @@ impl State {
             if actor_logs_enabled() {
                 eprintln!("[SDK.actor] ensure_synced yielded to a pending account switch");
             }
-            return Ok(());
+            return Ok(false);
         };
 
         // 跑的过程中账号被切走了：这一轮的结果属于**上一个** owner，既不能写进
@@ -9227,7 +9292,7 @@ impl State {
                     self.sync_coordinator.generation()
                 );
             }
-            return Ok(());
+            return Ok(false);
         }
 
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -9244,7 +9309,24 @@ impl State {
         emit(SdkEvent::SyncStateChanged {
             state: self.sync_coordinator.snapshot(),
         });
-        result
+        result.map(|()| true)
+    }
+
+    /// 自动触发的同步（重连成功 / connect / token 刷新后重认证）。
+    async fn ensure_synced<F>(&mut self, emit: F) -> Result<()>
+    where
+        F: FnMut(SdkEvent),
+    {
+        self.ensure_synced_inner(false, emit).await.map(|_| ())
+    }
+
+    /// 宿主显式要求的同步。返回「是否真的跑了」——调用方要靠它区分
+    /// 「同步完成」和「被闸门挡住、什么都没发生」。
+    async fn ensure_synced_explicit<F>(&mut self, emit: F) -> Result<bool>
+    where
+        F: FnMut(SdkEvent),
+    {
+        self.ensure_synced_inner(true, emit).await
     }
 
     async fn hydrate_system_channel_messages_from_history(&mut self) -> Result<()> {
@@ -11258,8 +11340,9 @@ pub struct PrivchatSdk {
     task_registry: TaskRegistry,
     shutting_down: Arc<AtomicBool>,
     supervised_sync_running: Arc<AtomicBool>,
-    /// 见 [State::switch_interrupt]：切换账号前先按铃，让正在跑的同步让出。
-    switch_interrupt: Arc<tokio::sync::Notify>,
+    /// 见 [State::switch_requested]：切换账号前先记一笔并叫醒 actor，让正在跑的同步让出。
+    switch_requested: Arc<AtomicU64>,
+    switch_wakeup: Arc<tokio::sync::Notify>,
     startup_error: Arc<StdMutex<Option<Error>>>,
     snowflake: Arc<snowflake_me::Snowflake>,
     presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
@@ -11341,10 +11424,13 @@ impl PrivchatSdk {
                         .expect("default snowflake must work"),
                 )
             });
-        // 切换账号的「让出」信号：一份给 actor（在同步里等它），一份给 SDK 句柄
-        // （切换 API 在投递命令前按响它）。
-        let switch_interrupt_sdk = Arc::new(tokio::sync::Notify::new());
-        let switch_interrupt_actor = switch_interrupt_sdk.clone();
+        // 账号切换的「让出」通道：计数器记事实，Notify 负责叫醒。见 State::switch_requested。
+        let switch_requested_sdk = Arc::new(AtomicU64::new(0));
+        let switch_processed_sdk = Arc::new(AtomicU64::new(0));
+        let switch_wakeup_sdk = Arc::new(tokio::sync::Notify::new());
+        let switch_requested_actor = switch_requested_sdk.clone();
+        let switch_processed_actor = switch_processed_sdk.clone();
+        let switch_wakeup_actor = switch_wakeup_sdk.clone();
         let actor_snowflake = snowflake.clone();
         let actor_task = runtime_provider.spawn(async move {
             if actor_logs_enabled() {
@@ -11413,7 +11499,11 @@ impl PrivchatSdk {
                 message_cache_policy: MessageCachePolicy::default(),
                 channel_message_cache: HashMap::new(),
                 channel_cache_generation: HashMap::new(),
-                switch_interrupt: switch_interrupt_actor,
+                switch_requested: switch_requested_actor,
+                switch_processed: switch_processed_actor,
+                switch_wakeup: switch_wakeup_actor,
+                #[cfg(test)]
+                sync_stall_for_test: None,
                 channel_cache_lru: VecDeque::new(),
                 channel_cache_total_bytes: 0,
                 cache_debug_log: std::env::var("PRIVCHAT_CACHE_LOG").ok().as_deref() == Some("1"),
@@ -12552,7 +12642,13 @@ impl PrivchatSdk {
                         if actor_logs_enabled() {
                             eprintln!("[SDK.actor] loop: cmd run_bootstrap_sync");
                         }
-                        let result = state.ensure_synced(|event| {
+                        // 显式路径：解除退避窗口，并且要知道这一轮到底跑没跑。
+                        //
+                        // 以前这里拿 Ok 就当 bootstrap 完成了，还照发 BootstrapCompleted
+                        // 事件——而被闸门挡掉时 bootstrap_completed 仍是 false，接下来
+                        // 每一个 local-first 操作都报 InvalidState。宿主拿到的是「成功」，
+                        // 看到的是全面失灵。
+                        let ran = state.ensure_synced_explicit(|event| {
                             emit_sequenced_event(
                                 &actor_event_tx,
                                 &actor_event_history,
@@ -12561,19 +12657,32 @@ impl PrivchatSdk {
                                 event,
                             );
                         }).await;
-                        if result.is_ok() {
-                            if let Some(uid) = &state.current_uid {
-                                if let Ok(user_id) = uid.parse::<u64>() {
-                                    emit_sequenced_event(
-                                        &actor_event_tx,
-                                        &actor_event_history,
-                                        &actor_event_seq,
-                                        event_history_limit,
-                                        SdkEvent::BootstrapCompleted { user_id },
-                                    );
+                        let result = match ran {
+                            Ok(true) => {
+                                if let Some(uid) = &state.current_uid {
+                                    if let Ok(user_id) = uid.parse::<u64>() {
+                                        emit_sequenced_event(
+                                            &actor_event_tx,
+                                            &actor_event_history,
+                                            &actor_event_seq,
+                                            event_history_limit,
+                                            SdkEvent::BootstrapCompleted { user_id },
+                                        );
+                                    }
                                 }
+                                Ok(())
                             }
-                        }
+                            Ok(false) if state.bootstrap_completed => {
+                                // 本来就已经 bootstrap 过，这次被合并掉——语义上确实
+                                // 「已经就绪」，报成功没有骗人。
+                                Ok(())
+                            }
+                            Ok(false) => Err(Error::InvalidState(format!(
+                                "bootstrap sync did not run (sync state: {:?}); local-first operations are not available",
+                                state.sync_coordinator.snapshot().phase
+                            ))),
+                            Err(e) => Err(e),
+                        };
                         let _ = resp.send(result);
                     }
                     Command::EnsureSynced { resp } => {
@@ -14224,6 +14333,10 @@ impl PrivchatSdk {
                         if actor_logs_enabled() {
                             eprintln!("[SDK.actor] loop: cmd switch_local_account uid={uid}");
                         }
+                        // 这条请求已被取走：销账。计数器只表达「还在排队的切换」，
+                        // 不销账的话每一轮同步开始时都会看到一个早已处理完的请求，
+                        // 于是永远开不了工。
+                        state.switch_processed.fetch_add(1, Ordering::SeqCst);
                         let now_ms = chrono::Utc::now().timestamp_millis();
                         let from_state = state.session_state.as_connection_state();
                         // 顺序是这条命令的全部要害：**所有可能失败的 IO 都排在拆除之前**。
@@ -14333,9 +14446,43 @@ impl PrivchatSdk {
                                 return Ok(());
                             };
                             // thumb_status: 1=已下载, 3=协议层确无缩略图（终态）。
-                            // 这两种都不必再取；0/2 才是「还没有 / 失败过」。
-                            if msg.thumb_status == 1 || msg.thumb_status == 3 {
+                            if msg.thumb_status == 1 {
                                 return Ok(());
+                            }
+                            if msg.thumb_status == 3 {
+                                // 3 是终态，但历史上有一批 3 是**误判**写下的：早先
+                                // history 回填丢了 metadata，extra 是空串，当时的代码
+                                // 把「我没看到缩略图字段」当成了「确实没有缩略图」。
+                                // 写入侧已经修好，这些行却永远停在灰块上。
+                                //
+                                // 判据不另写一份，就用写入侧那条：现在再看一次，服务端
+                                // 是否**明确**说了没有缩略图。它说了，3 就是对的；没说，
+                                // 这条 3 就是当年那次误判，退回 0 重新走一遍。
+                                //
+                                // 放在这里而不是启动扫全表：用户滑到哪修到哪，代价只落
+                                // 在真正被看到的那几条上。
+                                let says_none =
+                                    crate::canonical_inbound::CanonicalInboundMessage::from_sync_entity(
+                                        0,
+                                        0,
+                                        msg.channel_id,
+                                        msg.channel_type,
+                                        0,
+                                        0,
+                                        String::new(),
+                                        msg.extra.clone(),
+                                        0,
+                                        0,
+                                    )
+                                    .server_says_no_thumbnail();
+                                if says_none {
+                                    return Ok(());
+                                }
+                                tracing::info!(
+                                    message_id = msg.message_id,
+                                    "thumb_status=3 是早期误判（服务端未明确表示没有缩略图）：退回待重试"
+                                );
+                                state.storage.update_thumb_status(msg.message_id, 0).await?;
                             }
                             let paths = state.storage.get_storage_paths().await?;
                             let user_root = PathBuf::from(&paths.user_root);
@@ -14463,7 +14610,8 @@ impl PrivchatSdk {
             task_registry,
             shutting_down: Arc::new(AtomicBool::new(false)),
             supervised_sync_running: Arc::new(AtomicBool::new(false)),
-            switch_interrupt: switch_interrupt_sdk,
+            switch_requested: switch_requested_sdk,
+            switch_wakeup: switch_wakeup_sdk,
             startup_error,
             snowflake,
             presence_cache,
@@ -17014,9 +17162,13 @@ impl PrivchatSdk {
     /// 返回后 session 处于 `New`，由调用方发起新账号的连接流程。
     pub async fn switch_local_account(&self, uid: String) -> Result<()> {
         self.ensure_running()?;
-        // 先按铃再投命令：actor 可能正卡在一轮慢同步里内联 await，不先让它让出，
+        // 先记一笔再投命令：actor 可能正卡在一轮慢同步里内联 await，不先让它让出，
         // 这条命令只能排在队尾干等。顺序反过来就等于没有这个机制。
-        self.switch_interrupt.notify_waiters();
+        //
+        // 计数器先于唤醒：即使 actor 此刻没在等（唤醒落空），事实已经记下了，
+        // 下一轮同步开始前会看到它。
+        self.switch_requested.fetch_add(1, Ordering::SeqCst);
+        self.switch_wakeup.notify_waiters();
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::SwitchLocalAccount { uid, resp: resp_tx })
@@ -17441,7 +17593,10 @@ mod tests {
             message_cache_policy: MessageCachePolicy::default(),
             channel_message_cache: HashMap::new(),
             channel_cache_generation: HashMap::new(),
-            switch_interrupt: Arc::new(tokio::sync::Notify::new()),
+            switch_requested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            switch_processed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            switch_wakeup: Arc::new(tokio::sync::Notify::new()),
+            sync_stall_for_test: None,
             channel_cache_lru: VecDeque::new(),
             channel_cache_total_bytes: 0,
             cache_debug_log: false,
@@ -17620,13 +17775,89 @@ mod tests {
         );
     }
 
+    /// 切换请求在这一轮同步**开始之前**到达：绝不能被吞掉。
+    ///
+    /// 这是裸 `notify_waiters()` 的致命窗口——它只唤醒此刻已经在等的人，早到的一声
+    /// 永久丢失，慢同步照样把切换堵死。计数器版本必须立刻让出。
+    #[tokio::test]
+    async fn a_switch_request_that_arrives_before_the_run_is_not_lost() {
+        let (mut state, _dir) = new_seeded_state("switch-before-run").await;
+        state.sync_stall_for_test = Some(Duration::from_secs(30));
+        state.switch_requested.fetch_add(1, Ordering::SeqCst);
+
+        let started = std::time::Instant::now();
+        state.ensure_synced(|_| {}).await.expect("ensure_synced");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "切换请求在同步开始前到达却被吞掉，等满了 30s 的同步：{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 切换请求在同步**跑到一半**时到达：让出，且这一轮不留下任何痕迹。
+    #[tokio::test]
+    async fn a_slow_sync_yields_to_a_switch_and_writes_nothing_back() {
+        let (mut state, _dir) = new_seeded_state("switch-mid-run").await;
+        state.sync_stall_for_test = Some(Duration::from_secs(30));
+
+        let requested = state.switch_requested.clone();
+        let wakeup = state.switch_wakeup.clone();
+        let started = std::time::Instant::now();
+
+        let (result, _) = tokio::join!(
+            state.ensure_synced(|_| {}),
+            async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                requested.fetch_add(1, Ordering::SeqCst);
+                wakeup.notify_waiters();
+            },
+        );
+        result.expect("ensure_synced");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "慢同步没有让出，切换被堵了 {:?}",
+            started.elapsed()
+        );
+
+        // 被打断的一轮属于上一个 owner：既不能记成成功，也不能记成失败留下退避，
+        // 否则新账号一上来就背着上一个账号的 attempt。
+        let snapshot = state.sync_coordinator.snapshot();
+        assert_eq!(
+            snapshot.attempt, 0,
+            "被打断的一轮把 attempt 写了回去，新账号会背上它"
+        );
+        assert_ne!(snapshot.phase, SyncPhase::Synced, "被打断的一轮被记成同步成功了");
+    }
+
+    /// 让出之后闸门必须重新打开：新账号的同步要能照常开工。
+    #[tokio::test]
+    async fn the_new_account_can_sync_after_the_previous_run_yielded() {
+        let (mut state, _dir) = new_seeded_state("switch-then-sync").await;
+        state.sync_stall_for_test = Some(Duration::from_secs(30));
+        state.switch_requested.fetch_add(1, Ordering::SeqCst);
+        state.ensure_synced(|_| {}).await.expect("interrupted run");
+
+        // 切换命令被取走 = 销账；新账号这一轮不该再被「有切换排队」挡住。
+        state.switch_processed.fetch_add(1, Ordering::SeqCst);
+        state.sync_stall_for_test = None;
+        assert!(!state.switch_is_pending(), "切换已处理，闸门却仍认为有请求在排队");
+
+        // 这一轮会真的去跑同步（没有服务端，失败是预期的）——要证的是它**开工了**，
+        // 而不是被闸门挡回来。
+        let _ = state.ensure_synced(|_| {}).await;
+        assert_ne!(
+            state.sync_coordinator.snapshot().phase,
+            SyncPhase::Idle,
+            "让出之后新账号的同步没能开工，闸门卡死了"
+        );
+    }
+
     /// 上一个 owner 的同步结果不得回写。
     ///
-    /// 诚实说明这条测的是什么：它断言的是**守卫的前提**——切换会推进世代，
-    /// 于是 `ensure_synced` await 前后取到的值不相等。它**没有**真的制造
-    /// 「同步进行中被切走」的竞态，因为当前 actor 内联 await 整轮同步，期间
-    /// 不处理命令，那个竞态压根构造不出来。等同步移出 actor 线程之后，这里要
-    /// 换成真正挂起 sync RPC 再提交切换的测试。
+    /// 这条断言的是守卫的前提：切换会推进世代，于是 `ensure_synced` await 前后
+    /// 取到的值不相等。真正「同步跑到一半被切走」的场景由上面三条覆盖
+    /// （用 sync_stall_for_test 把一轮同步挂起，再从外部提交切换请求）。
     #[tokio::test(flavor = "current_thread")]
     async fn a_stale_sync_result_is_dropped_after_the_owner_changed() {
         let (mut state, _dir) = new_seeded_state("switch-stale-result").await;
