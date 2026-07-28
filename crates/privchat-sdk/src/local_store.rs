@@ -1215,7 +1215,15 @@ impl LocalStore {
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
                      server_message_id = ?15,
-                     created_at = ?18,
+                     -- 同一秒内保留精度更高的那个:秒精度只可能来自 push,任何
+                     -- 毫秒值都更接近真实发送时刻。跨秒才以新值为准(那是真的更新)。
+                     -- 不这样做的话,一条 history 拿到 .317 的消息会被随后到达的
+                     -- push 改成 .000,时间戳跟着「最后一条到达的路径」抖。
+                     created_at = CASE
+                         WHEN created_at > 0 AND created_at / 1000 = ?18 / 1000
+                             THEN MAX(created_at, ?18)
+                         ELSE ?18
+                     END,
                      mime_type = COALESCE(?17, mime_type)
                  WHERE id = ?16",
                 params![
@@ -1431,7 +1439,15 @@ impl LocalStore {
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
                      server_message_id = ?15,
-                     created_at = ?18,
+                     -- 同一秒内保留精度更高的那个:秒精度只可能来自 push,任何
+                     -- 毫秒值都更接近真实发送时刻。跨秒才以新值为准(那是真的更新)。
+                     -- 不这样做的话,一条 history 拿到 .317 的消息会被随后到达的
+                     -- push 改成 .000,时间戳跟着「最后一条到达的路径」抖。
+                     created_at = CASE
+                         WHEN created_at > 0 AND created_at / 1000 = ?18 / 1000
+                             THEN MAX(created_at, ?18)
+                         ELSE ?18
+                     END,
                      mime_type = COALESCE(?17, mime_type)
                  WHERE id = ?16",
                 params![
@@ -5943,6 +5959,59 @@ mod tests {
         assert_eq!(all.len(), 1, "duplicate server row should be merged");
         assert_eq!(all[0].message_id, local_id);
         assert_eq!(all[0].server_message_id, Some(900001));
+    }
+
+    /// push 的秒精度不得把 history 已经落下的毫秒值改粗。
+    ///
+    /// 同一条消息经常两条路都来一遍(翻页拿到 .317,随后 push 到 .000)。若后到的
+    /// 低精度值直接覆盖,同一条消息的时间戳会随「最后一条到达的路径」抖动,而且
+    /// 抖动方向不确定——排序元组第 2 位是 pts 不受影响,但显示时间会来回跳。
+    #[test]
+    fn a_push_second_never_degrades_a_millisecond_send_time() {
+        let store = test_store();
+        let uid = "701";
+        let precise = 1_785_148_271_317i64;
+        let mk = |timestamp: i64| UpsertRemoteMessageInput {
+            server_message_id: 920001,
+            local_message_id: 0,
+            channel_id: 46,
+            channel_type: 1,
+            timestamp,
+            from_uid: 800,
+            message_type: 2,
+            content: "[图片]".to_string(),
+            status: 2,
+            searchable_word: String::new(),
+            setting: 0,
+            pts: 1,
+            order_seq: 1,
+            extra: "{}".to_string(),
+            mime_type: None,
+        };
+
+        // history 先到(毫秒)。
+        store
+            .upsert_remote_message_with_result(uid, &mk(precise))
+            .expect("history upsert");
+        // push 后到,同一秒但只有秒精度。
+        store
+            .upsert_remote_message_with_result(uid, &mk(precise / 1000))
+            .expect("push upsert");
+
+        let rows = store.list_messages(uid, 46, 1, 10, 0).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].created_at, precise,
+            "秒精度的 push 把毫秒值改粗了"
+        );
+
+        // 跨秒是真的更新,必须跟上。
+        let next = precise + 5_000;
+        store
+            .upsert_remote_message_with_result(uid, &mk(next))
+            .expect("later upsert");
+        let rows = store.list_messages(uid, 46, 1, 10, 0).expect("list again");
+        assert_eq!(rows[0].created_at, next);
     }
 
     /// 回填的历史必须带着**发送时间**落库,而不是「本机什么时候存的」。

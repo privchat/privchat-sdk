@@ -69,6 +69,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
 pub mod attachment_crypto;
+pub mod canonical_inbound;
 mod avatar_cache;
 pub mod error_codes;
 mod local_store;
@@ -5721,27 +5722,34 @@ impl State {
                         );
                         continue;
                     }
-                    let mime_type = Self::extract_mime_type_from_json(&content, &extra);
-                    let extra_for_thumb = extra.clone();
-                    let upserted = self
-                        .storage
-                        .upsert_remote_message_with_result(UpsertRemoteMessageInput {
+                    // 同一条 canonical → 同一条投影。sync 专属的 setting /
+                    // order_seq / searchable_word 在下面单独补，它们不属于「这条
+                    // 消息本身」，而是本地同步簿记。
+                    let canonical =
+                        crate::canonical_inbound::CanonicalInboundMessage::from_sync_entity(
                             server_message_id,
                             local_message_id,
                             channel_id,
                             channel_type,
-                            timestamp,
                             from_uid,
                             message_type,
-                            content: content.clone(),
-                            status,
+                            content.clone(),
+                            extra.clone(),
                             pts,
-                            setting,
-                            order_seq,
-                            searchable_word,
-                            extra,
-                            mime_type,
-                        })
+                            timestamp,
+                        );
+                    let mime_type = Self::extract_mime_type_from_json(
+                        &canonical.content,
+                        &canonical.extra,
+                    );
+                    let extra_for_thumb = canonical.extra.clone();
+                    let mut input = canonical.to_upsert_input(status, mime_type);
+                    input.setting = setting;
+                    input.order_seq = order_seq;
+                    input.searchable_word = searchable_word;
+                    let upserted = self
+                        .storage
+                        .upsert_remote_message_with_result(input)
                         .await?;
                     let message_id = upserted.message_id;
                     // During bootstrap/periodic sync, do NOT bump unread —
@@ -7709,39 +7717,14 @@ impl State {
         item: &MessageHistoryItem,
         channel_type: i32,
     ) -> UpsertRemoteMessageInput {
-        // metadata 必须进 extra,而且要和 push 路径同一个 envelope 形状:媒体消息的
-        // file_id / 宽高 / thumbnail_file_id / thumbnail_url 全在里面。丢掉它,图片行
-        // 就没有任何可下载的东西——缩略图触发点找不到 file id,判定「这条消息本来就
-        // 没有缩略图」并永久标记,气泡从此是一个灰块。
-        let extra = item
-            .metadata
-            .as_ref()
-            .map(|metadata| {
-                serde_json::json!({ "content": item.content, "metadata": metadata }).to_string()
-            })
-            .unwrap_or_default();
-        let pts = item.message_seq.unwrap_or(0);
-        UpsertRemoteMessageInput {
-            server_message_id: item.message_id,
-            local_message_id: 0,
-            channel_id: item.channel_id,
-            channel_type,
-            // history 的 timestamp 是毫秒(server message_view_json 用
-            // created_at.timestamp_millis()),即消息的发送时间。
-            timestamp: i64::try_from(item.timestamp).unwrap_or(i64::MAX),
-            from_uid: item.sender_id,
-            message_type: Self::wire_message_type_to_i32(&item.message_type),
-            content: item.content.clone(),
-            status: 2,
-            // SDK-HISTORY-2：server history 响应带 message_seq(=per-channel pts)，
-            // 回填真实值（此前落 0 导致排序权威失效）；老 server 缺字段兜底 0。
-            pts,
-            setting: 0,
-            order_seq: pts,
-            searchable_word: String::new(),
-            mime_type: Self::extract_mime_type_from_json(&item.content, &extra),
-            extra,
-        }
+        let canonical = crate::canonical_inbound::CanonicalInboundMessage::from_history_item(
+            item,
+            if channel_type == 0 { 1 } else { channel_type },
+            Self::wire_message_type_to_i32,
+        );
+        let mime_type = Self::extract_mime_type_from_json(&canonical.content, &canonical.extra);
+        // status=2：history 返回的都是服务端已确认的消息。
+        canonical.to_upsert_input(2, mime_type)
     }
 
     async fn store_history_item(
@@ -7815,6 +7798,53 @@ impl State {
                 .await?;
         }
         Ok(resp)
+    }
+
+    /// 按 `server_message_id` 定向修复一条投影损坏的消息。
+    ///
+    /// 「投影损坏」指本地这一行是某条旧代码或半截写入留下的:metadata 丢了(图片
+    /// 永远加载不出来)、时间戳单位错了、pts 缺失。这类行不该靠删掉整段会话历史
+    /// 再全量重拉来救——那会连带丢掉本地已下载的媒体、已读位置和 gap 水位,代价
+    /// 远大于问题本身,而且用户会看到会话「闪空」。
+    ///
+    /// 修复路径就是一条:按 server_message_id 走 around 拿回权威消息 → 重新跑
+    /// canonical projection → 原地 upsert(`server_message_id` 唯一,天然幂等)。
+    ///
+    /// 返回本地 message id;消息在服务端也不存在时返回 None。
+    pub async fn repair_message_projection(
+        &mut self,
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+    ) -> Result<Option<u64>> {
+        let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        let resp = self
+            .fetch_and_store_messages_around(
+                channel_id,
+                normalized_channel_type,
+                server_message_id,
+                Some(0),
+                Some(0),
+            )
+            .await?;
+        if resp.anchor_message.message_id != server_message_id {
+            tracing::warn!(
+                server_message_id,
+                channel_id,
+                "repair: 服务端没有返回这条 anchor,跳过"
+            );
+            return Ok(None);
+        }
+        // fetch_and_store_messages_around 内部已按 canonical projection 落库,
+        // 这里只把本地 id 查回来给调用方。
+        Ok(self
+            .storage
+            .get_message_id_by_server_message_id(
+                channel_id,
+                normalized_channel_type,
+                server_message_id,
+            )
+            .await?)
     }
 
     async fn hydrate_channel_messages_from_history(
@@ -9617,11 +9647,42 @@ impl State {
             _ => match Self::extract_thumbnail_url(content) {
                 Some(url) if url.starts_with("http") => (url, 0, None),
                 _ => {
-                    // Protocol-level "no thumbnail" — mark thumb_status=3 so UI
-                    // renders a type-derived static placeholder instead of a loader.
-                    tokio::spawn(async move {
-                        let _ = storage.update_thumb_status(message_id, 3).await;
-                    });
+                    // thumb_status=3 是**终态**：写下去之后永不重试，UI 从此渲染
+                    // 静态占位符。所以它只能表示「已经看清楚了,这条消息确实没有
+                    // 缩略图」,不能表示「我没看到缩略图字段」。
+                    //
+                    // 这两者的区别就是上一次事故:history 回填丢了 metadata,extra
+                    // 是空串,于是这里判定「没有缩略图」并永久标记——整段历史的图片
+                    // 从此是灰块,重开 App 也不会好。
+                    //
+                    // 现在的规则:metadata 解析不出来时停在 0(未知/待重试),留给下
+                    // 一次投影或定向 repair 去补;只有确实解析出了 metadata 而其中
+                    // 没有缩略图字段,才允许进终态。
+                    let has_metadata =
+                        crate::canonical_inbound::CanonicalInboundMessage::from_sync_entity(
+                            0,
+                            0,
+                            channel_id,
+                            channel_type,
+                            0,
+                            0,
+                            String::new(),
+                            content.to_string(),
+                            0,
+                            0,
+                        )
+                        .has_metadata();
+                    if has_metadata {
+                        tokio::spawn(async move {
+                            let _ = storage.update_thumb_status(message_id, 3).await;
+                        });
+                    } else {
+                        tracing::warn!(
+                            message_id,
+                            channel_id,
+                            "缩略图信息缺失且 metadata 解析不出:保持待重试,不写终态"
+                        );
+                    }
                     return;
                 }
             },
