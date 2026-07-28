@@ -1,7 +1,8 @@
 //! 服务端来的一条消息，规范化之后的样子。
 //!
-//! 五条来源——realtime push、`sync/get_difference` commit、`message/history/get`、
-//! `message/history/around`、send ACK——的 transport 形态本来就不一样：字段名不同、
+//! 四条**投影**来源——realtime push、`sync/get_difference` commit、
+//! `message/history/get`、`message/history/around`——的 transport 形态本来就不一样：
+//! 字段名不同、
 //! 时间单位不同（push 是秒，其余是毫秒）、metadata 有的在 envelope 里有的在顶层。
 //! 以前每条来源各自拼一份数据库投影，于是「同一条消息从哪条路进来」决定了它在本地
 //! 长什么样：history 进来的图片没有 `extra`（缩略图永远下不来），push 进来的时间少
@@ -9,8 +10,13 @@
 //!
 //! 现在的规则：**来源只做适配，不做投影**。
 //!
+//! send ACK **不在其列**,这是有意的:它不构造消息行,只在已有的乐观行上补服务端
+//! 身份与顺序(`outbox_ack_sent` 只写 server_message_id / status / pts,连
+//! created_at 都不碰——本机发送时那个值本来就是准的)。给它硬造一个 adapter 只会
+//! 多一个没有生产调用者的函数,和一条测得很好看却不存在的路径。
+//!
 //! ```text
-//!   push / sync commit / history / around / send-ack
+//!   push / sync commit / history / around
 //!                      ↓  (各自的 from_* 适配器)
 //!              CanonicalInboundMessage
 //!                      ↓  (唯一一条投影)
@@ -149,6 +155,36 @@ impl CanonicalInboundMessage {
             .and_then(|value| value.get("metadata").cloned())
             .map(|metadata| !metadata.is_null())
             .unwrap_or(false)
+    }
+
+    /// 服务端是否**明确表示**这条消息没有缩略图。
+    ///
+    /// 这是写终态 `thumb_status=3` 的唯一许可条件。三件事必须同时成立：
+    /// metadata 解析出来了、其中没有 `thumbnail_file_id`(或为 0)、也没有非空的
+    /// `thumbnail_url`。
+    ///
+    /// 反过来最容易错的一种情况:metadata 里**明明有** `thumbnail_file_id`,只是这次
+    /// `file/get_url` 因为网络/token/服务端抖动没拿到票据。那是一次可重试的失败,不是
+    /// 「这条消息没有缩略图」——把它写成终态,一次网络抖动就能让一张图永久变成灰块。
+    pub fn server_says_no_thumbnail(&self) -> bool {
+        let Some(metadata) = self.metadata() else {
+            // 连 metadata 都没有 = 没有证据,不能下结论。
+            return false;
+        };
+        let has_file_id = metadata
+            .get("thumbnail_file_id")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
+            .map(|id| id > 0)
+            .unwrap_or(false);
+        let has_url = metadata
+            .get("thumbnail_url")
+            .and_then(|v| v.as_str())
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false);
+        !has_file_id && !has_url
     }
 
     /// 取出 metadata 子对象（若有）。
@@ -299,33 +335,6 @@ impl CanonicalInboundMessage {
         }
     }
 
-    /// 自己发出的消息拿到 ACK 之后：服务端补上了身份和顺序，正文仍是本地那份。
-    pub fn from_send_ack(
-        server_message_id: u64,
-        local_message_id: u64,
-        channel_id: u64,
-        channel_type: i32,
-        from_uid: u64,
-        message_type: i32,
-        content: String,
-        extra: String,
-        message_seq: i64,
-        sent_at_ms: i64,
-    ) -> Self {
-        Self {
-            server_message_id,
-            local_message_id,
-            channel_id,
-            channel_type,
-            from_uid,
-            message_type,
-            content,
-            extra,
-            pts: message_seq,
-            sent_at_ms: normalize_sent_at_ms(sent_at_ms),
-            revoked: false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -446,18 +455,6 @@ mod tests {
                         i64_of(payload, "pts"),
                         payload["timestamp"].as_i64().unwrap_or(0),
                     ),
-                    "send_ack" => CanonicalInboundMessage::from_send_ack(
-                        u64_of(payload, "server_message_id"),
-                        u64_of(payload, "local_message_id"),
-                        u64_of(payload, "channel_id"),
-                        payload["channel_type"].as_i64().unwrap_or(1) as i32,
-                        u64_of(payload, "from_uid"),
-                        payload["message_type"].as_i64().unwrap_or(0) as i32,
-                        payload["content"].as_str().unwrap_or("").to_string(),
-                        payload["extra"].as_str().unwrap_or("").to_string(),
-                        i64_of(payload, "message_seq"),
-                        payload["sent_at_ms"].as_i64().unwrap_or(0),
-                    ),
                     other if other.starts_with('$') => continue,
                     other => panic!("{name}: fixture 里有未知来源 {other}"),
                 };
@@ -470,7 +467,8 @@ mod tests {
                 checked_paths += 1;
             }
         }
-        // 五条来源都必须在 fixture 里出现过,否则「全都一致」可能只是没测到。
+        // 四条投影来源都必须在 fixture 里出现过,否则「全都一致」可能只是没测到。
+        // (send ACK 不是投影路径,见本文件头部。)
         assert!(
             checked_paths >= 9,
             "只比对了 {checked_paths} 条来源投影,fixture 覆盖不足"
@@ -500,6 +498,57 @@ mod tests {
         assert_eq!(prefer_precise_sent_at(precise, next_second), next_second);
         // 本地没有值:直接用新值。
         assert_eq!(prefer_precise_sent_at(0, coarse), coarse);
+    }
+
+    /// 终态 `thumb_status=3` 的许可条件。
+    ///
+    /// 关键是第三种情况:metadata 里有 thumbnail_file_id,只是这次没拿到下载票据。
+    /// 那是可重试失败,不是「没有缩略图」;写成终态的话,一次网络抖动就永久毁掉一张图。
+    #[test]
+    fn only_an_explicit_absence_may_become_terminal() {
+        let mk = |extra: String| CanonicalInboundMessage {
+            server_message_id: 1,
+            local_message_id: 0,
+            channel_id: 45,
+            channel_type: 1,
+            from_uid: 9,
+            message_type: 2,
+            content: "[图片]".into(),
+            extra,
+            pts: 1,
+            sent_at_ms: 1_785_148_271_317,
+            revoked: false,
+        };
+
+        // 服务端明确说了没有缩略图:可以进终态。
+        assert!(mk(build_extra_envelope(
+            "[图片]",
+            Some(&serde_json::json!({ "file_id": 7120 }))
+        ))
+        .server_says_no_thumbnail());
+
+        // metadata 里有 thumbnail_file_id —— 票据这次没拿到只是暂时失败。
+        assert!(!mk(build_extra_envelope(
+            "[图片]",
+            Some(&serde_json::json!({ "thumbnail_file_id": 7119 }))
+        ))
+        .server_says_no_thumbnail());
+        // legacy 明文 url 同理。
+        assert!(!mk(build_extra_envelope(
+            "[图片]",
+            Some(&serde_json::json!({ "thumbnail_url": "https://example.invalid/a.webp" }))
+        ))
+        .server_says_no_thumbnail());
+        // thumbnail_file_id=0 等于没有。
+        assert!(mk(build_extra_envelope(
+            "[图片]",
+            Some(&serde_json::json!({ "thumbnail_file_id": 0 }))
+        ))
+        .server_says_no_thumbnail());
+
+        // 没有 metadata = 没有证据,一律不许进终态。
+        assert!(!mk(String::new()).server_says_no_thumbnail());
+        assert!(!mk("not json".into()).server_says_no_thumbnail());
     }
 
     #[test]

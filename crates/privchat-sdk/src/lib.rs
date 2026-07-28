@@ -68,6 +68,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
+/// 一次读取最多顺带修几条:repair 走网络,不能让打开会话变成一次批量拉取。
+/// 没修完的下次读取继续。
+const REPAIR_BATCH_LIMIT: usize = 5;
+
 pub mod attachment_crypto;
 pub mod canonical_inbound;
 mod avatar_cache;
@@ -2511,6 +2515,12 @@ enum Command {
         after_limit: Option<u32>,
         resp: oneshot::Sender<Result<MessageHistoryAroundResponse>>,
     },
+    RepairMessageProjection {
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+        resp: oneshot::Sender<Result<Option<u64>>>,
+    },
     UpdateMessageStatus {
         message_id: u64,
         status: i32,
@@ -4584,21 +4594,36 @@ impl State {
     fn push_message_to_sync_item(push: PushMessageRequest) -> SyncEntityItem {
         let deleted = push.deleted;
         let (content, extra) = Self::payload_bytes_to_message_content_and_extra(&push.payload);
-        let mut item = Self::build_message_sync_item(
+        // push 走 canonical adapter 归一(timestamp 是**秒**——protocol/push.fbs 的
+        // `uint`,u32 装不下毫秒纪元),再进 sync item。这样 push 与 sync/history 用的
+        // 是同一份归一实现,也是门禁 fixture 调的那一份;此前这里是就地乘 1000,adapter
+        // 只有测试在用。
+        let canonical = crate::canonical_inbound::CanonicalInboundMessage::from_push(
             push.server_message_id,
             push.local_message_id,
             push.channel_id,
             i32::from(push.channel_type),
-            // `push.timestamp` is SECONDS (protocol/push.fbs: `timestamp : uint`
-            // — a u32 cannot hold a millisecond epoch at all). Everything below
-            // this line, and every other write path into `message`, is
-            // milliseconds. Passing it through raw put realtime rows a factor of
-            // 1000 below history rows in the same table, so the newest messages
-            // compared as the oldest.
-            i64::from(push.timestamp).saturating_mul(1_000),
             push.from_uid,
             i32::try_from(push.message_type).unwrap_or(0),
             content,
+            extra.unwrap_or_default(),
+            i64::from(push.message_seq),
+            i64::from(push.timestamp),
+        );
+        let extra = if canonical.extra.is_empty() {
+            None
+        } else {
+            Some(canonical.extra.clone())
+        };
+        let mut item = Self::build_message_sync_item(
+            canonical.server_message_id,
+            canonical.local_message_id,
+            canonical.channel_id,
+            canonical.channel_type,
+            canonical.sent_at_ms,
+            canonical.from_uid,
+            canonical.message_type,
+            canonical.content.clone(),
             extra,
             2,
             i64::from(push.message_seq),
@@ -9658,7 +9683,11 @@ impl State {
                     // 现在的规则:metadata 解析不出来时停在 0(未知/待重试),留给下
                     // 一次投影或定向 repair 去补;只有确实解析出了 metadata 而其中
                     // 没有缩略图字段,才允许进终态。
-                    let has_metadata =
+                    // 许可条件是「服务端明确说了没有缩略图」,不是「metadata 能解析」。
+                    // 后者会漏掉最要命的一种:metadata 里有 thumbnail_file_id,只是这次
+                    // file/get_url 因网络/token/服务端抖动没拿到票据——那是可重试失败,
+                    // 写成终态就等于一次抖动永久毁掉一张图。
+                    let explicit_absence =
                         crate::canonical_inbound::CanonicalInboundMessage::from_sync_entity(
                             0,
                             0,
@@ -9671,8 +9700,8 @@ impl State {
                             0,
                             0,
                         )
-                        .has_metadata();
-                    if has_metadata {
+                        .server_says_no_thumbnail();
+                    if explicit_absence {
                         tokio::spawn(async move {
                             let _ = storage.update_thumb_status(message_id, 3).await;
                         });
@@ -9680,7 +9709,7 @@ impl State {
                         tracing::warn!(
                             message_id,
                             channel_id,
-                            "缩略图信息缺失且 metadata 解析不出:保持待重试,不写终态"
+                            "拿不到缩略图票据,但服务端未明确表示没有缩略图:保持待重试,不写终态"
                         );
                     }
                     return;
@@ -12617,6 +12646,83 @@ impl PrivchatSdk {
                                 .map(|snapshot| snapshot.messages),
                             Err(e) => Err(e),
                         };
+                        // 自动 repair 触发点（MESSAGE_PROJECTION_SPEC §2.4）：读时发现
+                        // 投影损坏就按 server_message_id 定向修，不删会话历史。
+                        //
+                        // 判据只取「本地无法自愈、且服务端一定能补」的三种：媒体行没有
+                        // metadata（图片永远加载不出来）、已确认行缺 pts（排序无权威）、
+                        // 时间戳落在毫秒纪元之前（单位写错的旧行）。文本行缺 metadata 是
+                        // 正常的，不在其列。
+                        if let Ok(ref messages) = result {
+                            let image_type =
+                                i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(2);
+                            let video_type =
+                                i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(3);
+                            let damaged: Vec<u64> = messages
+                                .iter()
+                                .filter(|m| {
+                                    let smid = m.server_message_id.unwrap_or(0);
+                                    if smid == 0 {
+                                        return false; // 还没上服务端的本地行，不是投影损坏
+                                    }
+                                    let is_media =
+                                        m.message_type == image_type || m.message_type == video_type;
+                                    let media_without_metadata = is_media
+                                        && !crate::canonical_inbound::CanonicalInboundMessage::
+                                            from_sync_entity(
+                                                0, 0, 0, 1, 0, 0,
+                                                String::new(),
+                                                m.extra.clone(),
+                                                0, 0,
+                                            )
+                                            .has_metadata();
+                                    let missing_pts = m.pts.unwrap_or(0) <= 0;
+                                    let bad_timestamp = m.created_at > 0
+                                        && m.created_at < 100_000_000_000;
+                                    media_without_metadata || missing_pts || bad_timestamp
+                                })
+                                .filter_map(|m| m.server_message_id)
+                                .take(REPAIR_BATCH_LIMIT)
+                                .collect();
+                            for server_message_id in damaged {
+                                match state
+                                    .repair_message_projection(
+                                        channel_id,
+                                        channel_type,
+                                        server_message_id,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(message_id)) => {
+                                        if let (Some(tx), Some(history), Some(seq)) = (
+                                            state.event_tx.as_ref(),
+                                            state.event_history.as_ref(),
+                                            state.event_seq.as_ref(),
+                                        ) {
+                                            emit_sequenced_event(
+                                                tx,
+                                                history,
+                                                seq,
+                                                state.event_history_limit,
+                                                SdkEvent::TimelineUpdated {
+                                                    channel_id,
+                                                    channel_type,
+                                                    message_id,
+                                                    reason: "message_projection_repaired"
+                                                        .to_string(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => tracing::warn!(
+                                        server_message_id,
+                                        error = %e,
+                                        "定向 repair 失败,下次读取再试"
+                                    ),
+                                }
+                            }
+                        }
                         // Trigger thumbnail downloads for image/video messages missing thumbnails
                         if let Ok(ref messages) = result {
                             if let Ok(paths) = state.storage.get_storage_paths().await {
@@ -12849,6 +12955,44 @@ impl PrivchatSdk {
                                 channel_type,
                                 "fetch_messages_around",
                             );
+                        }
+                        let _ = resp.send(result);
+                    }
+                    Command::RepairMessageProjection {
+                        channel_id,
+                        channel_type,
+                        server_message_id,
+                        resp,
+                    } => {
+                        let result = state
+                            .repair_message_projection(channel_id, channel_type, server_message_id)
+                            .await;
+                        // 修好了就让 UI 重查这一条:投影原地更新,message.id 不变,
+                        // 未读不动,cursor 不动——repair 不是「收到新消息」。
+                        if let Ok(Some(message_id)) = result {
+                            state.invalidate_channel_cache_with_reason(
+                                channel_id,
+                                channel_type,
+                                "repair_message_projection",
+                            );
+                            if let (Some(tx), Some(history), Some(seq)) = (
+                                state.event_tx.as_ref(),
+                                state.event_history.as_ref(),
+                                state.event_seq.as_ref(),
+                            ) {
+                                emit_sequenced_event(
+                                    tx,
+                                    history,
+                                    seq,
+                                    state.event_history_limit,
+                                    SdkEvent::TimelineUpdated {
+                                        channel_id,
+                                        channel_type,
+                                        message_id,
+                                        reason: "message_projection_repaired".to_string(),
+                                    },
+                                );
+                            }
                         }
                         let _ = resp.send(result);
                     }
@@ -15382,6 +15526,39 @@ impl PrivchatSdk {
                 message_id,
                 before_limit,
                 after_limit,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 定向修复一条投影损坏的消息（MESSAGE_PROJECTION_SPEC §2.4）。
+    ///
+    /// 「投影损坏」= 本地这一行是旧代码或半截写入留下的：metadata 丢了（图片永远
+    /// 加载不出来）、时间单位错了、pts 缺失。修法是按 server_message_id 走
+    /// `message/history/around` 拿回权威消息，重新跑 canonical projection，原地
+    /// upsert。
+    ///
+    /// 契约：
+    /// - `message.id` 不变（upsert 按 server_message_id 命中既有行）；
+    /// - 不增加未读、不推进 sync cursor —— 这不是「收到新消息」；
+    /// - 成功后发 `TimelineUpdated{reason="message_projection_repaired"}`，宿主据此重查。
+    ///
+    /// 返回本地 message id；服务端也没有这条消息时返回 None。
+    pub async fn repair_message_projection(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+    ) -> Result<Option<u64>> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::RepairMessageProjection {
+                channel_id,
+                channel_type,
+                server_message_id,
                 resp: resp_tx,
             })
             .await

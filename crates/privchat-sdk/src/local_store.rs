@@ -1215,13 +1215,17 @@ impl LocalStore {
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
                      server_message_id = ?15,
-                     -- 同一秒内保留精度更高的那个:秒精度只可能来自 push,任何
-                     -- 毫秒值都更接近真实发送时刻。跨秒才以新值为准(那是真的更新)。
-                     -- 不这样做的话,一条 history 拿到 .317 的消息会被随后到达的
-                     -- push 改成 .000,时间戳跟着「最后一条到达的路径」抖。
+                     -- 一条消息的发送时间在服务端是**不变量**,所以这里唯一合法的
+                     -- 分歧来源是精度:push 只能给到秒(u32 秒),history/sync 给毫秒。
+                     -- 规则按精度定,不按到达顺序:
+                     --   * 本地还没有值 → 采用新值;
+                     --   * 新值是秒精度而本地已有毫秒 → 保留本地(低精度不覆盖高精度);
+                     --   * 其余 → 采用新值。
+                     -- 「跨秒就让最后到达者覆盖」是错的:最后到达恰恰是最没有权威性
+                     -- 的属性;真要改一条已确认消息的时间,只能走显式的定向 repair。
                      created_at = CASE
-                         WHEN created_at > 0 AND created_at / 1000 = ?18 / 1000
-                             THEN MAX(created_at, ?18)
+                         WHEN created_at <= 0 THEN ?18
+                         WHEN ?19 = 0 AND created_at % 1000 <> 0 THEN created_at
                          ELSE ?18
                      END,
                      mime_type = COALESCE(?17, mime_type)
@@ -1248,6 +1252,9 @@ impl LocalStore {
                     // push and re-seen through history must end up holding the
                     // send time, not whichever arrival happened to write last.
                     Self::sent_at_ms(input.timestamp, now_ms),
+                    // 1 = 毫秒精度,0 = 秒精度(只可能来自 push)。见上面 created_at
+                    // 的 CASE:精度决定谁覆盖谁,到达顺序不决定任何事。
+                    i32::from(Self::is_millisecond_precision(input.timestamp)),
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
@@ -1439,13 +1446,17 @@ impl LocalStore {
                      type = ?5, content = ?6, status = ?7, updated_at = ?8, searchable_word = ?9,
                      local_message_id = ?10, setting = ?11, extra = ?12, pts = ?13, order_seq = ?14,
                      server_message_id = ?15,
-                     -- 同一秒内保留精度更高的那个:秒精度只可能来自 push,任何
-                     -- 毫秒值都更接近真实发送时刻。跨秒才以新值为准(那是真的更新)。
-                     -- 不这样做的话,一条 history 拿到 .317 的消息会被随后到达的
-                     -- push 改成 .000,时间戳跟着「最后一条到达的路径」抖。
+                     -- 一条消息的发送时间在服务端是**不变量**,所以这里唯一合法的
+                     -- 分歧来源是精度:push 只能给到秒(u32 秒),history/sync 给毫秒。
+                     -- 规则按精度定,不按到达顺序:
+                     --   * 本地还没有值 → 采用新值;
+                     --   * 新值是秒精度而本地已有毫秒 → 保留本地(低精度不覆盖高精度);
+                     --   * 其余 → 采用新值。
+                     -- 「跨秒就让最后到达者覆盖」是错的:最后到达恰恰是最没有权威性
+                     -- 的属性;真要改一条已确认消息的时间,只能走显式的定向 repair。
                      created_at = CASE
-                         WHEN created_at > 0 AND created_at / 1000 = ?18 / 1000
-                             THEN MAX(created_at, ?18)
+                         WHEN created_at <= 0 THEN ?18
+                         WHEN ?19 = 0 AND created_at % 1000 <> 0 THEN created_at
                          ELSE ?18
                      END,
                      mime_type = COALESCE(?17, mime_type)
@@ -1472,6 +1483,9 @@ impl LocalStore {
                     // push and re-seen through history must end up holding the
                     // send time, not whichever arrival happened to write last.
                     Self::sent_at_ms(input.timestamp, now_ms),
+                    // 1 = 毫秒精度,0 = 秒精度(只可能来自 push)。见上面 created_at
+                    // 的 CASE:精度决定谁覆盖谁,到达顺序不决定任何事。
+                    i32::from(Self::is_millisecond_precision(input.timestamp)),
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
@@ -4842,6 +4856,14 @@ impl LocalStore {
         Ok(())
     }
 
+    /// 调用方给的时间戳是不是毫秒精度。
+    ///
+    /// 判据是量级,不是「看起来像不像整秒」——真实发送时间正好落在整秒上完全可能,
+    /// 拿数值形状去猜精度会误判。
+    fn is_millisecond_precision(timestamp: i64) -> bool {
+        timestamp >= 100_000_000_000
+    }
+
     /// The send time to persist, in milliseconds.
     ///
     /// Guards the one thing a caller can get wrong here that no reader can
@@ -6005,13 +6027,24 @@ mod tests {
             "秒精度的 push 把毫秒值改粗了"
         );
 
-        // 跨秒是真的更新,必须跟上。
-        let next = precise + 5_000;
+        // 另一条毫秒来源(history 重放)可以覆盖:同精度,以新值为准。
+        let corrected = precise + 5_000;
         store
-            .upsert_remote_message_with_result(uid, &mk(next))
+            .upsert_remote_message_with_result(uid, &mk(corrected))
             .expect("later upsert");
         let rows = store.list_messages(uid, 46, 1, 10, 0).expect("list again");
-        assert_eq!(rows[0].created_at, next);
+        assert_eq!(rows[0].created_at, corrected);
+
+        // 但秒精度的 push 即使跨秒也不许覆盖毫秒值——「最后到达者获胜」正是要
+        // 去掉的规则:最后到达是最没有权威性的属性。
+        store
+            .upsert_remote_message_with_result(uid, &mk(corrected / 1000 + 60))
+            .expect("stale push upsert");
+        let rows = store.list_messages(uid, 46, 1, 10, 0).expect("list third");
+        assert_eq!(
+            rows[0].created_at, corrected,
+            "秒精度来源跨秒覆盖了毫秒值"
+        );
     }
 
     /// 回填的历史必须带着**发送时间**落库,而不是「本机什么时候存的」。
