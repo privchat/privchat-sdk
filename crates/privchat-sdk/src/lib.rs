@@ -2995,6 +2995,12 @@ struct State {
     message_cache_policy: MessageCachePolicy,
     channel_message_cache: HashMap<ChannelCacheKey, ChannelMessageCache>,
     channel_cache_generation: HashMap<ChannelCacheKey, u64>,
+    /// 「有账号切换在排队」的信号。
+    ///
+    /// actor 在 ensure_synced 里内联 await 整轮同步，期间不处理命令——所以一次很慢
+    /// 的同步会把切换一起堵住（用户点了切换，界面十几秒没反应）。切换 API 在把命令
+    /// 投进队列**之前**先按响这个铃，正在跑的那一轮同步据此让出。
+    switch_interrupt: Arc<tokio::sync::Notify>,
     channel_cache_lru: VecDeque<ChannelCacheKey>,
     channel_cache_total_bytes: usize,
     cache_debug_log: bool,
@@ -9179,23 +9185,41 @@ impl State {
             state: self.sync_coordinator.snapshot(),
         });
 
-        let result = match kind {
-            SyncRunKind::Bootstrap => self.execute_bootstrap_sync().await,
-            SyncRunKind::Resume => self.execute_resume_sync().await,
+        // 同步跑起来，同时盯着「有账号切换在排队」这个铃。actor 在这里内联 await，
+        // 期间不处理命令——不盯着的话，一次卡住的同步会把切换一起堵死，用户点了
+        // 切换要等十几秒才有反应。铃响就让出：这一轮的结果已经不属于任何人了。
+        let interrupt = self.switch_interrupt.clone();
+        let result = tokio::select! {
+            biased;
+            _ = interrupt.notified() => None,
+            r = async {
+                match kind {
+                    SyncRunKind::Bootstrap => self.execute_bootstrap_sync().await,
+                    SyncRunKind::Resume => self.execute_resume_sync().await,
+                }
+            } => Some(r),
+        };
+
+        let Some(result) = result else {
+            // 主动放弃，不是失败：不能记 attempt/退避（那会让新账号背上上一个账号的
+            // 债），但必须把闸门撤下来，否则 begin() 会永远挡住后面每一个触发源。
+            self.sync_coordinator
+                .abandon(chrono::Utc::now().timestamp_millis());
+            if actor_logs_enabled() {
+                eprintln!("[SDK.actor] ensure_synced yielded to a pending account switch");
+            }
+            return Ok(());
         };
 
         // 跑的过程中账号被切走了：这一轮的结果属于**上一个** owner，既不能写进
         // 协调器（会污染新账号的 attempt/退避/终态），也不能发事件（UI 会拿旧账号
         // 的同步结果去更新新账号）。静默丢弃，新账号自己的那一轮会照常跑。
         //
-        // ⚠️ 当前执行模型下这个分支**跑不到**：actor 在这里内联 await 整轮同步，
-        // 期间不处理任何命令，所以 SwitchLocalAccount 只会排队等它结束，世代不可能
-        // 中途改变。留着它是为下一步铺路——一旦同步移出 actor 线程（或做成可取消），
-        // 这个竞态立刻成立。**别把它当成已经验证过的防线**：它现在是不变量声明，
-        // 不是被测过的保护。
-        //
-        // 同一件事的另一面是个已知限制：一次很慢或卡住的同步会把账号切换一起堵住。
-        // 要根治得让同步可取消/可让出，那是独立的一步（CODEX-5 编排下沉）。
+        // 正常情况下上面的 select 已经先一步让出（切换 API 投命令前会按铃），所以这里
+        // 兜的是漏网的那一格：铃响时这一轮恰好还没开始 await（notify_waiters 只唤醒
+        // **已经在等**的人，早响的一声会丢），同步照跑完，回来时世代已经变了。
+        // 那时这份结果属于上一个 owner，写进协调器会污染新账号的 attempt/退避，
+        // 发事件会让 UI 拿旧账号的同步结果去更新新账号。丢弃即可，新账号自己会跑。
         if self.sync_coordinator.generation() != generation {
             if actor_logs_enabled() {
                 eprintln!(
@@ -11234,6 +11258,8 @@ pub struct PrivchatSdk {
     task_registry: TaskRegistry,
     shutting_down: Arc<AtomicBool>,
     supervised_sync_running: Arc<AtomicBool>,
+    /// 见 [State::switch_interrupt]：切换账号前先按铃，让正在跑的同步让出。
+    switch_interrupt: Arc<tokio::sync::Notify>,
     startup_error: Arc<StdMutex<Option<Error>>>,
     snowflake: Arc<snowflake_me::Snowflake>,
     presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
@@ -11315,6 +11341,10 @@ impl PrivchatSdk {
                         .expect("default snowflake must work"),
                 )
             });
+        // 切换账号的「让出」信号：一份给 actor（在同步里等它），一份给 SDK 句柄
+        // （切换 API 在投递命令前按响它）。
+        let switch_interrupt_sdk = Arc::new(tokio::sync::Notify::new());
+        let switch_interrupt_actor = switch_interrupt_sdk.clone();
         let actor_snowflake = snowflake.clone();
         let actor_task = runtime_provider.spawn(async move {
             if actor_logs_enabled() {
@@ -11383,6 +11413,7 @@ impl PrivchatSdk {
                 message_cache_policy: MessageCachePolicy::default(),
                 channel_message_cache: HashMap::new(),
                 channel_cache_generation: HashMap::new(),
+                switch_interrupt: switch_interrupt_actor,
                 channel_cache_lru: VecDeque::new(),
                 channel_cache_total_bytes: 0,
                 cache_debug_log: std::env::var("PRIVCHAT_CACHE_LOG").ok().as_deref() == Some("1"),
@@ -14432,6 +14463,7 @@ impl PrivchatSdk {
             task_registry,
             shutting_down: Arc::new(AtomicBool::new(false)),
             supervised_sync_running: Arc::new(AtomicBool::new(false)),
+            switch_interrupt: switch_interrupt_sdk,
             startup_error,
             snowflake,
             presence_cache,
@@ -16982,6 +17014,9 @@ impl PrivchatSdk {
     /// 返回后 session 处于 `New`，由调用方发起新账号的连接流程。
     pub async fn switch_local_account(&self, uid: String) -> Result<()> {
         self.ensure_running()?;
+        // 先按铃再投命令：actor 可能正卡在一轮慢同步里内联 await，不先让它让出，
+        // 这条命令只能排在队尾干等。顺序反过来就等于没有这个机制。
+        self.switch_interrupt.notify_waiters();
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::SwitchLocalAccount { uid, resp: resp_tx })
@@ -17406,6 +17441,7 @@ mod tests {
             message_cache_policy: MessageCachePolicy::default(),
             channel_message_cache: HashMap::new(),
             channel_cache_generation: HashMap::new(),
+            switch_interrupt: Arc::new(tokio::sync::Notify::new()),
             channel_cache_lru: VecDeque::new(),
             channel_cache_total_bytes: 0,
             cache_debug_log: false,

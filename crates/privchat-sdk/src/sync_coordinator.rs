@@ -191,6 +191,19 @@ impl SyncCoordinator {
         }
     }
 
+    /// 这一轮被主动放弃（不是失败）：把 Running 撤下来，不计 attempt、不排退避。
+    ///
+    /// 用在「同步跑到一半被账号切换打断」：那一轮的结果已经不属于任何人了，既不该
+    /// 记成失败（会让新账号背上上一个账号的 attempt 和退避），也不能留着 Running
+    /// 不动——那样闸门永远关着，后面所有触发源都会被 begin() 挡回去，同步彻底卡死。
+    pub(crate) fn abandon(&mut self, now_ms: i64) {
+        self.next_retry_at_ms = None;
+        self.snapshot = SyncStateSnapshot {
+            updated_at_ms: now_ms,
+            ..SyncStateSnapshot::default()
+        };
+    }
+
     /// 换账号 / 换会话：清空一切并 bump 世代。
     pub(crate) fn reset(&mut self, now_ms: i64) {
         self.generation = self.generation.wrapping_add(1);
@@ -378,5 +391,35 @@ mod tests {
         );
         coordinator.reset(2);
         assert!(coordinator.begin(SyncRunKind::Bootstrap, 3).is_ok());
+    }
+
+    #[test]
+    fn an_abandoned_run_does_not_wedge_the_gate() {
+        let mut c = SyncCoordinator::new();
+        assert!(c.begin(SyncRunKind::Bootstrap, 0).is_ok());
+        // 跑到一半被打断
+        c.abandon(10);
+        // 闸门必须重新打开，否则后面每一个触发源都会被挡回去 = 同步永久卡死
+        assert!(
+            c.begin(SyncRunKind::Bootstrap, 20).is_ok(),
+            "放弃一轮之后闸门没打开，同步会永久卡在 Running"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_run_is_not_counted_as_a_failure() {
+        let mut c = SyncCoordinator::new();
+        assert!(c.begin(SyncRunKind::Resume, 0).is_ok());
+        c.fail(SyncRunKind::Resume, false, None, "boom".into(), 0);
+        let after_failure = c.snapshot().attempt;
+        assert!(after_failure > 0);
+
+        c.abandon(100);
+        assert_eq!(
+            c.snapshot().attempt,
+            0,
+            "被打断的一轮把 attempt/退避留给了下一个账号"
+        );
+        assert_eq!(c.snapshot().phase, SyncPhase::Idle);
     }
 }
