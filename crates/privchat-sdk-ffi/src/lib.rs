@@ -8453,6 +8453,14 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
+    /// 确保某条消息的缩略图已在本地（见 SDK 同名方法）。UI 在气泡进入可视区时调。
+    pub async fn ensure_message_thumbnail(&self, message_id: u64) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .ensure_message_thumbnail(message_id)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn wipe_current_user_full(&self) -> Result<(), PrivchatFfiError> {
         self.inner
             .wipe_current_user_full()

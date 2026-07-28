@@ -2816,6 +2816,10 @@ enum Command {
         uid: String,
         resp: oneshot::Sender<Result<()>>,
     },
+    EnsureMessageThumbnail {
+        message_id: u64,
+        resp: oneshot::Sender<Result<()>>,
+    },
     SetLocalAccountDisplayName {
         uid: String,
         display_name: Option<String>,
@@ -14286,6 +14290,47 @@ impl PrivchatSdk {
                             .await;
                         let _ = resp.send(result);
                     }
+                    // 「滚到哪儿就取哪儿的缩略图」。
+                    //
+                    // 缩略图的自动下载本来只挂在消息**入站**（push / sync）那条路径上，
+                    // 历史翻页拉回来的消息从来不触发——用户看到的就是「历史图片必须点
+                    // 一下才加载」。UI 在气泡进入可视区时调这里，语义是 ensure：已经有
+                    // 了就什么都不做，没有才去取。
+                    Command::EnsureMessageThumbnail { message_id, resp } => {
+                        let result = async {
+                            let Some(msg) = state.storage.get_message_by_id(message_id).await? else {
+                                return Ok(());
+                            };
+                            // thumb_status: 1=已下载, 3=协议层确无缩略图（终态）。
+                            // 这两种都不必再取；0/2 才是「还没有 / 失败过」。
+                            if msg.thumb_status == 1 || msg.thumb_status == 3 {
+                                return Ok(());
+                            }
+                            let paths = state.storage.get_storage_paths().await?;
+                            let user_root = PathBuf::from(&paths.user_root);
+                            let ticket = match State::extract_thumbnail_file_id(&msg.extra) {
+                                Some(tid) => state.resolve_thumbnail_ticket(tid).await,
+                                None => None,
+                            };
+                            State::spawn_auto_download_thumbnail(
+                                &msg.extra,
+                                ticket,
+                                &user_root,
+                                msg.message_id,
+                                msg.created_at,
+                                msg.channel_id,
+                                msg.channel_type,
+                                state.storage.clone(),
+                                Some(actor_event_tx.clone()),
+                                Some(actor_event_history.clone()),
+                                Some(actor_event_seq.clone()),
+                                event_history_limit,
+                            );
+                            Ok(())
+                        }
+                        .await;
+                        let _ = resp.send(result);
+                    }
                     Command::WipeCurrentUserFull { resp } => {
                         let from_state = state.session_state.as_connection_state();
                         state.should_auto_reconnect = false;
@@ -16968,6 +17013,20 @@ impl PrivchatSdk {
                 login_identifier,
                 resp: resp_tx,
             })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 确保某条消息的缩略图已在本地（没有才下载）。
+    ///
+    /// 供 UI 在气泡进入可视区时调用——历史消息的缩略图不会被入站路径自动拉取，
+    /// 不调这里就只能等用户点开原图。已下载或协议层确无缩略图时是 no-op。
+    pub async fn ensure_message_thumbnail(&self, message_id: u64) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::EnsureMessageThumbnail { message_id, resp: resp_tx })
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
