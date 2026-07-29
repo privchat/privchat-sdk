@@ -2939,6 +2939,31 @@ impl SessionState {
     }
 }
 
+/// 一页 anti-entropy 扫描的结果。
+///
+/// `cycle_completed` 表示游标绕回了起点 —— 只有走完完整一圈**且**没有 deferred
+/// stale，才能宣布收敛完成。
+#[derive(Debug, Clone, Copy, Default)]
+struct AntiEntropyPage {
+    page_scanned: usize,
+    stale_found: usize,
+    repaired: usize,
+    /// 本页发现但因预算未修的 stale 频道数
+    deferred: usize,
+    cycle_completed: bool,
+}
+
+impl AntiEntropyPage {
+    fn idle() -> Self {
+        Self::default()
+    }
+
+    /// 可以进入 Converged 吗：走完一圈，且没有留下未修的 stale。
+    fn is_converged(&self) -> bool {
+        self.cycle_completed && self.deferred == 0 && self.stale_found == self.repaired
+    }
+}
+
 struct State {
     config: PrivchatConfig,
     transport: Option<TransportClient>,
@@ -2978,6 +3003,12 @@ struct State {
     /// Phase 3 后台收敛：`Some(stats)` = 有一轮在进行中。
     /// 切账号 / 登出 / shutdown 置 `None` —— 这就是「可取消」。
     convergence_run: Option<ResumeRunStats>,
+    /// 本轮 resume 的归因 id。
+    ///
+    /// 没有它就只能拿全量日志的汇总去猜单次启动的构成 —— 不同用户、不同轮次
+    /// 混在一起，据此做的性能归因不成立（已发生过：把全用户的 get_difference
+    /// 总数当成单账号一次启动的请求量）。
+    resume_run_id: u64,
     anti_entropy_jitter: Duration,
     /// P1-05：room 广播按 (channel_id, server_message_id) 去重。订阅后服务端 replay
     /// 历史与实时广播在重叠窗口会重复投递同一条；每 channel 保留最近见过的一批
@@ -8391,20 +8422,29 @@ impl State {
     }
 
     /// Bounded repair for pushes lost while the transport still looked healthy.
-    async fn run_anti_entropy_once(&mut self) -> Result<usize> {
+    /// 一页 anti-entropy 的结果。
+    ///
+    /// 只返回「修了几条」是不够的：0 既可能是「这一页没东西修」，也可能是
+    /// 「整个账号都收敛了」，两者语义天差地别。据此判定 Converged 会在扫到
+    /// 第一页干净数据时就过早宣布收敛完成。
+    async fn run_anti_entropy_once(&mut self) -> Result<AntiEntropyPage> {
         const PAGE_SIZE: usize = 100;
         const WIFI_DIFFERENCE_BUDGET: usize = 8;
         const CELLULAR_DIFFERENCE_BUDGET: usize = 4;
 
         if self.session_state != SessionState::Authenticated || !self.bootstrap_completed {
-            return Ok(0);
+            return Ok(AntiEntropyPage::idle());
         }
         let (after_channel_id, after_channel_type) = self.load_anti_entropy_cursor().await;
+        // 从头开始扫的这一轮，是否已经走完一整圈
+        let mut cycle_completed = false;
         let mut channels = self
             .storage
             .list_channel_identifiers_after(after_channel_id, after_channel_type, PAGE_SIZE)
             .await?;
         if channels.is_empty() && after_channel_id != 0 {
+            // 游标走到末尾又绕回开头 = 完整扫过一圈
+            cycle_completed = true;
             self.save_anti_entropy_cursor(0, -1).await?;
             channels = self
                 .storage
@@ -8412,7 +8452,14 @@ impl State {
                 .await?;
         }
         if channels.is_empty() {
-            return Ok(0);
+            // 一个频道都没有：也算走完一圈
+            return Ok(AntiEntropyPage {
+                page_scanned: 0,
+                stale_found: 0,
+                repaired: 0,
+                deferred: 0,
+                cycle_completed: true,
+            });
         }
 
         let remote = self.batch_get_channel_pts(channels.clone()).await?;
@@ -8433,6 +8480,10 @@ impl State {
         };
         let mut repaired = 0usize;
         let mut difference_calls = 0usize;
+        // stale_found：本页真正落后的频道数；deferred：其中因预算未修的。
+        // 只要还有 deferred，这一圈就不能算收敛。
+        let mut stale_found = 0usize;
+        let mut deferred = 0usize;
         for (channel_id, channel_type) in channels.iter().copied() {
             let Some(server_pts) = remote_pts.get(&(channel_id, channel_type)).copied() else {
                 continue;
@@ -8446,7 +8497,13 @@ impl State {
                 .await
                 .unwrap_or(0)
                 .max(materialized_pts);
-            if server_pts <= local_pts || difference_calls >= budget {
+            if server_pts <= local_pts {
+                continue;
+            }
+            stale_found += 1;
+            if difference_calls >= budget {
+                // 预算用尽：这个频道确实落后但本页没修，留给下一页
+                deferred += 1;
                 continue;
             }
             repaired += self
@@ -8465,9 +8522,18 @@ impl State {
             scanned = channels.len(),
             difference_calls,
             repaired,
+            stale_found,
+            deferred,
+            cycle_completed,
             "anti-entropy channel page completed"
         );
-        Ok(repaired)
+        Ok(AntiEntropyPage {
+            page_scanned: channels.len(),
+            stale_found,
+            repaired,
+            deferred,
+            cycle_completed,
+        })
     }
 
     async fn execute_resume_sync(&mut self) -> Result<()> {
@@ -8498,6 +8564,9 @@ impl State {
             }
         }
         let mut stats = ResumeRunStats::default();
+        self.resume_run_id = self.resume_run_id.wrapping_add(1);
+        let run_id = self.resume_run_id;
+        eprintln!("[SDK.resume] run={run_id} phase=2 begin");
         self.queue_resume_started();
         if let Err(err) = self.send_session_ready().await {
             let _ = self
@@ -8550,11 +8619,15 @@ impl State {
         //
         // 开启 Phase 3。这里只置标志，实际收敛由 actor loop 的 repair_tick 驱动，
         // 一轮修一小批（有界预算），不阻塞命令处理，也不霸占 actor。
-        self.convergence_run = Some(stats.clone());
+        eprintln!(
+            "[SDK.resume] run={run_id} phase=2 done entity_types={} (critical path complete)",
+            stats.entity_types_synced
+        );
+        // stats 交给 Phase 3：ResumeSyncCompleted 只在真正全量收敛后发一次。
+        // 在这里发过一次是漏删——那会让宿主以为整轮结束，而收敛才刚开始。
+        self.convergence_run = Some(stats);
         self.sync_coordinator
             .set_convergence(crate::sync_coordinator::Convergence::Scanning, chrono::Utc::now().timestamp_millis());
-
-        self.queue_resume_completed(stats);
         Ok(())
     }
 
@@ -11405,6 +11478,7 @@ impl PrivchatSdk {
                 last_resume_synced: None,
                 last_anti_entropy_at: Instant::now(),
                 convergence_run: None,
+                resume_run_id: 0,
                 anti_entropy_jitter: Duration::from_secs(rand::random::<u64>() % 16),
                 room_seen_msg_ids: HashMap::new(),
                 last_terminal_reason: None,
@@ -11541,21 +11615,41 @@ impl PrivchatSdk {
                             && state.convergence_run.is_some()
                         {
                             match state.run_anti_entropy_once().await {
-                                Ok(0) => {
-                                    // 一轮下来没有 stale：收敛完成
+                                // 只有「完整扫过一圈 + 没有留下未修的 stale」才算收敛。
+                                // 用「本页修了 0 条」判定会在扫到第一页干净数据时就
+                                // 过早宣布完成，后面的频道再也不会被检查。
+                                Ok(page) if page.is_converged() => {
                                     if let Some(stats) = state.convergence_run.take() {
+                                        eprintln!(
+                                            "[SDK.resume] run={} phase=3 converged scanned={} repaired={}",
+                                            state.resume_run_id, page.page_scanned, page.repaired
+                                        );
                                         state.sync_coordinator.set_convergence(
                                             crate::sync_coordinator::Convergence::Converged,
                                             chrono::Utc::now().timestamp_millis(),
                                         );
-                                        // 收敛完成才发 ResumeSyncCompleted —— 保持它
+                                        // 全量收敛完成才发 ResumeSyncCompleted —— 保持它
                                         // 「这一轮全做完了」的原始语义。
                                         state.queue_resume_completed(stats);
                                     }
                                 }
-                                Ok(_) => {
+                                Ok(page) => {
+                                    if page.stale_found > 0 || page.deferred > 0 {
+                                        eprintln!(
+                                            "[SDK.resume] run={} phase=3 page scanned={} stale={} repaired={} deferred={}",
+                                            state.resume_run_id,
+                                            page.page_scanned,
+                                            page.stale_found,
+                                            page.repaired,
+                                            page.deferred
+                                        );
+                                    }
                                     state.sync_coordinator.set_convergence(
-                                        crate::sync_coordinator::Convergence::Repairing,
+                                        if page.stale_found > 0 {
+                                            crate::sync_coordinator::Convergence::Repairing
+                                        } else {
+                                            crate::sync_coordinator::Convergence::Scanning
+                                        },
                                         chrono::Utc::now().timestamp_millis(),
                                     );
                                 }
@@ -17609,6 +17703,7 @@ mod tests {
             last_resume_synced: None,
             last_anti_entropy_at: Instant::now(),
             convergence_run: None,
+            resume_run_id: 0,
             anti_entropy_jitter: Duration::ZERO,
             room_seen_msg_ids: HashMap::new(),
             last_terminal_reason: None,
@@ -17649,7 +17744,54 @@ mod tests {
         (state, dir)
     }
 
+    use super::AntiEntropyPage;
     use crate::sync_coordinator::{Readiness, SyncRunKind};
+
+    /// 收敛判定：`Ok(0)` 曾被当成「全账号收敛」，但它只代表本页修了 0 条。
+    /// 游标还停在中间时宣布 Converged，后面的频道就再也不会被检查。
+    #[test]
+    fn convergence_requires_a_full_clean_cycle() {
+        // 本页干净，但还没走完一圈 —— 不能收敛
+        let mid_cycle = AntiEntropyPage {
+            page_scanned: 100,
+            stale_found: 0,
+            repaired: 0,
+            deferred: 0,
+            cycle_completed: false,
+        };
+        assert!(!mid_cycle.is_converged(), "游标停在中间就宣布收敛了");
+
+        // 走完一圈但有 stale 因预算被推迟 —— 不能收敛
+        let deferred = AntiEntropyPage {
+            page_scanned: 100,
+            stale_found: 12,
+            repaired: 8,
+            deferred: 4,
+            cycle_completed: true,
+        };
+        assert!(!deferred.is_converged(), "还有 4 个 stale 没修就宣布收敛了");
+
+        // 走完一圈且全部处理干净 —— 才算收敛
+        let clean = AntiEntropyPage {
+            page_scanned: 100,
+            stale_found: 3,
+            repaired: 3,
+            deferred: 0,
+            cycle_completed: true,
+        };
+        assert!(clean.is_converged());
+
+        // 一个频道都没有：走完一圈，算收敛
+        let empty = AntiEntropyPage {
+            page_scanned: 0,
+            stale_found: 0,
+            repaired: 0,
+            deferred: 0,
+            cycle_completed: true,
+        };
+        assert!(empty.is_converged());
+    }
+
 
     // ==================== 账号切换：会话作用域隔离 ====================
     //
