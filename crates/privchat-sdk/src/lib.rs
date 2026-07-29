@@ -502,6 +502,17 @@ pub enum SdkEvent {
         state: SyncStateSnapshot,
     },
     ResumeSyncStarted,
+    /// Phase 2 完成：主界面数据就绪，宿主**必须**据此撤掉全局「同步中」。
+    /// 后台收敛仍在进行，由 `ConvergenceCompleted` 单独播报。
+    CriticalReady {
+        entity_types_synced: usize,
+    },
+    /// Phase 3 后台收敛完成。兼容期同时发旧 `ResumeSyncCompleted`（原义不变）。
+    ConvergenceCompleted {
+        channels_scanned: usize,
+        channels_applied: usize,
+        channel_failures: usize,
+    },
     ResumeSyncCompleted {
         entity_types_synced: usize,
         channels_scanned: usize,
@@ -2975,6 +2986,9 @@ struct State {
     /// periodic batch-PTS comparison repairs missed pushes without scanning
     /// every channel on every tick.
     last_anti_entropy_at: Instant,
+    /// Phase 3 后台收敛：`Some(stats)` = 有一轮在进行中。
+    /// 切账号 / 登出 / shutdown 置 `None` —— 这就是「可取消」。
+    convergence_run: Option<ResumeRunStats>,
     anti_entropy_jitter: Duration,
     /// P1-05：room 广播按 (channel_id, server_message_id) 去重。订阅后服务端 replay
     /// 历史与实时广播在重叠窗口会重复投递同一条；每 channel 保留最近见过的一批
@@ -3451,6 +3465,18 @@ impl State {
 
     fn queue_resume_started(&mut self) {
         self.pending_events.push(SdkEvent::ResumeSyncStarted);
+    }
+
+    /// Phase 2 完成 —— 主界面可用。**只发新事件**。
+    ///
+    /// 兼容策略是 additive（spec §Lifecycle Events）：旧宿主理解的
+    /// `ResumeSyncCompleted` 是「这一轮全做完了」，把它提前到这里发会让旧 App
+    /// 以为后台收敛也结束了——那只是把语义谎言换个地方讲。旧事件仍在
+    /// Phase 3 收敛完成时按原义发出。
+    fn queue_critical_ready(&mut self, stats: &ResumeRunStats) {
+        self.pending_events.push(SdkEvent::CriticalReady {
+            entity_types_synced: stats.entity_types_synced,
+        });
     }
 
     fn queue_resume_completed(&mut self, stats: ResumeRunStats) {
@@ -8527,117 +8553,25 @@ impl State {
             }
         }
 
-        let mut group_offset = 0usize;
-        let group_page_size = 500usize;
-        loop {
-            let groups = self
-                .storage
-                .list_groups(group_page_size, group_offset)
-                .await?;
-            if groups.is_empty() {
-                break;
-            }
-            for group in groups.iter() {
-                match self
-                    .sync_entities("group_member".to_string(), Some(group.group_id.to_string()))
-                    .await
-                {
-                    Ok(applied) => {
-                        stats.entity_types_synced += 1;
-                        self.queue_last_sync_events(
-                            "group_member".to_string(),
-                            Some(group.group_id.to_string()),
-                            applied,
-                        );
-                    }
-                    Err(e) if Self::is_unsupported_entity_error(&e) => {
-                        self.log_unsupported_sync_skip(
-                            "resume sync",
-                            "group_member",
-                            Some(group.group_id.to_string()),
-                            &e,
-                        );
-                    }
-                    Err(e) => {
-                        let handling = self
-                            .handle_resume_failure(
-                                ResumeFailureTarget::EntityType("group_member".to_string()),
-                                &e,
-                            )
-                            .await;
-                        if handling == ResumeFailureHandling::Abort {
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-            if groups.len() < group_page_size {
-                break;
-            }
-            group_offset += group_page_size;
-        }
+        // ── Phase 2 到此为止（spec SDK_SYNC_RESUME_SPEC §Startup Phases）──
+        //
+        // 上面几个实体族是**自包含列表投影**：会话/好友/群列表带着渲染该行所需的
+        // 名称、头像、类型，请求数固定为实体族个数，与账号大小无关。到这里主界面
+        // 就能正确显示了，立刻宣布 CriticalReady 让用户可用。
+        //
+        // 原先排在这之后的两段被移出关键路径：
+        //   1. 逐群 sync_entities("group_member", group_id) —— 请求数 O(群数)
+        //   2. 逐频道 resume_channel_difference        —— 请求数 O(频道数 × 分页)
+        // 它们让上线时延随账号大小线性增长（实测百来个会话就要挂几分钟），
+        // 现在交给 Phase 3 后台收敛：先 batch_get_channel_pts 批量比对，只修 stale。
+        self.queue_critical_ready(&stats);
 
-        let mut channel_offset = 0usize;
-        let channel_page_size = 500usize;
-        loop {
-            let channels = self
-                .storage
-                .list_channels(channel_page_size, channel_offset)
-                .await?;
-            if channels.is_empty() {
-                break;
-            }
-            for channel in channels.iter() {
-                stats.channels_scanned += 1;
-                self.pending_events
-                    .push(SdkEvent::ResumeSyncChannelStarted {
-                        channel_id: channel.channel_id,
-                        channel_type: channel.channel_type,
-                    });
-                match self
-                    .resume_channel_difference(channel.channel_id, channel.channel_type)
-                    .await
-                {
-                    Ok(applied) => {
-                        if applied > 0 {
-                            stats.channels_applied += 1;
-                            self.pending_events.push(SdkEvent::SyncChannelApplied {
-                                channel_id: channel.channel_id,
-                                channel_type: channel.channel_type,
-                                applied,
-                            });
-                        }
-                        self.pending_events
-                            .push(SdkEvent::ResumeSyncChannelCompleted {
-                                channel_id: channel.channel_id,
-                                channel_type: channel.channel_type,
-                                applied,
-                            });
-                    }
-                    Err(err) => {
-                        stats.channel_failures += 1;
-                        let handling = self
-                            .handle_resume_failure(
-                                ResumeFailureTarget::Channel {
-                                    channel_id: channel.channel_id,
-                                    channel_type: channel.channel_type,
-                                },
-                                &err,
-                            )
-                            .await;
-                        if handling == ResumeFailureHandling::Abort {
-                            return Err(err);
-                        }
-                    }
-                }
-            }
-            if channels.len() < channel_page_size {
-                break;
-            }
-            channel_offset += channel_page_size;
-        }
-        // 仅成功轮次记录；失败让下一个触发点自然重试。
-        self.last_resume_synced = Some((self.inbound_epoch, Instant::now()));
+        // 开启 Phase 3。这里只置标志，实际收敛由 actor loop 的 repair_tick 驱动，
+        // 一轮修一小批（有界预算），不阻塞命令处理，也不霸占 actor。
+        self.convergence_run = Some(stats.clone());
+        self.sync_coordinator
+            .set_convergence(crate::sync_coordinator::Convergence::Scanning, chrono::Utc::now().timestamp_millis());
+
         self.queue_resume_completed(stats);
         Ok(())
     }
@@ -9271,6 +9205,9 @@ impl State {
             // 债），但必须把闸门撤下来，否则 begin() 会永远挡住后面每一个触发源。
             self.sync_coordinator
                 .abandon(chrono::Utc::now().timestamp_millis());
+            // 后台收敛也必须停：那一轮属于正被切走的账号，继续跑会把上一个账号的
+            // 频道差异写进新账号的会话里。
+            self.convergence_run = None;
             if actor_logs_enabled() {
                 eprintln!("[SDK.actor] ensure_synced yielded to a pending account switch");
             }
@@ -11485,6 +11422,7 @@ impl PrivchatSdk {
                 inbound_epoch: 0,
                 last_resume_synced: None,
                 last_anti_entropy_at: Instant::now(),
+                convergence_run: None,
                 anti_entropy_jitter: Duration::from_secs(rand::random::<u64>() % 16),
                 room_seen_msg_ids: HashMap::new(),
                 last_terminal_reason: None,
@@ -11613,6 +11551,53 @@ impl PrivchatSdk {
                             && !state.repair_queue.is_empty()
                         {
                             state.drain_projection_repairs().await;
+                        }
+                        // Phase 3 后台收敛：一次一小批 stale 频道（run_anti_entropy_once
+                        // 内部用 batch_get_channel_pts 批量比对 + WiFi/蜂窝预算）。
+                        // 失败只退避重试，**不动 readiness** —— 用户此刻能正常收发。
+                        if state.session_state == SessionState::Authenticated
+                            && state.convergence_run.is_some()
+                        {
+                            match state.run_anti_entropy_once().await {
+                                Ok(0) => {
+                                    // 一轮下来没有 stale：收敛完成
+                                    if let Some(stats) = state.convergence_run.take() {
+                                        state.sync_coordinator.set_convergence(
+                                            crate::sync_coordinator::Convergence::Converged,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        );
+                                        state.pending_events.push(SdkEvent::ConvergenceCompleted {
+                                            channels_scanned: stats.channels_scanned,
+                                            channels_applied: stats.channels_applied,
+                                            channel_failures: stats.channel_failures,
+                                        });
+                                        // 兼容期：旧宿主在这里才收到 completed，语义不变
+                                        state.queue_resume_completed(stats);
+                                    }
+                                }
+                                Ok(_) => {
+                                    state.sync_coordinator.set_convergence(
+                                        crate::sync_coordinator::Convergence::Repairing,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "convergence pass failed");
+                                    state.sync_coordinator.set_convergence(
+                                        crate::sync_coordinator::Convergence::BackingOff,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    );
+                                }
+                            }
+                            for event in state.take_pending_events() {
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    event,
+                                );
+                            }
                         }
                         continue;
                     }
@@ -12752,6 +12737,7 @@ impl PrivchatSdk {
                         state.reset_reconnect_backoff();
                         let from_state = state.session_state.as_connection_state();
                         state.bootstrap_completed = false;
+                        state.convergence_run = None;
                         state
                             .sync_coordinator
                             .reset(chrono::Utc::now().timestamp_millis());
@@ -17644,6 +17630,7 @@ mod tests {
             inbound_epoch: 0,
             last_resume_synced: None,
             last_anti_entropy_at: Instant::now(),
+            convergence_run: None,
             anti_entropy_jitter: Duration::ZERO,
             room_seen_msg_ids: HashMap::new(),
             last_terminal_reason: None,
