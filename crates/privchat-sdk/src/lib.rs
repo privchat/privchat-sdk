@@ -502,17 +502,6 @@ pub enum SdkEvent {
         state: SyncStateSnapshot,
     },
     ResumeSyncStarted,
-    /// Phase 2 完成：主界面数据就绪，宿主**必须**据此撤掉全局「同步中」。
-    /// 后台收敛仍在进行，由 `ConvergenceCompleted` 单独播报。
-    CriticalReady {
-        entity_types_synced: usize,
-    },
-    /// Phase 3 后台收敛完成。兼容期同时发旧 `ResumeSyncCompleted`（原义不变）。
-    ConvergenceCompleted {
-        channels_scanned: usize,
-        channels_applied: usize,
-        channel_failures: usize,
-    },
     ResumeSyncCompleted {
         entity_types_synced: usize,
         channels_scanned: usize,
@@ -3465,18 +3454,6 @@ impl State {
 
     fn queue_resume_started(&mut self) {
         self.pending_events.push(SdkEvent::ResumeSyncStarted);
-    }
-
-    /// Phase 2 完成 —— 主界面可用。**只发新事件**。
-    ///
-    /// 兼容策略是 additive（spec §Lifecycle Events）：旧宿主理解的
-    /// `ResumeSyncCompleted` 是「这一轮全做完了」，把它提前到这里发会让旧 App
-    /// 以为后台收敛也结束了——那只是把语义谎言换个地方讲。旧事件仍在
-    /// Phase 3 收敛完成时按原义发出。
-    fn queue_critical_ready(&mut self, stats: &ResumeRunStats) {
-        self.pending_events.push(SdkEvent::CriticalReady {
-            entity_types_synced: stats.entity_types_synced,
-        });
     }
 
     fn queue_resume_completed(&mut self, stats: ResumeRunStats) {
@@ -8564,8 +8541,13 @@ impl State {
         //   2. 逐频道 resume_channel_difference        —— 请求数 O(频道数 × 分页)
         // 它们让上线时延随账号大小线性增长（实测百来个会话就要挂几分钟），
         // 现在交给 Phase 3 后台收敛：先 batch_get_channel_pts 批量比对，只修 stale。
-        self.queue_critical_ready(&stats);
-
+        // Phase 2 完成的信号就是 readiness → Ready：ensure_synced 收尾时
+        // `sync_coordinator.complete()` 会置位并发 SyncStateChanged，宿主据此撤横幅。
+        // 不另造 CriticalReady 事件——uniffi 绑定是手工维护的，多一个变体就要同步
+        // 三个平台的绑定文件，而 readiness 已经把这件事说清楚了。
+        //
+        // 旧 `ResumeSyncCompleted` 保持原义：在 Phase 3 收敛完成时才发（见 repair_tick）。
+        //
         // 开启 Phase 3。这里只置标志，实际收敛由 actor loop 的 repair_tick 驱动，
         // 一轮修一小批（有界预算），不阻塞命令处理，也不霸占 actor。
         self.convergence_run = Some(stats.clone());
@@ -11566,12 +11548,8 @@ impl PrivchatSdk {
                                             crate::sync_coordinator::Convergence::Converged,
                                             chrono::Utc::now().timestamp_millis(),
                                         );
-                                        state.pending_events.push(SdkEvent::ConvergenceCompleted {
-                                            channels_scanned: stats.channels_scanned,
-                                            channels_applied: stats.channels_applied,
-                                            channel_failures: stats.channel_failures,
-                                        });
-                                        // 兼容期：旧宿主在这里才收到 completed，语义不变
+                                        // 收敛完成才发 ResumeSyncCompleted —— 保持它
+                                        // 「这一轮全做完了」的原始语义。
                                         state.queue_resume_completed(stats);
                                     }
                                 }

@@ -1429,16 +1429,6 @@ pub enum SdkEvent {
         state: SyncStateSnapshot,
     },
     ResumeSyncStarted,
-    /// Phase 2 完成：宿主据此撤掉全局「同步中」
-    CriticalReady {
-        entity_types_synced: u64,
-    },
-    /// Phase 3 后台收敛完成
-    ConvergenceCompleted {
-        channels_scanned: u64,
-        channels_applied: u64,
-        channel_failures: u64,
-    },
     ResumeSyncCompleted {
         entity_types_synced: u64,
         channels_scanned: u64,
@@ -2394,20 +2384,6 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             state: map_sync_state(state),
         },
         privchat_sdk::SdkEvent::ResumeSyncStarted => SdkEvent::ResumeSyncStarted,
-        privchat_sdk::SdkEvent::CriticalReady {
-            entity_types_synced,
-        } => SdkEvent::CriticalReady {
-            entity_types_synced: entity_types_synced as u64,
-        },
-        privchat_sdk::SdkEvent::ConvergenceCompleted {
-            channels_scanned,
-            channels_applied,
-            channel_failures,
-        } => SdkEvent::ConvergenceCompleted {
-            channels_scanned: channels_scanned as u64,
-            channels_applied: channels_applied as u64,
-            channel_failures: channel_failures as u64,
-        },
         privchat_sdk::SdkEvent::ResumeSyncCompleted {
             entity_types_synced,
             channels_scanned,
@@ -2700,22 +2676,6 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
         }),
         SdkEvent::ResumeSyncStarted => json!({
             "type": "resume_sync_started"
-        }),
-        SdkEvent::CriticalReady {
-            entity_types_synced,
-        } => json!({
-            "type": "critical_ready",
-            "entity_types_synced": entity_types_synced
-        }),
-        SdkEvent::ConvergenceCompleted {
-            channels_scanned,
-            channels_applied,
-            channel_failures,
-        } => json!({
-            "type": "convergence_completed",
-            "channels_scanned": channels_scanned,
-            "channels_applied": channels_applied,
-            "channel_failures": channel_failures
         }),
         SdkEvent::ResumeSyncCompleted {
             entity_types_synced,
