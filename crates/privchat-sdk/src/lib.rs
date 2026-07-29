@@ -2947,7 +2947,8 @@ impl SessionState {
 struct AntiEntropyPage {
     page_scanned: usize,
     stale_found: usize,
-    repaired: usize,
+    channels_repaired: usize,
+    messages_applied: usize,
     /// 本页发现但因预算未修的 stale 频道数
     deferred: usize,
     cycle_completed: bool,
@@ -2960,8 +2961,51 @@ impl AntiEntropyPage {
 
     /// 可以进入 Converged 吗：走完一圈，且没有留下未修的 stale。
     fn is_converged(&self) -> bool {
-        self.cycle_completed && self.deferred == 0 && self.stale_found == self.repaired
+        self.cycle_completed && self.deferred == 0
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AntiEntropyObservation {
+    key: (u64, i32),
+    local_pts: u64,
+    server_pts: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct AntiEntropyPlan {
+    repair: Vec<(u64, i32)>,
+    consumed: usize,
+    last_consumed: Option<(u64, i32)>,
+    stale_found: usize,
+    deferred: usize,
+}
+
+fn plan_anti_entropy_page(
+    observations: &[AntiEntropyObservation],
+    difference_budget: usize,
+) -> AntiEntropyPlan {
+    let mut plan = AntiEntropyPlan::default();
+    for observation in observations {
+        let Some(server_pts) = observation.server_pts else {
+            plan.deferred += 1;
+            break;
+        };
+        if server_pts <= observation.local_pts {
+            plan.consumed += 1;
+            plan.last_consumed = Some(observation.key);
+            continue;
+        }
+        plan.stale_found += 1;
+        if plan.repair.len() >= difference_budget {
+            plan.deferred += 1;
+            break;
+        }
+        plan.repair.push(observation.key);
+        plan.consumed += 1;
+        plan.last_consumed = Some(observation.key);
+    }
+    plan
 }
 
 struct State {
@@ -8456,7 +8500,8 @@ impl State {
             return Ok(AntiEntropyPage {
                 page_scanned: 0,
                 stale_found: 0,
-                repaired: 0,
+                channels_repaired: 0,
+                messages_applied: 0,
                 deferred: 0,
                 cycle_completed: true,
             });
@@ -8478,16 +8523,8 @@ impl State {
         } else {
             WIFI_DIFFERENCE_BUDGET
         };
-        let mut repaired = 0usize;
-        let mut difference_calls = 0usize;
-        // stale_found：本页真正落后的频道数；deferred：其中因预算未修的。
-        // 只要还有 deferred，这一圈就不能算收敛。
-        let mut stale_found = 0usize;
-        let mut deferred = 0usize;
+        let mut observations = Vec::with_capacity(channels.len());
         for (channel_id, channel_type) in channels.iter().copied() {
-            let Some(server_pts) = remote_pts.get(&(channel_id, channel_type)).copied() else {
-                continue;
-            };
             let materialized_pts = self
                 .storage
                 .max_message_pts(channel_id, channel_type)
@@ -8497,41 +8534,50 @@ impl State {
                 .await
                 .unwrap_or(0)
                 .max(materialized_pts);
-            if server_pts <= local_pts {
-                continue;
-            }
-            stale_found += 1;
-            if difference_calls >= budget {
-                // 预算用尽：这个频道确实落后但本页没修，留给下一页
-                deferred += 1;
-                continue;
-            }
-            repaired += self
+            observations.push(AntiEntropyObservation {
+                key: (channel_id, channel_type),
+                local_pts,
+                server_pts: remote_pts.get(&(channel_id, channel_type)).copied(),
+            });
+        }
+        let plan = plan_anti_entropy_page(&observations, budget);
+        let mut messages_applied = 0usize;
+        for (channel_id, channel_type) in plan.repair.iter().copied() {
+            messages_applied += self
                 .resume_channel_difference(channel_id, channel_type)
                 .await?;
-            difference_calls += 1;
         }
+        let channels_repaired = plan.repair.len();
 
-        if channels.len() < PAGE_SIZE {
+        if plan.deferred > 0 {
+            if let Some((channel_id, channel_type)) = plan.last_consumed {
+                self.save_anti_entropy_cursor(channel_id, channel_type)
+                    .await?;
+            }
+        } else if channels.len() < PAGE_SIZE {
+            // 已消费末页，当前周期完整结束。
+            cycle_completed = true;
             self.save_anti_entropy_cursor(0, -1).await?;
         } else if let Some((channel_id, channel_type)) = channels.last().copied() {
             self.save_anti_entropy_cursor(channel_id, channel_type)
                 .await?;
         }
         tracing::debug!(
-            scanned = channels.len(),
-            difference_calls,
-            repaired,
-            stale_found,
-            deferred,
+            scanned = plan.consumed,
+            difference_calls = channels_repaired,
+            channels_repaired,
+            messages_applied,
+            stale_found = plan.stale_found,
+            deferred = plan.deferred,
             cycle_completed,
             "anti-entropy channel page completed"
         );
         Ok(AntiEntropyPage {
-            page_scanned: channels.len(),
-            stale_found,
-            repaired,
-            deferred,
+            page_scanned: plan.consumed,
+            stale_found: plan.stale_found,
+            channels_repaired,
+            messages_applied,
+            deferred: plan.deferred,
             cycle_completed,
         })
     }
@@ -11621,8 +11667,11 @@ impl PrivchatSdk {
                                 Ok(page) if page.is_converged() => {
                                     if let Some(stats) = state.convergence_run.take() {
                                         eprintln!(
-                                            "[SDK.resume] run={} phase=3 converged scanned={} repaired={}",
-                                            state.resume_run_id, page.page_scanned, page.repaired
+                                            "[SDK.resume] run={} phase=3 converged scanned={} channels_repaired={} messages_applied={}",
+                                            state.resume_run_id,
+                                            page.page_scanned,
+                                            page.channels_repaired,
+                                            page.messages_applied
                                         );
                                         state.sync_coordinator.set_convergence(
                                             crate::sync_coordinator::Convergence::Converged,
@@ -11636,11 +11685,12 @@ impl PrivchatSdk {
                                 Ok(page) => {
                                     if page.stale_found > 0 || page.deferred > 0 {
                                         eprintln!(
-                                            "[SDK.resume] run={} phase=3 page scanned={} stale={} repaired={} deferred={}",
+                                            "[SDK.resume] run={} phase=3 page scanned={} stale={} channels_repaired={} messages_applied={} deferred={}",
                                             state.resume_run_id,
                                             page.page_scanned,
                                             page.stale_found,
-                                            page.repaired,
+                                            page.channels_repaired,
+                                            page.messages_applied,
                                             page.deferred
                                         );
                                     }
@@ -17744,7 +17794,7 @@ mod tests {
         (state, dir)
     }
 
-    use super::AntiEntropyPage;
+    use super::{plan_anti_entropy_page, AntiEntropyObservation, AntiEntropyPage};
     use crate::sync_coordinator::{Readiness, SyncRunKind};
 
     /// 收敛判定：`Ok(0)` 曾被当成「全账号收敛」，但它只代表本页修了 0 条。
@@ -17755,7 +17805,8 @@ mod tests {
         let mid_cycle = AntiEntropyPage {
             page_scanned: 100,
             stale_found: 0,
-            repaired: 0,
+            channels_repaired: 0,
+            messages_applied: 0,
             deferred: 0,
             cycle_completed: false,
         };
@@ -17763,19 +17814,22 @@ mod tests {
 
         // 走完一圈但有 stale 因预算被推迟 —— 不能收敛
         let deferred = AntiEntropyPage {
-            page_scanned: 100,
-            stale_found: 12,
-            repaired: 8,
-            deferred: 4,
-            cycle_completed: true,
+            page_scanned: 8,
+            stale_found: 9,
+            channels_repaired: 8,
+            messages_applied: 80,
+            deferred: 1,
+            cycle_completed: false,
         };
-        assert!(!deferred.is_converged(), "还有 4 个 stale 没修就宣布收敛了");
+        assert!(!deferred.is_converged(), "还有 stale 没修就宣布收敛了");
 
         // 走完一圈且全部处理干净 —— 才算收敛
         let clean = AntiEntropyPage {
             page_scanned: 100,
             stale_found: 3,
-            repaired: 3,
+            channels_repaired: 3,
+            // 应用消息数与频道数无关，不能拿它参与收敛判定。
+            messages_applied: 37,
             deferred: 0,
             cycle_completed: true,
         };
@@ -17785,11 +17839,55 @@ mod tests {
         let empty = AntiEntropyPage {
             page_scanned: 0,
             stale_found: 0,
-            repaired: 0,
+            channels_repaired: 0,
+            messages_applied: 0,
             deferred: 0,
             cycle_completed: true,
         };
         assert!(empty.is_converged());
+    }
+
+    #[test]
+    fn thousand_channels_with_three_stale_only_repairs_three() {
+        let stale = [17_u64, 511, 999];
+        let observations: Vec<_> = (1_u64..=1000)
+            .map(|channel_id| AntiEntropyObservation {
+                key: (channel_id, 1),
+                local_pts: 10,
+                server_pts: Some(if stale.contains(&channel_id) { 11 } else { 10 }),
+            })
+            .collect();
+
+        let mut repaired = Vec::new();
+        for page in observations.chunks(100) {
+            let plan = plan_anti_entropy_page(page, 8);
+            assert_eq!(plan.consumed, 100);
+            assert_eq!(plan.deferred, 0);
+            repaired.extend(plan.repair.into_iter().map(|(channel_id, _)| channel_id));
+        }
+
+        assert_eq!(repaired, stale);
+    }
+
+    #[test]
+    fn budget_stops_before_the_first_deferred_channel() {
+        let observations: Vec<_> = (1_u64..=12)
+            .map(|channel_id| AntiEntropyObservation {
+                key: (channel_id, 1),
+                local_pts: 0,
+                server_pts: Some(1),
+            })
+            .collect();
+
+        let first = plan_anti_entropy_page(&observations, 8);
+        assert_eq!(first.repair.len(), 8);
+        assert_eq!(first.last_consumed, Some((8, 1)));
+        assert_eq!(first.deferred, 1);
+
+        let second = plan_anti_entropy_page(&observations[8..], 8);
+        assert_eq!(second.repair.len(), 4);
+        assert_eq!(second.last_consumed, Some((12, 1)));
+        assert_eq!(second.deferred, 0);
     }
 
 

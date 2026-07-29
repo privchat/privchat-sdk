@@ -1376,6 +1376,24 @@ pub enum SyncPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SyncReadiness {
+    Disconnected,
+    Authenticated,
+    SyncingCritical,
+    Ready,
+    CriticalFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SyncCriticalFailure {
+    Network,
+    ServerUnavailable,
+    Protocol,
+    Storage,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SyncRunKind {
     Bootstrap,
     Resume,
@@ -1383,6 +1401,10 @@ pub enum SyncRunKind {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SyncStateSnapshot {
+    pub readiness: SyncReadiness,
+    pub failure: Option<SyncCriticalFailure>,
+    pub retryable: bool,
+    /// Compatibility projection for hosts that have not migrated to `readiness`.
     pub phase: SyncPhase,
     pub run_kind: Option<SyncRunKind>,
     pub attempt: u32,
@@ -2278,11 +2300,26 @@ fn map_sdk_resume_escalation_scope(
 }
 
 fn map_sync_state(v: privchat_sdk::SyncStateSnapshot) -> SyncStateSnapshot {
-    // 公共 ABI 只投影 readiness；Convergence 是 SDK 内部维度，不出现在这里
-    // （spec SDK_SYNC_STATE_MACHINE_SPEC §2.3.1）。
+    let readiness = match v.readiness {
+        privchat_sdk::Readiness::Disconnected => SyncReadiness::Disconnected,
+        privchat_sdk::Readiness::Authenticated => SyncReadiness::Authenticated,
+        privchat_sdk::Readiness::SyncingCritical => SyncReadiness::SyncingCritical,
+        privchat_sdk::Readiness::Ready => SyncReadiness::Ready,
+        privchat_sdk::Readiness::CriticalFailed => SyncReadiness::CriticalFailed,
+    };
+    let failure = v.failure.map(|failure| match failure {
+        privchat_sdk::CriticalFailureCode::Network => SyncCriticalFailure::Network,
+        privchat_sdk::CriticalFailureCode::ServerUnavailable => {
+            SyncCriticalFailure::ServerUnavailable
+        }
+        privchat_sdk::CriticalFailureCode::Protocol => SyncCriticalFailure::Protocol,
+        privchat_sdk::CriticalFailureCode::Storage => SyncCriticalFailure::Storage,
+        privchat_sdk::CriticalFailureCode::Unknown => SyncCriticalFailure::Unknown,
+    });
     let phase = match v.readiness {
-        privchat_sdk::Readiness::Disconnected => SyncPhase::Idle,
-        privchat_sdk::Readiness::Authenticated => SyncPhase::Idle,
+        privchat_sdk::Readiness::Disconnected | privchat_sdk::Readiness::Authenticated => {
+            SyncPhase::Idle
+        }
         privchat_sdk::Readiness::SyncingCritical => SyncPhase::Syncing,
         privchat_sdk::Readiness::Ready => SyncPhase::Synced,
         privchat_sdk::Readiness::CriticalFailed => SyncPhase::FailedTerminal,
@@ -2292,6 +2329,9 @@ fn map_sync_state(v: privchat_sdk::SyncStateSnapshot) -> SyncStateSnapshot {
         privchat_sdk::SyncRunKind::Resume => SyncRunKind::Resume,
     });
     SyncStateSnapshot {
+        readiness,
+        failure,
+        retryable: v.retryable,
         phase,
         run_kind,
         attempt: v.attempt,
@@ -9387,4 +9427,3 @@ extern "C" fn ffi_privchat_sdk_ffi_rust_future_complete_pointer(
     unsafe { set_call_status_ok(out_status) };
     std::ptr::null_mut()
 }
-
