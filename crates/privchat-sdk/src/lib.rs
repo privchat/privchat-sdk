@@ -97,7 +97,8 @@ use runtime::runtime_provider::RuntimeProvider;
 use storage_actor::StorageHandle;
 use sync_commit_applier::SyncCommitApplier;
 use sync_coordinator::SyncCoordinator;
-pub use sync_coordinator::{SyncPhase, SyncRunKind, SyncStateSnapshot};
+// Convergence 刻意不导出：它是 SDK 内部维度，不进公共 API / FFI ABI。
+pub use sync_coordinator::{CriticalFailureCode, Readiness, SyncPhase, SyncRunKind, SyncStateSnapshot};
 use task::task_registry::TaskRegistry;
 
 /// 下载票据：下载前由 `file/get_url` 解析（file_id 路径），或由 legacy file_url 构造
@@ -11970,6 +11971,33 @@ impl PrivchatSdk {
                                 // 增量同步上来（与 retry driver 的成功分支一致）。
                                 // 入口可能是 Authenticated（fast-track）或 New（后台 disconnect 后回前台），
                                 // 只要本地有 session 且当前已 Authenticated，就跑 resume_sync。
+                                // 先把「连接已就绪」告诉宿主，再跑 resume sync。
+                                //
+                                // 顺序反过来会让状态事件被整轮同步挡住：会话多的账号 ensure_synced
+                                // 要跑很久，期间 UI 收不到 Authenticated，状态条一直停在「服务器
+                                // 连接中」——而连接其实早就建好、数据也正在回来。连接态是既成事实，
+                                // 不该等数据层动作完成才通知；同步进度本来就有 resume_sync_* 事件
+                                // 单独播报。
+                                emit_sequenced_event(
+                                    &actor_event_tx,
+                                    &actor_event_history,
+                                    &actor_event_seq,
+                                    event_history_limit,
+                                    SdkEvent::ConnectionStateChanged {
+                                        from: from_state,
+                                        to: state.session_state.as_connection_state(),
+                                    },
+                                );
+
+                                // 连接已就绪，先答复宿主再跑 resume sync。
+                                //
+                                // 把 resp.send 留到同步之后，宿主的 connect() 就要挂到整轮
+                                // 同步结束才返回：会话多的账号能挂几十秒，而宿主往往在 connect()
+                                // 前后切状态条文案（「连接中」→「同步中」→清空），于是状态条
+                                // 卡死在「服务器连接中」——连接其实早就建好了。
+                                // connect 的语义是「连接建立成功」，不该捎带数据层的耗时。
+                                let _ = resp.send(Ok(()));
+
                                 let _ = was_authenticated;
                                 if had_local_session
                                     && state.session_state == SessionState::Authenticated
@@ -11989,23 +12017,12 @@ impl PrivchatSdk {
                                         );
                                     }
                                 }
-
-                                emit_sequenced_event(
-                                    &actor_event_tx,
-                                    &actor_event_history,
-                                    &actor_event_seq,
-                                    event_history_limit,
-                                    SdkEvent::ConnectionStateChanged {
-                                        from: from_state,
-                                        to: state.session_state.as_connection_state(),
-                                    },
-                                );
                             } else {
                                 // First attempt failed — schedule a backoff retry so we
                                 // don't leave the client silently unconnected.
                                 state.schedule_next_reconnect();
+                                let _ = resp.send(result);
                             }
-                            let _ = resp.send(result);
                         }
                     }
                     Command::Disconnect { resp } => {
@@ -12679,7 +12696,7 @@ impl PrivchatSdk {
                             }
                             Ok(false) => Err(Error::InvalidState(format!(
                                 "bootstrap sync did not run (sync state: {:?}); local-first operations are not available",
-                                state.sync_coordinator.snapshot().phase
+                                state.sync_coordinator.snapshot().readiness
                             ))),
                             Err(e) => Err(e),
                         };
@@ -17667,7 +17684,7 @@ mod tests {
         (state, dir)
     }
 
-    use crate::sync_coordinator::{SyncPhase, SyncRunKind};
+    use crate::sync_coordinator::{Readiness, SyncRunKind};
 
     // ==================== 账号切换：会话作用域隔离 ====================
     //
@@ -17717,7 +17734,7 @@ mod tests {
             "切换后仍开着自动重连：A 的失败会继续驱动 B 的重连"
         );
         assert_eq!(state.reconnect_attempt, 0);
-        assert_eq!(state.sync_coordinator.snapshot().phase, SyncPhase::Idle);
+        assert_eq!(state.sync_coordinator.snapshot().readiness, Readiness::Disconnected);
         assert_eq!(state.sync_coordinator.snapshot().attempt, 0);
     }
 
@@ -17876,7 +17893,7 @@ mod tests {
             snapshot.attempt, 0,
             "被打断的一轮把 attempt 写了回去，新账号会背上它"
         );
-        assert_ne!(snapshot.phase, SyncPhase::Synced, "被打断的一轮被记成同步成功了");
+        assert_ne!(snapshot.readiness, Readiness::Ready, "被打断的一轮被记成同步成功了");
     }
 
     /// 让出之后闸门必须重新打开：新账号的同步要能照常开工。
@@ -17896,8 +17913,8 @@ mod tests {
         // 而不是被闸门挡回来。
         let _ = state.ensure_synced(|_| {}).await;
         assert_ne!(
-            state.sync_coordinator.snapshot().phase,
-            SyncPhase::Idle,
+            state.sync_coordinator.snapshot().readiness,
+            Readiness::Disconnected,
             "让出之后新账号的同步没能开工，闸门卡死了"
         );
     }

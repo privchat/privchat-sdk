@@ -1,5 +1,47 @@
 use serde::{Deserialize, Serialize};
 
+/// 上线就绪度 —— **唯一允许驱动阻塞式 UI 的维度**。
+///
+/// 见 spec `SDK_SYNC_RESUME_SPEC` §Startup Phases。要点：`Ready` 一旦到达，
+/// 后台收敛（[`Convergence`]）的任何失败都不得让它回退——用户此刻能正常收发，
+/// 界面就不能表现成「尚未上线」。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Readiness {
+    Disconnected,
+    /// 已认证、实时推送已启用；关键增量尚未完成
+    Authenticated,
+    /// Phase 2 关键增量进行中 —— 唯一允许显示全局「同步中」的状态
+    SyncingCritical,
+    /// 主界面数据就绪，用户可正常收发
+    Ready,
+    /// **仅** Phase 2 失败可达；typed，不含裸错误串
+    CriticalFailed,
+}
+
+/// Phase 2 失败分类。原始错误只进日志：裸串曾把
+/// `[10009] no local refresh token for uid=...` 这类内部诊断直接弹给用户。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CriticalFailureCode {
+    Network,
+    ServerUnavailable,
+    Protocol,
+    Storage,
+    Unknown,
+}
+
+/// 后台收敛健康度 —— **SDK 内部**，不进公共 API / FFI ABI。
+/// 产品不消费它，暴露出去只会多出没人用的跨端状态组合。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum Convergence {
+    Idle,
+    /// batch_get_channel_pts 批量比对中
+    Scanning,
+    Repairing,
+    BackingOff,
+    Converged,
+}
+
+/// 兼容别名：旧线性 phase 仍被部分调用点引用，逐步替换。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncPhase {
     Idle,
@@ -7,6 +49,19 @@ pub enum SyncPhase {
     Synced,
     Retrying,
     FailedTerminal,
+}
+
+impl Readiness {
+    /// 旧 phase 投影，供尚未迁移的调用点与兼容事件使用。
+    pub fn as_legacy_phase(self) -> SyncPhase {
+        match self {
+            Readiness::Disconnected => SyncPhase::Idle,
+            Readiness::Authenticated => SyncPhase::Idle,
+            Readiness::SyncingCritical => SyncPhase::Syncing,
+            Readiness::Ready => SyncPhase::Synced,
+            Readiness::CriticalFailed => SyncPhase::FailedTerminal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,21 +72,70 @@ pub enum SyncRunKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncStateSnapshot {
-    pub phase: SyncPhase,
+    /// 公共维度：宿主判断「能不能用」只看它
+    pub readiness: Readiness,
+    /// Phase 2 失败分类；仅 `readiness == CriticalFailed` 时有值
+    pub failure: Option<CriticalFailureCode>,
+    /// 是否可重试（typed failure 的一部分，UI 决定是否给「重试」）
+    pub retryable: bool,
+    /// 内部维度：不导出到 FFI，仅 telemetry / debug snapshot
+    pub(crate) convergence: Convergence,
     pub run_kind: Option<SyncRunKind>,
     pub attempt: u32,
-    pub error_code: Option<u32>,
     pub message: Option<String>,
     pub updated_at_ms: i64,
+}
+
+impl SyncStateSnapshot {
+    /// 供 SDK 外部（FFI / 测试）构造快照。**故意不暴露 convergence**：
+    /// 那是内部维度，外部既不该读也不该写。
+    pub fn new_public(
+        readiness: Readiness,
+        failure: Option<CriticalFailureCode>,
+        retryable: bool,
+        run_kind: Option<SyncRunKind>,
+        attempt: u32,
+        message: Option<String>,
+        updated_at_ms: i64,
+    ) -> Self {
+        Self {
+            readiness,
+            failure,
+            retryable,
+            convergence: Convergence::Idle,
+            run_kind,
+            attempt,
+            message,
+            updated_at_ms,
+        }
+    }
+
+    /// 旧 `phase` 字段的兼容读法。新代码请直接读 [`Self::readiness`]。
+    pub fn phase(&self) -> SyncPhase {
+        self.readiness.as_legacy_phase()
+    }
+
+    /// 旧 `error_code` 兼容读法：typed code 的数值投影。
+    pub fn error_code(&self) -> Option<u32> {
+        self.failure.map(|c| match c {
+            CriticalFailureCode::Network => 1,
+            CriticalFailureCode::ServerUnavailable => 2,
+            CriticalFailureCode::Protocol => 3,
+            CriticalFailureCode::Storage => 4,
+            CriticalFailureCode::Unknown => 0,
+        })
+    }
 }
 
 impl Default for SyncStateSnapshot {
     fn default() -> Self {
         Self {
-            phase: SyncPhase::Idle,
+            readiness: Readiness::Disconnected,
+            failure: None,
+            retryable: true,
+            convergence: Convergence::Idle,
             run_kind: None,
             attempt: 0,
-            error_code: None,
             message: None,
             updated_at_ms: 0,
         }
@@ -111,10 +215,10 @@ impl SyncCoordinator {
         kind: SyncRunKind,
         now_ms: i64,
     ) -> std::result::Result<(), SyncBeginRejection> {
-        if self.snapshot.phase == SyncPhase::Syncing {
+        if self.snapshot.readiness == Readiness::SyncingCritical {
             return Err(SyncBeginRejection::AlreadyRunning);
         }
-        if self.snapshot.phase == SyncPhase::FailedTerminal {
+        if self.snapshot.readiness == Readiness::CriticalFailed && !self.snapshot.retryable {
             return Err(SyncBeginRejection::Terminal);
         }
         if let Some(deadline) = self.next_retry_at_ms {
@@ -126,10 +230,13 @@ impl SyncCoordinator {
         }
         self.next_retry_at_ms = None;
         self.snapshot = SyncStateSnapshot {
-            phase: SyncPhase::Syncing,
+            readiness: Readiness::SyncingCritical,
+            failure: None,
+            retryable: true,
+            // 关键阶段重跑不重置后台收敛：它是另一条独立的生命线
+            convergence: self.snapshot.convergence,
             run_kind: Some(kind),
             attempt: self.snapshot.attempt,
-            error_code: None,
             message: None,
             updated_at_ms: now_ms,
         };
@@ -139,13 +246,28 @@ impl SyncCoordinator {
     pub(crate) fn complete(&mut self, kind: SyncRunKind, now_ms: i64) {
         self.next_retry_at_ms = None;
         self.snapshot = SyncStateSnapshot {
-            phase: SyncPhase::Synced,
+            readiness: Readiness::Ready,
+            failure: None,
+            retryable: true,
+            convergence: self.snapshot.convergence,
             run_kind: Some(kind),
             attempt: 0,
-            error_code: None,
             message: None,
             updated_at_ms: now_ms,
         };
+    }
+
+    /// 后台收敛维度的流转 —— **不触碰 readiness**。
+    ///
+    /// 这是双维模型的全部意义：Phase 3 的失败落在这里退避重试，已经 `Ready`
+    /// 的应用不会因此被打回「连接中」。
+    pub(crate) fn set_convergence(&mut self, next: Convergence, now_ms: i64) {
+        self.snapshot.convergence = next;
+        self.snapshot.updated_at_ms = now_ms;
+    }
+
+    pub(crate) fn convergence(&self) -> Convergence {
+        self.snapshot.convergence
     }
 
     pub(crate) fn fail(
@@ -167,15 +289,19 @@ impl SyncCoordinator {
         } else {
             Some(now_ms.saturating_add(Self::retry_delay_ms(attempt, now_ms)))
         };
+        // Phase 2 失败才动 readiness；非终态失败退回 Authenticated 等下一次触发，
+        // 而不是造一个「Retrying」全局态去驱动阻塞横幅。
         self.snapshot = SyncStateSnapshot {
-            phase: if terminal {
-                SyncPhase::FailedTerminal
+            readiness: if terminal {
+                Readiness::CriticalFailed
             } else {
-                SyncPhase::Retrying
+                Readiness::Authenticated
             },
+            failure: error_code.map(Self::classify_failure),
+            retryable: !terminal,
+            convergence: self.snapshot.convergence,
             run_kind: Some(kind),
             attempt,
-            error_code,
             message: Some(message),
             updated_at_ms: now_ms,
         };
@@ -186,8 +312,18 @@ impl SyncCoordinator {
     /// 退避是为了不在**没有希望**的时候空转；网络刚回来正是最有希望的时刻，
     /// 这时还让用户干等剩余的退避时间是把节流用错了地方。
     pub(crate) fn note_network_available(&mut self) {
-        if self.snapshot.phase == SyncPhase::Retrying {
+        if self.snapshot.readiness == Readiness::Authenticated || self.next_retry_at_ms.is_some() {
             self.next_retry_at_ms = None;
+        }
+    }
+
+    /// 服务端错误码 → typed 分类。原始文本留给日志。
+    fn classify_failure(code: u32) -> CriticalFailureCode {
+        match code {
+            0 => CriticalFailureCode::Unknown,
+            c if (500..600).contains(&c) => CriticalFailureCode::ServerUnavailable,
+            c if (400..500).contains(&c) => CriticalFailureCode::Protocol,
+            _ => CriticalFailureCode::Network,
         }
     }
 
@@ -212,7 +348,7 @@ impl SyncCoordinator {
     ///
     /// 终态不在此列：那等的不是时间，是重新登录/换账号这样的显式动作。
     pub(crate) fn note_explicit_request(&mut self) {
-        if self.snapshot.phase != SyncPhase::FailedTerminal {
+        if self.snapshot.readiness != Readiness::CriticalFailed || self.snapshot.retryable {
             self.next_retry_at_ms = None;
         }
     }
@@ -263,7 +399,8 @@ mod tests {
             "transport".to_string(),
             2,
         );
-        assert_eq!(coordinator.snapshot().phase, SyncPhase::Retrying);
+        // 非终态失败回落 Authenticated 等下次触发，不再造全局 Retrying
+        assert_eq!(coordinator.snapshot().readiness, Readiness::Authenticated);
         assert_eq!(coordinator.snapshot().attempt, 1);
 
         begin_after_backoff(&mut coordinator, SyncRunKind::Resume, 3);
@@ -278,7 +415,7 @@ mod tests {
 
         begin_after_backoff(&mut coordinator, SyncRunKind::Resume, 5_000);
         coordinator.complete(SyncRunKind::Resume, 6_000);
-        assert_eq!(coordinator.snapshot().phase, SyncPhase::Synced);
+        assert_eq!(coordinator.snapshot().readiness, Readiness::Ready);
         assert_eq!(coordinator.snapshot().attempt, 0);
         assert_eq!(coordinator.next_retry_at_ms(), None);
     }
@@ -294,7 +431,7 @@ mod tests {
             "token expired".to_string(),
             2,
         );
-        assert_eq!(coordinator.snapshot().phase, SyncPhase::FailedTerminal);
+        assert_eq!(coordinator.snapshot().readiness, Readiness::CriticalFailed);
         assert_eq!(coordinator.snapshot().attempt, 0);
         // 终态不排期重试，也不接受新一轮：它等的是一个显式动作。
         assert_eq!(coordinator.next_retry_at_ms(), None);
@@ -386,7 +523,7 @@ mod tests {
 
         assert_eq!(coordinator.generation(), gen_before + 1);
         assert_eq!(coordinator.next_retry_at_ms(), None);
-        assert_eq!(coordinator.snapshot().phase, SyncPhase::Idle);
+        assert_eq!(coordinator.snapshot().readiness, Readiness::Disconnected);
         assert_eq!(coordinator.snapshot().attempt, 0);
         // 换账号之后必须能立刻开跑，不继承上一个账号的退避。
         assert!(coordinator.begin(SyncRunKind::Bootstrap, 101).is_ok());
@@ -433,7 +570,7 @@ mod tests {
             0,
             "被打断的一轮把 attempt/退避留给了下一个账号"
         );
-        assert_eq!(c.snapshot().phase, SyncPhase::Idle);
+        assert_eq!(c.snapshot().readiness, Readiness::Disconnected);
     }
 
     #[test]

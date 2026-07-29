@@ -2278,12 +2278,14 @@ fn map_sdk_resume_escalation_scope(
 }
 
 fn map_sync_state(v: privchat_sdk::SyncStateSnapshot) -> SyncStateSnapshot {
-    let phase = match v.phase {
-        privchat_sdk::SyncPhase::Idle => SyncPhase::Idle,
-        privchat_sdk::SyncPhase::Syncing => SyncPhase::Syncing,
-        privchat_sdk::SyncPhase::Synced => SyncPhase::Synced,
-        privchat_sdk::SyncPhase::Retrying => SyncPhase::Retrying,
-        privchat_sdk::SyncPhase::FailedTerminal => SyncPhase::FailedTerminal,
+    // 公共 ABI 只投影 readiness；Convergence 是 SDK 内部维度，不出现在这里
+    // （spec SDK_SYNC_STATE_MACHINE_SPEC §2.3.1）。
+    let phase = match v.readiness {
+        privchat_sdk::Readiness::Disconnected => SyncPhase::Idle,
+        privchat_sdk::Readiness::Authenticated => SyncPhase::Idle,
+        privchat_sdk::Readiness::SyncingCritical => SyncPhase::Syncing,
+        privchat_sdk::Readiness::Ready => SyncPhase::Synced,
+        privchat_sdk::Readiness::CriticalFailed => SyncPhase::FailedTerminal,
     };
     let run_kind = v.run_kind.map(|kind| match kind {
         privchat_sdk::SyncRunKind::Bootstrap => SyncRunKind::Bootstrap,
@@ -2293,7 +2295,7 @@ fn map_sync_state(v: privchat_sdk::SyncStateSnapshot) -> SyncStateSnapshot {
         phase,
         run_kind,
         attempt: v.attempt,
-        error_code: v.error_code,
+        error_code: v.error_code(),
         message: v.message,
         updated_at_ms: v.updated_at_ms,
     }
@@ -9225,22 +9227,26 @@ mod tests {
     #[test]
     fn sync_state_event_preserves_typed_fields() {
         let event = map_sdk_event(privchat_sdk::SdkEvent::SyncStateChanged {
-            state: privchat_sdk::SyncStateSnapshot {
-                phase: privchat_sdk::SyncPhase::Retrying,
-                run_kind: Some(privchat_sdk::SyncRunKind::Resume),
-                attempt: 3,
-                error_code: Some(9),
-                message: Some("transport".to_string()),
-                updated_at_ms: 42,
-            },
+            state: privchat_sdk::SyncStateSnapshot::new_public(
+                privchat_sdk::Readiness::Authenticated,
+                Some(privchat_sdk::CriticalFailureCode::Network),
+                true,
+                Some(privchat_sdk::SyncRunKind::Resume),
+                3,
+                Some("transport".to_string()),
+                42,
+            ),
         });
         let SdkEvent::SyncStateChanged { state } = event else {
             panic!("expected typed sync state event");
         };
-        assert_eq!(state.phase, SyncPhase::Retrying);
+        // 非终态失败回落 Authenticated（投影为 Idle），不再产生全局 Retrying：
+        // 后台退避属于 Convergence 维度，按 spec 不进公共 ABI。
+        assert_eq!(state.phase, SyncPhase::Idle);
         assert_eq!(state.run_kind, Some(SyncRunKind::Resume));
         assert_eq!(state.attempt, 3);
-        assert_eq!(state.error_code, Some(9));
+        // error_code 现在是 typed CriticalFailureCode 的数值投影（Network => 1）
+        assert_eq!(state.error_code, Some(1));
         assert_eq!(state.updated_at_ms, 42);
     }
 
