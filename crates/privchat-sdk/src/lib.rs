@@ -2988,8 +2988,17 @@ fn plan_anti_entropy_page(
     let mut plan = AntiEntropyPlan::default();
     for observation in observations {
         let Some(server_pts) = observation.server_pts else {
-            plan.deferred += 1;
-            break;
+            // 批量比对**成功**返回但结果里没有这个频道 —— 服务端不认识它
+            // （已删除 / 非消息频道 / 本地多余）。跳过并推进游标。
+            //
+            // 原来这里 break 且不推进 last_consumed，于是游标永远停在它前面，
+            // 每一轮都从同一个频道重新开始：真机实测 429 会话账号出现
+            // `scanned=0 deferred=1` 每 80ms 刷一次、永不收敛（deferred != 0
+            // 让 is_converged() 恒假）。批量请求本身失败会在调用处 `?` 返回，
+            // 走不到这里，所以缺失只可能是「服务端没有」。
+            plan.consumed += 1;
+            plan.last_consumed = Some(observation.key);
+            continue;
         };
         if server_pts <= observation.local_pts {
             plan.consumed += 1;
@@ -17867,6 +17876,30 @@ mod tests {
         }
 
         assert_eq!(repaired, stale);
+    }
+
+    /// 服务端不认识的频道**不得**卡住游标。
+    ///
+    /// 真机实测(429 会话账号)：`server_pts=None` 时原实现 break 且不推进
+    /// `last_consumed`，游标永远停在该频道之前，每轮从它重来 —— 日志刷出
+    /// `scanned=0 deferred=1` 每 80ms 一次、永不收敛。
+    #[test]
+    fn unknown_server_channel_does_not_stall_the_cursor() {
+        let observations = vec![
+            // 服务端没有它（已删除 / 非消息频道）
+            AntiEntropyObservation { key: (7, 1), local_pts: 3, server_pts: None },
+            // 它后面还有真正需要修的
+            AntiEntropyObservation { key: (8, 1), local_pts: 3, server_pts: Some(9) },
+        ];
+
+        let plan = plan_anti_entropy_page(&observations, 8);
+        assert_eq!(plan.deferred, 0, "服务端缺失被当成了「待修」，会让收敛永不完成");
+        assert_eq!(
+            plan.last_consumed,
+            Some((8, 1)),
+            "游标没能推进到本页末尾，下一轮会从同一个频道重来"
+        );
+        assert_eq!(plan.repair, vec![(8, 1)], "缺失频道后面的 stale 被跳过了");
     }
 
     #[test]
