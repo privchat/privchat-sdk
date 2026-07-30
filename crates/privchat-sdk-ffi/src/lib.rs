@@ -4813,7 +4813,11 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)?;
         // 立刻拉 bot 详情写入本地 users 表，避免会话头没昵称（spec BOT_INTERACTION_SPEC §3.0.4）。
         // 失败只忽略——不阻塞 follow 主路径。
-        let _ = self.persist_user_profile_local(bot_user_id).await;
+        // 来源是刚建好的这个会话,不是「好友」——follow 一个 bot 并不让双方成为好友,
+        // 谎报 friend 会被 PROFILE_VISIBILITY §2.5 的闸口以 10004 拒掉。
+        let _ = self
+            .persist_user_profile_local(bot_user_id, resp.channel_id)
+            .await;
         Ok(BotFollowResult {
             bot_user_id: resp.bot_user_id,
             channel_id: resp.channel_id,
@@ -4825,17 +4829,23 @@ impl PrivchatClient {
 
     /// 拉一次 `account/user/detail` 并把对端用户写入本地 users 表。
     /// 用于 follow 后让会话头显示昵称/头像，spec BOT_INTERACTION_SPEC §3.0。
+    ///
+    /// [channel_id] 是双方共处的会话——即本次请求向服务端声明的**真实来源**
+    /// (`conversation:{channel_id}`,PROFILE_VISIBILITY §2.5:viewer ∈ channel ∧
+    /// target ∈ channel → 公开投影)。此处原本固定报 `friend`,而 follow 一个 bot
+    /// 并不建立好友关系,闸口一律以 10004 拒绝,写回从未发生。
     async fn persist_user_profile_local(
         &self,
         target_user_id: u64,
+        channel_id: u64,
     ) -> Result<(), PrivchatFfiError> {
         let detail: AccountUserDetailResponse = rpc_call_typed(
             &self.inner,
             routes::account_user::DETAIL,
             &AccountUserDetailRequest {
                 target_user_id,
-                source: DetailSourceType::Friend.as_str().to_string(),
-                source_id: target_user_id.to_string(),
+                source: DetailSourceType::Conversation.as_str().to_string(),
+                source_id: channel_id.to_string(),
                 user_id: 0,
             },
         )
@@ -8037,60 +8047,27 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
+    /// **纯本地读。** 不发任何网络请求。
+    ///
+    /// 这里曾经有一段「本地没有 → 直接 RPC 拉 detail → 写回」的兜底，`source` 硬编码成
+    /// `"user_cache"`。那不是一种来源,而是调用方所在的缓存层名字漏进了一个语义为
+    /// 「你凭什么认识这个人」的字段——协议侧 `ProfileSource` 枚举里根本没有它
+    /// (PROFILE_VISIBILITY §2.5 的来源白名单:search/group/friend/friend_pending/
+    /// card_share/conversation/self)。
+    ///
+    /// 服务端 2026-07-28 上线来源校验后,这段代码 **100% 返回 10100**,而错误被 `.ok()`
+    /// 吞掉、写回一步从此再没执行过。生产实测:`account/user/detail` 三小时 5145 次调用中
+    /// 732 次是这个错误码。它不只是没用,它还在替真正的调用方掩盖问题——上层拿到 `None`
+    /// 时无法区分「这个人不存在」和「我刚偷偷问了一次但被拒了」。
+    ///
+    /// 正确的补拉入口是 Kotlin 侧的 `getUserProfileLocalFirst(user_id, context)`:它由
+    /// **有上下文的调用方**声明真实来源(会话里传 `Conversation(channel_id)`、群成员列表传
+    /// `Group(group_id)`),没有合法来源时按 `Unknown` 只读本地、根本不发请求。一个拿不到
+    /// 上下文的底层函数没有资格代它编一个。
     pub async fn get_user_by_id(
         &self,
         user_id: u64,
     ) -> Result<Option<StoredUser>, PrivchatFfiError> {
-        // 1. 优先本地缓存
-        if let Some(user) = self
-            .inner
-            .get_user_by_id(user_id)
-            .await
-            .map_err(PrivchatFfiError::from)?
-        {
-            return Ok(Some(map_stored_user(user)));
-        }
-
-        // 2. 本地没有 → RPC 拉远程
-        let remote: Option<AccountUserDetailResponse> = rpc_call_typed(
-            &self.inner,
-            routes::account_user::DETAIL,
-            &AccountUserDetailRequest {
-                target_user_id: user_id,
-                source: "user_cache".to_string(),
-                source_id: user_id.to_string(),
-                user_id: 0,
-            },
-        )
-        .await
-        .ok();
-
-        let Some(remote) = remote else {
-            return Ok(None);
-        };
-
-        // 3. 写回本地 user 表
-        let updated_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.inner
-            .upsert_user(SdkUpsertUserInput {
-                user_id,
-                username: Some(remote.username).filter(|s| !s.is_empty()),
-                nickname: Some(remote.nickname).filter(|s| !s.is_empty()),
-                alias: None,
-                avatar: remote.avatar_url.unwrap_or_default(),
-                user_type: remote.user_type as i32,
-                is_deleted: false,
-                channel_id: String::new(),
-                version: 0,
-                updated_at,
-            })
-            .await
-            .map_err(PrivchatFfiError::from)?;
-
-        // 4. 返回刚写入的数据
         let user = self
             .inner
             .get_user_by_id(user_id)
