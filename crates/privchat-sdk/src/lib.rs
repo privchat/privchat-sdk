@@ -2951,6 +2951,8 @@ struct AntiEntropyPage {
     messages_applied: usize,
     /// 本页发现但因预算未修的 stale 频道数
     deferred: usize,
+    /// 本页中服务端没有 PTS 的频道数（异常规模指标，非正常态）
+    unknown_channels: usize,
     cycle_completed: bool,
 }
 
@@ -2979,6 +2981,11 @@ struct AntiEntropyPlan {
     last_consumed: Option<(u64, i32)>,
     stale_found: usize,
     deferred: usize,
+    /// 批量比对成功但服务端没有 PTS 的频道数。
+    ///
+    /// 跳过它们是对的（否则游标卡死），但**必须计数**：服务端数据缺失、
+    /// 已删除频道、本地脏数据会被同一条路径吞掉，不记数就看不出异常规模。
+    unknown_channels: usize,
 }
 
 fn plan_anti_entropy_page(
@@ -2996,6 +3003,7 @@ fn plan_anti_entropy_page(
             // `scanned=0 deferred=1` 每 80ms 刷一次、永不收敛（deferred != 0
             // 让 is_converged() 恒假）。批量请求本身失败会在调用处 `?` 返回，
             // 走不到这里，所以缺失只可能是「服务端没有」。
+            plan.unknown_channels += 1;
             plan.consumed += 1;
             plan.last_consumed = Some(observation.key);
             continue;
@@ -8512,6 +8520,7 @@ impl State {
                 channels_repaired: 0,
                 messages_applied: 0,
                 deferred: 0,
+                unknown_channels: 0,
                 cycle_completed: true,
             });
         }
@@ -8577,6 +8586,7 @@ impl State {
             channels_repaired,
             messages_applied,
             stale_found = plan.stale_found,
+            unknown_channels = plan.unknown_channels,
             deferred = plan.deferred,
             cycle_completed,
             "anti-entropy channel page completed"
@@ -8584,6 +8594,7 @@ impl State {
         Ok(AntiEntropyPage {
             page_scanned: plan.consumed,
             stale_found: plan.stale_found,
+            unknown_channels: plan.unknown_channels,
             channels_repaired,
             messages_applied,
             deferred: plan.deferred,
@@ -8621,7 +8632,7 @@ impl State {
         let mut stats = ResumeRunStats::default();
         self.resume_run_id = self.resume_run_id.wrapping_add(1);
         let run_id = self.resume_run_id;
-        eprintln!("[SDK.resume] run={run_id} phase=2 begin");
+        println!("[SDK.resume] run={run_id} phase=2 begin");
         self.queue_resume_started();
         if let Err(err) = self.send_session_ready().await {
             let _ = self
@@ -8674,7 +8685,9 @@ impl State {
         //
         // 开启 Phase 3。这里只置标志，实际收敛由 actor loop 的 repair_tick 驱动，
         // 一轮修一小批（有界预算），不阻塞命令处理，也不霸占 actor。
-        eprintln!(
+        // println! 而非 eprintln!：Android 的 logcat 收不到 stderr，
+        // 而这些打点的用途正是生产排查。
+        println!(
             "[SDK.resume] run={run_id} phase=2 done entity_types={} (critical path complete)",
             stats.entity_types_synced
         );
@@ -11577,6 +11590,11 @@ impl PrivchatSdk {
             // repair tick 比 health tick 快:损坏的图片/顺序应当尽快自愈,但仍然是
             // **后台**节奏——读路径只入队,一次 tick 最多处理 REPAIR_BATCH_LIMIT 条。
             let mut repair_tick = interval(Duration::from_secs(2));
+            // Burst（默认）会把错过的 tick 补齐：后台收敛一轮跑几秒（429 会话账号每页
+            // 要 200 次本地读 + 一次批量 RPC + 最多 8 个 difference），错过的 tick 于是
+            // 连续就绪，actor 再也回不到命令处理 —— 宿主的 ensure_synced 永远收不到应答，
+            // 界面卡在「同步中」。Skip：迟到的 tick 直接丢，只保留下一次。
+            repair_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 // Backoff driver: fires when `next_reconnect_at` is due. When no retry
@@ -11666,6 +11684,15 @@ impl PrivchatSdk {
                         // Phase 3 后台收敛：一次一小批 stale 频道（run_anti_entropy_once
                         // 内部用 batch_get_channel_pts 批量比对 + WiFi/蜂窝预算）。
                         // 失败只退避重试，**不动 readiness** —— 用户此刻能正常收发。
+                        //
+                        // 命令优先：队列里有待处理命令时不开新一轮。收敛是后台工作，
+                        // 让宿主等应答（进而卡住界面）是本末倒置。
+                        if !rx.is_empty()
+                            && state.session_state == SessionState::Authenticated
+                            && state.convergence_run.is_some()
+                        {
+                            continue;
+                        }
                         if state.session_state == SessionState::Authenticated
                             && state.convergence_run.is_some()
                         {
@@ -11675,7 +11702,7 @@ impl PrivchatSdk {
                                 // 过早宣布完成，后面的频道再也不会被检查。
                                 Ok(page) if page.is_converged() => {
                                     if let Some(stats) = state.convergence_run.take() {
-                                        eprintln!(
+                                        println!(
                                             "[SDK.resume] run={} phase=3 converged scanned={} channels_repaired={} messages_applied={}",
                                             state.resume_run_id,
                                             page.page_scanned,
@@ -11692,15 +11719,20 @@ impl PrivchatSdk {
                                     }
                                 }
                                 Ok(page) => {
-                                    if page.stale_found > 0 || page.deferred > 0 {
-                                        eprintln!(
-                                            "[SDK.resume] run={} phase=3 page scanned={} stale={} channels_repaired={} messages_applied={} deferred={}",
+                                    // unknown 不为零也要出声：那是异常规模指标
+                                    if page.stale_found > 0
+                                        || page.deferred > 0
+                                        || page.unknown_channels > 0
+                                    {
+                                        println!(
+                                            "[SDK.resume] run={} phase=3 page scanned={} stale={} channels_repaired={} messages_applied={} deferred={} unknown={}",
                                             state.resume_run_id,
                                             page.page_scanned,
                                             page.stale_found,
                                             page.channels_repaired,
                                             page.messages_applied,
-                                            page.deferred
+                                            page.deferred,
+                                            page.unknown_channels
                                         );
                                     }
                                     state.sync_coordinator.set_convergence(
@@ -11729,6 +11761,8 @@ impl PrivchatSdk {
                                     event,
                                 );
                             }
+                            // 让调度器有机会把排队的命令喂进来
+                            tokio::task::yield_now().await;
                         }
                         continue;
                     }
@@ -17817,6 +17851,7 @@ mod tests {
             channels_repaired: 0,
             messages_applied: 0,
             deferred: 0,
+            unknown_channels: 0,
             cycle_completed: false,
         };
         assert!(!mid_cycle.is_converged(), "游标停在中间就宣布收敛了");
@@ -17828,6 +17863,7 @@ mod tests {
             channels_repaired: 8,
             messages_applied: 80,
             deferred: 1,
+            unknown_channels: 0,
             cycle_completed: false,
         };
         assert!(!deferred.is_converged(), "还有 stale 没修就宣布收敛了");
@@ -17840,6 +17876,7 @@ mod tests {
             // 应用消息数与频道数无关，不能拿它参与收敛判定。
             messages_applied: 37,
             deferred: 0,
+            unknown_channels: 0,
             cycle_completed: true,
         };
         assert!(clean.is_converged());
@@ -17851,6 +17888,7 @@ mod tests {
             channels_repaired: 0,
             messages_applied: 0,
             deferred: 0,
+            unknown_channels: 0,
             cycle_completed: true,
         };
         assert!(empty.is_converged());
