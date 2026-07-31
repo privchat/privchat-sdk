@@ -697,12 +697,6 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-
-
-
-
-
-
     pub async fn create_local_message(
         &self,
         local_message_id: u64,
@@ -1055,7 +1049,6 @@ impl StorageHandle {
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
-
 
     pub async fn update_message_content(&self, message_id: u64, content: &str) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -2316,7 +2309,11 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             status,
             resp,
         } => {
-            with_uid!(resp, |uid| store.outbox_reject(&uid, local_message_id, status));
+            with_uid!(resp, |uid| store.outbox_reject(
+                &uid,
+                local_message_id,
+                status
+            ));
         }
         StorageCmd::OutboxReconcileSent {
             local_message_id,

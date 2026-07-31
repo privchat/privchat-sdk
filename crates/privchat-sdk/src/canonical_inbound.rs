@@ -230,12 +230,20 @@ impl CanonicalInboundMessage {
     ///
     /// `status` 由调用方给：同一条消息 history 回填是「已确认」，而乐观发送那条在
     /// ACK 之前是 pending——这是真实差异，不属于 canonical model。
-    pub fn to_upsert_input(&self, status: i32, mime_type: Option<String>) -> UpsertRemoteMessageInput {
+    pub fn to_upsert_input(
+        &self,
+        status: i32,
+        mime_type: Option<String>,
+    ) -> UpsertRemoteMessageInput {
         UpsertRemoteMessageInput {
             server_message_id: self.server_message_id,
             local_message_id: self.local_message_id,
             channel_id: self.channel_id,
-            channel_type: if self.channel_type == 0 { 1 } else { self.channel_type },
+            channel_type: if self.channel_type == 0 {
+                1
+            } else {
+                self.channel_type
+            },
             timestamp: self.sent_at_ms,
             from_uid: self.from_uid,
             message_type: self.message_type,
@@ -354,7 +362,6 @@ impl CanonicalInboundMessage {
             revoked: false,
         }
     }
-
 }
 
 #[cfg(test)]

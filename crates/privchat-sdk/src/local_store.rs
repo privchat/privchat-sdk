@@ -3962,7 +3962,6 @@ impl LocalStore {
         payload: &[u8],
         route_key: Option<&str>,
     ) -> Result<()> {
-
         let mut conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let tx = conn
@@ -4047,8 +4046,7 @@ impl LocalStore {
             let db = Self::open_db(db_path)?;
             let mut done: Vec<Vec<u8>> = Vec::new();
             for row in db.iter() {
-                let (k, v) = row
-                    .map_err(|e| Error::Storage(format!("legacy queue iter: {e}")))?;
+                let (k, v) = row.map_err(|e| Error::Storage(format!("legacy queue iter: {e}")))?;
                 let Ok(key) = <[u8; 8]>::try_from(k.as_ref()) else {
                     // 不是 8 字节的键说明这条记录本身就坏了，重试一万次也还是
                     // 坏的。丢掉并计数，不能既不搬走也不删除——那会被当成
@@ -5188,11 +5186,7 @@ impl LocalStore {
     }
 
     #[cfg(test)]
-    fn legacy_queue_path<'a>(
-        &self,
-        paths: &'a StoragePaths,
-        kind: LegacyQueueKind,
-    ) -> &'a Path {
+    fn legacy_queue_path<'a>(&self, paths: &'a StoragePaths, kind: LegacyQueueKind) -> &'a Path {
         match kind {
             LegacyQueueKind::Normal => paths.normal_queue_path.as_path(),
             LegacyQueueKind::File => paths
@@ -5492,8 +5486,6 @@ mod tests {
         assert_eq!(remain, 0);
     }
 
-
-
     #[test]
     fn message_lifecycle_uses_message_id_pk() {
         let store = test_store();
@@ -5674,7 +5666,10 @@ mod tests {
             .get_message_by_id(uid, id)
             .expect("load")
             .expect("exists");
-        assert_eq!(row.status, 1, "命令已落库，所以「发送中」从第一刻起就是真的");
+        assert_eq!(
+            row.status, 1,
+            "命令已落库，所以「发送中」从第一刻起就是真的"
+        );
         let queued = store
             .outbox_peek(uid, "message", 10, i64::MAX)
             .expect("peek");
@@ -5690,7 +5685,10 @@ mod tests {
         let err = store
             .create_local_message_queued(uid, &input, 555_001, "message", b"payload", None)
             .unwrap_err();
-        assert!(format!("{err}").contains("command"), "应当是命令写入失败: {err}");
+        assert!(
+            format!("{err}").contains("command"),
+            "应当是命令写入失败: {err}"
+        );
         assert_eq!(
             store
                 .list_messages(uid, 100, 1, 100, 0)
@@ -5788,7 +5786,9 @@ mod tests {
         assert_eq!(extra_version, 9, "message_extra 取版本更新的那份");
 
         let dup_left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM message WHERE id = 2", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM message WHERE id = 2", [], |r| {
+                r.get(0)
+            })
             .expect("count dup");
         assert_eq!(dup_left, 0, "重复行最后才删");
 
@@ -5940,9 +5940,7 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].0, id);
 
-        store
-            .outbox_ack_sent(uid, id, 900_777, 42)
-            .expect("ack");
+        store.outbox_ack_sent(uid, id, 900_777, 42).expect("ack");
 
         let row = store
             .get_message_by_id(uid, id)
@@ -6238,7 +6236,10 @@ mod tests {
         // 失败后进入退避：退避期内不再排队（离线时不空转）。
         backoff.insert(
             key,
-            (1, std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            (
+                1,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ),
         );
         enqueue(&mut queue, &mut seen, &backoff, key);
         assert!(queue.is_empty(), "退避期内仍然重新排队了");
@@ -6246,7 +6247,10 @@ mod tests {
         // 退避到期后可以再排（网络恢复后由下一次读取重新发现）。
         backoff.insert(
             key,
-            (1, std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            (
+                1,
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            ),
         );
         enqueue(&mut queue, &mut seen, &backoff, key);
         assert_eq!(queue.len(), 1, "退避到期后没有恢复排队");
@@ -6322,12 +6326,12 @@ mod tests {
     /// 其中一份。
     #[test]
     fn display_order_matches_the_typescript_fixture() {
-        let raw = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../privchat-docs/fixtures/display-order.json"),
-        )
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../privchat-docs/fixtures/display-order.json"
+        ))
         .expect("read shared display-order fixture");
-        let fixture: serde_json::Value =
-            serde_json::from_str(&raw).expect("parse shared fixture");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("parse shared fixture");
 
         let store = test_store();
         let uid = "10099";

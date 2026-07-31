@@ -598,7 +598,10 @@ mod tests {
         c.fail(SyncRunKind::Resume, true, Some(10002), "auth".into(), 0);
         c.note_explicit_request();
         assert!(
-            matches!(c.begin(SyncRunKind::Resume, 10), Err(SyncBeginRejection::Terminal)),
+            matches!(
+                c.begin(SyncRunKind::Resume, 10),
+                Err(SyncBeginRejection::Terminal)
+            ),
             "终态等的是重新登录，不是再喊一遍"
         );
     }

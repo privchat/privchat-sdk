@@ -80,8 +80,8 @@ const REPAIR_BACKOFF_BASE_MS: u64 = 2_000;
 const REPAIR_BACKOFF_MAX_SHIFT: u32 = 6;
 
 pub mod attachment_crypto;
-pub mod canonical_inbound;
 mod avatar_cache;
+pub mod canonical_inbound;
 pub mod error_codes;
 mod local_store;
 pub mod media_download;
@@ -98,7 +98,9 @@ use storage_actor::StorageHandle;
 use sync_commit_applier::SyncCommitApplier;
 use sync_coordinator::SyncCoordinator;
 // Convergence 刻意不导出：它是 SDK 内部维度，不进公共 API / FFI ABI。
-pub use sync_coordinator::{CriticalFailureCode, Readiness, SyncPhase, SyncRunKind, SyncStateSnapshot};
+pub use sync_coordinator::{
+    CriticalFailureCode, Readiness, SyncPhase, SyncRunKind, SyncStateSnapshot,
+};
 use task::task_registry::TaskRegistry;
 
 /// 下载票据：下载前由 `file/get_url` 解析（file_id 路径），或由 legacy file_url 构造
@@ -5970,10 +5972,8 @@ impl State {
                             pts,
                             timestamp,
                         );
-                    let mime_type = Self::extract_mime_type_from_json(
-                        &canonical.content,
-                        &canonical.extra,
-                    );
+                    let mime_type =
+                        Self::extract_mime_type_from_json(&canonical.content, &canonical.extra);
                     let extra_for_thumb = canonical.extra.clone();
                     let mut input = canonical.to_upsert_input(status, mime_type);
                     input.setting = setting;
@@ -6707,7 +6707,7 @@ impl State {
                             kind: "normal".to_string(),
                             action: "commit_retry".to_string(),
                             message_id: Some(message_id),
-                            });
+                        });
                         return Err(err);
                     }
                     let last_ts = if msg.created_at > 0 {
@@ -6767,7 +6767,7 @@ impl State {
                             kind: "normal".to_string(),
                             action: "dequeue_reconciled".to_string(),
                             message_id: Some(message_id),
-                            });
+                        });
                         self.pending_events
                             .push(SdkEvent::MessageSendStatusChanged {
                                 message_id,
@@ -6801,7 +6801,7 @@ impl State {
                             kind: "normal".to_string(),
                             action: format!("deferred:{}", e),
                             message_id: Some(message_id),
-                            });
+                        });
                         break;
                     }
                     eprintln!(
@@ -6899,7 +6899,7 @@ impl State {
                             kind: "file".to_string(),
                             action: "commit_retry".to_string(),
                             message_id: Some(message_id),
-                            });
+                        });
                         return Err(err);
                     }
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
@@ -6938,7 +6938,7 @@ impl State {
                             kind: "file".to_string(),
                             action: "dequeue_reconciled".to_string(),
                             message_id: Some(message_id),
-                            });
+                        });
                         self.pending_events
                             .push(SdkEvent::MessageSendStatusChanged {
                                 message_id,
@@ -6975,7 +6975,7 @@ impl State {
                             kind: "file".to_string(),
                             action: format!("deferred:{}", e),
                             message_id: Some(message_id),
-                            });
+                        });
                         break;
                     }
                     eprintln!(
@@ -8123,11 +8123,14 @@ impl State {
 
     fn note_repair_failure(&mut self, key: (i32, u64, u64), reason: &str) {
         let attempts = self.repair_backoff.get(&key).map(|(n, _)| *n).unwrap_or(0) + 1;
-        let delay = REPAIR_BACKOFF_BASE_MS
-            .saturating_mul(1u64 << attempts.min(REPAIR_BACKOFF_MAX_SHIFT));
+        let delay =
+            REPAIR_BACKOFF_BASE_MS.saturating_mul(1u64 << attempts.min(REPAIR_BACKOFF_MAX_SHIFT));
         self.repair_backoff.insert(
             key,
-            (attempts, std::time::Instant::now() + Duration::from_millis(delay)),
+            (
+                attempts,
+                std::time::Instant::now() + Duration::from_millis(delay),
+            ),
         );
         tracing::warn!(
             server_message_id = key.2,
@@ -8694,8 +8697,10 @@ impl State {
         // stats 交给 Phase 3：ResumeSyncCompleted 只在真正全量收敛后发一次。
         // 在这里发过一次是漏删——那会让宿主以为整轮结束，而收敛才刚开始。
         self.convergence_run = Some(stats);
-        self.sync_coordinator
-            .set_convergence(crate::sync_coordinator::Convergence::Scanning, chrono::Utc::now().timestamp_millis());
+        self.sync_coordinator.set_convergence(
+            crate::sync_coordinator::Convergence::Scanning,
+            chrono::Utc::now().timestamp_millis(),
+        );
         Ok(())
     }
 
@@ -15986,7 +15991,6 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-
     /// 重发一条失败的消息。**消息生命周期编排属于 Core**（SDK_LAYERED spec §4.1），
     /// FFI 只做薄委托，不得维护第二套重试状态机。
     ///
@@ -16022,7 +16026,9 @@ impl PrivchatSdk {
             let route_key = self.file_route_key.as_ref().clone().ok_or_else(|| {
                 Error::InvalidState("no endpoint configured for attachment retry".to_string())
             })?;
-            return self.enqueue_outbound_attachment(message_id, route_key).await;
+            return self
+                .enqueue_outbound_attachment(message_id, route_key)
+                .await;
         }
 
         self.enqueue_outbound_message(message_id, Vec::new()).await
@@ -17425,7 +17431,10 @@ impl PrivchatSdk {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(Command::EnsureMessageThumbnail { message_id, resp: resp_tx })
+            .send(Command::EnsureMessageThumbnail {
+                message_id,
+                resp: resp_tx,
+            })
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
@@ -17497,14 +17506,13 @@ mod tests {
 
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
-        outbound_queue_ready,
-        group_settings_key, Action, AuthErrorKind, CanonicalTimelineEvent, ConnectionState,
-        ContentMessageType, Error, ErrorCode, LoginResult, MessageCachePolicy, NetworkHint,
-        NewMessage, PresenceStatus, PrivchatConfig, PrivchatSdk, ResumeEscalationScope,
-        ResumeFailureClass, ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State,
-        SyncCoordinator, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
-        UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertRemoteMessageInput,
-        UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
+        group_settings_key, outbound_queue_ready, Action, AuthErrorKind, CanonicalTimelineEvent,
+        ConnectionState, ContentMessageType, Error, ErrorCode, LoginResult, MessageCachePolicy,
+        NetworkHint, NewMessage, PresenceStatus, PrivchatConfig, PrivchatSdk,
+        ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, ServerCommit,
+        SessionState, State, SyncCoordinator, UpsertChannelInput, UpsertFriendInput,
+        UpsertGroupInput, UpsertGroupMemberInput, UpsertMessageReactionInput,
+        UpsertRemoteMessageInput, UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
     };
     use crate::local_store::LocalStore;
     use crate::receive_pipeline::ReceivePipeline;
@@ -17612,9 +17620,7 @@ mod tests {
         store
             .corrupt_session_for_test("10002")
             .expect("corrupt target session");
-        store
-            .save_current_uid("10001")
-            .expect("seed active uid");
+        store.save_current_uid("10001").expect("seed active uid");
         drop(store);
 
         let mut config = PrivchatConfig::default();
@@ -17655,7 +17661,10 @@ mod tests {
 
         let accounts = sdk.list_local_accounts().await.expect("list accounts");
         assert_eq!(
-            accounts.iter().find(|a| a.is_active).map(|a| a.uid.as_str()),
+            accounts
+                .iter()
+                .find(|a| a.is_active)
+                .map(|a| a.uid.as_str()),
             Some("10001"),
         );
         assert!(sdk.is_bootstrap_completed().await.expect("query bootstrap"));
@@ -17695,7 +17704,10 @@ mod tests {
 
         let accounts = sdk.list_local_accounts().await.expect("list accounts");
         assert_eq!(
-            accounts.iter().find(|a| a.is_active).map(|a| a.uid.as_str()),
+            accounts
+                .iter()
+                .find(|a| a.is_active)
+                .map(|a| a.uid.as_str()),
             Some("10002"),
         );
         // 新账号自己的 bootstrap 状态，不是继承旧账号的。
@@ -17920,13 +17932,24 @@ mod tests {
     fn unknown_server_channel_does_not_stall_the_cursor() {
         let observations = vec![
             // 服务端没有它（已删除 / 非消息频道）
-            AntiEntropyObservation { key: (7, 1), local_pts: 3, server_pts: None },
+            AntiEntropyObservation {
+                key: (7, 1),
+                local_pts: 3,
+                server_pts: None,
+            },
             // 它后面还有真正需要修的
-            AntiEntropyObservation { key: (8, 1), local_pts: 3, server_pts: Some(9) },
+            AntiEntropyObservation {
+                key: (8, 1),
+                local_pts: 3,
+                server_pts: Some(9),
+            },
         ];
 
         let plan = plan_anti_entropy_page(&observations, 8);
-        assert_eq!(plan.deferred, 0, "服务端缺失被当成了「待修」，会让收敛永不完成");
+        assert_eq!(
+            plan.deferred, 0,
+            "服务端缺失被当成了「待修」，会让收敛永不完成"
+        );
         assert_eq!(
             plan.last_consumed,
             Some((8, 1)),
@@ -17955,7 +17978,6 @@ mod tests {
         assert_eq!(second.last_consumed, Some((12, 1)));
         assert_eq!(second.deferred, 0);
     }
-
 
     // ==================== 账号切换：会话作用域隔离 ====================
     //
@@ -17989,7 +18011,10 @@ mod tests {
         // A 正在重连 + sync 已经失败进了退避。
         state.should_auto_reconnect = true;
         state.reconnect_attempt = 5;
-        state.sync_coordinator.begin(SyncRunKind::Resume, 0).unwrap();
+        state
+            .sync_coordinator
+            .begin(SyncRunKind::Resume, 0)
+            .unwrap();
         state.sync_coordinator.fail(
             SyncRunKind::Resume,
             false,
@@ -18005,7 +18030,10 @@ mod tests {
             "切换后仍开着自动重连：A 的失败会继续驱动 B 的重连"
         );
         assert_eq!(state.reconnect_attempt, 0);
-        assert_eq!(state.sync_coordinator.snapshot().readiness, Readiness::Disconnected);
+        assert_eq!(
+            state.sync_coordinator.snapshot().readiness,
+            Readiness::Disconnected
+        );
         assert_eq!(state.sync_coordinator.snapshot().attempt, 0);
     }
 
@@ -18016,7 +18044,10 @@ mod tests {
     async fn switching_back_can_sync_immediately_without_a_cold_start() {
         let (mut state, _dir) = new_seeded_state("switch-back").await;
         // 上一个账号留下一个终态失败 + 一段退避。
-        state.sync_coordinator.begin(SyncRunKind::Resume, 0).unwrap();
+        state
+            .sync_coordinator
+            .begin(SyncRunKind::Resume, 0)
+            .unwrap();
         state.sync_coordinator.fail(
             SyncRunKind::Resume,
             true,
@@ -18028,7 +18059,10 @@ mod tests {
         state.reset_session_scoped_state(1_000);
 
         assert!(
-            state.sync_coordinator.begin(SyncRunKind::Bootstrap, 1_001).is_ok(),
+            state
+                .sync_coordinator
+                .begin(SyncRunKind::Bootstrap, 1_001)
+                .is_ok(),
             "切回来还被上一个账号的终态/退避挡着 —— 只能靠冷启动恢复"
         );
     }
@@ -18039,19 +18073,25 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn switching_clears_every_session_scoped_structure() {
         let (mut state, _dir) = new_seeded_state("switch-clear").await;
-        state.active_subscriptions.insert((45, 1), Some("tok".into()));
+        state
+            .active_subscriptions
+            .insert((45, 1), Some("tok".into()));
         state.update_presence_cache(&[]);
         state
             .room_seen_msg_ids
             .insert(45, VecDeque::from(vec![604_621_803_637_178_368]));
         state.channel_cache_total_bytes = 4096;
         state.cache_hit_count = 12;
-        state.repair_queue.push_back((1, 45, 604_621_803_637_178_368));
+        state
+            .repair_queue
+            .push_back((1, 45, 604_621_803_637_178_368));
         state.repair_seen.insert((1, 45, 604_621_803_637_178_368));
         state
             .repair_backoff
             .insert((1, 45, 1), (3, std::time::Instant::now()));
-        state.pending_prelogin_inbound_frames.push((7, vec![1, 2, 3]));
+        state
+            .pending_prelogin_inbound_frames
+            .push((7, vec![1, 2, 3]));
         state.last_resume_synced = Some((7, Instant::now()));
         state.last_sync_queued = 9;
         state.pending_events.push(SdkEvent::SyncStateChanged {
@@ -18096,7 +18136,10 @@ mod tests {
 
             epochs.push(state.inbound_epoch);
             generations.push(state.sync_coordinator.generation());
-            assert!(state.active_subscriptions.is_empty(), "第 {round} 轮订阅残留");
+            assert!(
+                state.active_subscriptions.is_empty(),
+                "第 {round} 轮订阅残留"
+            );
             assert!(state.repair_seen.is_empty(), "第 {round} 轮 repair 残留");
             assert!(!state.should_auto_reconnect, "第 {round} 轮仍开着自动重连");
         }
@@ -18141,14 +18184,11 @@ mod tests {
         let wakeup = state.switch_wakeup.clone();
         let started = std::time::Instant::now();
 
-        let (result, _) = tokio::join!(
-            state.ensure_synced(|_| {}),
-            async move {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                requested.fetch_add(1, Ordering::SeqCst);
-                wakeup.notify_waiters();
-            },
-        );
+        let (result, _) = tokio::join!(state.ensure_synced(|_| {}), async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            requested.fetch_add(1, Ordering::SeqCst);
+            wakeup.notify_waiters();
+        },);
         result.expect("ensure_synced");
 
         assert!(
@@ -18164,7 +18204,11 @@ mod tests {
             snapshot.attempt, 0,
             "被打断的一轮把 attempt 写了回去，新账号会背上它"
         );
-        assert_ne!(snapshot.readiness, Readiness::Ready, "被打断的一轮被记成同步成功了");
+        assert_ne!(
+            snapshot.readiness,
+            Readiness::Ready,
+            "被打断的一轮被记成同步成功了"
+        );
     }
 
     /// 让出之后闸门必须重新打开：新账号的同步要能照常开工。
@@ -18178,7 +18222,10 @@ mod tests {
         // 切换命令被取走 = 销账；新账号这一轮不该再被「有切换排队」挡住。
         state.switch_processed.fetch_add(1, Ordering::SeqCst);
         state.sync_stall_for_test = None;
-        assert!(!state.switch_is_pending(), "切换已处理，闸门却仍认为有请求在排队");
+        assert!(
+            !state.switch_is_pending(),
+            "切换已处理，闸门却仍认为有请求在排队"
+        );
 
         // 这一轮会真的去跑同步（没有服务端，失败是预期的）——要证的是它**开工了**，
         // 而不是被闸门挡回来。
@@ -18198,7 +18245,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_stale_sync_result_is_dropped_after_the_owner_changed() {
         let (mut state, _dir) = new_seeded_state("switch-stale-result").await;
-        state.sync_coordinator.begin(SyncRunKind::Resume, 0).unwrap();
+        state
+            .sync_coordinator
+            .begin(SyncRunKind::Resume, 0)
+            .unwrap();
         let generation_at_start = state.sync_coordinator.generation();
 
         // sync 还在 await 里，账号被切走。
@@ -18383,9 +18433,17 @@ mod tests {
         );
 
         // 缺 transport:真断网/重连中,发不出去,等重连后再排。
-        assert!(!outbound_queue_ready(SessionState::Authenticated, true, false));
+        assert!(!outbound_queue_ready(
+            SessionState::Authenticated,
+            true,
+            false
+        ));
         // 缺 uid:没有当前用户,无从发送。
-        assert!(!outbound_queue_ready(SessionState::Authenticated, false, true));
+        assert!(!outbound_queue_ready(
+            SessionState::Authenticated,
+            false,
+            true
+        ));
         // 未鉴权的通道(握好 TCP 但 ConnAuth 未回)上 drain 只会撞 10000,必须等 Authenticated。
         for st in [
             SessionState::New,
@@ -20741,11 +20799,18 @@ mod tests {
             .await
             .expect("create local attachment message");
 
-        let returned = sdk.retry_message(message_id).await.expect("retry attachment");
+        let returned = sdk
+            .retry_message(message_id)
+            .await
+            .expect("retry attachment");
         assert_eq!(returned, message_id);
 
         let files = retry_test_file_items(&sdk).await;
-        assert_eq!(files.len(), 1, "attachment must land in the attachment outbox");
+        assert_eq!(
+            files.len(),
+            1,
+            "attachment must land in the attachment outbox"
+        );
         assert_eq!(files[0].message_id, message_id);
         // 早期版本把源文件字节复制进队列 payload。主发送路径
         // (`finalize_attachment_and_enqueue`) 从来不这样做——字节留在托管路径
@@ -20867,14 +20932,19 @@ mod tests {
             ))
             .await
             .expect("create local attachment message");
-        sdk.retry_message(message_id).await.expect("retry attachment");
+        sdk.retry_message(message_id)
+            .await
+            .expect("retry attachment");
         sdk.shutdown().await;
 
         let reopened = retry_test_sdk(&dir).await;
         let files = retry_test_file_items(&reopened).await;
         assert_eq!(files.len(), 1, "queued retry must survive a restart");
         assert_eq!(files[0].message_id, message_id);
-        assert!(files[0].payload.is_empty(), "bytes stay on disk, not in the row");
+        assert!(
+            files[0].payload.is_empty(),
+            "bytes stay on disk, not in the row"
+        );
         let row = reopened
             .get_message_by_id(message_id)
             .await
