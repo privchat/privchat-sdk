@@ -2304,6 +2304,11 @@ enum Command {
     GetConnectionState {
         resp: oneshot::Sender<Result<ConnectionState>>,
     },
+    #[cfg(test)]
+    SetSessionStateForTest {
+        session_state: SessionState,
+        resp: oneshot::Sender<()>,
+    },
     /// 读取最近一次 Terminal 认证错误快照（`None` = 当前没有未清的 ForcedLogout 记录）。
     GetLastTerminalReason {
         resp: oneshot::Sender<Result<Option<TerminalReason>>>,
@@ -2858,6 +2863,51 @@ enum Action {
     Login,
     Authenticate,
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectPlan {
+    AlreadyReady,
+    RestorePersistedSession,
+    ConnectTransportOnly,
+}
+
+fn plan_connect(
+    session_state: SessionState,
+    has_local_session: bool,
+    transport_connected: bool,
+) -> Result<ConnectPlan> {
+    if session_state == SessionState::Shutdown {
+        return Err(Error::Shutdown);
+    }
+    if session_state == SessionState::Authenticated && transport_connected {
+        return Ok(ConnectPlan::AlreadyReady);
+    }
+    if has_local_session {
+        Ok(ConnectPlan::RestorePersistedSession)
+    } else {
+        Ok(ConnectPlan::ConnectTransportOnly)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticateTransportPlan {
+    UseCurrent,
+    ReconnectTransport,
+}
+
+fn plan_authenticate_transport(
+    session_state: SessionState,
+    transport_connected: bool,
+) -> Result<AuthenticateTransportPlan> {
+    if session_state == SessionState::Shutdown {
+        return Err(Error::Shutdown);
+    }
+    if !transport_connected {
+        return Ok(AuthenticateTransportPlan::ReconnectTransport);
+    }
+    session_state.can(Action::Authenticate)?;
+    Ok(AuthenticateTransportPlan::UseCurrent)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -11592,6 +11642,8 @@ impl PrivchatSdk {
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut health_tick = interval(Duration::from_secs(15));
+            #[allow(unused_mut)]
+            let mut health_tick_enabled = true;
             // repair tick 比 health tick 快:损坏的图片/顺序应当尽快自愈,但仍然是
             // **后台**节奏——读路径只入队,一次 tick 最多处理 REPAIR_BATCH_LIMIT 条。
             let mut repair_tick = interval(Duration::from_secs(2));
@@ -11771,7 +11823,7 @@ impl PrivchatSdk {
                         }
                         continue;
                     }
-                    _ = health_tick.tick() => {
+                    _ = health_tick.tick(), if health_tick_enabled => {
                         if state.session_state == SessionState::Shutdown {
                             continue;
                         }
@@ -12047,8 +12099,31 @@ impl PrivchatSdk {
                             state.should_auto_reconnect = true;
                             let from_state = state.session_state.as_connection_state();
                             let had_local_session = state.current_uid.is_some();
-                            let was_authenticated =
-                                state.session_state == SessionState::Authenticated;
+                            let transport_connected = state.is_connected().await;
+                            let plan = plan_connect(
+                                state.session_state,
+                                had_local_session,
+                                transport_connected,
+                            );
+                            let already_ready =
+                                matches!(&plan, Ok(ConnectPlan::AlreadyReady));
+                            let mut transition_from = from_state;
+
+                            // Queries are observers. Explicit connect is the intent boundary
+                            // that reconciles a stale logical session with transport reality.
+                            if !transport_connected {
+                                if let Some((from, to)) = state.apply_transport_health(false) {
+                                    stop_inbound_task(&mut inbound_task).await;
+                                    emit_sequenced_event(
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        SdkEvent::ConnectionStateChanged { from, to },
+                                    );
+                                    transition_from = to;
+                                }
+                            }
 
                             // 关键不变量：宿主在已登录场景下点 connect()（前台 fast-track / 网络
                             // 恢复 / 后台 disconnect 后回前台），final state 必须**仍是** Authenticated，
@@ -12067,31 +12142,36 @@ impl PrivchatSdk {
                             //
                             // 之前用过"先转 Connected 再尝试 auto-restore"两步法，transport 偶尔在
                             // `state.connect()` 内部短路没真正重建 → auto-restore race 到失败 → 卡 Connected。
-                            let result: Result<()> = if had_local_session {
-                                match state.try_auto_reconnect().await {
-                                    Ok(next) => {
-                                        state.session_state = next;
-                                        Ok(())
-                                    }
-                                    Err(e) => Err(e),
-                                }
-                            } else {
-                                // 冷启动且无本地 session（用户没登录过）/ logged out / forced：
-                                // 走简单 connect+transition；不 authenticate（没 session 可用）。
-                                match state.session_state.can(Action::Connect) {
-                                    Ok(next_state) => {
-                                        match timeout(state.connect_timeout_total(), state.connect()).await
-                                        {
-                                            Ok(r) => {
-                                                if r.is_ok() {
-                                                    state.session_state = next_state;
-                                                }
-                                                r
-                                            }
-                                            Err(_) => Err(Error::Transport("connect timeout".to_string())),
+                            let result: Result<()> = match plan {
+                                Err(e) => Err(e),
+                                Ok(ConnectPlan::AlreadyReady) => Ok(()),
+                                Ok(ConnectPlan::RestorePersistedSession) => {
+                                    match state.try_auto_reconnect().await {
+                                        Ok(next) => {
+                                            state.session_state = next;
+                                            Ok(())
                                         }
+                                        Err(e) => Err(e),
                                     }
-                                    Err(e) => Err(e),
+                                }
+                                Ok(ConnectPlan::ConnectTransportOnly) => {
+                                    // 冷启动且无本地 session（用户没登录过）/ logged out / forced：
+                                    // 走简单 connect+transition；不 authenticate（没 session 可用）。
+                                    match state.session_state.can(Action::Connect) {
+                                        Ok(next_state) => {
+                                            match timeout(state.connect_timeout_total(), state.connect()).await
+                                            {
+                                                Ok(r) => {
+                                                    if r.is_ok() {
+                                                        state.session_state = next_state;
+                                                    }
+                                                    r
+                                                }
+                                                Err(_) => Err(Error::Transport("connect timeout".to_string())),
+                                            }
+                                        }
+                                        Err(e) => Err(e),
+                                    }
                                 }
                             };
 
@@ -12108,18 +12188,24 @@ impl PrivchatSdk {
                                 // Terminal 错可以再次触发 ForcedLogout。
                                 state.auth_terminal_fired = false;
                                 state.last_terminal_reason = None;
-                                start_inbound_task(&mut state, actor_cmd_tx.clone(), &mut inbound_task)
+                                if !already_ready {
+                                    start_inbound_task(
+                                        &mut state,
+                                        actor_cmd_tx.clone(),
+                                        &mut inbound_task,
+                                    )
                                     .await;
-                                if realtime_trace_enabled() { eprintln!(
-                                    "[SDK_RECONNECT_OK] (connect-path) new_epoch={} state={:?} uid={:?}",
-                                    state.inbound_epoch, state.session_state, state.current_uid
-                                ); }
-                                // [硬化] 防御性 replay：push 帧可能在登录前缓冲，current_uid 恢复后立即重放。
-                                if let Err(err) = state.replay_prelogin_inbound_frames().await {
-                                    eprintln!("[SDK.actor] connect: prelogin replay failed: {err}");
+                                    if realtime_trace_enabled() { eprintln!(
+                                        "[SDK_RECONNECT_OK] (connect-path) new_epoch={} state={:?} uid={:?}",
+                                        state.inbound_epoch, state.session_state, state.current_uid
+                                    ); }
+                                    // [硬化] 防御性 replay：push 帧可能在登录前缓冲，current_uid 恢复后立即重放。
+                                    if let Err(err) = state.replay_prelogin_inbound_frames().await {
+                                        eprintln!("[SDK.actor] connect: prelogin replay failed: {err}");
+                                    }
+                                    // 重连后重放活跃订阅：恢复 presence_changed / typing / room 广播。
+                                    state.replay_subscriptions().await;
                                 }
-                                // 重连后重放活跃订阅：恢复 presence_changed / typing / room 广播。
-                                state.replay_subscriptions().await;
 
                                 // 若 try_auto_reconnect 把 session 拉回 Authenticated 且
                                 // bootstrap 早已完成，触发一次 resume_sync 把背景期间漏掉的
@@ -12133,16 +12219,19 @@ impl PrivchatSdk {
                                 // 连接中」——而连接其实早就建好、数据也正在回来。连接态是既成事实，
                                 // 不该等数据层动作完成才通知；同步进度本来就有 resume_sync_* 事件
                                 // 单独播报。
-                                emit_sequenced_event(
-                                    &actor_event_tx,
-                                    &actor_event_history,
-                                    &actor_event_seq,
-                                    event_history_limit,
-                                    SdkEvent::ConnectionStateChanged {
-                                        from: from_state,
-                                        to: state.session_state.as_connection_state(),
-                                    },
-                                );
+                                let to_state = state.session_state.as_connection_state();
+                                if transition_from != to_state {
+                                    emit_sequenced_event(
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        SdkEvent::ConnectionStateChanged {
+                                            from: transition_from,
+                                            to: to_state,
+                                        },
+                                    );
+                                }
 
                                 // 连接已就绪，先答复宿主再跑 resume sync。
                                 //
@@ -12153,7 +12242,6 @@ impl PrivchatSdk {
                                 // connect 的语义是「连接建立成功」，不该捎带数据层的耗时。
                                 let _ = resp.send(Ok(()));
 
-                                let _ = was_authenticated;
                                 if had_local_session
                                     && state.session_state == SessionState::Authenticated
                                     && state.bootstrap_completed
@@ -12210,26 +12298,24 @@ impl PrivchatSdk {
                     }
                     // **只读，不得有副作用。**
                     //
-                    // 这里以前会 apply_transport_health(is_connected)：一旦 transport 瞬时
-                    // 报 false,这条**查询**就把 session 打回 New、停掉 inbound task。
-                    // 于是「问一句连着没有」变成了「把连接处决掉」——宿主为了刷横幅/
-                    // 判断能否发送而轮询它,轮询本身就成了断连源,再由重连拉起,
-                    // 形成 AUTHENTICATED↔NEW 每秒约 2 次的自激。
-                    //
-                    // 生产实测(2026-07-31,福寿 1.0.18):20 秒内往返 11 次,每次
-                    // reason=null(非服务端踢、非真实断网,同期 wifi 满格且在正常收消息),
-                    // 用户点登录只要落在 New 那半秒就报「网络错误」。
-                    //
-                    // 连接健康只能由**真实 transport 事件**与健康 tick 驱动
-                    // (见下方 health tick 分支),观察者不参与裁决。
+                    // 连接健康由真实 transport 事件、health tick 和显式 connect/authenticate
+                    // 意图对账；观察者不得改变 session 或停止 inbound task。
                     Command::IsConnected { resp } => {
                         let is_connected = state.is_connected().await;
                         let _ = resp.send(Ok(is_connected));
                     }
-                    // 同 IsConnected：只读，不裁决健康（原实现会让「读一下当前状态」
-                    // 把已认证的连接打掉）。
+                    // 同 IsConnected：只读，不裁决健康。
                     Command::GetConnectionState { resp } => {
                         let _ = resp.send(Ok(state.session_state.as_connection_state()));
+                    }
+                    #[cfg(test)]
+                    Command::SetSessionStateForTest {
+                        session_state,
+                        resp,
+                    } => {
+                        health_tick_enabled = false;
+                        state.session_state = session_state;
+                        let _ = resp.send(());
                     }
                     Command::GetCurrentAccessToken { resp } => {
                         let token = match state.current_uid.clone() {
@@ -12447,7 +12533,69 @@ impl PrivchatSdk {
                             state_before = ?state.session_state,
                             "authenticate command started"
                         );
-                        let can_result = state.session_state.can(Action::Authenticate);
+                        let transport_connected = state.is_connected().await;
+                        let preflight = plan_authenticate_transport(
+                            state.session_state,
+                            transport_connected,
+                        );
+                        let preflight_result = match preflight {
+                            Err(e) => Err(e),
+                            Ok(AuthenticateTransportPlan::UseCurrent) => Ok(()),
+                            Ok(AuthenticateTransportPlan::ReconnectTransport) => {
+                                // `connect()` and credential exchange are separated by host HTTP
+                                // work. The transport may die in that gap. Reconnect only the
+                                // transport here and authenticate with the supplied fresh token;
+                                // do not run try_auto_reconnect with the persisted old token.
+                                stop_inbound_task(&mut inbound_task).await;
+                                if let Some((from, to)) =
+                                    state.apply_transport_health(false)
+                                {
+                                    emit_sequenced_event(
+                                        &actor_event_tx,
+                                        &actor_event_history,
+                                        &actor_event_seq,
+                                        event_history_limit,
+                                        SdkEvent::ConnectionStateChanged { from, to },
+                                    );
+                                }
+                                match timeout(
+                                    state.connect_timeout_total(),
+                                    state.connect(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {
+                                        let connected_from =
+                                            state.session_state.as_connection_state();
+                                        state.session_state = SessionState::Connected;
+                                        if connected_from
+                                            != state.session_state.as_connection_state()
+                                        {
+                                            emit_sequenced_event(
+                                                &actor_event_tx,
+                                                &actor_event_history,
+                                                &actor_event_seq,
+                                                event_history_limit,
+                                                SdkEvent::ConnectionStateChanged {
+                                                    from: connected_from,
+                                                    to: state
+                                                        .session_state
+                                                        .as_connection_state(),
+                                                },
+                                            );
+                                        }
+                                        Ok(())
+                                    }
+                                    Ok(Err(e)) => Err(e),
+                                    Err(_) => Err(Error::Transport(
+                                        "authenticate transport reconnect timeout".to_string(),
+                                    )),
+                                }
+                            }
+                        };
+                        let can_result = preflight_result.and_then(|_| {
+                            state.session_state.can(Action::Authenticate)
+                        });
                         let result = match can_result {
                             Ok(next_state) => match timeout(
                                 Duration::from_secs(20),
@@ -17506,9 +17654,10 @@ mod tests {
 
     use super::{
         channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
-        group_settings_key, outbound_queue_ready, Action, AuthErrorKind, CanonicalTimelineEvent,
-        ConnectionState, ContentMessageType, Error, ErrorCode, LoginResult, MessageCachePolicy,
-        NetworkHint, NewMessage, PresenceStatus, PrivchatConfig, PrivchatSdk,
+        group_settings_key, outbound_queue_ready, plan_authenticate_transport, plan_connect,
+        Action, AuthErrorKind, AuthenticateTransportPlan, CanonicalTimelineEvent, Command,
+        ConnectPlan, ConnectionState, ContentMessageType, Error, ErrorCode, LoginResult,
+        MessageCachePolicy, NetworkHint, NewMessage, PresenceStatus, PrivchatConfig, PrivchatSdk,
         ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, ServerCommit,
         SessionState, State, SyncCoordinator, UpsertChannelInput, UpsertFriendInput,
         UpsertGroupInput, UpsertGroupMemberInput, UpsertMessageReactionInput,
@@ -17531,6 +17680,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use tokio::sync::oneshot;
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -18275,6 +18425,91 @@ mod tests {
             SessionState::LoggedIn.can(Action::Authenticate),
             Ok(SessionState::Authenticated)
         ));
+    }
+
+    #[test]
+    fn explicit_connect_reconciles_stale_session_without_query_side_effects() {
+        assert_eq!(
+            plan_connect(SessionState::Authenticated, true, true).unwrap(),
+            ConnectPlan::AlreadyReady
+        );
+        assert_eq!(
+            plan_connect(SessionState::Authenticated, true, false).unwrap(),
+            ConnectPlan::RestorePersistedSession
+        );
+        assert_eq!(
+            plan_connect(SessionState::Connected, true, false).unwrap(),
+            ConnectPlan::RestorePersistedSession
+        );
+        assert_eq!(
+            plan_connect(SessionState::New, false, false).unwrap(),
+            ConnectPlan::ConnectTransportOnly
+        );
+        assert!(matches!(
+            plan_connect(SessionState::Shutdown, true, false),
+            Err(Error::Shutdown)
+        ));
+    }
+
+    #[test]
+    fn authenticate_reconnects_transport_lost_after_connect() {
+        assert_eq!(
+            plan_authenticate_transport(SessionState::Connected, true).unwrap(),
+            AuthenticateTransportPlan::UseCurrent
+        );
+        assert_eq!(
+            plan_authenticate_transport(SessionState::Connected, false).unwrap(),
+            AuthenticateTransportPlan::ReconnectTransport
+        );
+        assert_eq!(
+            plan_authenticate_transport(SessionState::Authenticated, false).unwrap(),
+            AuthenticateTransportPlan::ReconnectTransport
+        );
+        assert_eq!(
+            plan_authenticate_transport(SessionState::New, false).unwrap(),
+            AuthenticateTransportPlan::ReconnectTransport
+        );
+        assert!(matches!(
+            plan_authenticate_transport(SessionState::Shutdown, false),
+            Err(Error::Shutdown)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_status_queries_do_not_reconcile_or_tear_down_the_session() {
+        let dir = unique_test_dir("pure-connection-queries");
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        let sdk = PrivchatSdk::new(config);
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        sdk.tx
+            .send(Command::SetSessionStateForTest {
+                session_state: SessionState::Authenticated,
+                resp: resp_tx,
+            })
+            .await
+            .expect("actor accepts test state");
+        resp_rx.await.expect("actor applies test state");
+
+        assert_eq!(
+            sdk.connection_state().await.expect("read logical state"),
+            ConnectionState::Authenticated
+        );
+        assert!(
+            !sdk.is_connected().await.expect("read transport state"),
+            "test fixture intentionally has no transport"
+        );
+        assert_eq!(
+            sdk.connection_state()
+                .await
+                .expect("read logical state again"),
+            ConnectionState::Authenticated,
+            "a status query reconciled transport health and tore down the session"
+        );
+
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
