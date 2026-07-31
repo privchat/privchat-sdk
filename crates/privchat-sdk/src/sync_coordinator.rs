@@ -159,6 +159,10 @@ pub(crate) struct SyncCoordinator {
     snapshot: SyncStateSnapshot,
     /// 下一次允许开跑的时刻。`None` = 不受限。
     next_retry_at_ms: Option<i64>,
+    /// Phase 3 的独立退避。后台收敛失败不能复用 Phase 2 的 readiness 闸门，
+    /// 但也不能只把状态写成 `BackingOff` 后仍被 2s tick 立即重跑。
+    convergence_attempt: u32,
+    convergence_next_retry_at_ms: Option<i64>,
     /// account/session 世代。切账号、重置会 bump；跨代的旧结果不得回写。
     generation: u64,
 }
@@ -179,6 +183,8 @@ impl SyncCoordinator {
         Self {
             snapshot: SyncStateSnapshot::default(),
             next_retry_at_ms: None,
+            convergence_attempt: 0,
+            convergence_next_retry_at_ms: None,
             generation: 0,
         }
     }
@@ -194,6 +200,17 @@ impl SyncCoordinator {
     /// 下一次允许开跑的绝对时刻（epoch ms）。actor 据此建定时器唤醒。
     pub(crate) fn next_retry_at_ms(&self) -> Option<i64> {
         self.next_retry_at_ms
+    }
+
+    pub(crate) fn convergence_retry_ready(&self, now_ms: i64) -> bool {
+        self.convergence_next_retry_at_ms
+            .map(|deadline| now_ms >= deadline)
+            .unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn convergence_next_retry_at_ms(&self) -> Option<i64> {
+        self.convergence_next_retry_at_ms
     }
 
     /// 第 `attempt` 次失败之后要等多久。指数退避 + 抖动，封顶 `SYNC_RETRY_MAX_MS`。
@@ -262,8 +279,23 @@ impl SyncCoordinator {
     /// 这是双维模型的全部意义：Phase 3 的失败落在这里退避重试，已经 `Ready`
     /// 的应用不会因此被打回「连接中」。
     pub(crate) fn set_convergence(&mut self, next: Convergence, now_ms: i64) {
+        if next != Convergence::BackingOff {
+            self.convergence_attempt = 0;
+            self.convergence_next_retry_at_ms = None;
+        }
         self.snapshot.convergence = next;
         self.snapshot.updated_at_ms = now_ms;
+    }
+
+    /// Phase 3 失败只影响后台维度，但必须真正排下退避截止点。
+    pub(crate) fn backoff_convergence(&mut self, now_ms: i64) -> (u32, i64) {
+        self.convergence_attempt = self.convergence_attempt.saturating_add(1);
+        let delay = Self::retry_delay_ms(self.convergence_attempt, now_ms);
+        let deadline = now_ms.saturating_add(delay);
+        self.convergence_next_retry_at_ms = Some(deadline);
+        self.snapshot.convergence = Convergence::BackingOff;
+        self.snapshot.updated_at_ms = now_ms;
+        (self.convergence_attempt, deadline)
     }
 
     pub(crate) fn convergence(&self) -> Convergence {
@@ -315,6 +347,11 @@ impl SyncCoordinator {
         if self.snapshot.readiness == Readiness::Authenticated || self.next_retry_at_ms.is_some() {
             self.next_retry_at_ms = None;
         }
+        self.convergence_attempt = 0;
+        self.convergence_next_retry_at_ms = None;
+        if self.snapshot.convergence == Convergence::BackingOff {
+            self.snapshot.convergence = Convergence::Scanning;
+        }
     }
 
     /// 服务端错误码 → typed 分类。原始文本留给日志。
@@ -334,6 +371,8 @@ impl SyncCoordinator {
     /// 不动——那样闸门永远关着，后面所有触发源都会被 begin() 挡回去，同步彻底卡死。
     pub(crate) fn abandon(&mut self, now_ms: i64) {
         self.next_retry_at_ms = None;
+        self.convergence_attempt = 0;
+        self.convergence_next_retry_at_ms = None;
         self.snapshot = SyncStateSnapshot {
             updated_at_ms: now_ms,
             ..SyncStateSnapshot::default()
@@ -357,6 +396,8 @@ impl SyncCoordinator {
     pub(crate) fn reset(&mut self, now_ms: i64) {
         self.generation = self.generation.wrapping_add(1);
         self.next_retry_at_ms = None;
+        self.convergence_attempt = 0;
+        self.convergence_next_retry_at_ms = None;
         self.snapshot = SyncStateSnapshot {
             updated_at_ms: now_ms,
             ..SyncStateSnapshot::default()
@@ -510,6 +551,42 @@ mod tests {
         // 网络回来了，等待就没有意义了。
         coordinator.note_network_available();
         assert!(coordinator.begin(SyncRunKind::Resume, 11).is_ok());
+    }
+
+    #[test]
+    fn convergence_backoff_blocks_the_two_second_tick_until_its_deadline() {
+        let mut coordinator = SyncCoordinator::new();
+        coordinator.set_convergence(Convergence::Scanning, 0);
+
+        let (attempt, deadline) = coordinator.backoff_convergence(1_000);
+        assert_eq!(attempt, 1);
+        assert_eq!(coordinator.convergence(), Convergence::BackingOff);
+        assert_eq!(coordinator.convergence_next_retry_at_ms(), Some(deadline));
+        assert!(deadline > 1_000);
+        assert!(!coordinator.convergence_retry_ready(deadline - 1));
+        assert!(coordinator.convergence_retry_ready(deadline));
+
+        let first_delay = deadline - 1_000;
+        let (attempt, second_deadline) = coordinator.backoff_convergence(deadline);
+        assert_eq!(attempt, 2);
+        assert!(
+            second_deadline - deadline >= first_delay,
+            "repeated convergence failures did not increase the backoff"
+        );
+    }
+
+    #[test]
+    fn network_recovery_releases_convergence_backoff_immediately() {
+        let mut coordinator = SyncCoordinator::new();
+        coordinator.set_convergence(Convergence::Scanning, 0);
+        let (_, deadline) = coordinator.backoff_convergence(1_000);
+        assert!(!coordinator.convergence_retry_ready(deadline - 1));
+
+        coordinator.note_network_available();
+
+        assert!(coordinator.convergence_retry_ready(1_001));
+        assert_eq!(coordinator.convergence_next_retry_at_ms(), None);
+        assert_eq!(coordinator.convergence(), Convergence::Scanning);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use msgtrans::ClientEvent;
+use msgtrans::{ClientEvent, TransportError};
 // msgtrans 2.0 把 TransportOptions 拆成了 SendOptions / RequestOptions
 // （上游 54da0b0）。这三处都是请求-响应，用 RequestOptions；构造器同名。
 use msgtrans::RequestOptions;
@@ -3396,6 +3396,24 @@ impl State {
         !matches!(entity_type, "user" | "group" | "channel")
     }
 
+    /// A failed request is not proof that the underlying connection died.
+    /// Timeouts, protocol responses and local resource/configuration failures are scoped to the
+    /// operation; the transport lifecycle event or an explicit probe owns connection teardown.
+    fn transport_error_proves_disconnect(error: &TransportError) -> bool {
+        matches!(error, TransportError::Connection { .. })
+    }
+
+    fn handle_transport_request_error(&mut self, context: &str, error: TransportError) -> Error {
+        eprintln!("[SDK.actor] {context} transport error: {error}");
+        if Self::transport_error_proves_disconnect(&error) {
+            let transition = self.apply_transport_health(false);
+            self.push_connection_transition_event(transition);
+            self.network_disconnected_error()
+        } else {
+            Error::Transport(format!("{context}: {error}"))
+        }
+    }
+
     fn apply_transport_health(
         &mut self,
         is_connected: bool,
@@ -4218,12 +4236,7 @@ impl State {
                 }
                 Ok(raw)
             }
-            Err(e) => {
-                eprintln!("[SDK.actor] {context} transport error: {e}");
-                let transition = self.apply_transport_health(false);
-                self.push_connection_transition_event(transition);
-                Err(self.network_disconnected_error())
-            }
+            Err(e) => Err(self.handle_transport_request_error(context, e)),
         }
     }
 
@@ -9983,12 +9996,7 @@ impl State {
         let raw = transport
             .request_with_options(Bytes::from(request_data), opt)
             .await
-            .map_err(|e| {
-                eprintln!("[SDK.actor] direct send message transport error: {e}");
-                let transition = self.apply_transport_health(false);
-                self.push_connection_transition_event(transition);
-                self.network_disconnected_error()
-            })?;
+            .map_err(|e| self.handle_transport_request_error("direct send message", e))?;
         let resp: SendMessageResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode send response: {e}")))?;
         if resp.reason_code != 0 {
@@ -11228,6 +11236,7 @@ impl State {
         let timeout = self.timeout();
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|e| Error::Serialization(format!("encode rpc body: {e}")))?;
+        let request_context = format!("rpc call route={route}");
         let request = RpcRequest {
             route,
             body: body_bytes,
@@ -11239,7 +11248,7 @@ impl State {
                 Bytes::from(payload),
                 MessageType::RpcRequest as u8,
                 timeout,
-                "rpc call",
+                &request_context,
             )
             .await?;
         let rpc_resp: RpcResponse = decode_message(&raw)
@@ -11752,6 +11761,9 @@ impl PrivchatSdk {
                         }
                         if state.session_state == SessionState::Authenticated
                             && state.convergence_run.is_some()
+                            && state.sync_coordinator.convergence_retry_ready(
+                                chrono::Utc::now().timestamp_millis(),
+                            )
                         {
                             match state.run_anti_entropy_once().await {
                                 // 只有「完整扫过一圈 + 没有留下未修的 stale」才算收敛。
@@ -11802,10 +11814,14 @@ impl PrivchatSdk {
                                     );
                                 }
                                 Err(err) => {
-                                    tracing::warn!(error = %err, "convergence pass failed");
-                                    state.sync_coordinator.set_convergence(
-                                        crate::sync_coordinator::Convergence::BackingOff,
-                                        chrono::Utc::now().timestamp_millis(),
+                                    let now_ms = chrono::Utc::now().timestamp_millis();
+                                    let (attempt, next_retry_at_ms) =
+                                        state.sync_coordinator.backoff_convergence(now_ms);
+                                    tracing::warn!(
+                                        error = %err,
+                                        attempt,
+                                        next_retry_at_ms,
+                                        "convergence pass failed; backing off"
                                     );
                                 }
                             }
@@ -11933,6 +11949,7 @@ impl PrivchatSdk {
                             Ok(next) => {
                                 state.session_state = next;
                                 state.reset_reconnect_backoff();
+                                state.sync_coordinator.note_network_available();
                                 // 握手 + 认证全通了，解除 Terminal 闸门，后续如果再过期还能再触发一次。
                                 state.auth_terminal_fired = false;
                                 // 真实连接成功是网络在线的最强证据:覆盖系统 reachability 的
@@ -12177,6 +12194,9 @@ impl PrivchatSdk {
 
                             if result.is_ok() {
                                 state.reset_reconnect_backoff();
+                                if !already_ready {
+                                    state.sync_coordinator.note_network_available();
+                                }
                                 // 连上了就是网络可达的铁证:复位系统 reachability 的 Offline
                                 // 假信号,否则 hint 会继续压制退避节奏与其它路径。
                                 if !state.network_hint.is_online() {
@@ -12626,6 +12646,7 @@ impl PrivchatSdk {
                             // SessionState 已经在 can() 里转回 Authenticated（含 AccessTokenRefreshNeeded → Authenticated 路径）。
                             state.auth_terminal_fired = false;
                             state.should_auto_reconnect = true;
+                            state.sync_coordinator.note_network_available();
                             // [P0 根因修复] 这条路径是「token 过期 → 刷新 → 重新 authenticate」的重连主链：
                             // try_auto_reconnect 因 10002 失败、transport 被换，真正成功的握手走这里。
                             // 此前这里 **没有重启 inbound task** → 新 transport 上没有事件订阅 →
@@ -18473,6 +18494,63 @@ mod tests {
             plan_authenticate_transport(SessionState::Shutdown, false),
             Err(Error::Shutdown)
         ));
+    }
+
+    #[test]
+    fn only_connection_errors_prove_that_the_transport_is_dead() {
+        use msgtrans::TransportError;
+
+        assert!(State::transport_error_proves_disconnect(
+            &TransportError::connection_error("socket closed", true)
+        ));
+        assert!(!State::transport_error_proves_disconnect(
+            &TransportError::timeout_error("sync/get_difference", Duration::from_secs(5))
+        ));
+        assert!(!State::transport_error_proves_disconnect(
+            &TransportError::protocol_error("rpc", "malformed response")
+        ));
+        assert!(!State::transport_error_proves_disconnect(
+            &TransportError::resource_error("pending requests", 32, 16)
+        ));
+        assert!(!State::transport_error_proves_disconnect(
+            &TransportError::config_error("route", "unsupported")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_timeout_does_not_tear_down_an_authenticated_session() {
+        let (mut state, dir) = new_seeded_state("request-timeout-keeps-session").await;
+
+        let error = state.handle_transport_request_error(
+            "rpc get_difference",
+            msgtrans::TransportError::timeout_error("sync/get_difference", Duration::from_secs(5)),
+        );
+
+        assert!(matches!(error, Error::Transport(_)));
+        assert_eq!(state.session_state, SessionState::Authenticated);
+        assert_eq!(state.current_uid.as_deref(), Some("10001"));
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_error_still_tears_down_and_arms_reconnect() {
+        let (mut state, dir) = new_seeded_state("request-connection-drops-session").await;
+        state.should_auto_reconnect = true;
+
+        let error = state.handle_transport_request_error(
+            "rpc get_difference",
+            msgtrans::TransportError::connection_error("socket closed", true),
+        );
+
+        assert!(matches!(
+            error,
+            Error::Transport(ref message) if message == NETWORK_DISCONNECTED_MESSAGE
+        ));
+        assert_eq!(state.session_state, SessionState::New);
+        assert!(state.next_reconnect_at.is_some());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
