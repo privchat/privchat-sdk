@@ -12203,32 +12203,27 @@ impl PrivchatSdk {
                         }
                         let _ = resp.send(result);
                     }
+                    // **只读，不得有副作用。**
+                    //
+                    // 这里以前会 apply_transport_health(is_connected)：一旦 transport 瞬时
+                    // 报 false,这条**查询**就把 session 打回 New、停掉 inbound task。
+                    // 于是「问一句连着没有」变成了「把连接处决掉」——宿主为了刷横幅/
+                    // 判断能否发送而轮询它,轮询本身就成了断连源,再由重连拉起,
+                    // 形成 AUTHENTICATED↔NEW 每秒约 2 次的自激。
+                    //
+                    // 生产实测(2026-07-31,福寿 1.0.18):20 秒内往返 11 次,每次
+                    // reason=null(非服务端踢、非真实断网,同期 wifi 满格且在正常收消息),
+                    // 用户点登录只要落在 New 那半秒就报「网络错误」。
+                    //
+                    // 连接健康只能由**真实 transport 事件**与健康 tick 驱动
+                    // (见下方 health tick 分支),观察者不参与裁决。
                     Command::IsConnected { resp } => {
                         let is_connected = state.is_connected().await;
-                        if let Some((from, to)) = state.apply_transport_health(is_connected) {
-                            stop_inbound_task(&mut inbound_task).await;
-                            emit_sequenced_event(
-                                &actor_event_tx,
-                                &actor_event_history,
-                                &actor_event_seq,
-                                event_history_limit,
-                                SdkEvent::ConnectionStateChanged { from, to },
-                            );
-                        }
                         let _ = resp.send(Ok(is_connected));
                     }
+                    // 同 IsConnected：只读，不裁决健康（原实现会让「读一下当前状态」
+                    // 把已认证的连接打掉）。
                     Command::GetConnectionState { resp } => {
-                        let is_connected = state.is_connected().await;
-                        if let Some((from, to)) = state.apply_transport_health(is_connected) {
-                            stop_inbound_task(&mut inbound_task).await;
-                            emit_sequenced_event(
-                                &actor_event_tx,
-                                &actor_event_history,
-                                &actor_event_seq,
-                                event_history_limit,
-                                SdkEvent::ConnectionStateChanged { from, to },
-                            );
-                        }
                         let _ = resp.send(Ok(state.session_state.as_connection_state()));
                     }
                     Command::GetCurrentAccessToken { resp } => {
