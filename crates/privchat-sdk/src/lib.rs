@@ -10335,8 +10335,13 @@ impl State {
                         )
                         .server_says_no_thumbnail();
                     if explicit_absence {
+                        // thumb_status=3 是**终态**，写下去就永不重试。所以这条更不能
+                        // 跨账号：切号后同 ID 的另一条消息会被永久判成「没有缩略图」，
+                        // 而且不可逆。与成功/失败两条路一样走账号限定写入。
                         tokio::spawn(async move {
-                            let _ = storage.update_thumb_status(message_id, 3).await;
+                            let _ = storage
+                                .update_thumb_status_scoped(owner_uid.clone(), message_id, 3)
+                                .await;
                         });
                     } else {
                         tracing::warn!(
@@ -17989,6 +17994,41 @@ mod tests {
             super::THUMBNAIL_BACKFILL_BATCH_LIMIT < super::THUMBNAIL_BACKFILL_QUEUE_LIMIT / 10,
             "单次 tick 的批量必须远小于队列上限",
         );
+    }
+
+    /// 下载任务在**启动之后**才切号：完成阶段必须整条放弃。
+    ///
+    /// 这是清队列覆盖不到的那一半——队列只管「还没开始的」，而缩略图下载是异步的，
+    /// 切号时已经在飞的那些照样会回来写库。`update_thumb_status` 在执行时才用
+    /// active uid 解析账号，所以旧账号的 message_id 会被写进新账号的库，
+    /// 尤其 thumb_status=3 是不可逆终态。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_download_finishing_after_an_account_switch_writes_nothing() {
+        let (state, dir) = new_seeded_state("thumb_switch_during_download").await;
+        let storage = state.storage.clone();
+        // 夹具的 active uid 是 "10001"；这里模拟任务出生于另一个账号。
+        let stale_owner = "20002".to_string();
+
+        for status in [1, 2, 3] {
+            let applied = storage
+                .update_thumb_status_scoped(stale_owner.clone(), 4242, status)
+                .await
+                .expect("scoped write must not error");
+            assert!(
+                !applied,
+                "账号已切换，thumb_status={status} 不该落到新账号头上（3 还是不可逆终态）",
+            );
+        }
+
+        // 对照：账号没变时照常写入，别把功能一起挡掉。
+        let applied = storage
+            .update_thumb_status_scoped("10001".to_string(), 4242, 1)
+            .await
+            .expect("scoped write must not error");
+        assert!(applied, "账号一致时必须真的写入");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 队首那条属于上一个账号时必须被丢弃，而且**不许**因此停止消费。
