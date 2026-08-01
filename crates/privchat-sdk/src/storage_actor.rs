@@ -239,6 +239,17 @@ enum StorageCmd {
         thumb_status: i32,
         resp: oneshot::Sender<Result<()>>,
     },
+    /// 带账号归属的缩略图状态更新。`owner_uid` 与当前 active uid 不一致时**整条放弃**。
+    ///
+    /// 普通的 [`StorageCmd::UpdateThumbStatus`] 在**执行时**才用 `load_current_uid()`
+    /// 解析账号，而缩略图下载是异步的：切号之后完成的那些，会拿旧账号的
+    /// message_id 去写新账号的库。返回 `true` = 真的写了。
+    UpdateThumbStatusScoped {
+        owner_uid: String,
+        message_id: u64,
+        thumb_status: i32,
+        resp: oneshot::Sender<Result<bool>>,
+    },
     UpdateMediaDownloaded {
         message_id: u64,
         downloaded: bool,
@@ -1123,6 +1134,25 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::UpdateThumbStatus {
+                message_id,
+                thumb_status,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// 见 [`StorageCmd::UpdateThumbStatusScoped`]。返回 `false` = 账号已切换，未写入。
+    pub async fn update_thumb_status_scoped(
+        &self,
+        owner_uid: String,
+        message_id: u64,
+        thumb_status: i32,
+    ) -> Result<bool> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UpdateThumbStatusScoped {
+                owner_uid,
                 message_id,
                 thumb_status,
                 resp: resp_tx,
@@ -2368,6 +2398,23 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         } => {
             with_uid!(resp, |uid| store
                 .update_message_status(&uid, message_id, status));
+        }
+        StorageCmd::UpdateThumbStatusScoped {
+            owner_uid,
+            message_id,
+            thumb_status,
+            resp,
+        } => {
+            // 归属校验和写入在同一个 storage actor 轮次里完成，中间没有 await，
+            // 所以不存在「查完 uid、写之前又被切走」的窗口。
+            let result = match store.load_current_uid() {
+                Ok(Some(uid)) if uid == owner_uid => store
+                    .update_thumb_status(&uid, message_id, thumb_status)
+                    .map(|_| true),
+                Ok(_) => Ok(false),
+                Err(e) => Err(e),
+            };
+            let _ = resp.send(result);
         }
         StorageCmd::UpdateThumbStatus {
             message_id,

@@ -2287,7 +2287,10 @@ impl Error {
             // Auth 错误不可重试：服务端已明确拒绝（token 过期/session 未建立/挤下线），
             // 盲目重试只会把同样的请求反复丢到未授权会话上，造成「一直发送中」。
             // 恢复路径应走 reconnect + re-authenticate，而非让 drain loop 原地重试。
-            Error::NotConnected | Error::Transport(_) => true,
+            // 「没拿到应答」必须可重试。它只说明这一次请求没有回音——网络恢复后
+            // 原样重发是安全的。漏掉它的代价是发送超时被当成永久失败：outbox 条目
+            // 被 reject 并删除，用户的消息就此消失。
+            Error::NotConnected | Error::Transport(_) | Error::RequestUnanswered { .. } => true,
             Error::Server { code, .. } => is_retryable_server_code(*code),
             _ => false,
         }
@@ -8250,6 +8253,10 @@ impl State {
     /// [`commands_idle`] 由 actor 传入，用来在**每一条之间**重新判断队列里有没有
     /// 待处理命令——后台工作让位给宿主请求，是每一步都要成立的，不是开头一次。
     async fn drain_thumbnail_backfill(&mut self, commands_idle: impl Fn() -> bool) {
+        // 没有当前账号就没有归属可言，整批不做。
+        let Some(owner_uid) = self.current_uid.clone() else {
+            return;
+        };
         let user_root = match self.storage.get_storage_paths().await {
             Ok(paths) => PathBuf::from(&paths.user_root),
             Err(_) => return,
@@ -8274,6 +8281,7 @@ impl State {
                 None => None,
             };
             Self::spawn_auto_download_thumbnail(
+                owner_uid.clone(),
                 &item.extra,
                 ticket,
                 &user_root,
@@ -10272,7 +10280,11 @@ impl State {
     /// 没有 `thumbnail_file_id` 时 `ticket=None`，退回消息里的 legacy 明文 `thumbnail_url`（v0）。
     /// **CEK 只来自 get_url ticket，绝不取自消息 metadata。**
     #[allow(clippy::too_many_arguments)]
+    /// `owner_uid` = 这个下载属于哪个账号。下载是异步的，完成时账号可能已经切走——
+    /// 那时写库和发事件都必须整条放弃，否则会拿旧账号的 message_id 写进新账号的库、
+    /// 把旧账号的 timeline 事件发给新账号的界面。
     fn spawn_auto_download_thumbnail(
+        owner_uid: String,
         content: &str,
         ticket: Option<ResolvedFileDownload>,
         user_root: &Path,
@@ -10343,7 +10355,9 @@ impl State {
         let png_path = dir.join(media_store::THUMB_PNG_FILENAME);
         if thumb_path.exists() || webp_path.exists() || png_path.exists() {
             let _ = tokio::spawn(async move {
-                let _ = storage.update_thumb_status(message_id, 1).await;
+                let _ = storage
+                    .update_thumb_status_scoped(owner_uid.clone(), message_id, 1)
+                    .await;
             });
             return;
         }
@@ -10358,8 +10372,16 @@ impl State {
             .await
             {
                 Ok(()) => {
-                    if let Err(e) = storage.update_thumb_status(message_id, 1).await {
-                        eprintln!("[SDK.thumb] update thumb_status=1 failed: {e}");
+                    // 账号已切走 → 不写库、也不发事件。
+                    match storage
+                        .update_thumb_status_scoped(owner_uid.clone(), message_id, 1)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(e) => {
+                            eprintln!("[SDK.thumb] update thumb_status=1 failed: {e}");
+                        }
                     }
                     // Notify clients that the thumbnail is ready so they can refresh
                     let event = SdkEvent::TimelineUpdated {
@@ -10381,7 +10403,10 @@ impl State {
                         "[SDK.thumb] auto-download failed message_id={} url={}: {}",
                         message_id, thumb_url, e
                     );
-                    if let Err(e2) = storage.update_thumb_status(message_id, 2).await {
+                    if let Err(e2) = storage
+                        .update_thumb_status_scoped(owner_uid.clone(), message_id, 2)
+                        .await
+                    {
                         eprintln!("[SDK.thumb] update thumb_status=2 failed: {e2}");
                     }
                 }
@@ -15059,6 +15084,7 @@ impl PrivchatSdk {
                                 msg
                             };
 
+                            let owner_uid = state.current_uid_required()?.to_string();
                             let paths = state.storage.get_storage_paths().await?;
                             let user_root = PathBuf::from(&paths.user_root);
                             let Some(thumbnail_file_id) = State::extract_thumbnail_file_id(&msg.extra)
@@ -15073,6 +15099,7 @@ impl PrivchatSdk {
                             };
                             let ticket = state.resolve_thumbnail_ticket(thumbnail_file_id).await;
                             State::spawn_auto_download_thumbnail(
+                                owner_uid.clone(),
                                 &msg.extra,
                                 ticket,
                                 &user_root,
@@ -17988,11 +18015,29 @@ mod tests {
             state.enqueue_thumbnail_backfill(id, 7, 2, 0, "{}");
         }
         let before = state.thumbnail_backfill_queue.len();
+
+        // 一开始就有命令 → 一条都不消费。
         state.drain_thumbnail_backfill(|| false).await;
         assert_eq!(
             state.thumbnail_backfill_queue.len(),
             before,
             "队列里有待处理命令时，一条都不该被消费",
+        );
+
+        // 关键的那半：第一条**处理完之后**才来命令。只在开头查一次的实现会把
+        // 整批做完，这个断言就是用来钉死「每条之间都要重新查」的。
+        let calls = std::cell::Cell::new(0u32);
+        state
+            .drain_thumbnail_backfill(|| {
+                let n = calls.get();
+                calls.set(n + 1);
+                n == 0
+            })
+            .await;
+        assert_eq!(
+            state.thumbnail_backfill_queue.len(),
+            before - 1,
+            "第一条之后命令到达，就必须停在那里，只消费一条",
         );
     }
 
@@ -18892,6 +18937,25 @@ mod tests {
         assert!(!State::transport_error_proves_disconnect(
             &TransportError::config_error("route", "unsupported")
         ));
+    }
+
+    /// 「没拿到应答」必须是**可重试**的。
+    ///
+    /// 这条测试是为一个真实回归立的：把传输超时改成类型化的
+    /// [`Error::RequestUnanswered`] 时漏了 [`Error::is_retryable`]，于是所有发送超时
+    /// 都掉进「永久失败」分支——outbox 条目被 reject 并删除，用户的消息直接消失。
+    /// 分类的语义变了，就必须把依赖这个语义的每一处一起过一遍。
+    #[test]
+    fn an_unanswered_request_is_retryable_so_the_outbox_survives() {
+        assert!(
+            Error::RequestUnanswered {
+                context: "message/send".to_string(),
+            }
+            .is_retryable(),
+            "发送超时必须可重试，否则 outbox 会被当成永久失败删掉",
+        );
+        // 对照：鉴权失败仍然不可重试（原地重试只会反复撞未授权会话）。
+        assert!(!Error::Auth("token expired".to_string()).is_retryable());
     }
 
     #[tokio::test(flavor = "current_thread")]
