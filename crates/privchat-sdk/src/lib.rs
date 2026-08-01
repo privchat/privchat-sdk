@@ -16,8 +16,10 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -1658,25 +1660,6 @@ pub struct OpenConversationPage {
     pub fetched_from_server: bool,
 }
 
-/// 一条待补缩略图的消息。字段是入队时**拷贝**下来的，消费时不再回查消息表。
-#[derive(Debug, Clone)]
-struct ThumbnailBackfillItem {
-    /// 入队时的会话世代。消费前再校验一次：清队列与「已经取出、正要消费」之间
-    /// 仍有一个窗口，光靠 [`reset_session_scoped_state`] 清空挡不住它。
-    session_epoch: u64,
-    message_id: u64,
-    channel_id: u64,
-    channel_type: i32,
-    created_at_ms: i64,
-    extra: String,
-}
-
-/// 队列上限：超出就丢弃。缩略图不是必需品——UI 在气泡进入可视区时会用
-/// `ensure_message_thumbnail` 单独补，那条路是用户驱动的、也是即时的。
-const THUMBNAIL_BACKFILL_QUEUE_LIMIT: usize = 512;
-/// 每个 tick（2s）最多补几条。这是**给 actor 留出处理命令的余地**，不是吞吐目标。
-const THUMBNAIL_BACKFILL_BATCH_LIMIT: usize = 3;
-
 /// per-channel 历史 gap 水位持久化态（KV `__hist_gap__:<ct>:<cid>`，§2.5.1 V1 最小契约）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistGapState {
@@ -2355,6 +2338,13 @@ fn is_retryable_server_code(code: u32) -> bool {
 
 type Result<T> = std::result::Result<T, Error>;
 const NETWORK_DISCONNECTED_MESSAGE: &str = "网络已断开，请检查网络连接后再试。";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThumbnailDownloadOutcome {
+    Ready,
+    ConfirmedAbsent,
+    Failed,
+}
 const OUTBOUND_DRAIN_BATCH_SIZE: usize = 20;
 
 enum Command {
@@ -2637,6 +2627,22 @@ enum Command {
         message_id: u64,
         downloaded: bool,
         resp: oneshot::Sender<Result<()>>,
+    },
+    UpdateMediaDownloadedScoped {
+        owner_uid: String,
+        session_epoch: u64,
+        message_id: u64,
+        downloaded: bool,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    CompleteThumbnailDownload {
+        owner_uid: String,
+        session_epoch: u64,
+        message_id: u64,
+        channel_id: u64,
+        channel_type: i32,
+        outcome: ThumbnailDownloadOutcome,
+        resp: oneshot::Sender<()>,
     },
     FinalizeLocalAttachment {
         message_id: u64,
@@ -2984,6 +2990,142 @@ fn plan_authenticate_transport(
     Ok(AuthenticateTransportPlan::UseCurrent)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticateRetryOperation {
+    Reconnect,
+    Authenticate,
+}
+
+type AuthenticateRetryFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+trait AuthenticateRetryDriver {
+    fn run(&mut self, operation: AuthenticateRetryOperation) -> AuthenticateRetryFuture<'_>;
+}
+
+const MAX_AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn auth_request_timeout(configured: Duration) -> Duration {
+    configured.min(MAX_AUTH_REQUEST_TIMEOUT)
+}
+
+async fn dismantle_auth_transport(
+    state: &mut State,
+    inbound_task: &mut Option<tokio::task::JoinHandle<()>>,
+    event_tx: &broadcast::Sender<SdkEvent>,
+    event_history: &Arc<StdMutex<VecDeque<SequencedSdkEvent>>>,
+    event_seq: &Arc<AtomicU64>,
+    event_history_limit: usize,
+) {
+    stop_inbound_task(inbound_task).await;
+    // Do not wait for graceful close here: this path exists because the current
+    // socket failed to answer. Dropping the actor's transport generation is the
+    // authoritative teardown and must not add another network timeout.
+    if let Some((from, to)) = state.apply_transport_health(false) {
+        emit_sequenced_event(
+            event_tx,
+            event_history,
+            event_seq,
+            event_history_limit,
+            SdkEvent::ConnectionStateChanged { from, to },
+        );
+    }
+}
+
+/// Production authentication retry sequence. A missing response invalidates the
+/// current transport, not the credential, so exactly one reconnect + retry is
+/// allowed. Every other error is returned unchanged.
+async fn execute_authenticate_with_retry(
+    driver: &mut impl AuthenticateRetryDriver,
+    mut need_reconnect: bool,
+) -> Result<()> {
+    for round in 0..2u8 {
+        if need_reconnect {
+            driver.run(AuthenticateRetryOperation::Reconnect).await?;
+        }
+        match driver.run(AuthenticateRetryOperation::Authenticate).await {
+            Ok(()) => return Ok(()),
+            Err(Error::RequestUnanswered { .. }) if round == 0 => {
+                need_reconnect = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("two authentication attempts always return from the loop")
+}
+
+struct ActorAuthenticateRetryDriver<'a> {
+    state: &'a mut State,
+    inbound_task: &'a mut Option<tokio::task::JoinHandle<()>>,
+    event_tx: &'a broadcast::Sender<SdkEvent>,
+    event_history: &'a Arc<StdMutex<VecDeque<SequencedSdkEvent>>>,
+    event_seq: &'a Arc<AtomicU64>,
+    event_history_limit: usize,
+    user_id: u64,
+    token: String,
+    device_id: String,
+}
+
+impl AuthenticateRetryDriver for ActorAuthenticateRetryDriver<'_> {
+    fn run(&mut self, operation: AuthenticateRetryOperation) -> AuthenticateRetryFuture<'_> {
+        Box::pin(async move {
+            match operation {
+                AuthenticateRetryOperation::Reconnect => {
+                    dismantle_auth_transport(
+                        self.state,
+                        self.inbound_task,
+                        self.event_tx,
+                        self.event_history,
+                        self.event_seq,
+                        self.event_history_limit,
+                    )
+                    .await;
+                    match timeout(self.state.connect_timeout_total(), self.state.connect()).await {
+                        Ok(Ok(())) => {
+                            let connected_from = self.state.session_state.as_connection_state();
+                            self.state.session_state = SessionState::Connected;
+                            let connected_to = self.state.session_state.as_connection_state();
+                            if connected_from != connected_to {
+                                emit_sequenced_event(
+                                    self.event_tx,
+                                    self.event_history,
+                                    self.event_seq,
+                                    self.event_history_limit,
+                                    SdkEvent::ConnectionStateChanged {
+                                        from: connected_from,
+                                        to: connected_to,
+                                    },
+                                );
+                            }
+                            Ok(())
+                        }
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(Error::Transport(
+                            "authenticate transport reconnect timeout".to_string(),
+                        )),
+                    }
+                }
+                AuthenticateRetryOperation::Authenticate => {
+                    let next_state = self.state.session_state.can(Action::Authenticate)?;
+                    self.state
+                        .authenticate(
+                            self.user_id,
+                            self.token.clone(),
+                            self.device_id.clone(),
+                        )
+                        .await?;
+                    self.state.session_state = next_state;
+                    tracing::debug!(
+                        user_id = %self.user_id,
+                        state_after = ?self.state.session_state,
+                        "authenticate command completed"
+                    );
+                    Ok(())
+                }
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ChannelCacheKey {
     channel_id: u64,
@@ -3169,6 +3311,12 @@ struct State {
     sync_coordinator: SyncCoordinator,
     snowflake: Arc<snowflake_me::Snowflake>,
     storage: StorageHandle,
+    /// The single receiver-side media coordinator. Payload and thumbnail work
+    /// share its account/session scope, cancellation and concurrency budget.
+    download_manager: media_download::DownloadManager,
+    /// Receiver workers report typed outcomes back through the actor. A weak
+    /// sender avoids keeping the actor alive after every public SDK handle drops.
+    actor_tx: mpsc::WeakSender<Command>,
     skip_inbound_materialization_for_load_testing: bool,
     current_uid: Option<String>,
     /// 会话世代：每次**显式**建立或废弃一个账号会话时自增。
@@ -3276,16 +3424,6 @@ struct State {
     /// 不落库，这是有意的：repair 状态没有独立价值，重启后从损坏的投影本身就能
     /// 重新发现。为它建一张表是过度设计。
     repair_queue: VecDeque<(i32, u64, u64)>,
-    /// 待补缩略图的消息（SDK 内部背景工作，不阻塞任何命令）。
-    ///
-    /// 存在的理由：解析下载票据要打一次 `file/get_url`，而它必须在 actor 上跑
-    /// （`rpc_call_json` 要 `&mut self` 做 transport 健康对账）。原来的实现在
-    /// `ListMessages` 的处理器里对整页消息**串行 await** 这个 RPC——一页几千张图
-    /// 就是几千次网络往返锁死 actor，宿主的所有查询排在后面饿死（真机实测：登录后
-    /// `loadAllData` 的四个查询 4 分钟一个都没返回，界面永远停在「数据初始化中」）。
-    /// 现在只入队，由 tick 限量消费。
-    thumbnail_backfill_queue: VecDeque<ThumbnailBackfillItem>,
-    thumbnail_backfill_seen: HashSet<u64>,
     /// 已排队/已修过的 key，用于 singleflight 去重。
     repair_seen: HashSet<(i32, u64, u64)>,
     /// 失败后的退避到期时间与次数：离线时不空转，恢复后由下一次读取重新发现。
@@ -4230,12 +4368,7 @@ impl State {
         self.inbound_epoch = self.inbound_epoch.wrapping_add(1);
         self.last_resume_synced = None;
         self.pending_prelogin_inbound_frames.clear();
-        // 缩略图回填是**账号作用域**的：队列里存的是上一个账号的 message_id，
-        // 而磁盘上的 active uid 在切号时已经先改成新账号了。不清的话，旧任务会
-        // 拿新账号的目录和数据库去更新旧账号的 message_id——跨账号污染。
-        self.thumbnail_backfill_queue.clear();
-        self.thumbnail_backfill_seen.clear();
-
+        self.download_manager.cancel_all_scoped();
         self.sync_coordinator.reset(now_ms);
 
         self.active_subscriptions.clear();
@@ -6218,13 +6351,13 @@ impl State {
                         // 同样只入队。入站路径每条消息都要解析一次票据，一轮大同步灌进来
                         // 几百条图片就是几百次串行网络往返压在 actor 上——与列表查询那处
                         // 是同一个病。DB 的 created_at 是毫秒，回填路径要对齐同一单位。
-                        let created_at_ms = chrono::Utc::now().timestamp_millis();
-                        self.enqueue_thumbnail_backfill(
+                        self.submit_thumbnail_download(
                             message_id,
                             channel_id,
                             channel_type,
-                            created_at_ms,
+                            timestamp,
                             &extra_for_thumb,
+                            media_download::DownloadPriority::Background,
                         );
                     }
 
@@ -7286,7 +7419,14 @@ impl State {
         Err(last_err.unwrap_or_else(|| Error::Transport("no endpoint".into())))
     }
 
-    async fn try_auto_reconnect(&mut self) -> Result<SessionState> {
+    async fn try_auto_reconnect(
+        &mut self,
+        inbound_task: &mut Option<tokio::task::JoinHandle<()>>,
+        event_tx: &broadcast::Sender<SdkEvent>,
+        event_history: &Arc<StdMutex<VecDeque<SequencedSdkEvent>>>,
+        event_seq: &Arc<AtomicU64>,
+        event_history_limit: usize,
+    ) -> Result<SessionState> {
         if realtime_trace_enabled() {
             eprintln!(
                 "[SDK_RECONNECT_BEGIN] old_epoch={} state_before={:?} uid={:?}",
@@ -7299,7 +7439,9 @@ impl State {
             "auto reconnect started"
         );
         match timeout(self.connect_timeout_total(), self.connect()).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                self.session_state = SessionState::Connected;
+            }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "auto reconnect transport failed");
                 return Err(e);
@@ -7341,16 +7483,19 @@ impl State {
             state_before = ?self.session_state,
             "authenticating restored session"
         );
-        let first_attempt = timeout(
-            Duration::from_secs(20),
-            self.authenticate(user_id, snapshot.token, device_id.clone()),
-        )
-        .await;
-        let auth_result = match first_attempt {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(Error::Transport("reconnect auth timeout".to_string())),
+        let mut driver = ActorAuthenticateRetryDriver {
+            state: self,
+            inbound_task,
+            event_tx,
+            event_history,
+            event_seq,
+            event_history_limit,
+            user_id,
+            token: snapshot.token,
+            device_id,
         };
+        let auth_result = execute_authenticate_with_retry(&mut driver, false).await;
+        drop(driver);
         match auth_result {
             Ok(()) => {
                 self.bootstrap_completed = bootstrap_completed;
@@ -7358,10 +7503,19 @@ impl State {
                 Ok(SessionState::Authenticated)
             }
             Err(e) => {
-                // 新 transport 还留着服务端会视为「未认证会话」，后续 RPC 会被 10000 拒绝。
-                // 主动释放，让监控循环走 backoff 再来一次完整握手。
+                // A failed authentication must leave neither a live unauthenticated
+                // transport nor stale logical state behind. Use the same lifecycle
+                // teardown as the retry path rather than assigning transport directly.
                 eprintln!("[SDK.actor] monitor: restore auth failed: {e} (dropping transport)");
-                let _ = self.disconnect().await;
+                dismantle_auth_transport(
+                    self,
+                    inbound_task,
+                    event_tx,
+                    event_history,
+                    event_seq,
+                    event_history_limit,
+                )
+                .await;
                 Err(e)
             }
         }
@@ -7569,6 +7723,7 @@ impl State {
         self.storage.save_login(uid.clone(), out.clone()).await?;
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
+        self.download_manager.cancel_all_scoped();
         self.session_epoch += 1;
         if let Err(e) = self.replay_prelogin_inbound_frames().await {
             eprintln!("[SDK.inbound] replay after login failed: {e}");
@@ -7647,6 +7802,7 @@ impl State {
         self.storage.save_login(uid.clone(), out.clone()).await?;
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
+        self.download_manager.cancel_all_scoped();
         self.session_epoch += 1;
         if let Err(e) = self.replay_prelogin_inbound_frames().await {
             eprintln!("[SDK.inbound] replay after register failed: {e}");
@@ -7658,7 +7814,11 @@ impl State {
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] authenticate: enter user_id={user_id}");
         }
-        let timeout = self.timeout();
+        // ConnAuth gets a short, request-only deadline. Retrying a silent
+        // connection after five seconds is safer than holding startup for the
+        // general 30-second RPC timeout. Token persistence below is deliberately
+        // outside this transport deadline.
+        let timeout = auth_request_timeout(self.timeout());
         let token_for_persist = token.clone();
         let device_id_for_persist = device_id.clone();
         let os = std::env::consts::OS.to_string();
@@ -7757,6 +7917,7 @@ impl State {
         }
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
+        self.download_manager.cancel_all_scoped();
         self.session_epoch += 1;
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] authenticate: success");
@@ -8222,118 +8383,154 @@ impl State {
         self.repair_queue.push_back(key);
     }
 
-    /// 登记一条待补缩略图的消息。**纯内存操作，不做任何 await。**
+    /// Submit a thumbnail to the existing receiver-side [`DownloadManager`].
     ///
-    /// 这是本修复的要害：调用方（消息列表查询、入站消息）只负责说「这条需要补」，
-    /// 网络往返一律留给 [`drain_thumbnail_backfill`] 在 tick 里限量做。
-    fn enqueue_thumbnail_backfill(
-        &mut self,
+    /// This method is deliberately synchronous: message materialization and UI
+    /// visibility only register work. Ticket resolution, HTTP and disk IO run in
+    /// the manager's bounded account/session-scoped task.
+    fn submit_thumbnail_download(
+        &self,
         message_id: u64,
         channel_id: u64,
         channel_type: i32,
         created_at_ms: i64,
         extra: &str,
+        priority: media_download::DownloadPriority,
     ) {
-        if !self.thumbnail_backfill_seen.insert(message_id) {
-            return;
-        }
-        if self.thumbnail_backfill_queue.len() >= THUMBNAIL_BACKFILL_QUEUE_LIMIT {
-            self.thumbnail_backfill_seen.remove(&message_id);
-            return;
-        }
-        self.thumbnail_backfill_queue.push_back(ThumbnailBackfillItem {
-            session_epoch: self.session_epoch,
-            message_id,
-            channel_id,
-            channel_type,
-            created_at_ms,
-            extra: extra.to_string(),
-        });
-    }
-
-    /// 交出一小批缩略图回填任务。由 actor tick 调用。
-    ///
-    /// **这个方法不做任何网络 await。** 票据解析（`file/get_url`）和下载都在 spawn 出去的
-    /// worker 里完成——actor 只负责出队和分发。
-    ///
-    /// 为什么必须这样：早先的实现在 actor 内串行 await `file/get_url`。即使做到「每条之间
-    /// 让位」，一条请求在坏网络下仍能占住 actor 直到整个请求超时（App 默认 30 秒），
-    /// 期间到达的宿主命令只能干等。「后台工作永不压过宿主请求」要成立，
-    /// 后台就一次都不能在 actor 上等网络。
-    ///
-    /// [`commands_idle`] 仍然逐条检查：出队本身也要给命令让路。
-    async fn dispatch_thumbnail_backfill(&mut self, commands_idle: impl Fn() -> bool) {
         let Some(owner_uid) = self.current_uid.clone() else {
             return;
         };
-        // **在 actor 上取目录**：`get_storage_paths()` 按执行时的 active uid 解析，
-        // 放进 worker 就等于让切号后才跑到的任务去问「现在是谁」，于是 A 账号的
-        // 缩略图会被写进 B 账号的目录。文件一旦落盘就撤不回来——后面的 scoped
-        // 数据库校验只拦得住写库和发事件，拦不住已经写下的文件。
-        //
-        // 这是一次本地存储读，不是网络往返，而且每个 tick 只做一次。
-        let user_root = match self.storage.get_storage_paths().await {
-            Ok(paths) => PathBuf::from(&paths.user_root),
-            Err(_) => return,
-        };
-        // 注意顺序：**先出队、先按世代丢弃**，再要求连接。
-        // 陈旧项是垃圾，丢它不需要网络；反过来先要连接的话，离线时队首那条陈旧项
-        // 会把整个队列堵住。
-        let transport = self.transport.clone();
-        let session_epoch = self.session_epoch;
-        let timeout = self.timeout();
+        let key = media_download::MediaTaskKey::thumbnail(
+            owner_uid.clone(),
+            self.session_epoch,
+            message_id,
+        );
         let storage = self.storage.clone();
-        let event_tx = self.event_tx.clone();
-        let event_history = self.event_history.clone();
-        let event_seq = self.event_seq.clone();
-        let event_history_limit = self.event_history_limit;
+        let transport = self.transport.clone();
+        let timeout = self.timeout();
+        let content = extra.to_string();
+        let thumbnail_file_id = Self::extract_thumbnail_file_id(extra);
+        let actor_tx = self.actor_tx.clone();
+        let session_epoch = self.session_epoch;
 
-        for _ in 0..THUMBNAIL_BACKFILL_BATCH_LIMIT {
-            if !commands_idle() {
-                return;
-            }
-            let Some(item) = self.thumbnail_backfill_queue.pop_front() else {
-                return;
+        let _ = self.download_manager.submit(key, priority, async move {
+            let paths = match storage
+                .get_storage_paths_for_uid(owner_uid.clone())
+                .await
+            {
+                Ok(paths) => paths,
+                Err(error) => {
+                    tracing::warn!(message_id, %error, "resolve thumbnail owner storage failed");
+                    return;
+                }
             };
-            self.thumbnail_backfill_seen.remove(&item.message_id);
-            if item.session_epoch != session_epoch {
-                continue;
-            }
-            // 没有连接就原样放回队首，等下一个 tick——不丢用户的活。
-            let Some(transport) = transport.clone() else {
-                self.thumbnail_backfill_seen.insert(item.message_id);
-                self.thumbnail_backfill_queue.push_front(item);
-                return;
-            };
-            let owner_uid = owner_uid.clone();
-            let storage = storage.clone();
-            let event_tx = event_tx.clone();
-            let event_history = event_history.clone();
-            let event_seq = event_seq.clone();
-            let user_root = user_root.clone();
-            tokio::spawn(async move {
-                let ticket = match Self::extract_thumbnail_file_id(&item.extra) {
-                    Some(tid) => Self::resolve_thumbnail_ticket_detached(&transport, tid, timeout)
-                        .await,
-                    None => None,
+            let ticket = if let Some(file_id) = thumbnail_file_id {
+                let Some(transport) = transport.as_ref() else {
+                    return;
                 };
-                Self::spawn_auto_download_thumbnail(
+                let mut resolved = None;
+                for attempt in 0..3u64 {
+                    resolved =
+                        State::resolve_thumbnail_ticket_detached(transport, file_id, timeout).await;
+                    if resolved.is_some() {
+                        break;
+                    }
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                    }
+                }
+                let Some(ticket) = resolved else {
+                    tracing::warn!(message_id, file_id, "thumbnail ticket unavailable after retry");
+                    return;
+                };
+                Some(ticket)
+            } else {
+                None
+            };
+            let Some(outcome) = State::run_auto_download_thumbnail(
+                &content,
+                ticket,
+                &paths.user_root,
+                message_id,
+                created_at_ms,
+                channel_id,
+                channel_type,
+            )
+            .await
+            else {
+                return;
+            };
+            let Some(actor_tx) = actor_tx.upgrade() else {
+                return;
+            };
+            let (resp_tx, resp_rx) = oneshot::channel();
+            if actor_tx
+                .send(Command::CompleteThumbnailDownload {
                     owner_uid,
-                    &item.extra,
-                    ticket,
-                    &user_root,
-                    item.message_id,
-                    item.created_at_ms,
-                    item.channel_id,
-                    item.channel_type,
-                    storage,
-                    event_tx,
-                    event_history,
-                    event_seq,
-                    event_history_limit,
-                );
-            });
+                    session_epoch,
+                    message_id,
+                    channel_id,
+                    channel_type,
+                    outcome,
+                    resp: resp_tx,
+                })
+                .await
+                .is_ok()
+            {
+                // Keep the DownloadManager singleflight entry until the actor has
+                // either committed or rejected this exact session's outcome.
+                let _ = resp_rx.await;
+            }
+        });
+    }
+
+    /// Commit a receiver worker outcome only if it still belongs to the active
+    /// account session. Keeping this check in the main actor closes the same-UID
+    /// relogin race that a storage-only UID guard cannot distinguish.
+    async fn apply_thumbnail_download_outcome(
+        &mut self,
+        owner_uid: &str,
+        session_epoch: u64,
+        message_id: u64,
+        channel_id: u64,
+        channel_type: i32,
+        outcome: ThumbnailDownloadOutcome,
+    ) -> bool {
+        if self.current_uid.as_deref() != Some(owner_uid) || self.session_epoch != session_epoch {
+            return false;
         }
+        let thumb_status = match outcome {
+            ThumbnailDownloadOutcome::Ready => 1,
+            ThumbnailDownloadOutcome::ConfirmedAbsent => 3,
+            ThumbnailDownloadOutcome::Failed => 2,
+        };
+        let applied = match self
+            .storage
+            .update_thumb_status_scoped(owner_uid.to_string(), message_id, thumb_status)
+            .await
+        {
+            Ok(applied) => applied,
+            Err(error) => {
+                tracing::warn!(message_id, %error, "commit thumbnail outcome failed");
+                false
+            }
+        };
+        if applied && outcome == ThumbnailDownloadOutcome::Ready {
+            let event = SdkEvent::TimelineUpdated {
+                channel_id,
+                channel_type,
+                message_id,
+                reason: "thumbnail_ready".to_string(),
+            };
+            if let (Some(tx), Some(history), Some(seq)) =
+                (&self.event_tx, &self.event_history, &self.event_seq)
+            {
+                emit_sequenced_event(tx, history, seq, self.event_history_limit, event);
+            } else if let Some(tx) = &self.event_tx {
+                let _ = tx.send(event);
+            }
+        }
+        applied
     }
 
     /// 处理一批排队的 repair。由 actor tick 调用，每次最多 [`REPAIR_BATCH_LIMIT`] 条。
@@ -10286,10 +10483,10 @@ impl State {
             .filter(|id| *id > 0)
     }
 
-    /// 解析缩略图下载票据：State 内（actor 上下文）按 `thumbnail_file_id` 调 `file/get_url`，
-    /// 拿 signed_url + encryption_version + cek。失败返回 None（缩略图静默不下载，不阻塞）。
+    /// 在 DownloadManager worker 内按 `thumbnail_file_id` 调 `file/get_url`，拿
+    /// signed_url + encryption_version + cek。失败返回 None（缩略图静默不下载，不阻塞）。
     /// CEK 只来自此处，绝不取自消息 metadata。
-    /// 见 [`State::dispatch_thumbnail_backfill`]：后台路径用它，不占 actor。
+    /// 由 [`media_download::DownloadManager`] 的受控任务调用，不占 actor。
     async fn resolve_thumbnail_ticket_detached(
         transport: &TransportClient,
         thumbnail_file_id: u64,
@@ -10313,40 +10510,14 @@ impl State {
         })
     }
 
-    async fn resolve_thumbnail_ticket(
-        &mut self,
-        thumbnail_file_id: u64,
-    ) -> Option<ResolvedFileDownload> {
-        let req = FileGetUrlRequest {
-            file_id: thumbnail_file_id,
-            user_id: 0,
-        };
-        let resp: FileGetUrlResponse = self
-            .rpc_call_typed(routes::file::GET_URL, &req)
-            .await
-            .ok()?;
-        if resp.file_url.trim().is_empty() {
-            return None;
-        }
-        Some(ResolvedFileDownload {
-            url: resp.file_url,
-            encryption_version: resp.encryption_version,
-            cek: resp.cek,
-        })
-    }
-
-    /// Spawn a background task to download a thumbnail for an incoming message.
+    /// Download one thumbnail inside DownloadManager's tracked task.
     ///
     /// Scheme B：缩略图也是独立 file。`ticket` 是 caller 用 `thumbnail_file_id` 经
     /// `file/get_url` 解析出的下载票据（v1 加密：url + encryption_version + cek）。
     /// 没有 `thumbnail_file_id` 时 `ticket=None`，退回消息里的 legacy 明文 `thumbnail_url`（v0）。
     /// **CEK 只来自 get_url ticket，绝不取自消息 metadata。**
     #[allow(clippy::too_many_arguments)]
-    /// `owner_uid` = 这个下载属于哪个账号。下载是异步的，完成时账号可能已经切走——
-    /// 那时写库和发事件都必须整条放弃，否则会拿旧账号的 message_id 写进新账号的库、
-    /// 把旧账号的 timeline 事件发给新账号的界面。
-    fn spawn_auto_download_thumbnail(
-        owner_uid: String,
+    async fn run_auto_download_thumbnail(
         content: &str,
         ticket: Option<ResolvedFileDownload>,
         user_root: &Path,
@@ -10354,12 +10525,7 @@ impl State {
         created_at_ms: i64,
         channel_id: u64,
         channel_type: i32,
-        storage: crate::storage_actor::StorageHandle,
-        event_tx: Option<broadcast::Sender<SdkEvent>>,
-        event_history: Option<Arc<StdMutex<VecDeque<SequencedSdkEvent>>>>,
-        event_seq: Option<Arc<AtomicU64>>,
-        event_history_limit: usize,
-    ) {
+    ) -> Option<ThumbnailDownloadOutcome> {
         let (thumb_url, thumb_enc_version, thumb_cek) = match ticket {
             // v1：get_url 解析的票据，密文 blob，用票据里的 cek 解密。
             Some(t) if t.url.starts_with("http") => (t.url, t.encryption_version, t.cek),
@@ -10397,14 +10563,7 @@ impl State {
                         )
                         .server_says_no_thumbnail();
                     if explicit_absence {
-                        // thumb_status=3 是**终态**，写下去就永不重试。所以这条更不能
-                        // 跨账号：切号后同 ID 的另一条消息会被永久判成「没有缩略图」，
-                        // 而且不可逆。与成功/失败两条路一样走账号限定写入。
-                        tokio::spawn(async move {
-                            let _ = storage
-                                .update_thumb_status_scoped(owner_uid.clone(), message_id, 3)
-                                .await;
-                        });
+                        return Some(ThumbnailDownloadOutcome::ConfirmedAbsent);
                     } else {
                         tracing::warn!(
                             message_id,
@@ -10412,7 +10571,7 @@ impl State {
                             "拿不到缩略图票据,但服务端未明确表示没有缩略图:保持待重试,不写终态"
                         );
                     }
-                    return;
+                    return None;
                 }
             },
         };
@@ -10421,14 +10580,10 @@ impl State {
         let webp_path = dir.join(media_store::THUMB_FILENAME);
         let png_path = dir.join(media_store::THUMB_PNG_FILENAME);
         if thumb_path.exists() || webp_path.exists() || png_path.exists() {
-            let _ = tokio::spawn(async move {
-                let _ = storage
-                    .update_thumb_status_scoped(owner_uid.clone(), message_id, 1)
-                    .await;
-            });
-            return;
+            return Some(ThumbnailDownloadOutcome::Ready);
         }
-        tokio::spawn(async move {
+        let mut downloaded = None;
+        for attempt in 0..3u64 {
             match Self::do_download_thumbnail(
                 &thumb_url,
                 &dir,
@@ -10439,46 +10594,29 @@ impl State {
             .await
             {
                 Ok(()) => {
-                    // 账号已切走 → 不写库、也不发事件。
-                    match storage
-                        .update_thumb_status_scoped(owner_uid.clone(), message_id, 1)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => return,
-                        Err(e) => {
-                            eprintln!("[SDK.thumb] update thumb_status=1 failed: {e}");
-                        }
-                    }
-                    // Notify clients that the thumbnail is ready so they can refresh
-                    let event = SdkEvent::TimelineUpdated {
-                        channel_id,
-                        channel_type,
-                        message_id,
-                        reason: "thumbnail_ready".to_string(),
-                    };
-                    if let (Some(tx), Some(history), Some(seq)) =
-                        (&event_tx, &event_history, &event_seq)
-                    {
-                        emit_sequenced_event(tx, history, seq, event_history_limit, event);
-                    } else if let Some(tx) = &event_tx {
-                        let _ = tx.send(event);
-                    }
+                    downloaded = Some(Ok(()));
+                    break;
                 }
-                Err(e) => {
-                    eprintln!(
-                        "[SDK.thumb] auto-download failed message_id={} url={}: {}",
-                        message_id, thumb_url, e
-                    );
-                    if let Err(e2) = storage
-                        .update_thumb_status_scoped(owner_uid.clone(), message_id, 2)
-                        .await
-                    {
-                        eprintln!("[SDK.thumb] update thumb_status=2 failed: {e2}");
-                    }
+                Err(error) if attempt < 2 => {
+                    tracing::warn!(message_id, attempt, %error, "thumbnail download retrying");
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                }
+                Err(error) => {
+                    downloaded = Some(Err(error));
+                    break;
                 }
             }
-        });
+        }
+        match downloaded.expect("thumbnail retry loop must produce an outcome") {
+            Ok(()) => Some(ThumbnailDownloadOutcome::Ready),
+            Err(e) => {
+                eprintln!(
+                    "[SDK.thumb] auto-download failed message_id={} url={}: {}",
+                    message_id, thumb_url, e
+                );
+                Some(ThumbnailDownloadOutcome::Failed)
+            }
+        }
     }
 
     /// Pick canonical thumbnail filename based on the remote URL extension,
@@ -10504,7 +10642,12 @@ impl State {
         encryption_version: i32,
         cek: Option<&str>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let resp = reqwest::Client::new().get(url).send().await?;
+        let resp = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?
+            .get(url)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()).into());
         }
@@ -10517,7 +10660,16 @@ impl State {
             &bytes,
         )?;
         std::fs::create_dir_all(dir)?;
-        std::fs::write(thumb_path, &plaintext)?;
+        let part_path = thumb_path.with_extension(format!(
+            "{}.part",
+            thumb_path.extension().and_then(|ext| ext.to_str()).unwrap_or("thumb")
+        ));
+        {
+            let mut file = std::fs::File::create(&part_path)?;
+            file.write_all(&plaintext)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&part_path, thumb_path)?;
         eprintln!(
             "[SDK.thumb] auto-download ok: {} ({} bytes, enc_v={})",
             thumb_path.display(),
@@ -11834,6 +11986,8 @@ impl PrivchatSdk {
         let pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let actor_pending_media_jobs = pending_media_jobs.clone();
+        let download_manager = media_download::DownloadManager::new();
+        let actor_download_manager = download_manager.clone();
         // CODEX-8：worker 位取自持久化 installation id（稳定设备身份），替代 pid/启动毫秒的
         // 临时派生 —— 重启后 worker 位不漂移；配合服务端 (sender, device, local_message_id)
         // 幂等命名空间，雪花碰撞面收敛到单设备内（由毫秒+序列保证唯一）。
@@ -11901,6 +12055,8 @@ impl PrivchatSdk {
                 sync_coordinator: SyncCoordinator::new(),
                 snowflake,
                 storage: storage.clone(),
+                download_manager: actor_download_manager,
+                actor_tx: actor_cmd_tx.downgrade(),
                 skip_inbound_materialization_for_load_testing:
                     SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.load(Ordering::SeqCst),
                 current_uid,
@@ -11949,8 +12105,6 @@ impl PrivchatSdk {
                 pending_media_jobs: actor_pending_media_jobs,
                 repair_queue: VecDeque::new(),
                 repair_seen: HashSet::new(),
-                thumbnail_backfill_queue: VecDeque::new(),
-                thumbnail_backfill_seen: HashSet::new(),
                 repair_backoff: HashMap::new(),
                 avatar_cache: avatar_cache::AvatarCacheManager::default(),
             };
@@ -12051,14 +12205,6 @@ impl PrivchatSdk {
                             && !state.repair_queue.is_empty()
                         {
                             state.drain_projection_repairs().await;
-                        }
-                        // 缩略图回填：同样是后台工作，命令优先。队列里有待处理命令时
-                        // 直接跳过——让宿主等应答（进而卡住界面）是本末倒置。
-                        if rx.is_empty()
-                            && state.session_state == SessionState::Authenticated
-                            && !state.thumbnail_backfill_queue.is_empty()
-                        {
-                            state.dispatch_thumbnail_backfill(|| rx.is_empty()).await;
                         }
                         // Phase 3 后台收敛：一次一小批 stale 频道（run_anti_entropy_once
                         // 内部用 batch_get_channel_pts 批量比对 + WiFi/蜂窝预算）。
@@ -12258,7 +12404,16 @@ impl PrivchatSdk {
                         let attempt_n = state.reconnect_attempt.saturating_add(1);
                         eprintln!("[SDK.actor] auto_reconnect_attempt #{attempt_n}");
                         let from = state.session_state.as_connection_state();
-                        match state.try_auto_reconnect().await {
+                        match state
+                            .try_auto_reconnect(
+                                &mut inbound_task,
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                            )
+                            .await
+                        {
                             Ok(next) => {
                                 state.session_state = next;
                                 state.reset_reconnect_backoff();
@@ -12476,7 +12631,16 @@ impl PrivchatSdk {
                                 Err(e) => Err(e),
                                 Ok(ConnectPlan::AlreadyReady) => Ok(()),
                                 Ok(ConnectPlan::RestorePersistedSession) => {
-                                    match state.try_auto_reconnect().await {
+                                    match state
+                                        .try_auto_reconnect(
+                                            &mut inbound_task,
+                                            &actor_event_tx,
+                                            &actor_event_history,
+                                            &actor_event_seq,
+                                            event_history_limit,
+                                        )
+                                        .await
+                                    {
                                         Ok(next) => {
                                             state.session_state = next;
                                             Ok(())
@@ -12882,7 +13046,7 @@ impl PrivchatSdk {
                         // 认证要么用当前连接、要么先重建——**两条路共用同一段拆除流程**
                         // （停 inbound / 掀 transport 健康 / 发状态事件 / 重连），
                         // 免得重试路径少做几步，留下「逻辑上已认证、实际没有 transport」。
-                        let mut need_reconnect = match preflight {
+                        let need_reconnect = match preflight {
                             Err(e) => {
                                 let _ = resp.send(Err(e));
                                 continue;
@@ -12890,105 +13054,19 @@ impl PrivchatSdk {
                             Ok(AuthenticateTransportPlan::UseCurrent) => false,
                             Ok(AuthenticateTransportPlan::ReconnectTransport) => true,
                         };
-                        let mut result: Result<()> = Err(Error::ActorClosed);
-                        for round in 0..2u8 {
-                            if need_reconnect {
-                                let reconnected = async {
-                                // `connect()` and credential exchange are separated by host HTTP
-                                // work. The transport may die in that gap. Reconnect only the
-                                // transport here and authenticate with the supplied fresh token;
-                                // do not run try_auto_reconnect with the persisted old token.
-                                stop_inbound_task(&mut inbound_task).await;
-                                if let Some((from, to)) =
-                                    state.apply_transport_health(false)
-                                {
-                                    emit_sequenced_event(
-                                        &actor_event_tx,
-                                        &actor_event_history,
-                                        &actor_event_seq,
-                                        event_history_limit,
-                                        SdkEvent::ConnectionStateChanged { from, to },
-                                    );
-                                }
-                                match timeout(
-                                    state.connect_timeout_total(),
-                                    state.connect(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => {
-                                        let connected_from =
-                                            state.session_state.as_connection_state();
-                                        state.session_state = SessionState::Connected;
-                                        if connected_from
-                                            != state.session_state.as_connection_state()
-                                        {
-                                            emit_sequenced_event(
-                                                &actor_event_tx,
-                                                &actor_event_history,
-                                                &actor_event_seq,
-                                                event_history_limit,
-                                                SdkEvent::ConnectionStateChanged {
-                                                    from: connected_from,
-                                                    to: state
-                                                        .session_state
-                                                        .as_connection_state(),
-                                                },
-                                            );
-                                        }
-                                        Ok(())
-                                    }
-                                    Ok(Err(e)) => Err(e),
-                                    Err(_) => Err(Error::Transport(
-                                        "authenticate transport reconnect timeout".to_string(),
-                                    )),
-                                }
-                                }
-                                .await;
-                                if let Err(e) = reconnected {
-                                    result = Err(e);
-                                    break;
-                                }
-                            }
-                            let next_state = match state.session_state.can(Action::Authenticate) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    result = Err(e);
-                                    break;
-                                }
-                            };
-                            result = state
-                                .authenticate(user_id, token.clone(), device_id.clone())
-                                .await;
-                            if result.is_ok() {
-                                state.session_state = next_state;
-                                tracing::debug!(
-                                    user_id = %user_id,
-                                    state_after = ?state.session_state,
-                                    "authenticate command completed"
-                                );
-                                break;
-                            }
-                            // 「没拿到应答」只否决这条连接，不否决这次登录。
-                            //
-                            // `plan_authenticate_transport` 拿 `is_connected()` 做判断，而那是
-                            // 客户端自己的信念——对端或中间 CDN 单方面关掉之后，半开的 socket
-                            // 照样报 connected，ConnAuth 就写进了没人读的管子。真机实测：那段
-                            // 时间服务端**完全没有这次 ConnAuth 的记录**（它的连接处理器每次
-                            // <1ms、CPU 4%），而同一分钟另一个账号 0.4 秒就认证成功。
-                            //
-                            // 所以先证伪那条连接：走上面同一段拆除流程重建，再试一次。
-                            // 第二次仍然没有应答才是真失败。
-                            if round == 0 && matches!(result, Err(Error::RequestUnanswered { .. })) {
-                                tracing::warn!(
-                                    user_id = %user_id,
-                                    "authenticate got no response; rebuilding transport and retrying once"
-                                );
-                                need_reconnect = true;
-                                continue;
-                            }
-                            break;
-                        }
+                        let mut driver = ActorAuthenticateRetryDriver {
+                            state: &mut state,
+                            inbound_task: &mut inbound_task,
+                            event_tx: &actor_event_tx,
+                            event_history: &actor_event_history,
+                            event_seq: &actor_event_seq,
+                            event_history_limit,
+                            user_id,
+                            token: token.clone(),
+                            device_id: device_id.clone(),
+                        };
+                        let result = execute_authenticate_with_retry(&mut driver, need_reconnect).await;
+                        drop(driver);
                         if result.is_ok() {
                             // 新 token 生效，解除 Terminal 闸门、重启 auto-reconnect。
                             // SessionState 已经在 can() 里转回 Authenticated（含 AccessTokenRefreshNeeded → Authenticated 路径）。
@@ -13415,6 +13493,7 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::ClearLocalState { resp } => {
+                        state.download_manager.cancel_all_scoped();
                         state.should_auto_reconnect = false;
                         state.reset_reconnect_backoff();
                         let from_state = state.session_state.as_connection_state();
@@ -13811,7 +13890,7 @@ impl PrivchatSdk {
                         // 这里原本对整页消息串行 await `file/get_url`：一页几千张图就是几千次
                         // 网络往返卡死 actor，宿主的所有查询排在后面饿死——真机实测登录后
                         // `loadAllData` 的四个查询 4 分钟一个都没回，界面永远停在「数据初始化中」。
-                        // 网络往返现在交给 tick 限量做（[`drain_thumbnail_backfill`]）。
+                        // 网络往返现在统一交给有界的 [`media_download::DownloadManager`]。
                         if let Ok(ref messages) = result {
                             // 兜底值写的是这两个类型自己的判别值,不是随便挑的:写错的兜底一旦被
                             // 用上,就会拿 Voice/File 去当图片匹配。
@@ -13821,12 +13900,13 @@ impl PrivchatSdk {
                                 if (msg.message_type == image_type || msg.message_type == video_type)
                                     && msg.thumb_status == 0
                                 {
-                                    state.enqueue_thumbnail_backfill(
+                                    state.submit_thumbnail_download(
                                         msg.message_id,
                                         channel_id,
                                         channel_type,
                                         msg.created_at,
                                         &msg.extra,
+                                        media_download::DownloadPriority::Background,
                                     );
                                 }
                             }
@@ -14123,6 +14203,45 @@ impl PrivchatSdk {
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
+                    }
+                    Command::UpdateMediaDownloadedScoped {
+                        owner_uid,
+                        session_epoch,
+                        message_id,
+                        downloaded,
+                        resp,
+                    } => {
+                        let owner_matches = state.current_uid.as_deref() == Some(owner_uid.as_str())
+                            && state.session_epoch == session_epoch;
+                        let result = if owner_matches {
+                            state.storage.update_media_downloaded(message_id, downloaded).await
+                        } else {
+                            Err(Error::InvalidState(
+                                "receiver media task belongs to a stale session".to_string(),
+                            ))
+                        };
+                        let _ = resp.send(result);
+                    }
+                    Command::CompleteThumbnailDownload {
+                        owner_uid,
+                        session_epoch,
+                        message_id,
+                        channel_id,
+                        channel_type,
+                        outcome,
+                        resp,
+                    } => {
+                        let _ = state
+                            .apply_thumbnail_download_outcome(
+                                &owner_uid,
+                                session_epoch,
+                                message_id,
+                                channel_id,
+                                channel_type,
+                                outcome,
+                            )
+                            .await;
+                        let _ = resp.send(());
                     }
                     Command::CreateLocalAttachmentPlaceholder { input, local_message_id, resp } => {
                         let result = match state.current_uid_required() {
@@ -15160,78 +15279,30 @@ impl PrivchatSdk {
                                 state.storage.update_thumb_status(msg.message_id, 0).await?;
                             }
 
-                            // 当年那次事故丢的不只是状态，还有 `extra` 本身——metadata
-                            // 没写进去，所以本地这条消息里根本没有 thumbnail_file_id。
-                            // 只把状态改回 0 是修了「允许重试」却没给它可重试的东西：
-                            // 下一步照样解析不出 file_id，用户看到的还是灰块。
-                            //
-                            // 所以先按 server_message_id 定向重取这条消息的投影，把
-                            // metadata 补回本地，再重读一次拿修好的 extra。
-                            // 只在 extra 确实没有缩略图字段时才走这一趟网络：正常消息
-                            // 一次都不会多花。
-                            let msg = if State::extract_thumbnail_file_id(&msg.extra).is_none() {
-                                match msg.server_message_id {
-                                    Some(server_id) if server_id != 0 => {
-                                        let repaired = state
-                                            .repair_message_projection(
-                                                msg.channel_id,
-                                                msg.channel_type,
-                                                server_id,
-                                            )
-                                            .await;
-                                        if let Err(e) = &repaired {
-                                            tracing::warn!(
-                                                message_id = msg.message_id,
-                                                error = %e,
-                                                "缩略图修复：定向重取投影失败，这一轮放弃"
-                                            );
-                                        }
-                                        // 重读：上面那趟把 metadata 写回了本地，手里这份
-                                        // 还是修复前的旧值。
-                                        match state.storage.get_message_by_id(message_id).await? {
-                                            Some(fresh) => fresh,
-                                            None => return Ok(()),
-                                        }
-                                    }
-                                    // 没有 server_message_id 就无从定向重取（本地草稿 /
-                                    // 从未落到服务端）。没有缩略图可下，直接收工。
-                                    _ => return Ok(()),
+                            // Missing metadata is projection repair work, not a reason to
+                            // block this UI command on `message/history/around`. Queue the
+                            // existing repair path and return; its TimelineUpdated event
+                            // causes the visible bubble to submit again with fresh metadata.
+                            if State::extract_thumbnail_file_id(&msg.extra).is_none()
+                                && State::extract_thumbnail_url(&msg.extra).is_none()
+                            {
+                                if let Some(server_id) = msg.server_message_id.filter(|id| *id != 0)
+                                {
+                                    state.enqueue_projection_repair(
+                                        msg.channel_id,
+                                        msg.channel_type,
+                                        server_id,
+                                    );
                                 }
-                            } else {
-                                msg
-                            };
-
-                            let owner_uid = state.current_uid_required()?.to_string();
-                            let paths = state.storage.get_storage_paths().await?;
-                            let user_root = PathBuf::from(&paths.user_root);
-                            let Some(thumbnail_file_id) = State::extract_thumbnail_file_id(&msg.extra)
-                            else {
-                                // 修完投影仍然没有缩略图字段 = 这条消息确实没有缩略图。
-                                // 这才是 3 该表达的意思，现在有依据写它了。
-                                tracing::info!(
-                                    message_id = msg.message_id,
-                                    "修复投影后仍无缩略图字段：这条消息确实没有缩略图"
-                                );
                                 return Ok(());
-                            };
-                            // 这是**用户点开图片**触发的单条有界请求，与其它所有 RPC 命令
-                            // 一样在 actor 上 await——那是这套 actor 架构的普遍性质。
-                            // 规则 A2 管的是「往返次数与数据量成正比」的无界循环，不是这里。
-                            let ticket = state.resolve_thumbnail_ticket(thumbnail_file_id).await;
-                            State::spawn_auto_download_thumbnail(
-                                owner_uid.clone(),
-                                &msg.extra,
-                                ticket,
-                                &user_root,
+                            }
+                            state.submit_thumbnail_download(
                                 msg.message_id,
-                                msg.created_at,
                                 msg.channel_id,
                                 msg.channel_type,
-                                state.storage.clone(),
-                                Some(actor_event_tx.clone()),
-                                Some(actor_event_history.clone()),
-                                Some(actor_event_seq.clone()),
-                                event_history_limit,
+                                msg.created_at,
+                                &msg.extra,
+                                media_download::DownloadPriority::Visible,
                             );
                             Ok(())
                         }
@@ -15239,6 +15310,7 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::WipeCurrentUserFull { resp } => {
+                        state.download_manager.cancel_all_scoped();
                         let from_state = state.session_state.as_connection_state();
                         state.should_auto_reconnect = false;
                         state.reset_reconnect_backoff();
@@ -15275,6 +15347,7 @@ impl PrivchatSdk {
                         }
                         state.should_auto_reconnect = false;
                         state.reset_reconnect_backoff();
+                        state.download_manager.cancel_all_scoped();
                         stop_inbound_task(&mut inbound_task).await;
                         emit_sequenced_event(
                             &actor_event_tx,
@@ -15348,7 +15421,7 @@ impl PrivchatSdk {
             typing_throttle: Arc::new(StdMutex::new(HashMap::new())),
             data_dir: Arc::new(data_dir_for_self),
             file_route_key: Arc::new(file_route_key),
-            download_manager: media_download::DownloadManager::new(),
+            download_manager,
             pending_media_jobs,
         }
     }
@@ -15500,10 +15573,18 @@ impl PrivchatSdk {
         filename_hint: Option<String>,
         created_at_ms: i64,
     ) -> Result<()> {
-        let snapshot = self.session_snapshot().await?.ok_or_else(|| {
+        let status = self.session_status().await?;
+        let owner_uid = status.account_uid.ok_or_else(|| {
             Error::InvalidState("session is empty; login/authenticate required".to_string())
         })?;
-        let uid = snapshot.user_id;
+        let uid = owner_uid
+            .parse::<u64>()
+            .map_err(|_| Error::InvalidState("active account uid is invalid".to_string()))?;
+        let key = media_download::MediaTaskKey::payload(
+            owner_uid,
+            status.session_epoch,
+            message_id,
+        );
         let root = std::path::Path::new(self.data_dir.as_str());
         let target_dir =
             media_store::ensure_attachment_dir(root, uid, message_id as i64, created_at_ms)
@@ -15513,7 +15594,7 @@ impl PrivchatSdk {
         self.download_manager
             .start(
                 self.clone(),
-                message_id,
+                key,
                 download_url,
                 target_dir,
                 payload_filename,
@@ -15537,10 +15618,18 @@ impl PrivchatSdk {
         filename_hint: Option<String>,
         created_at_ms: i64,
     ) -> Result<()> {
-        let snapshot = self.session_snapshot().await?.ok_or_else(|| {
+        let status = self.session_status().await?;
+        let owner_uid = status.account_uid.ok_or_else(|| {
             Error::InvalidState("session is empty; login/authenticate required".to_string())
         })?;
-        let uid = snapshot.user_id;
+        let uid = owner_uid
+            .parse::<u64>()
+            .map_err(|_| Error::InvalidState("active account uid is invalid".to_string()))?;
+        let key = media_download::MediaTaskKey::payload(
+            owner_uid,
+            status.session_epoch,
+            message_id,
+        );
         let ticket = self.resolve_file_download(file_id).await?;
         let root = std::path::Path::new(self.data_dir.as_str());
         let target_dir =
@@ -15551,7 +15640,7 @@ impl PrivchatSdk {
         self.download_manager
             .start_with_ticket(
                 self.clone(),
-                message_id,
+                key,
                 ticket,
                 target_dir,
                 payload_filename,
@@ -15561,19 +15650,54 @@ impl PrivchatSdk {
     }
 
     pub async fn pause_message_media_download(&self, message_id: u64) {
-        self.download_manager.pause(self, message_id).await;
+        if let Ok(status) = self.session_status().await {
+            if let Some(uid) = status.account_uid {
+                let key = media_download::MediaTaskKey::payload(
+                    uid,
+                    status.session_epoch,
+                    message_id,
+                );
+                self.download_manager.pause(self, &key).await;
+            }
+        }
     }
 
     pub async fn resume_message_media_download(&self, message_id: u64) {
-        self.download_manager.resume(self, message_id).await;
+        if let Ok(status) = self.session_status().await {
+            if let Some(uid) = status.account_uid {
+                let key = media_download::MediaTaskKey::payload(
+                    uid,
+                    status.session_epoch,
+                    message_id,
+                );
+                self.download_manager.resume(self, &key).await;
+            }
+        }
     }
 
     pub async fn cancel_message_media_download(&self, message_id: u64) {
-        self.download_manager.cancel(self, message_id).await;
+        if let Ok(status) = self.session_status().await {
+            if let Some(uid) = status.account_uid {
+                let key = media_download::MediaTaskKey::payload(
+                    uid,
+                    status.session_epoch,
+                    message_id,
+                );
+                self.download_manager.cancel(self, &key).await;
+            }
+        }
     }
 
     pub async fn get_media_download_state(&self, message_id: u64) -> MediaDownloadState {
-        self.download_manager.get_state(message_id).await
+        let Ok(status) = self.session_status().await else {
+            return MediaDownloadState::Idle;
+        };
+        let Some(uid) = status.account_uid else {
+            return MediaDownloadState::Idle;
+        };
+        let key =
+            media_download::MediaTaskKey::payload(uid, status.session_epoch, message_id);
+        self.download_manager.get_state(&key).await
     }
 
     pub(crate) fn runtime_provider(&self) -> &RuntimeProvider {
@@ -17070,6 +17194,26 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    async fn update_media_downloaded_scoped(
+        &self,
+        key: &media_download::MediaTaskKey,
+        downloaded: bool,
+    ) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::UpdateMediaDownloadedScoped {
+                owner_uid: key.owner_uid.clone(),
+                session_epoch: key.session_epoch,
+                message_id: key.message_id,
+                downloaded,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
     /// 本地发送附件的占位 INSERT：拿 DB 自增 id，但不 emit 任何事件。
     /// 调用方必须在文件写盘后调用 `finalize_local_attachment`，由 finalize 负责 emit，
     /// 这样 UI 只会看到一次完整态的气泡，不会有"空内容 → 有内容"的闪动。
@@ -18066,49 +18210,56 @@ impl PrivchatSdk {
 
 #[cfg(test)]
 mod tests {
-    /// 缩略图回填队列的不变量——**直接调用生产方法**。
-    ///
-    /// 上一版这个测试在测试体里自己复制了一份 enqueue 判定，于是它只证明了那份副本
-    /// 自洽，生产代码改坏了照样绿。
-    ///
-    /// 回归背景：`ListMessages` 处理器曾对整页消息串行 await `file/get_url`，一页几千张图
-    /// 就是几千次网络往返锁死 actor。真机实测（账号 aa1112，群里 9487 条消息）登录后
-    /// `loadAllData` 的四个查询 4 分钟一个都没返回，界面永远停在「数据初始化中」，
-    /// 而 SDK 其实 20 秒时就已经 SYNC_READY。
+    /// Receiver media work is keyed by account + session + message + kind,
+    /// remains singleflight until completion, is bounded, and is aborted on a
+    /// session reset. This calls the production manager rather than duplicating
+    /// its admission logic in the test.
     #[tokio::test(flavor = "current_thread")]
-    async fn thumbnail_backfill_queue_is_bounded_deduplicated_and_account_scoped() {
+    async fn receiver_download_manager_is_bounded_deduplicated_and_account_scoped() {
         let (mut state, _dir) = new_seeded_state("thumb_queue_invariants").await;
+        use crate::media_download::{DownloadPriority, MediaTaskKey};
 
-        // 同一条消息被多次查询命中，只应占一个位置。
+        let first = MediaTaskKey::thumbnail("10001".to_string(), 0, 1001);
         for _ in 0..50 {
-            state.enqueue_thumbnail_backfill(1001, 7, 2, 0, "{}");
+            let _ = state.download_manager.submit(
+                first.clone(),
+                DownloadPriority::Background,
+                std::future::pending(),
+            );
         }
-        assert_eq!(state.thumbnail_backfill_queue.len(), 1, "重复的 message_id 不得重复排队");
+        assert_eq!(state.download_manager.tracked_count(), 1);
 
-        // 洪水必须被截断，而不是无限增长——一个大群能轻易灌进上万条。
+        // Same local id in another account is a different task, not a collision.
+        assert!(state.download_manager.submit(
+            MediaTaskKey::thumbnail("20002".to_string(), 0, 1001),
+            DownloadPriority::Background,
+            std::future::pending(),
+        ));
+        assert_eq!(state.download_manager.tracked_count(), 2);
+
         for id in 2000..20_000u64 {
-            state.enqueue_thumbnail_backfill(id, 7, 2, 0, "{}");
+            let _ = state.download_manager.submit(
+                MediaTaskKey::thumbnail("10001".to_string(), 0, id),
+                DownloadPriority::Background,
+                std::future::pending(),
+            );
         }
         assert_eq!(
-            state.thumbnail_backfill_queue.len(),
-            super::THUMBNAIL_BACKFILL_QUEUE_LIMIT,
-            "队列必须有界",
+            state.download_manager.tracked_count(),
+            480,
+            "background work must leave admission capacity for visible media",
         );
+        for id in 30_000..40_000u64 {
+            let _ = state.download_manager.submit(
+                MediaTaskKey::thumbnail("10001".to_string(), 0, id),
+                DownloadPriority::Visible,
+                std::future::pending(),
+            );
+        }
+        assert_eq!(state.download_manager.tracked_count(), 512);
 
-        // 切号必须清空：队列里存的是上一个账号的 message_id，而磁盘 active uid
-        // 已经指向新账号了，不清就是跨账号写。
         state.reset_session_scoped_state(0);
-        assert!(
-            state.thumbnail_backfill_queue.is_empty() && state.thumbnail_backfill_seen.is_empty(),
-            "切号必须清空缩略图队列，否则旧任务会写进新账号",
-        );
-
-        // 单次 tick 的批量必须远小于队列上限，否则问题只是从「一次查询卡死」
-        // 搬成「一次 tick 卡死」。
-        assert!(
-            super::THUMBNAIL_BACKFILL_BATCH_LIMIT < super::THUMBNAIL_BACKFILL_QUEUE_LIMIT / 10,
-            "单次 tick 的批量必须远小于队列上限",
-        );
+        assert_eq!(state.download_manager.tracked_count(), 0);
     }
 
     /// 下载任务在**启动之后**才切号：完成阶段必须整条放弃。
@@ -18122,7 +18273,7 @@ mod tests {
     /// 是假绿：它在一个空表上也会通过。
     #[tokio::test(flavor = "current_thread")]
     async fn a_download_finishing_after_an_account_switch_writes_nothing() {
-        let (state, dir) = new_seeded_state("thumb_switch_during_download").await;
+        let (mut state, dir) = new_seeded_state("thumb_switch_during_download").await;
         let storage = state.storage.clone();
 
         // 先造一条真实消息，thumb_status=0（未下载）。
@@ -18190,70 +18341,76 @@ mod tests {
             .expect("scoped write must not error");
         assert!(!applied, "命中零行不算成功");
 
+        // 同一个 UID 重新登录也属于新会话。只校验 owner_uid 会把旧任务的完成
+        // 结果写进新会话；生产完成入口必须同时校验 session_epoch。
+        storage
+            .update_thumb_status(message_id, 0)
+            .await
+            .expect("reset status before epoch check");
+        let applied = state
+            .apply_thumbnail_download_outcome(
+                "10001",
+                state.session_epoch + 1,
+                message_id,
+                7,
+                2,
+                super::ThumbnailDownloadOutcome::Ready,
+            )
+            .await;
+        assert!(!applied, "旧会话完成结果不得写入同 UID 的新会话");
+        assert_eq!(thumb_status_now(storage.clone()).await, 0);
+
+        let applied = state
+            .apply_thumbnail_download_outcome(
+                "10001",
+                state.session_epoch,
+                message_id,
+                7,
+                2,
+                super::ThumbnailDownloadOutcome::Ready,
+            )
+            .await;
+        assert!(applied, "当前会话结果应正常落库");
+        assert_eq!(thumb_status_now(storage.clone()).await, 1);
+
+        // Now exercise the real manager lifecycle, not just the storage guard.
+        storage
+            .update_thumb_status(message_id, 0)
+            .await
+            .expect("reset status");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_storage = storage.clone();
+        let task_started = started.clone();
+        let task_release = release.clone();
+        assert!(state.download_manager.submit(
+            crate::media_download::MediaTaskKey::thumbnail(
+                "10001".to_string(),
+                state.session_epoch,
+                message_id,
+            ),
+            crate::media_download::DownloadPriority::Visible,
+            async move {
+                task_started.notify_one();
+                task_release.notified().await;
+                let _ = task_storage
+                    .update_thumb_status_scoped("10001".to_string(), message_id, 1)
+                    .await;
+            },
+        ));
+        started.notified().await;
+        state.reset_session_scoped_state(0);
+        release.notify_waiters();
+        tokio::task::yield_now().await;
+        assert_eq!(state.download_manager.tracked_count(), 0);
+        assert_eq!(
+            thumb_status_now(storage.clone()).await,
+            0,
+            "account switch must abort an already-running receiver download",
+        );
+
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// 队首那条属于上一个账号时必须被丢弃，而且**不许**因此停止消费。
-    #[tokio::test(flavor = "current_thread")]
-    async fn drain_skips_items_from_a_previous_session() {
-        let (mut state, _dir) = new_seeded_state("thumb_drain_epoch").await;
-        state.enqueue_thumbnail_backfill(1, 7, 2, 0, "{}");
-        state.session_epoch += 1; // 切号
-        state.enqueue_thumbnail_backfill(2, 7, 2, 0, "{}");
-        assert_eq!(state.thumbnail_backfill_queue.len(), 2);
-
-        state.dispatch_thumbnail_backfill(|| true).await;
-
-        // 陈旧的那条被丢弃（丢垃圾不需要网络），当前世代那条因为夹具没有连接
-        // 被原样放回——不能因为暂时发不出去就把用户的活丢掉。
-        assert_eq!(
-            state.thumbnail_backfill_queue.len(),
-            1,
-            "旧世代那条应被丢弃，且不得卡住它后面的",
-        );
-        assert_eq!(
-            state.thumbnail_backfill_queue.front().map(|i| i.message_id),
-            Some(2),
-            "留下的必须是当前世代那条",
-        );
-    }
-
-    /// 命令一到就必须让位——**每一条之间**都要重新判断，不是开头查一次。
-    #[tokio::test(flavor = "current_thread")]
-    async fn drain_yields_to_pending_commands_between_items() {
-        let (mut state, _dir) = new_seeded_state("thumb_drain_yield").await;
-        for id in 1..=5u64 {
-            state.enqueue_thumbnail_backfill(id, 7, 2, 0, "{}");
-        }
-        // 让这批变成陈旧项：它们会走「丢弃」分支，因此不需要真实连接就能被消费，
-        // 而消费与否仍由同一个让位判断控制——这里测的就是那个判断。
-        state.session_epoch += 1;
-        let before = state.thumbnail_backfill_queue.len();
-
-        // 一开始就有命令 → 一条都不消费。
-        state.dispatch_thumbnail_backfill(|| false).await;
-        assert_eq!(
-            state.thumbnail_backfill_queue.len(),
-            before,
-            "队列里有待处理命令时，一条都不该被消费",
-        );
-
-        // 关键的那半：第一条**处理完之后**才来命令。只在开头查一次的实现会把
-        // 整批做完，这个断言就是用来钉死「每条之间都要重新查」的。
-        let calls = std::cell::Cell::new(0u32);
-        state
-            .dispatch_thumbnail_backfill(|| {
-                let n = calls.get();
-                calls.set(n + 1);
-                n == 0
-            })
-            .await;
-        assert_eq!(
-            state.thumbnail_backfill_queue.len(),
-            before - 1,
-            "第一条之后命令到达，就必须停在那里，只消费一条",
-        );
     }
 
     /// history 回填必须把 `metadata` 带进 `extra`。
@@ -18308,12 +18465,15 @@ mod tests {
     }
 
     use super::{
-        channel_prefs_key, decode_channel_prefs, decode_group_settings_cache, error_codes,
-        group_settings_key, outbound_queue_ready, plan_authenticate_transport, plan_connect,
-        Action, AuthErrorKind, AuthenticateTransportPlan, CanonicalTimelineEvent, Command,
+        auth_request_timeout, channel_prefs_key, decode_channel_prefs,
+        decode_group_settings_cache, error_codes, execute_authenticate_with_retry,
+        group_settings_key, outbound_queue_ready,
+        plan_authenticate_transport, plan_connect, Action, AuthErrorKind,
+        AuthenticateRetryDriver, AuthenticateRetryFuture, AuthenticateRetryOperation,
+        AuthenticateTransportPlan, CanonicalTimelineEvent, Command,
         ConnectPlan, ConnectionState, ContentMessageType, Error, ErrorCode, LoginResult,
         MessageCachePolicy, NetworkHint, NewMessage, PresenceStatus, PrivchatConfig, PrivchatSdk,
-        ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, ServerCommit,
+        Result, ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, ServerCommit,
         SessionState, State, SyncCoordinator, UpsertChannelInput, UpsertFriendInput,
         UpsertGroupInput, UpsertGroupMemberInput, UpsertMessageReactionInput,
         UpsertRemoteMessageInput, UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
@@ -18598,11 +18758,14 @@ mod tests {
                     .expect("test snowflake"),
             ),
             storage,
+            download_manager: crate::media_download::DownloadManager::new(),
+            actor_tx: {
+                let (tx, _rx) = tokio::sync::mpsc::channel::<Command>(1);
+                tx.downgrade()
+            },
             skip_inbound_materialization_for_load_testing: false,
             current_uid: Some("10001".to_string()),
             session_epoch: 0,
-            thumbnail_backfill_queue: VecDeque::new(),
-            thumbnail_backfill_seen: std::collections::HashSet::new(),
             should_auto_reconnect: false,
             reconnect_attempt: 0,
             next_reconnect_at: None,
@@ -19131,6 +19294,141 @@ mod tests {
             plan_authenticate_transport(SessionState::Shutdown, false),
             Err(Error::Shutdown)
         ));
+    }
+
+    struct ScriptedAuthenticateDriver {
+        reconnect_results: VecDeque<Result<()>>,
+        authenticate_results: VecDeque<Result<()>>,
+        calls: Vec<AuthenticateRetryOperation>,
+    }
+
+    impl ScriptedAuthenticateDriver {
+        fn new(
+            reconnect_results: Vec<Result<()>>,
+            authenticate_results: Vec<Result<()>>,
+        ) -> Self {
+            Self {
+                reconnect_results: reconnect_results.into(),
+                authenticate_results: authenticate_results.into(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl AuthenticateRetryDriver for ScriptedAuthenticateDriver {
+        fn run(&mut self, operation: AuthenticateRetryOperation) -> AuthenticateRetryFuture<'_> {
+            Box::pin(async move {
+                self.calls.push(operation);
+                match operation {
+                    AuthenticateRetryOperation::Reconnect => self
+                        .reconnect_results
+                        .pop_front()
+                        .expect("missing scripted reconnect result"),
+                    AuthenticateRetryOperation::Authenticate => self
+                        .authenticate_results
+                        .pop_front()
+                        .expect("missing scripted authenticate result"),
+                }
+            })
+        }
+    }
+
+    fn unanswered_auth() -> Error {
+        Error::RequestUnanswered {
+            context: "auth request".to_string(),
+        }
+    }
+
+    #[test]
+    fn authentication_request_timeout_is_capped_at_five_seconds() {
+        assert_eq!(
+            auth_request_timeout(Duration::from_secs(30)),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            auth_request_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_retry_sequence_returns_first_success_without_reconnect() {
+        let mut driver = ScriptedAuthenticateDriver::new(vec![], vec![Ok(())]);
+        execute_authenticate_with_retry(&mut driver, false)
+            .await
+            .expect("authenticate");
+        assert_eq!(driver.calls, vec![AuthenticateRetryOperation::Authenticate]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_retry_sequence_reconnects_once_after_missing_response() {
+        let mut driver = ScriptedAuthenticateDriver::new(
+            vec![Ok(())],
+            vec![Err(unanswered_auth()), Ok(())],
+        );
+        execute_authenticate_with_retry(&mut driver, false)
+            .await
+            .expect("second authenticate");
+        assert_eq!(
+            driver.calls,
+            vec![
+                AuthenticateRetryOperation::Authenticate,
+                AuthenticateRetryOperation::Reconnect,
+                AuthenticateRetryOperation::Authenticate,
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_retry_sequence_stops_when_reconnect_fails() {
+        let mut driver = ScriptedAuthenticateDriver::new(
+            vec![Err(Error::Transport("reconnect failed".to_string()))],
+            vec![Err(unanswered_auth())],
+        );
+        let error = execute_authenticate_with_retry(&mut driver, false)
+            .await
+            .expect_err("reconnect failure must escape");
+        assert!(matches!(error, Error::Transport(_)));
+        assert_eq!(
+            driver.calls,
+            vec![
+                AuthenticateRetryOperation::Authenticate,
+                AuthenticateRetryOperation::Reconnect,
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_retry_sequence_returns_second_missing_response() {
+        let mut driver = ScriptedAuthenticateDriver::new(
+            vec![Ok(())],
+            vec![Err(unanswered_auth()), Err(unanswered_auth())],
+        );
+        let error = execute_authenticate_with_retry(&mut driver, false)
+            .await
+            .expect_err("second missing response is terminal for this command");
+        assert!(matches!(error, Error::RequestUnanswered { .. }));
+        assert_eq!(
+            driver.calls,
+            vec![
+                AuthenticateRetryOperation::Authenticate,
+                AuthenticateRetryOperation::Reconnect,
+                AuthenticateRetryOperation::Authenticate,
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_retry_sequence_does_not_retry_non_timeout_errors() {
+        let mut driver = ScriptedAuthenticateDriver::new(
+            vec![],
+            vec![Err(Error::Auth("credential rejected".to_string()))],
+        );
+        let error = execute_authenticate_with_retry(&mut driver, false)
+            .await
+            .expect_err("auth rejection must escape");
+        assert!(matches!(error, Error::Auth(_)));
+        assert_eq!(driver.calls, vec![AuthenticateRetryOperation::Authenticate]);
     }
 
     #[test]

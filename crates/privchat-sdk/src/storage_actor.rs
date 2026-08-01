@@ -543,6 +543,10 @@ enum StorageCmd {
     GetStoragePaths {
         resp: oneshot::Sender<Result<StoragePaths>>,
     },
+    GetStoragePathsForUid {
+        uid: String,
+        resp: oneshot::Sender<Result<StoragePaths>>,
+    },
     Shutdown,
 }
 
@@ -1987,6 +1991,17 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
+    /// Resolve storage for the task owner rather than the process-wide active
+    /// account. Background work must never ask "who is current now?" after it
+    /// has already been scoped to a different account.
+    pub async fn get_storage_paths_for_uid(&self, uid: String) -> Result<StoragePaths> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::GetStoragePathsForUid { uid, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.send(StorageCmd::Shutdown);
     }
@@ -2875,6 +2890,9 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::GetStoragePaths { resp } => {
             with_uid!(resp, |uid| store.ensure_user_storage(&uid));
+        }
+        StorageCmd::GetStoragePathsForUid { uid, resp } => {
+            let _ = resp.send(store.ensure_user_storage(&uid));
         }
         StorageCmd::Shutdown => { /* handled in run_loop */ }
     }
