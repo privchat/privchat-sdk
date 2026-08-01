@@ -3153,7 +3153,10 @@ fn plan_anti_entropy_page(
 
 struct State {
     config: PrivchatConfig,
-    transport: Option<TransportClient>,
+    /// 共享句柄。`TransportClient::request_with_options` 取的是 `&self`，
+    /// 内部又是 `Arc<Transport>`——所以后台任务可以**自己**发请求，不必占用 actor。
+    /// （需要 `&mut self` 的是 SDK 自己的健康对账，不是传输层。）
+    transport: Option<Arc<TransportClient>>,
     /// 该 transport 的事件流。msgtrans 的客户端事件流是单消费者、只能取一次，
     /// 所以在建连时取走并存在这里，inbound task **借用**而不是夺走它。
     ///
@@ -4299,7 +4302,7 @@ impl State {
                 }
             }
         }
-        let transport = match self.transport.as_mut() {
+        let transport = match self.transport.clone() {
             Some(t) => t,
             None => {
                 let transition = self.apply_transport_health(false);
@@ -7258,7 +7261,7 @@ impl State {
             }
             match timeout(self.timeout(), self.connect_one(&ep)).await {
                 Ok(Ok((c, events))) => {
-                    self.transport = Some(c);
+                    self.transport = Some(Arc::new(c));
                     *self.transport_events.lock().await = Some(events);
                     if actor_logs_enabled() {
                         eprintln!("[SDK.actor] connect: success");
@@ -8248,23 +8251,34 @@ impl State {
         });
     }
 
-    /// 补一小批缩略图。由 actor tick 调用，每次最多
-    /// [`THUMBNAIL_BACKFILL_BATCH_LIMIT`] 条——**下载仍然是 spawn 的，这里只做票据解析**。
-    /// [`commands_idle`] 由 actor 传入，用来在**每一条之间**重新判断队列里有没有
-    /// 待处理命令——后台工作让位给宿主请求，是每一步都要成立的，不是开头一次。
-    async fn drain_thumbnail_backfill(&mut self, commands_idle: impl Fn() -> bool) {
-        // 没有当前账号就没有归属可言，整批不做。
+    /// 交出一小批缩略图回填任务。由 actor tick 调用。
+    ///
+    /// **这个方法不做任何网络 await。** 票据解析（`file/get_url`）和下载都在 spawn 出去的
+    /// worker 里完成——actor 只负责出队和分发。
+    ///
+    /// 为什么必须这样：早先的实现在 actor 内串行 await `file/get_url`。即使做到「每条之间
+    /// 让位」，一条请求在坏网络下仍能占住 actor 直到整个请求超时（App 默认 30 秒），
+    /// 期间到达的宿主命令只能干等。「后台工作永不压过宿主请求」要成立，
+    /// 后台就一次都不能在 actor 上等网络。
+    ///
+    /// [`commands_idle`] 仍然逐条检查：出队本身也要给命令让路。
+    fn dispatch_thumbnail_backfill(&mut self, commands_idle: impl Fn() -> bool) {
         let Some(owner_uid) = self.current_uid.clone() else {
             return;
         };
-        let user_root = match self.storage.get_storage_paths().await {
-            Ok(paths) => PathBuf::from(&paths.user_root),
-            Err(_) => return,
-        };
+        // 注意顺序：**先出队、先按世代丢弃**，再要求连接。
+        // 陈旧项是垃圾，丢它不需要网络；反过来先要连接的话，离线时队首那条陈旧项
+        // 会把整个队列堵住。
+        let transport = self.transport.clone();
+        let session_epoch = self.session_epoch;
+        let timeout = self.timeout();
+        let storage = self.storage.clone();
+        let event_tx = self.event_tx.clone();
+        let event_history = self.event_history.clone();
+        let event_seq = self.event_seq.clone();
+        let event_history_limit = self.event_history_limit;
+
         for _ in 0..THUMBNAIL_BACKFILL_BATCH_LIMIT {
-            // 每条之间都重新让位。只在开头查一次是不够的：一条 `file/get_url`
-            // 在坏网络下可以耗到整个请求超时，三条串起来就是几十秒，期间新到的
-            // 宿主命令只能干等——那样「后台工作永不压过宿主请求」就是句空话。
             if !commands_idle() {
                 return;
             }
@@ -8272,29 +8286,47 @@ impl State {
                 return;
             };
             self.thumbnail_backfill_seen.remove(&item.message_id);
-            // 世代对不上 = 这条属于上一个账号，丢弃（见 ThumbnailBackfillItem）。
-            if item.session_epoch != self.session_epoch {
+            if item.session_epoch != session_epoch {
                 continue;
             }
-            let ticket = match Self::extract_thumbnail_file_id(&item.extra) {
-                Some(tid) => self.resolve_thumbnail_ticket(tid).await,
-                None => None,
+            // 没有连接就原样放回队首，等下一个 tick——不丢用户的活。
+            let Some(transport) = transport.clone() else {
+                self.thumbnail_backfill_seen.insert(item.message_id);
+                self.thumbnail_backfill_queue.push_front(item);
+                return;
             };
-            Self::spawn_auto_download_thumbnail(
-                owner_uid.clone(),
-                &item.extra,
-                ticket,
-                &user_root,
-                item.message_id,
-                item.created_at_ms,
-                item.channel_id,
-                item.channel_type,
-                self.storage.clone(),
-                self.event_tx.clone(),
-                self.event_history.clone(),
-                self.event_seq.clone(),
-                self.event_history_limit,
-            );
+            let owner_uid = owner_uid.clone();
+            let storage = storage.clone();
+            let event_tx = event_tx.clone();
+            let event_history = event_history.clone();
+            let event_seq = event_seq.clone();
+            tokio::spawn(async move {
+                // user_root 也在 worker 里取：它是账号作用域的路径，而这一步同样不该占 actor。
+                let Ok(paths) = storage.get_storage_paths().await else {
+                    return;
+                };
+                let user_root = PathBuf::from(&paths.user_root);
+                let ticket = match Self::extract_thumbnail_file_id(&item.extra) {
+                    Some(tid) => Self::resolve_thumbnail_ticket_detached(&transport, tid, timeout)
+                        .await,
+                    None => None,
+                };
+                Self::spawn_auto_download_thumbnail(
+                    owner_uid,
+                    &item.extra,
+                    ticket,
+                    &user_root,
+                    item.message_id,
+                    item.created_at_ms,
+                    item.channel_id,
+                    item.channel_type,
+                    storage,
+                    event_tx,
+                    event_history,
+                    event_seq,
+                    event_history_limit,
+                );
+            });
         }
     }
 
@@ -10251,6 +10283,30 @@ impl State {
     /// 解析缩略图下载票据：State 内（actor 上下文）按 `thumbnail_file_id` 调 `file/get_url`，
     /// 拿 signed_url + encryption_version + cek。失败返回 None（缩略图静默不下载，不阻塞）。
     /// CEK 只来自此处，绝不取自消息 metadata。
+    /// 见 [`State::dispatch_thumbnail_backfill`]：后台路径用它，不占 actor。
+    async fn resolve_thumbnail_ticket_detached(
+        transport: &TransportClient,
+        thumbnail_file_id: u64,
+        timeout: Duration,
+    ) -> Option<ResolvedFileDownload> {
+        let req = FileGetUrlRequest {
+            file_id: thumbnail_file_id,
+            user_id: 0,
+        };
+        let resp: FileGetUrlResponse =
+            Self::rpc_call_typed_detached(transport, routes::file::GET_URL, &req, timeout)
+                .await
+                .ok()?;
+        if resp.file_url.trim().is_empty() {
+            return None;
+        }
+        Some(ResolvedFileDownload {
+            url: resp.file_url,
+            encryption_version: resp.encryption_version,
+            cek: resp.cek,
+        })
+    }
+
     async fn resolve_thumbnail_ticket(
         &mut self,
         thumbnail_file_id: u64,
@@ -11465,6 +11521,56 @@ impl State {
         }
     }
 
+    /// 不依赖 actor 状态的一次 RPC。供**后台任务**使用。
+    ///
+    /// 与 [`State::rpc_call_typed`] 的区别：不做连接健康对账。后台请求超时本来就不构成
+    /// 断线证据（只有 `TransportError::Connection` 才是），而健康对账要 `&mut State`——
+    /// 把它一起搬出去就等于让后台工作去裁决连接状态，那是本末倒置。
+    async fn rpc_call_typed_detached<Req, Resp>(
+        transport: &TransportClient,
+        route: &str,
+        body: &Req,
+        timeout: Duration,
+    ) -> Result<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let body_bytes = serde_json::to_vec(body)
+            .map_err(|e| Error::Serialization(format!("encode {route} body: {e}")))?;
+        let request = RpcRequest {
+            route: route.to_string(),
+            body: body_bytes,
+        };
+        let payload = encode_message(&request)
+            .map_err(|e| Error::Serialization(format!("encode rpc request: {e}")))?;
+        let opt = RequestOptions::new()
+            .biz_type(MessageType::RpcRequest as u8)
+            .timeout(timeout);
+        let raw = transport
+            .request_with_options(Bytes::from(payload), opt)
+            .await
+            .map_err(|e| match e {
+                TransportError::Timeout { .. } => Error::RequestUnanswered {
+                    context: route.to_string(),
+                },
+                other => Error::Transport(format!("{route}: {other}")),
+            })?;
+        let rpc_resp: RpcResponse = decode_message(&raw)
+            .map_err(|e| Error::Serialization(format!("decode rpc response: {e}")))?;
+        if rpc_resp.code != 0 {
+            return Err(Error::Server {
+                code: rpc_resp.code as u32,
+                message: rpc_resp.message,
+            });
+        }
+        match rpc_resp.data {
+            Some(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Serialization(format!("decode rpc data: {e}"))),
+            _ => Err(Error::Serialization(format!("{route}: empty data"))),
+        }
+    }
+
     async fn rpc_call_typed<Req, Resp>(&mut self, route: &str, body: &Req) -> Result<Resp>
     where
         Req: Serialize,
@@ -11946,7 +12052,7 @@ impl PrivchatSdk {
                             && state.session_state == SessionState::Authenticated
                             && !state.thumbnail_backfill_queue.is_empty()
                         {
-                            state.drain_thumbnail_backfill(|| rx.is_empty()).await;
+                            state.dispatch_thumbnail_backfill(|| rx.is_empty());
                         }
                         // Phase 3 后台收敛：一次一小批 stale 频道（run_anti_entropy_once
                         // 内部用 batch_get_channel_pts 批量比对 + WiFi/蜂窝预算）。
@@ -15102,6 +15208,9 @@ impl PrivchatSdk {
                                 );
                                 return Ok(());
                             };
+                            // 这是**用户点开图片**触发的单条有界请求，与其它所有 RPC 命令
+                            // 一样在 actor 上 await——那是这套 actor 架构的普遍性质。
+                            // 规则 A2 管的是「往返次数与数据量成正比」的无界循环，不是这里。
                             let ticket = state.resolve_thumbnail_ticket(thumbnail_file_id).await;
                             State::spawn_auto_download_thumbnail(
                                 owner_uid.clone(),
@@ -18040,10 +18149,19 @@ mod tests {
         state.enqueue_thumbnail_backfill(2, 7, 2, 0, "{}");
         assert_eq!(state.thumbnail_backfill_queue.len(), 2);
 
-        state.drain_thumbnail_backfill(|| true).await;
-        assert!(
-            state.thumbnail_backfill_queue.is_empty(),
-            "旧世代那条应被丢弃而不是卡住队列",
+        state.dispatch_thumbnail_backfill(|| true);
+
+        // 陈旧的那条被丢弃（丢垃圾不需要网络），当前世代那条因为夹具没有连接
+        // 被原样放回——不能因为暂时发不出去就把用户的活丢掉。
+        assert_eq!(
+            state.thumbnail_backfill_queue.len(),
+            1,
+            "旧世代那条应被丢弃，且不得卡住它后面的",
+        );
+        assert_eq!(
+            state.thumbnail_backfill_queue.front().map(|i| i.message_id),
+            Some(2),
+            "留下的必须是当前世代那条",
         );
     }
 
@@ -18054,10 +18172,13 @@ mod tests {
         for id in 1..=5u64 {
             state.enqueue_thumbnail_backfill(id, 7, 2, 0, "{}");
         }
+        // 让这批变成陈旧项：它们会走「丢弃」分支，因此不需要真实连接就能被消费，
+        // 而消费与否仍由同一个让位判断控制——这里测的就是那个判断。
+        state.session_epoch += 1;
         let before = state.thumbnail_backfill_queue.len();
 
         // 一开始就有命令 → 一条都不消费。
-        state.drain_thumbnail_backfill(|| false).await;
+        state.dispatch_thumbnail_backfill(|| false);
         assert_eq!(
             state.thumbnail_backfill_queue.len(),
             before,
@@ -18067,13 +18188,11 @@ mod tests {
         // 关键的那半：第一条**处理完之后**才来命令。只在开头查一次的实现会把
         // 整批做完，这个断言就是用来钉死「每条之间都要重新查」的。
         let calls = std::cell::Cell::new(0u32);
-        state
-            .drain_thumbnail_backfill(|| {
-                let n = calls.get();
-                calls.set(n + 1);
-                n == 0
-            })
-            .await;
+        state.dispatch_thumbnail_backfill(|| {
+            let n = calls.get();
+            calls.set(n + 1);
+            n == 0
+        });
         assert_eq!(
             state.thumbnail_backfill_queue.len(),
             before - 1,
