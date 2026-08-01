@@ -429,6 +429,20 @@ pub struct TransferReply {
     pub data: Vec<u8>,
 }
 
+/// 会话状态快照：精确阶段 + 它属于哪个账号的哪一次会话。
+///
+/// 三个字段必须一起读：宿主拿到阶段后再去问「当前是谁」是不安全的，两次读之间
+/// 账号可能已经换过，而同一个 client 会原地切号（`switch_local_account`），
+/// 所以 client 身份并不等于账号身份。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionStatus {
+    pub state: ConnectionState,
+    /// 当前账号 uid。未登录为 `None`。
+    pub account_uid: Option<String>,
+    /// 见 actor state 上的 `session_epoch` 注释：只有显式建立/废弃会话才自增。
+    pub session_epoch: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ConnectionState {
     New,
@@ -2304,6 +2318,14 @@ enum Command {
     GetConnectionState {
         resp: oneshot::Sender<Result<ConnectionState>>,
     },
+    /// 会话快照：精确阶段 + 它属于哪个账号的哪一次会话。
+    ///
+    /// 宿主不能靠「读到状态时再去问一次当前是谁」来防串号——那两次读之间账号可能
+    /// 已经换过，且同一个 client 会原地切号，client 身份并不等于账号身份。
+    /// 三个字段必须在**同一次**读取里原子取出。
+    GetSessionStatus {
+        resp: oneshot::Sender<Result<SessionStatus>>,
+    },
     #[cfg(test)]
     SetSessionStateForTest {
         session_state: SessionState,
@@ -3094,6 +3116,16 @@ struct State {
     storage: StorageHandle,
     skip_inbound_materialization_for_load_testing: bool,
     current_uid: Option<String>,
+    /// 会话世代：每次**显式**建立或废弃一个账号会话时自增。
+    ///
+    /// 存在的理由是宿主的对账需要一个「这份快照属于哪一次会话」的权威标识，而
+    /// `current_uid` 单独不够：同一个账号被强制登出后重新登录，uid 一模一样，
+    /// 但那是新会话，旧会话的终态（AuthExpired）必须在此刻、也只在此刻被清除。
+    ///
+    /// 只有 login / register / authenticate / switch_local_account / logout / wipe
+    /// 会自增。普通重连**不会**——重连不是新会话，若在那里自增，强制登出的终态
+    /// 会被下一次自动重连悄悄抹掉。
+    session_epoch: u64,
     should_auto_reconnect: bool,
     reconnect_attempt: u32,
     next_reconnect_at: Option<Instant>,
@@ -7480,6 +7512,7 @@ impl State {
         self.storage.save_login(uid.clone(), out.clone()).await?;
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
+        self.session_epoch += 1;
         if let Err(e) = self.replay_prelogin_inbound_frames().await {
             eprintln!("[SDK.inbound] replay after login failed: {e}");
         }
@@ -7557,6 +7590,7 @@ impl State {
         self.storage.save_login(uid.clone(), out.clone()).await?;
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
+        self.session_epoch += 1;
         if let Err(e) = self.replay_prelogin_inbound_frames().await {
             eprintln!("[SDK.inbound] replay after register failed: {e}");
         }
@@ -7666,6 +7700,7 @@ impl State {
         }
         self.storage.flush_user(uid.clone()).await?;
         self.current_uid = Some(uid);
+        self.session_epoch += 1;
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] authenticate: success");
         }
@@ -11602,6 +11637,7 @@ impl PrivchatSdk {
                 skip_inbound_materialization_for_load_testing:
                     SKIP_INBOUND_MATERIALIZATION_FOR_LOAD_TESTING.load(Ordering::SeqCst),
                 current_uid,
+                session_epoch: 0,
                 should_auto_reconnect: false,
                 reconnect_attempt: 0,
                 next_reconnect_at: None,
@@ -12327,6 +12363,14 @@ impl PrivchatSdk {
                     // 同 IsConnected：只读，不裁决健康。
                     Command::GetConnectionState { resp } => {
                         let _ = resp.send(Ok(state.session_state.as_connection_state()));
+                    }
+                    // 同上，只读。三个字段一次取出，保证它们互相自洽。
+                    Command::GetSessionStatus { resp } => {
+                        let _ = resp.send(Ok(SessionStatus {
+                            state: state.session_state.as_connection_state(),
+                            account_uid: state.current_uid.clone(),
+                            session_epoch: state.session_epoch,
+                        }));
                     }
                     #[cfg(test)]
                     Command::SetSessionStateForTest {
@@ -13083,6 +13127,7 @@ impl PrivchatSdk {
                             let clear = state.storage.clear_session(uid.clone()).await;
                             let clear_uid = state.storage.clear_current_uid().await;
                             state.current_uid = None;
+                            state.session_epoch += 1;
                             clear.and(clear_uid)
                         } else {
                             Ok(())
@@ -14726,6 +14771,7 @@ impl PrivchatSdk {
 
                                 // ⑤ 提交内存状态。
                                 state.current_uid = Some(uid.clone());
+                                state.session_epoch += 1;
                                 state.bootstrap_completed =
                                     snapshot.map(|s| s.bootstrap_completed).unwrap_or(false);
                                 state.session_state = SessionState::New;
@@ -14907,6 +14953,7 @@ impl PrivchatSdk {
                                 let clear_uid = state.storage.clear_current_uid().await;
                                 let wipe = state.storage.wipe_user_full(uid).await;
                                 state.current_uid = None;
+                                state.session_epoch += 1;
                                 wipe.and(clear_uid)
                             }
                             None => Ok(()),
@@ -15065,6 +15112,18 @@ impl PrivchatSdk {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::IsConnected { resp: resp_tx })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 读取会话快照（精确阶段 + 账号 + 会话世代）。宿主对账连接状态时用它，
+    /// 不要用 [`connection_state`]——那个值不带身份，无法防串号。
+    pub async fn session_status(&self) -> Result<SessionStatus> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::GetSessionStatus { resp: resp_tx })
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
@@ -17966,6 +18025,7 @@ mod tests {
             storage,
             skip_inbound_materialization_for_load_testing: false,
             current_uid: Some("10001".to_string()),
+            session_epoch: 0,
             should_auto_reconnect: false,
             reconnect_attempt: 0,
             next_reconnect_at: None,

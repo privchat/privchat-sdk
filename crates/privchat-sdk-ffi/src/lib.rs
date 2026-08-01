@@ -1328,6 +1328,16 @@ pub struct SessionSnapshot {
     pub bootstrap_completed: bool,
 }
 
+/// 会话状态快照：精确阶段 + 账号 uid + 会话世代，一次原子读出。见 SDK 同名类型。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SessionStatus {
+    pub state: ConnectionState,
+    /// 当前账号 uid，未登录为 `None`。
+    pub account_uid: Option<String>,
+    /// 只有显式建立/废弃会话（登录/注册/鉴权/切号/登出）才自增；普通重连不增。
+    pub session_epoch: u64,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ConnectionState {
     New,
@@ -3869,6 +3879,23 @@ impl PrivchatClient {
             .is_connected()
             .await
             .map_err(PrivchatFfiError::from)
+    }
+
+    /// 会话状态快照：精确阶段 + 账号 uid + 会话世代，一次原子读出。
+    ///
+    /// 宿主对账连接横幅时必须用它，不要用 [`connection_state`]：那个值不带身份，
+    /// 而同一个 client 会原地切号，「读到阶段后再问当前是谁」两次读之间账号可能已换。
+    pub async fn session_status(&self) -> Result<SessionStatus, PrivchatFfiError> {
+        let status = self
+            .inner
+            .session_status()
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(SessionStatus {
+            state: map_connection_state(status.state),
+            account_uid: status.account_uid,
+            session_epoch: status.session_epoch,
+        })
     }
 
     pub async fn connection_state(&self) -> Result<ConnectionState, PrivchatFfiError> {
@@ -9302,6 +9329,36 @@ mod tests {
             connection_timeout_secs: 1,
             data_dir: String::new(),
         }
+    }
+
+    /// `session_status` 的三个字段必须一次原子取出，且世代只在**显式**会话变更时动。
+    ///
+    /// 这是宿主防串号的唯一凭据：同一个 client 会原地 `switch_local_account`，所以
+    /// client 身份不等于账号身份；而「读到阶段之后再去问当前账号是谁」两次读之间账号
+    /// 可能已经换过。宿主若拿不到一个自洽的三元组，就只能靠猜。
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_status_reports_a_self_consistent_triple() {
+        let client = PrivchatClient::new(test_config()).expect("create client");
+
+        let before = client.session_status().await.expect("read status");
+        assert_eq!(before.session_epoch, 0, "冷启动世代从 0 起");
+        // 注意：`account_uid` 冷启动会从存储恢复，未登录不代表它是 None。
+
+        // 只读观察不得改变世代——把它做成写操作就等于让轮询自己制造「新会话」，
+        // 于是每 1.5 秒的对账都会宣布「这是新会话」，终态 sticky 立刻失效。
+        for _ in 0..3 {
+            let again = client.session_status().await.expect("read status");
+            assert_eq!(
+                again.session_epoch, before.session_epoch,
+                "session_status 是纯读，重复读取不得推进世代"
+            );
+            assert_eq!(
+                again.account_uid, before.account_uid,
+                "同一次会话内账号身份不得漂移"
+            );
+        }
+
+        client.shutdown().await.expect("shutdown should succeed");
     }
 
     #[tokio::test(flavor = "current_thread")]
