@@ -1661,6 +1661,9 @@ pub struct OpenConversationPage {
 /// 一条待补缩略图的消息。字段是入队时**拷贝**下来的，消费时不再回查消息表。
 #[derive(Debug, Clone)]
 struct ThumbnailBackfillItem {
+    /// 入队时的会话世代。消费前再校验一次：清队列与「已经取出、正要消费」之间
+    /// 仍有一个窗口，光靠 [`reset_session_scoped_state`] 清空挡不住它。
+    session_epoch: u64,
     message_id: u64,
     channel_id: u64,
     channel_type: i32,
@@ -1673,9 +1676,6 @@ struct ThumbnailBackfillItem {
 const THUMBNAIL_BACKFILL_QUEUE_LIMIT: usize = 512;
 /// 每个 tick（2s）最多补几条。这是**给 actor 留出处理命令的余地**，不是吞吐目标。
 const THUMBNAIL_BACKFILL_BATCH_LIMIT: usize = 3;
-
-/// ConnAuth 超时的判别串。调用方靠它区分「这条连接没送到」和「服务端拒绝了登录」。
-const AUTHENTICATE_TIMEOUT: &str = "authenticate timeout";
 
 /// per-channel 历史 gap 水位持久化态（KV `__hist_gap__:<ct>:<cid>`，§2.5.1 V1 最小契约）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2171,6 +2171,13 @@ pub enum Error {
     NotConnected,
     #[error("auth failed: {0}")]
     Auth(String),
+    /// 请求发出去了，但在超时窗口内**没有拿到任何应答**。
+    ///
+    /// 与 [`Error::Transport`] 的区别在于它对调用方是可操作的：这条连接没把请求送到，
+    /// 但并不说明业务失败。半开的 socket（对端或中间 CDN 单方面关闭、本端没察觉）
+    /// 正是这个形状——`is_connected()` 仍然报 true，请求写进去没人读。
+    #[error("no response for {context}")]
+    RequestUnanswered { context: String },
     #[error("actor closed")]
     ActorClosed,
     #[error("sdk shutdown")]
@@ -2289,6 +2296,8 @@ impl Error {
     pub fn sdk_code(&self) -> u32 {
         match self {
             Error::Transport(_) => error_codes::TRANSPORT_FAILURE,
+            // 没拿到应答，对宿主而言与传输失败同一类。
+            Error::RequestUnanswered { .. } => error_codes::TRANSPORT_FAILURE,
             Error::Serialization(_) => error_codes::SERIALIZATION_FAILURE,
             Error::Storage(_) => error_codes::STORAGE_FAILURE,
             Error::MissingLocalMessageId { .. } => error_codes::STORAGE_FAILURE,
@@ -2306,6 +2315,7 @@ impl Error {
     pub fn protocol_code(&self) -> u32 {
         match self {
             Error::Transport(_) => ErrorCode::NetworkError as u32,
+            Error::RequestUnanswered { .. } => ErrorCode::NetworkError as u32,
             Error::Serialization(_) => ErrorCode::DecodingError as u32,
             Error::Storage(_) => ErrorCode::DatabaseError as u32,
             Error::MissingLocalMessageId { .. } => ErrorCode::DatabaseError as u32,
@@ -3490,6 +3500,12 @@ impl State {
             let transition = self.apply_transport_health(false);
             self.push_connection_transition_event(transition);
             self.network_disconnected_error()
+        } else if matches!(error, TransportError::Timeout { .. }) {
+            // 超时不是「断线」（那要 Connection 才算），但也不是普通业务失败：
+            // 它意味着**没有应答**。调用方可以据此决定换一条连接重试。
+            Error::RequestUnanswered {
+                context: context.to_string(),
+            }
         } else {
             Error::Transport(format!("{context}: {error}"))
         }
@@ -3567,9 +3583,10 @@ impl State {
 
     fn classify_resume_error(err: &Error) -> ResumeFailureClass {
         match err {
-            Error::Transport(_) | Error::NotConnected | Error::ActorClosed => {
-                ResumeFailureClass::RetryableTemporaryError
-            }
+            Error::Transport(_)
+            | Error::RequestUnanswered { .. }
+            | Error::NotConnected
+            | Error::ActorClosed => ResumeFailureClass::RetryableTemporaryError,
             Error::Serialization(_) => ResumeFailureClass::FatalProtocolError,
             // 本地行缺幂等身份：重试或重连都救不回来，只能重建本地状态。
             Error::Storage(_) | Error::MissingLocalMessageId { .. } => {
@@ -4207,6 +4224,11 @@ impl State {
         self.inbound_epoch = self.inbound_epoch.wrapping_add(1);
         self.last_resume_synced = None;
         self.pending_prelogin_inbound_frames.clear();
+        // 缩略图回填是**账号作用域**的：队列里存的是上一个账号的 message_id，
+        // 而磁盘上的 active uid 在切号时已经先改成新账号了。不清的话，旧任务会
+        // 拿新账号的目录和数据库去更新旧账号的 message_id——跨账号污染。
+        self.thumbnail_backfill_queue.clear();
+        self.thumbnail_backfill_seen.clear();
 
         self.sync_coordinator.reset(now_ms);
 
@@ -7626,28 +7648,6 @@ impl State {
         Ok(out)
     }
 
-    /// 一次带超时的 ConnAuth。超时返回 [`AUTHENTICATE_TIMEOUT`]，调用方据此决定是否
-    /// 先重建连接再试——超时**不是**登录失败，只是这条连接没把请求送到。
-    async fn authenticate_once(
-        &mut self,
-        user_id: u64,
-        token: String,
-        device_id: String,
-    ) -> Result<()> {
-        match timeout(
-            Duration::from_secs(20),
-            self.authenticate(user_id, token, device_id),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::warn!(user_id = %user_id, "authenticate command timed out");
-                Err(Error::Transport(AUTHENTICATE_TIMEOUT.to_string()))
-            }
-        }
-    }
-
     async fn authenticate(&mut self, user_id: u64, token: String, device_id: String) -> Result<()> {
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] authenticate: enter user_id={user_id}");
@@ -8236,6 +8236,7 @@ impl State {
             return;
         }
         self.thumbnail_backfill_queue.push_back(ThumbnailBackfillItem {
+            session_epoch: self.session_epoch,
             message_id,
             channel_id,
             channel_type,
@@ -8246,16 +8247,28 @@ impl State {
 
     /// 补一小批缩略图。由 actor tick 调用，每次最多
     /// [`THUMBNAIL_BACKFILL_BATCH_LIMIT`] 条——**下载仍然是 spawn 的，这里只做票据解析**。
-    async fn drain_thumbnail_backfill(&mut self) {
+    /// [`commands_idle`] 由 actor 传入，用来在**每一条之间**重新判断队列里有没有
+    /// 待处理命令——后台工作让位给宿主请求，是每一步都要成立的，不是开头一次。
+    async fn drain_thumbnail_backfill(&mut self, commands_idle: impl Fn() -> bool) {
         let user_root = match self.storage.get_storage_paths().await {
             Ok(paths) => PathBuf::from(&paths.user_root),
             Err(_) => return,
         };
         for _ in 0..THUMBNAIL_BACKFILL_BATCH_LIMIT {
+            // 每条之间都重新让位。只在开头查一次是不够的：一条 `file/get_url`
+            // 在坏网络下可以耗到整个请求超时，三条串起来就是几十秒，期间新到的
+            // 宿主命令只能干等——那样「后台工作永不压过宿主请求」就是句空话。
+            if !commands_idle() {
+                return;
+            }
             let Some(item) = self.thumbnail_backfill_queue.pop_front() else {
                 return;
             };
             self.thumbnail_backfill_seen.remove(&item.message_id);
+            // 世代对不上 = 这条属于上一个账号，丢弃（见 ThumbnailBackfillItem）。
+            if item.session_epoch != self.session_epoch {
+                continue;
+            }
             let ticket = match Self::extract_thumbnail_file_id(&item.extra) {
                 Some(tid) => self.resolve_thumbnail_ticket(tid).await,
                 None => None,
@@ -11903,7 +11916,7 @@ impl PrivchatSdk {
                             && state.session_state == SessionState::Authenticated
                             && !state.thumbnail_backfill_queue.is_empty()
                         {
-                            state.drain_thumbnail_backfill().await;
+                            state.drain_thumbnail_backfill(|| rx.is_empty()).await;
                         }
                         // Phase 3 后台收敛：一次一小批 stale 频道（run_anti_entropy_once
                         // 内部用 batch_get_channel_pts 批量比对 + WiFi/蜂窝预算）。
@@ -12724,10 +12737,21 @@ impl PrivchatSdk {
                             state.session_state,
                             transport_connected,
                         );
-                        let preflight_result = match preflight {
-                            Err(e) => Err(e),
-                            Ok(AuthenticateTransportPlan::UseCurrent) => Ok(()),
-                            Ok(AuthenticateTransportPlan::ReconnectTransport) => {
+                        // 认证要么用当前连接、要么先重建——**两条路共用同一段拆除流程**
+                        // （停 inbound / 掀 transport 健康 / 发状态事件 / 重连），
+                        // 免得重试路径少做几步，留下「逻辑上已认证、实际没有 transport」。
+                        let mut need_reconnect = match preflight {
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                                continue;
+                            }
+                            Ok(AuthenticateTransportPlan::UseCurrent) => false,
+                            Ok(AuthenticateTransportPlan::ReconnectTransport) => true,
+                        };
+                        let mut result: Result<()> = Err(Error::ActorClosed);
+                        for round in 0..2u8 {
+                            if need_reconnect {
+                                let reconnected = async {
                                 // `connect()` and credential exchange are separated by host HTTP
                                 // work. The transport may die in that gap. Reconnect only the
                                 // transport here and authenticate with the supplied fresh token;
@@ -12777,62 +12801,52 @@ impl PrivchatSdk {
                                         "authenticate transport reconnect timeout".to_string(),
                                     )),
                                 }
-                            }
-                        };
-                        let can_result = preflight_result.and_then(|_| {
-                            state.session_state.can(Action::Authenticate)
-                        });
-                        let result = match can_result {
-                            Ok(next_state) => {
-                                let mut attempt = state.authenticate_once(
-                                    user_id,
-                                    token.clone(),
-                                    device_id.clone(),
-                                )
+                                }
                                 .await;
-                                // 超时**只证明这条连接不可用，不证明登录失败**。
-                                //
-                                // `plan_authenticate_transport` 是拿 `is_connected()` 做判断的，
-                                // 而那是客户端自己的信念——对端（或中间的 CDN）单方面关掉之后，
-                                // 半开的 socket 照样报 connected。ConnAuth 就此发进一个没人听的
-                                // 管子里，白等 20 秒然后告诉用户「网络错误」。真机实测：服务端
-                                // 那几十秒里**根本没收到过这次 ConnAuth**（连接处理器每次 <1ms，
-                                // 负载 4%），而同一分钟另一个账号 0.4 秒就认证成功了。
-                                //
-                                // 所以超时之后必须先证伪那条连接：丢掉它、重建、再试一次。
-                                // 第二次仍然超时才是真失败。
-                                if matches!(&attempt, Err(Error::Transport(m)) if m == AUTHENTICATE_TIMEOUT) {
-                                    tracing::warn!(
-                                        user_id = %user_id,
-                                        "authenticate timed out; rebuilding transport and retrying once"
-                                    );
-                                    state.transport = None;
-                                    match timeout(state.connect_timeout_total(), state.connect()).await {
-                                        Ok(Ok(())) => {
-                                            attempt = state
-                                                .authenticate_once(user_id, token, device_id)
-                                                .await;
-                                        }
-                                        Ok(Err(e)) => attempt = Err(e),
-                                        Err(_) => {
-                                            attempt = Err(Error::Transport(
-                                                "authenticate transport reconnect timeout".to_string(),
-                                            ))
-                                        }
-                                    }
+                                if let Err(e) = reconnected {
+                                    result = Err(e);
+                                    break;
                                 }
-                                if attempt.is_ok() {
-                                    state.session_state = next_state;
-                                    tracing::debug!(
-                                        user_id = %user_id,
-                                        state_after = ?state.session_state,
-                                        "authenticate command completed"
-                                    );
-                                }
-                                attempt
                             }
-                            Err(e) => Err(e),
-                        };
+                            let next_state = match state.session_state.can(Action::Authenticate) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    result = Err(e);
+                                    break;
+                                }
+                            };
+                            result = state
+                                .authenticate(user_id, token.clone(), device_id.clone())
+                                .await;
+                            if result.is_ok() {
+                                state.session_state = next_state;
+                                tracing::debug!(
+                                    user_id = %user_id,
+                                    state_after = ?state.session_state,
+                                    "authenticate command completed"
+                                );
+                                break;
+                            }
+                            // 「没拿到应答」只否决这条连接，不否决这次登录。
+                            //
+                            // `plan_authenticate_transport` 拿 `is_connected()` 做判断，而那是
+                            // 客户端自己的信念——对端或中间 CDN 单方面关掉之后，半开的 socket
+                            // 照样报 connected，ConnAuth 就写进了没人读的管子。真机实测：那段
+                            // 时间服务端**完全没有这次 ConnAuth 的记录**（它的连接处理器每次
+                            // <1ms、CPU 4%），而同一分钟另一个账号 0.4 秒就认证成功。
+                            //
+                            // 所以先证伪那条连接：走上面同一段拆除流程重建，再试一次。
+                            // 第二次仍然没有应答才是真失败。
+                            if round == 0 && matches!(result, Err(Error::RequestUnanswered { .. })) {
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    "authenticate got no response; rebuilding transport and retrying once"
+                                );
+                                need_reconnect = true;
+                                continue;
+                            }
+                            break;
+                        }
                         if result.is_ok() {
                             // 新 token 生效，解除 Terminal 闸门、重启 auto-reconnect。
                             // SessionState 已经在 can() 里转回 Authenticated（含 AccessTokenRefreshNeeded → Authenticated 路径）。
@@ -17905,59 +17919,80 @@ impl PrivchatSdk {
 
 #[cfg(test)]
 mod tests {
-    /// 缩略图回填队列的两条不变量。
+    /// 缩略图回填队列的不变量——**直接调用生产方法**。
     ///
-    /// 回归背景：`ListMessages` 的处理器曾对整页消息**串行 await** `file/get_url`，
-    /// 一页几千张图就是几千次网络往返锁死 actor。真机实测（账号 aa1112）登录后
+    /// 上一版这个测试在测试体里自己复制了一份 enqueue 判定，于是它只证明了那份副本
+    /// 自洽，生产代码改坏了照样绿。
+    ///
+    /// 回归背景：`ListMessages` 处理器曾对整页消息串行 await `file/get_url`，一页几千张图
+    /// 就是几千次网络往返锁死 actor。真机实测（账号 aa1112，群里 9487 条消息）登录后
     /// `loadAllData` 的四个查询 4 分钟一个都没返回，界面永远停在「数据初始化中」，
-    /// 而 SDK 其实早在 20 秒时就 SYNC_READY 了。
-    ///
-    /// 队列本身必须满足：**有界**（不能让一个大账号把内存吃掉），
-    /// **去重**（同一条消息重复查询不重复排队）。
-    #[test]
-    fn thumbnail_backfill_queue_is_bounded_and_deduplicated() {
-        use std::collections::{HashSet, VecDeque};
+    /// 而 SDK 其实 20 秒时就已经 SYNC_READY。
+    #[tokio::test(flavor = "current_thread")]
+    async fn thumbnail_backfill_queue_is_bounded_deduplicated_and_account_scoped() {
+        let (mut state, _dir) = new_seeded_state("thumb_queue_invariants").await;
 
-        // 复刻 enqueue 的判定，不依赖 actor 实例（它要 transport/storage 才能构造）。
-        fn enqueue(
-            queue: &mut VecDeque<u64>,
-            seen: &mut HashSet<u64>,
-            message_id: u64,
-        ) {
-            if !seen.insert(message_id) {
-                return;
-            }
-            if queue.len() >= super::THUMBNAIL_BACKFILL_QUEUE_LIMIT {
-                seen.remove(&message_id);
-                return;
-            }
-            queue.push_back(message_id);
-        }
-
-        let mut queue = VecDeque::new();
-        let mut seen = HashSet::new();
-
-        // 同一条消息反复入队（同一个会话被查询多次）只应占一个位置。
+        // 同一条消息被多次查询命中，只应占一个位置。
         for _ in 0..50 {
-            enqueue(&mut queue, &mut seen, 1001);
+            state.enqueue_thumbnail_backfill(1001, 7, 2, 0, "{}");
         }
-        assert_eq!(queue.len(), 1, "重复的 message_id 不得重复排队");
+        assert_eq!(state.thumbnail_backfill_queue.len(), 1, "重复的 message_id 不得重复排队");
 
-        // 远超上限的洪水必须被截断，而不是无限增长。
-        for id in 2000..10_000 {
-            enqueue(&mut queue, &mut seen, id);
+        // 洪水必须被截断，而不是无限增长——一个大群能轻易灌进上万条。
+        for id in 2000..20_000u64 {
+            state.enqueue_thumbnail_backfill(id, 7, 2, 0, "{}");
         }
         assert_eq!(
-            queue.len(),
+            state.thumbnail_backfill_queue.len(),
             super::THUMBNAIL_BACKFILL_QUEUE_LIMIT,
-            "队列必须有界——缩略图不是必需品，UI 还有 ensure_message_thumbnail 这条按需路径",
+            "队列必须有界",
         );
 
-        // 每个 tick 的消费量必须远小于队列上限，否则一次 tick 又会把 actor 占满，
-        // 等于把问题从「一次查询卡死」搬成「一次 tick 卡死」。
+        // 切号必须清空：队列里存的是上一个账号的 message_id，而磁盘 active uid
+        // 已经指向新账号了，不清就是跨账号写。
+        state.reset_session_scoped_state(0);
+        assert!(
+            state.thumbnail_backfill_queue.is_empty() && state.thumbnail_backfill_seen.is_empty(),
+            "切号必须清空缩略图队列，否则旧任务会写进新账号",
+        );
+
+        // 单次 tick 的批量必须远小于队列上限，否则问题只是从「一次查询卡死」
+        // 搬成「一次 tick 卡死」。
         assert!(
             super::THUMBNAIL_BACKFILL_BATCH_LIMIT < super::THUMBNAIL_BACKFILL_QUEUE_LIMIT / 10,
             "单次 tick 的批量必须远小于队列上限",
+        );
+    }
+
+    /// 队首那条属于上一个账号时必须被丢弃，而且**不许**因此停止消费。
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_skips_items_from_a_previous_session() {
+        let (mut state, _dir) = new_seeded_state("thumb_drain_epoch").await;
+        state.enqueue_thumbnail_backfill(1, 7, 2, 0, "{}");
+        state.session_epoch += 1; // 切号
+        state.enqueue_thumbnail_backfill(2, 7, 2, 0, "{}");
+        assert_eq!(state.thumbnail_backfill_queue.len(), 2);
+
+        state.drain_thumbnail_backfill(|| true).await;
+        assert!(
+            state.thumbnail_backfill_queue.is_empty(),
+            "旧世代那条应被丢弃而不是卡住队列",
+        );
+    }
+
+    /// 命令一到就必须让位——**每一条之间**都要重新判断，不是开头查一次。
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_yields_to_pending_commands_between_items() {
+        let (mut state, _dir) = new_seeded_state("thumb_drain_yield").await;
+        for id in 1..=5u64 {
+            state.enqueue_thumbnail_backfill(id, 7, 2, 0, "{}");
+        }
+        let before = state.thumbnail_backfill_queue.len();
+        state.drain_thumbnail_backfill(|| false).await;
+        assert_eq!(
+            state.thumbnail_backfill_queue.len(),
+            before,
+            "队列里有待处理命令时，一条都不该被消费",
         );
     }
 
@@ -18868,7 +18903,10 @@ mod tests {
             msgtrans::TransportError::timeout_error("sync/get_difference", Duration::from_secs(5)),
         );
 
-        assert!(matches!(error, Error::Transport(_)));
+        // 超时被归为 [`Error::RequestUnanswered`]——比 `Transport` 更具体：请求没拿到
+        // 应答，但这**不构成断线证据**（只有 `TransportError::Connection` 才是）。
+        // 下面两条才是本测试真正守的东西：会话一根汗毛都不许动。
+        assert!(matches!(error, Error::RequestUnanswered { .. }));
         assert_eq!(state.session_state, SessionState::Authenticated);
         assert_eq!(state.current_uid.as_deref(), Some("10001"));
         drop(state);
