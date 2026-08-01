@@ -1658,6 +1658,22 @@ pub struct OpenConversationPage {
     pub fetched_from_server: bool,
 }
 
+/// 一条待补缩略图的消息。字段是入队时**拷贝**下来的，消费时不再回查消息表。
+#[derive(Debug, Clone)]
+struct ThumbnailBackfillItem {
+    message_id: u64,
+    channel_id: u64,
+    channel_type: i32,
+    created_at_ms: i64,
+    extra: String,
+}
+
+/// 队列上限：超出就丢弃。缩略图不是必需品——UI 在气泡进入可视区时会用
+/// `ensure_message_thumbnail` 单独补，那条路是用户驱动的、也是即时的。
+const THUMBNAIL_BACKFILL_QUEUE_LIMIT: usize = 512;
+/// 每个 tick（2s）最多补几条。这是**给 actor 留出处理命令的余地**，不是吞吐目标。
+const THUMBNAIL_BACKFILL_BATCH_LIMIT: usize = 3;
+
 /// per-channel 历史 gap 水位持久化态（KV `__hist_gap__:<ct>:<cid>`，§2.5.1 V1 最小契约）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistGapState {
@@ -3241,6 +3257,16 @@ struct State {
     /// 不落库，这是有意的：repair 状态没有独立价值，重启后从损坏的投影本身就能
     /// 重新发现。为它建一张表是过度设计。
     repair_queue: VecDeque<(i32, u64, u64)>,
+    /// 待补缩略图的消息（SDK 内部背景工作，不阻塞任何命令）。
+    ///
+    /// 存在的理由：解析下载票据要打一次 `file/get_url`，而它必须在 actor 上跑
+    /// （`rpc_call_json` 要 `&mut self` 做 transport 健康对账）。原来的实现在
+    /// `ListMessages` 的处理器里对整页消息**串行 await** 这个 RPC——一页几千张图
+    /// 就是几千次网络往返锁死 actor，宿主的所有查询排在后面饿死（真机实测：登录后
+    /// `loadAllData` 的四个查询 4 分钟一个都没返回，界面永远停在「数据初始化中」）。
+    /// 现在只入队，由 tick 限量消费。
+    thumbnail_backfill_queue: VecDeque<ThumbnailBackfillItem>,
+    thumbnail_backfill_seen: HashSet<u64>,
     /// 已排队/已修过的 key，用于 singleflight 去重。
     repair_seen: HashSet<(i32, u64, u64)>,
     /// 失败后的退避到期时间与次数：离线时不空转，恢复后由下一次读取重新发现。
@@ -6158,37 +6184,17 @@ impl State {
                         || message_type
                             == i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(3);
                     if is_image_or_video && !from_self {
-                        if let Ok(paths) = self.storage.get_storage_paths().await {
-                            let user_root = PathBuf::from(&paths.user_root);
-                            // DB stores created_at as now_ms (millis), so use
-                            // the same unit for the download path to match
-                            // resolveThumbnailPath which reads DB created_at.
-                            let created_at_ms = chrono::Utc::now().timestamp_millis();
-                            // Scheme B：缩略图按 thumbnail_file_id 经 file/get_url 解析下载票据
-                            // （含 cek，in-actor RPC）；旧 v0 消息无 file_id 时 ticket=None，
-                            // spawn 内退回 legacy 明文 thumbnail_url。CEK 只来自 get_url。
-                            let thumb_ticket =
-                                match Self::extract_thumbnail_file_id(&extra_for_thumb) {
-                                    Some(tid) => self.resolve_thumbnail_ticket(tid).await,
-                                    None => None,
-                                };
-                            let storage = self.storage.clone();
-                            // thumbnail_url lives in `extra`, not `content`
-                            Self::spawn_auto_download_thumbnail(
-                                &extra_for_thumb,
-                                thumb_ticket,
-                                &user_root,
-                                message_id,
-                                created_at_ms,
-                                channel_id,
-                                channel_type,
-                                storage,
-                                self.event_tx.clone(),
-                                self.event_history.clone(),
-                                self.event_seq.clone(),
-                                self.event_history_limit,
-                            );
-                        }
+                        // 同样只入队。入站路径每条消息都要解析一次票据，一轮大同步灌进来
+                        // 几百条图片就是几百次串行网络往返压在 actor 上——与列表查询那处
+                        // 是同一个病。DB 的 created_at 是毫秒，回填路径要对齐同一单位。
+                        let created_at_ms = chrono::Utc::now().timestamp_millis();
+                        self.enqueue_thumbnail_backfill(
+                            message_id,
+                            channel_id,
+                            channel_type,
+                            created_at_ms,
+                            &extra_for_thumb,
+                        );
                     }
 
                     // NewMessage is immutable. Realtime delivery and anti-entropy may overlap,
@@ -8183,6 +8189,67 @@ impl State {
             return;
         }
         self.repair_queue.push_back(key);
+    }
+
+    /// 登记一条待补缩略图的消息。**纯内存操作，不做任何 await。**
+    ///
+    /// 这是本修复的要害：调用方（消息列表查询、入站消息）只负责说「这条需要补」，
+    /// 网络往返一律留给 [`drain_thumbnail_backfill`] 在 tick 里限量做。
+    fn enqueue_thumbnail_backfill(
+        &mut self,
+        message_id: u64,
+        channel_id: u64,
+        channel_type: i32,
+        created_at_ms: i64,
+        extra: &str,
+    ) {
+        if !self.thumbnail_backfill_seen.insert(message_id) {
+            return;
+        }
+        if self.thumbnail_backfill_queue.len() >= THUMBNAIL_BACKFILL_QUEUE_LIMIT {
+            self.thumbnail_backfill_seen.remove(&message_id);
+            return;
+        }
+        self.thumbnail_backfill_queue.push_back(ThumbnailBackfillItem {
+            message_id,
+            channel_id,
+            channel_type,
+            created_at_ms,
+            extra: extra.to_string(),
+        });
+    }
+
+    /// 补一小批缩略图。由 actor tick 调用，每次最多
+    /// [`THUMBNAIL_BACKFILL_BATCH_LIMIT`] 条——**下载仍然是 spawn 的，这里只做票据解析**。
+    async fn drain_thumbnail_backfill(&mut self) {
+        let user_root = match self.storage.get_storage_paths().await {
+            Ok(paths) => PathBuf::from(&paths.user_root),
+            Err(_) => return,
+        };
+        for _ in 0..THUMBNAIL_BACKFILL_BATCH_LIMIT {
+            let Some(item) = self.thumbnail_backfill_queue.pop_front() else {
+                return;
+            };
+            self.thumbnail_backfill_seen.remove(&item.message_id);
+            let ticket = match Self::extract_thumbnail_file_id(&item.extra) {
+                Some(tid) => self.resolve_thumbnail_ticket(tid).await,
+                None => None,
+            };
+            Self::spawn_auto_download_thumbnail(
+                &item.extra,
+                ticket,
+                &user_root,
+                item.message_id,
+                item.created_at_ms,
+                item.channel_id,
+                item.channel_type,
+                self.storage.clone(),
+                self.event_tx.clone(),
+                self.event_history.clone(),
+                self.event_seq.clone(),
+                self.event_history_limit,
+            );
+        }
     }
 
     /// 处理一批排队的 repair。由 actor tick 调用，每次最多 [`REPAIR_BATCH_LIMIT`] 条。
@@ -11702,6 +11769,8 @@ impl PrivchatSdk {
                 pending_media_jobs: actor_pending_media_jobs,
                 repair_queue: VecDeque::new(),
                 repair_seen: HashSet::new(),
+                thumbnail_backfill_queue: VecDeque::new(),
+                thumbnail_backfill_seen: HashSet::new(),
                 repair_backoff: HashMap::new(),
                 avatar_cache: avatar_cache::AvatarCacheManager::default(),
             };
@@ -11802,6 +11871,14 @@ impl PrivchatSdk {
                             && !state.repair_queue.is_empty()
                         {
                             state.drain_projection_repairs().await;
+                        }
+                        // 缩略图回填：同样是后台工作，命令优先。队列里有待处理命令时
+                        // 直接跳过——让宿主等应答（进而卡住界面）是本末倒置。
+                        if rx.is_empty()
+                            && state.session_state == SessionState::Authenticated
+                            && !state.thumbnail_backfill_queue.is_empty()
+                        {
+                            state.drain_thumbnail_backfill().await;
                         }
                         // Phase 3 后台收敛：一次一小批 stale 频道（run_anti_entropy_once
                         // 内部用 batch_get_channel_pts 批量比对 + WiFi/蜂窝预算）。
@@ -13522,40 +13599,28 @@ impl PrivchatSdk {
                                 }
                             }
                         }
-                        // Trigger thumbnail downloads for image/video messages missing thumbnails
+                        // 缺缩略图的图片/视频**只入队**，一次 await 都不做。
+                        //
+                        // 这里原本对整页消息串行 await `file/get_url`：一页几千张图就是几千次
+                        // 网络往返卡死 actor，宿主的所有查询排在后面饿死——真机实测登录后
+                        // `loadAllData` 的四个查询 4 分钟一个都没回，界面永远停在「数据初始化中」。
+                        // 网络往返现在交给 tick 限量做（[`drain_thumbnail_backfill`]）。
                         if let Ok(ref messages) = result {
-                            if let Ok(paths) = state.storage.get_storage_paths().await {
-                                let user_root = PathBuf::from(&paths.user_root);
-                                // 兜底值写的是这两个类型自己的判别值,不是随便挑的:写错的兜底一旦被
-                                // 用上,就会拿 Voice/File 去当图片匹配。
-                                let image_type = i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(2);
-                                let video_type = i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(3);
-                                for msg in messages {
-                                    if (msg.message_type == image_type || msg.message_type == video_type)
-                                        && msg.thumb_status == 0
-                                    {
-                                        // Scheme B：缩略图按 thumbnail_file_id 经 get_url 解析票据（含 cek）。
-                                        let thumb_ticket =
-                                            match State::extract_thumbnail_file_id(&msg.extra) {
-                                                Some(tid) => state.resolve_thumbnail_ticket(tid).await,
-                                                None => None,
-                                            };
-                                        // thumbnail_url lives in `extra`, not `content`
-                                        State::spawn_auto_download_thumbnail(
-                                            &msg.extra,
-                                            thumb_ticket,
-                                            &user_root,
-                                            msg.message_id,
-                                            msg.created_at,
-                                            channel_id,
-                                            channel_type,
-                                            state.storage.clone(),
-                                            state.event_tx.clone(),
-                                            state.event_history.clone(),
-                                            state.event_seq.clone(),
-                                            state.event_history_limit,
-                                        );
-                                    }
+                            // 兜底值写的是这两个类型自己的判别值,不是随便挑的:写错的兜底一旦被
+                            // 用上,就会拿 Voice/File 去当图片匹配。
+                            let image_type = i32::try_from(ContentMessageType::Image.as_u32()).unwrap_or(2);
+                            let video_type = i32::try_from(ContentMessageType::Video.as_u32()).unwrap_or(3);
+                            for msg in messages {
+                                if (msg.message_type == image_type || msg.message_type == video_type)
+                                    && msg.thumb_status == 0
+                                {
+                                    state.enqueue_thumbnail_backfill(
+                                        msg.message_id,
+                                        channel_id,
+                                        channel_type,
+                                        msg.created_at,
+                                        &msg.extra,
+                                    );
                                 }
                             }
                         }
@@ -17789,6 +17854,62 @@ impl PrivchatSdk {
 
 #[cfg(test)]
 mod tests {
+    /// 缩略图回填队列的两条不变量。
+    ///
+    /// 回归背景：`ListMessages` 的处理器曾对整页消息**串行 await** `file/get_url`，
+    /// 一页几千张图就是几千次网络往返锁死 actor。真机实测（账号 aa1112）登录后
+    /// `loadAllData` 的四个查询 4 分钟一个都没返回，界面永远停在「数据初始化中」，
+    /// 而 SDK 其实早在 20 秒时就 SYNC_READY 了。
+    ///
+    /// 队列本身必须满足：**有界**（不能让一个大账号把内存吃掉），
+    /// **去重**（同一条消息重复查询不重复排队）。
+    #[test]
+    fn thumbnail_backfill_queue_is_bounded_and_deduplicated() {
+        use std::collections::{HashSet, VecDeque};
+
+        // 复刻 enqueue 的判定，不依赖 actor 实例（它要 transport/storage 才能构造）。
+        fn enqueue(
+            queue: &mut VecDeque<u64>,
+            seen: &mut HashSet<u64>,
+            message_id: u64,
+        ) {
+            if !seen.insert(message_id) {
+                return;
+            }
+            if queue.len() >= super::THUMBNAIL_BACKFILL_QUEUE_LIMIT {
+                seen.remove(&message_id);
+                return;
+            }
+            queue.push_back(message_id);
+        }
+
+        let mut queue = VecDeque::new();
+        let mut seen = HashSet::new();
+
+        // 同一条消息反复入队（同一个会话被查询多次）只应占一个位置。
+        for _ in 0..50 {
+            enqueue(&mut queue, &mut seen, 1001);
+        }
+        assert_eq!(queue.len(), 1, "重复的 message_id 不得重复排队");
+
+        // 远超上限的洪水必须被截断，而不是无限增长。
+        for id in 2000..10_000 {
+            enqueue(&mut queue, &mut seen, id);
+        }
+        assert_eq!(
+            queue.len(),
+            super::THUMBNAIL_BACKFILL_QUEUE_LIMIT,
+            "队列必须有界——缩略图不是必需品，UI 还有 ensure_message_thumbnail 这条按需路径",
+        );
+
+        // 每个 tick 的消费量必须远小于队列上限，否则一次 tick 又会把 actor 占满，
+        // 等于把问题从「一次查询卡死」搬成「一次 tick 卡死」。
+        assert!(
+            super::THUMBNAIL_BACKFILL_BATCH_LIMIT < super::THUMBNAIL_BACKFILL_QUEUE_LIMIT / 10,
+            "单次 tick 的批量必须远小于队列上限",
+        );
+    }
+
     /// history 回填必须把 `metadata` 带进 `extra`。
     ///
     /// 生产事故的回归:翻页拉回来的图片消息 extra 是空串,而 file_id /
@@ -18134,6 +18255,8 @@ mod tests {
             skip_inbound_materialization_for_load_testing: false,
             current_uid: Some("10001".to_string()),
             session_epoch: 0,
+            thumbnail_backfill_queue: VecDeque::new(),
+            thumbnail_backfill_seen: std::collections::HashSet::new(),
             should_auto_reconnect: false,
             reconnect_attempt: 0,
             next_reconnect_at: None,
