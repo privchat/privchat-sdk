@@ -8262,9 +8262,19 @@ impl State {
     /// 后台就一次都不能在 actor 上等网络。
     ///
     /// [`commands_idle`] 仍然逐条检查：出队本身也要给命令让路。
-    fn dispatch_thumbnail_backfill(&mut self, commands_idle: impl Fn() -> bool) {
+    async fn dispatch_thumbnail_backfill(&mut self, commands_idle: impl Fn() -> bool) {
         let Some(owner_uid) = self.current_uid.clone() else {
             return;
+        };
+        // **在 actor 上取目录**：`get_storage_paths()` 按执行时的 active uid 解析，
+        // 放进 worker 就等于让切号后才跑到的任务去问「现在是谁」，于是 A 账号的
+        // 缩略图会被写进 B 账号的目录。文件一旦落盘就撤不回来——后面的 scoped
+        // 数据库校验只拦得住写库和发事件，拦不住已经写下的文件。
+        //
+        // 这是一次本地存储读，不是网络往返，而且每个 tick 只做一次。
+        let user_root = match self.storage.get_storage_paths().await {
+            Ok(paths) => PathBuf::from(&paths.user_root),
+            Err(_) => return,
         };
         // 注意顺序：**先出队、先按世代丢弃**，再要求连接。
         // 陈旧项是垃圾，丢它不需要网络；反过来先要连接的话，离线时队首那条陈旧项
@@ -8300,12 +8310,8 @@ impl State {
             let event_tx = event_tx.clone();
             let event_history = event_history.clone();
             let event_seq = event_seq.clone();
+            let user_root = user_root.clone();
             tokio::spawn(async move {
-                // user_root 也在 worker 里取：它是账号作用域的路径，而这一步同样不该占 actor。
-                let Ok(paths) = storage.get_storage_paths().await else {
-                    return;
-                };
-                let user_root = PathBuf::from(&paths.user_root);
                 let ticket = match Self::extract_thumbnail_file_id(&item.extra) {
                     Some(tid) => Self::resolve_thumbnail_ticket_detached(&transport, tid, timeout)
                         .await,
@@ -12052,7 +12058,7 @@ impl PrivchatSdk {
                             && state.session_state == SessionState::Authenticated
                             && !state.thumbnail_backfill_queue.is_empty()
                         {
-                            state.dispatch_thumbnail_backfill(|| rx.is_empty());
+                            state.dispatch_thumbnail_backfill(|| rx.is_empty()).await;
                         }
                         // Phase 3 后台收敛：一次一小批 stale 频道（run_anti_entropy_once
                         // 内部用 batch_get_channel_pts 批量比对 + WiFi/蜂窝预算）。
@@ -18108,33 +18114,73 @@ mod tests {
     /// 下载任务在**启动之后**才切号：完成阶段必须整条放弃。
     ///
     /// 这是清队列覆盖不到的那一半——队列只管「还没开始的」，而缩略图下载是异步的，
-    /// 切号时已经在飞的那些照样会回来写库。`update_thumb_status` 在执行时才用
-    /// active uid 解析账号，所以旧账号的 message_id 会被写进新账号的库，
-    /// 尤其 thumb_status=3 是不可逆终态。
+    /// 切号时已经在飞的那些照样会回来写库。
+    ///
+    /// **断言的是数据库里的真实值，不是返回码。** 上一版只看 `update_thumb_status_scoped`
+    /// 的返回布尔，而底层 `UPDATE ... WHERE id = ?` 命中零行也返回 `Ok`——
+    /// 夹具里那个 message_id 根本不存在，于是「账号一致时必须真的写入」那条断言
+    /// 是假绿：它在一个空表上也会通过。
     #[tokio::test(flavor = "current_thread")]
     async fn a_download_finishing_after_an_account_switch_writes_nothing() {
         let (state, dir) = new_seeded_state("thumb_switch_during_download").await;
         let storage = state.storage.clone();
-        // 夹具的 active uid 是 "10001"；这里模拟任务出生于另一个账号。
-        let stale_owner = "20002".to_string();
 
+        // 先造一条真实消息，thumb_status=0（未下载）。
+        let message_id = storage
+            .create_local_message(
+                4242,
+                NewMessage {
+                    channel_id: 7,
+                    channel_type: 2,
+                    from_uid: 10001,
+                    message_type: 2,
+                    content: "img".to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: "{}".to_string(),
+                    mime_type: Some("image/webp".to_string()),
+                    media_downloaded: false,
+                    thumb_status: 0,
+                },
+            )
+            .await
+            .expect("seed message");
+
+        let thumb_status_now = |storage: StorageHandle| async move {
+            storage
+                .get_message_by_id(message_id)
+                .await
+                .expect("read message")
+                .expect("message must exist")
+                .thumb_status
+        };
+        assert_eq!(thumb_status_now(storage.clone()).await, 0, "前提：初值为 0");
+
+        // 夹具的 active uid 是 "10001"；任务出生于另一个账号。
         for status in [1, 2, 3] {
             let applied = storage
-                .update_thumb_status_scoped(stale_owner.clone(), 4242, status)
+                .update_thumb_status_scoped("20002".to_string(), message_id, status)
                 .await
                 .expect("scoped write must not error");
-            assert!(
-                !applied,
-                "账号已切换，thumb_status={status} 不该落到新账号头上（3 还是不可逆终态）",
+            assert!(!applied, "账号已切换，不该报告写入成功");
+            assert_eq!(
+                thumb_status_now(storage.clone()).await,
+                0,
+                "账号已切换，thumb_status={status} 不该真的落进新账号的库（3 还是不可逆终态）",
             );
         }
 
-        // 对照：账号没变时照常写入，别把功能一起挡掉。
+        // 对照：账号一致时确实改到了数据库，别把功能一起挡掉。
         let applied = storage
-            .update_thumb_status_scoped("10001".to_string(), 4242, 1)
+            .update_thumb_status_scoped("10001".to_string(), message_id, 1)
             .await
             .expect("scoped write must not error");
-        assert!(applied, "账号一致时必须真的写入");
+        assert!(applied);
+        assert_eq!(
+            thumb_status_now(storage.clone()).await,
+            1,
+            "账号一致时必须真的写进数据库",
+        );
 
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
@@ -18149,7 +18195,7 @@ mod tests {
         state.enqueue_thumbnail_backfill(2, 7, 2, 0, "{}");
         assert_eq!(state.thumbnail_backfill_queue.len(), 2);
 
-        state.dispatch_thumbnail_backfill(|| true);
+        state.dispatch_thumbnail_backfill(|| true).await;
 
         // 陈旧的那条被丢弃（丢垃圾不需要网络），当前世代那条因为夹具没有连接
         // 被原样放回——不能因为暂时发不出去就把用户的活丢掉。
@@ -18178,7 +18224,7 @@ mod tests {
         let before = state.thumbnail_backfill_queue.len();
 
         // 一开始就有命令 → 一条都不消费。
-        state.dispatch_thumbnail_backfill(|| false);
+        state.dispatch_thumbnail_backfill(|| false).await;
         assert_eq!(
             state.thumbnail_backfill_queue.len(),
             before,
@@ -18188,11 +18234,13 @@ mod tests {
         // 关键的那半：第一条**处理完之后**才来命令。只在开头查一次的实现会把
         // 整批做完，这个断言就是用来钉死「每条之间都要重新查」的。
         let calls = std::cell::Cell::new(0u32);
-        state.dispatch_thumbnail_backfill(|| {
-            let n = calls.get();
-            calls.set(n + 1);
-            n == 0
-        });
+        state
+            .dispatch_thumbnail_backfill(|| {
+                let n = calls.get();
+                calls.set(n + 1);
+                n == 0
+            })
+            .await;
         assert_eq!(
             state.thumbnail_backfill_queue.len(),
             before - 1,
