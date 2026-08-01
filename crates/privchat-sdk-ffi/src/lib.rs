@@ -1021,6 +1021,16 @@ pub struct OlderHistoryView {
     pub has_more_before: bool,
 }
 
+/// SDK-HISTORY-7 打开会话返回的最新窗口。
+/// [messages] 空 = 这个会话确实一条消息都没有（不是加载失败，也不许拿占位消息填充）。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OpenConversationView {
+    pub messages: Vec<StoredMessage>,
+    pub has_more_before: bool,
+    /// 本次是否真的打了网络。仅供诊断。
+    pub fetched_from_server: bool,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MessageHistoryItemView {
     pub message_id: u64,
@@ -7679,6 +7689,30 @@ impl PrivchatClient {
         Ok(OlderHistoryView {
             messages: page.messages.into_iter().map(map_stored_message).collect(),
             has_more_before: page.has_more_before,
+        })
+    }
+
+    /// SDK-HISTORY-7：打开会话。本地为渲染真源，本地为空时补一次**最新**窗口。
+    ///
+    /// 此前打开会话是纯本地读（`get_messages`），本地没有就永远显示「暂无聊天内容」——
+    /// 上滑翻页救不了它，翻页需要一个已存在的锚点，一条都没有时连起点都没有。
+    ///
+    /// 空会话返回空列表，**不注入任何占位/问候消息**。
+    pub async fn open_conversation(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        limit: u32,
+    ) -> Result<OpenConversationView, PrivchatFfiError> {
+        let page = self
+            .inner
+            .open_conversation(channel_id, channel_type, limit)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(OpenConversationView {
+            messages: page.messages.into_iter().map(map_stored_message).collect(),
+            has_more_before: page.has_more_before,
+            fetched_from_server: page.fetched_from_server,
         })
     }
 

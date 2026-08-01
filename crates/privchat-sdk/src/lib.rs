@@ -1647,10 +1647,30 @@ pub struct OlderHistoryPage {
     pub has_more_before: bool,
 }
 
+/// 打开会话时返回的最新窗口（SDK-HISTORY-7）。
+#[derive(Debug, Clone)]
+pub struct OpenConversationPage {
+    /// 本地重读的最新窗口（显示序）。空 = 这个会话确实一条消息都没有。
+    pub messages: Vec<StoredMessage>,
+    /// 服务端是否还有更早（供 UI 决定是否允许继续上滑）。
+    pub has_more_before: bool,
+    /// 本次是否真的打了网络。仅供诊断，不参与渲染判断。
+    pub fetched_from_server: bool,
+}
+
 /// per-channel 历史 gap 水位持久化态（KV `__hist_gap__:<ct>:<cid>`，§2.5.1 V1 最小契约）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistGapState {
     has_more_before: bool,
+}
+
+/// 「这个会话补过最新窗口了吗」（KV `__hist_hydrated__:<ct>:<cid>`，SDK-HISTORY-7）。
+///
+/// 必须与「本地是否为空」分开。只看本地为空的话，「从没补过」和「补过、结果就是空」
+/// 无法区分，真空会话每次打开都会白打一次网络。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistHydratedState {
+    hydrated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16554,6 +16574,94 @@ impl PrivchatSdk {
         Ok(OlderHistoryPage {
             messages: older,
             has_more_before: resp.has_more,
+        })
+    }
+
+    /// 打开会话（SDK-HISTORY-7）：本地为渲染真源，本地为空时补一次**最新**窗口。
+    ///
+    /// 这个入口此前根本不存在——`list_messages` 是纯本地读，打开一个本地没有消息的会话
+    /// 只会显示「暂无聊天内容」，而上滑翻页救不了它：翻页需要一个已存在的锚点往前翻，
+    /// 一条都没有时连起点都没有。
+    ///
+    /// 「没补过」和「补过、结果是空」必须分开记（[HistHydratedState]）。只看「本地是否为空」
+    /// 的话，一个真正空的会话每次打开都会白打一次网络，永远收敛不了。
+    ///
+    /// 空会话就返回空。**不注入任何占位/问候消息**——那是伪造历史。
+    pub async fn open_conversation(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        limit: u32,
+    ) -> Result<OpenConversationPage> {
+        let gap_key = format!("__hist_gap__:{channel_type}:{channel_id}");
+        let read_has_more = |raw: Option<Vec<u8>>| -> bool {
+            raw.and_then(|b| serde_json::from_slice::<HistGapState>(&b).ok())
+                .map(|s| s.has_more_before)
+                // 没有水位记录 = 未知，按「可能还有」处理：宁可多给一次上滑机会，
+                // 也不要谎称到顶把用户挡在门外。
+                .unwrap_or(true)
+        };
+
+        // 1. 先读本地。有内容就直接渲染，不打网络——冷启动秒开靠的就是这一步。
+        let local = self
+            .list_messages(channel_id, channel_type, limit as usize, 0)
+            .await?;
+        if !local.is_empty() {
+            return Ok(OpenConversationPage {
+                messages: local,
+                has_more_before: read_has_more(self.kv_get_local(gap_key).await?),
+                fetched_from_server: false,
+            });
+        }
+
+        // 2. 本地空。补过一次且结果就是空 → 这是个真的空会话，不再空转。
+        let hydrated_key = format!("__hist_hydrated__:{channel_type}:{channel_id}");
+        let hydrated = self
+            .kv_get_local(hydrated_key.clone())
+            .await?
+            .and_then(|b| serde_json::from_slice::<HistHydratedState>(&b).ok())
+            .map(|s| s.hydrated)
+            .unwrap_or(false);
+        if hydrated {
+            return Ok(OpenConversationPage {
+                messages: Vec::new(),
+                has_more_before: false,
+                fetched_from_server: false,
+            });
+        }
+
+        // 3. 从没补过 → 拉最新一页。`before = None` 即「最新」，服务端本来就支持，
+        //    与上滑翻页复用同一个 RPC（回填带真实 pts，SDK-HISTORY-2 已做 upsert）。
+        let resp = self
+            .fetch_channel_history(channel_id, channel_type, None, Some(limit))
+            .await?;
+
+        // 只有网络这一步成功了才落 hydrated：失败就落的话，一次超时会让这个会话
+        // 永远显示「暂无聊天内容」，再也不会重试。
+        let _ = self
+            .kv_put_local(
+                hydrated_key,
+                serde_json::to_vec(&HistHydratedState { hydrated: true }).unwrap_or_default(),
+            )
+            .await;
+        let _ = self
+            .kv_put_local(
+                gap_key,
+                serde_json::to_vec(&HistGapState {
+                    has_more_before: resp.has_more,
+                })
+                .unwrap_or_default(),
+            )
+            .await;
+
+        // 4. 从本地库重读（回填已 upsert）。本地始终是渲染真源，不直接渲染 RPC 响应。
+        let messages = self
+            .list_messages(channel_id, channel_type, limit as usize, 0)
+            .await?;
+        Ok(OpenConversationPage {
+            messages,
+            has_more_before: resp.has_more,
+            fetched_from_server: true,
         })
     }
 
