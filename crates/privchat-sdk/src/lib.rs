@@ -18182,6 +18182,14 @@ mod tests {
             "账号一致时必须真的写进数据库",
         );
 
+        // 不存在的消息：账号对得上，但一行都没改到——不得报告成功，
+        // 否则调用方会据此发出 `thumbnail_ready`，UI 收到事件去刷新却什么都没变。
+        let applied = storage
+            .update_thumb_status_scoped("10001".to_string(), 999_999, 1)
+            .await
+            .expect("scoped write must not error");
+        assert!(!applied, "命中零行不算成功");
+
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }

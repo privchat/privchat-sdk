@@ -2408,9 +2408,11 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             // 归属校验和写入在同一个 storage actor 轮次里完成，中间没有 await，
             // 所以不存在「查完 uid、写之前又被切走」的窗口。
             let result = match store.load_current_uid() {
-                Ok(Some(uid)) if uid == owner_uid => store
-                    .update_thumb_status(&uid, message_id, thumb_status)
-                    .map(|_| true),
+                // 账号对上**且**真的改到了一行才算成功。零行说明这条消息在本地不存在
+                // （被清理/从未落库），此时发 `thumbnail_ready` 是在骗 UI。
+                Ok(Some(uid)) if uid == owner_uid => {
+                    store.update_thumb_status(&uid, message_id, thumb_status)
+                }
                 Ok(_) => Ok(false),
                 Err(e) => Err(e),
             };
@@ -2421,11 +2423,9 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             thumb_status,
             resp,
         } => {
-            with_uid!(resp, |uid| store.update_thumb_status(
-                &uid,
-                message_id,
-                thumb_status
-            ));
+            with_uid!(resp, |uid| store
+                .update_thumb_status(&uid, message_id, thumb_status)
+                .map(|_| ()));
         }
         StorageCmd::UpdateMediaDownloaded {
             message_id,

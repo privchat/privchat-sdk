@@ -1990,18 +1990,28 @@ impl LocalStore {
         Ok(out)
     }
 
-    pub fn update_thumb_status(&self, uid: &str, message_id: u64, thumb_status: i32) -> Result<()> {
+    /// 更新缩略图状态。返回**是否真的改到了一行**。
+    ///
+    /// 影响行数不能丢：`WHERE id = ?` 命中零行同样是 `Ok`，把它当成成功就会让调用方
+    /// 在什么都没写的情况下发出 `thumbnail_ready`——UI 收到事件去刷新，却什么都没变。
+    pub fn update_thumb_status(
+        &self,
+        uid: &str,
+        message_id: u64,
+        thumb_status: i32,
+    ) -> Result<bool> {
         let conn = self.conn_for_user(uid)?;
-        conn.execute(
-            "UPDATE message SET thumb_status = ?1, updated_at = ?3 WHERE id = ?2",
-            params![
-                thumb_status,
-                message_id as i64,
-                chrono::Utc::now().timestamp_millis()
-            ],
-        )
-        .map_err(|e| Error::Storage(format!("update thumb_status: {e}")))?;
-        Ok(())
+        let rows = conn
+            .execute(
+                "UPDATE message SET thumb_status = ?1, updated_at = ?3 WHERE id = ?2",
+                params![
+                    thumb_status,
+                    message_id as i64,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )
+            .map_err(|e| Error::Storage(format!("update thumb_status: {e}")))?;
+        Ok(rows == 1)
     }
 
     /// 更新消息的主文件下载状态
