@@ -1674,6 +1674,9 @@ const THUMBNAIL_BACKFILL_QUEUE_LIMIT: usize = 512;
 /// 每个 tick（2s）最多补几条。这是**给 actor 留出处理命令的余地**，不是吞吐目标。
 const THUMBNAIL_BACKFILL_BATCH_LIMIT: usize = 3;
 
+/// ConnAuth 超时的判别串。调用方靠它区分「这条连接没送到」和「服务端拒绝了登录」。
+const AUTHENTICATE_TIMEOUT: &str = "authenticate timeout";
+
 /// per-channel 历史 gap 水位持久化态（KV `__hist_gap__:<ct>:<cid>`，§2.5.1 V1 最小契约）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistGapState {
@@ -7623,6 +7626,28 @@ impl State {
         Ok(out)
     }
 
+    /// 一次带超时的 ConnAuth。超时返回 [`AUTHENTICATE_TIMEOUT`]，调用方据此决定是否
+    /// 先重建连接再试——超时**不是**登录失败，只是这条连接没把请求送到。
+    async fn authenticate_once(
+        &mut self,
+        user_id: u64,
+        token: String,
+        device_id: String,
+    ) -> Result<()> {
+        match timeout(
+            Duration::from_secs(20),
+            self.authenticate(user_id, token, device_id),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(user_id = %user_id, "authenticate command timed out");
+                Err(Error::Transport(AUTHENTICATE_TIMEOUT.to_string()))
+            }
+        }
+    }
+
     async fn authenticate(&mut self, user_id: u64, token: String, device_id: String) -> Result<()> {
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] authenticate: enter user_id={user_id}");
@@ -12758,28 +12783,54 @@ impl PrivchatSdk {
                             state.session_state.can(Action::Authenticate)
                         });
                         let result = match can_result {
-                            Ok(next_state) => match timeout(
-                                Duration::from_secs(20),
-                                state.authenticate(user_id, token, device_id),
-                            )
-                            .await
-                            {
-                                Ok(r) => {
-                                    if r.is_ok() {
-                                        state.session_state = next_state;
-                                        tracing::debug!(
-                                            user_id = %user_id,
-                                            state_after = ?state.session_state,
-                                            "authenticate command completed"
-                                        );
+                            Ok(next_state) => {
+                                let mut attempt = state.authenticate_once(
+                                    user_id,
+                                    token.clone(),
+                                    device_id.clone(),
+                                )
+                                .await;
+                                // 超时**只证明这条连接不可用，不证明登录失败**。
+                                //
+                                // `plan_authenticate_transport` 是拿 `is_connected()` 做判断的，
+                                // 而那是客户端自己的信念——对端（或中间的 CDN）单方面关掉之后，
+                                // 半开的 socket 照样报 connected。ConnAuth 就此发进一个没人听的
+                                // 管子里，白等 20 秒然后告诉用户「网络错误」。真机实测：服务端
+                                // 那几十秒里**根本没收到过这次 ConnAuth**（连接处理器每次 <1ms，
+                                // 负载 4%），而同一分钟另一个账号 0.4 秒就认证成功了。
+                                //
+                                // 所以超时之后必须先证伪那条连接：丢掉它、重建、再试一次。
+                                // 第二次仍然超时才是真失败。
+                                if matches!(&attempt, Err(Error::Transport(m)) if m == AUTHENTICATE_TIMEOUT) {
+                                    tracing::warn!(
+                                        user_id = %user_id,
+                                        "authenticate timed out; rebuilding transport and retrying once"
+                                    );
+                                    state.transport = None;
+                                    match timeout(state.connect_timeout_total(), state.connect()).await {
+                                        Ok(Ok(())) => {
+                                            attempt = state
+                                                .authenticate_once(user_id, token, device_id)
+                                                .await;
+                                        }
+                                        Ok(Err(e)) => attempt = Err(e),
+                                        Err(_) => {
+                                            attempt = Err(Error::Transport(
+                                                "authenticate transport reconnect timeout".to_string(),
+                                            ))
+                                        }
                                     }
-                                    r
                                 }
-                                Err(_) => {
-                                    tracing::warn!(user_id = %user_id, "authenticate command timed out");
-                                    Err(Error::Transport("authenticate timeout".to_string()))
-                                },
-                            },
+                                if attempt.is_ok() {
+                                    state.session_state = next_state;
+                                    tracing::debug!(
+                                        user_id = %user_id,
+                                        state_after = ?state.session_state,
+                                        "authenticate command completed"
+                                    );
+                                }
+                                attempt
+                            }
                             Err(e) => Err(e),
                         };
                         if result.is_ok() {
