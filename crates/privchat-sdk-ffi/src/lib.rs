@@ -2052,6 +2052,12 @@ pub struct StoredGroupMember {
     pub role: i32,
     pub status: i32,
     pub alias: Option<String>,
+    pub username: Option<String>,
+    pub nickname: Option<String>,
+    pub user_alias: Option<String>,
+    pub display_name: String,
+    pub avatar: String,
+    pub user_type: i32,
     pub is_muted: bool,
     pub joined_at: i64,
     pub updated_at: i64,
@@ -3546,6 +3552,12 @@ fn map_stored_group_member(v: SdkStoredGroupMember) -> StoredGroupMember {
         role: v.role,
         status: v.status,
         alias: v.alias,
+        username: v.username,
+        nickname: v.nickname,
+        user_alias: v.user_alias,
+        display_name: v.display_name,
+        avatar: v.avatar,
+        user_type: v.user_type,
         is_muted: v.is_muted,
         joined_at: v.joined_at,
         updated_at: v.updated_at,
@@ -5189,7 +5201,15 @@ impl PrivchatClient {
                 _ => 0,
             };
             let status = 0;
-            let alias = Some(entry.nickname.clone());
+            // Group alias and global nickname are separate identity domains.
+            // Older code stored profile.nickname into group_member.alias, which
+            // permanently shadowed later user-profile updates.
+            let alias = entry
+                .alias
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
             let is_muted = entry.is_muted;
             let joined_at = now;
             let updated_at = now;

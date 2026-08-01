@@ -1952,6 +1952,18 @@ pub struct StoredGroupMember {
     pub role: i32,
     pub status: i32,
     pub alias: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub nickname: Option<String>,
+    #[serde(default)]
+    pub user_alias: Option<String>,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub avatar: String,
+    #[serde(default)]
+    pub user_type: i32,
     pub is_muted: bool,
     pub joined_at: i64,
     pub version: i64,

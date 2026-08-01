@@ -19,6 +19,25 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn resolve_group_member_display_name(
+    group_alias: Option<&str>,
+    user_alias: Option<&str>,
+    nickname: Option<&str>,
+    username: Option<&str>,
+    user_id: u64,
+) -> String {
+    non_blank(group_alias)
+        .or_else(|| non_blank(user_alias))
+        .or_else(|| non_blank(nickname))
+        .or_else(|| non_blank(username))
+        .map(str::to_owned)
+        .unwrap_or_else(|| user_id.to_string())
+}
+
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
@@ -3437,10 +3456,16 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         let mut stmt = conn
             .prepare(
-                "SELECT group_id, user_id, role, status, alias, is_muted, joined_at, version, updated_at
-                 FROM group_member
-                 WHERE group_id = ?1
-                 ORDER BY version DESC, user_id DESC
+                "SELECT
+                    gm.group_id, gm.user_id, gm.role, gm.status, NULLIF(TRIM(gm.alias), ''),
+                    NULLIF(TRIM(u.username), ''), NULLIF(TRIM(u.nickname), ''),
+                    NULLIF(TRIM(u.alias), ''), COALESCE(u.avatar, ''),
+                    COALESCE(u.user_type, 0),
+                    gm.is_muted, gm.joined_at, gm.version, gm.updated_at
+                 FROM group_member AS gm
+                 LEFT JOIN user AS u ON u.user_id = gm.user_id AND u.is_deleted = 0
+                 WHERE gm.group_id = ?1 AND gm.status = 0
+                 ORDER BY gm.version DESC, gm.user_id DESC
                  LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| Error::Storage(format!("prepare list group members: {e}")))?;
@@ -3448,16 +3473,34 @@ impl LocalStore {
             .query_map(
                 params![group_id as i64, limit as i64, offset as i64],
                 |row| {
+                    let user_id = row.get::<_, i64>(1)? as u64;
+                    let group_alias = row.get::<_, Option<String>>(4)?;
+                    let username = row.get::<_, Option<String>>(5)?;
+                    let nickname = row.get::<_, Option<String>>(6)?;
+                    let user_alias = row.get::<_, Option<String>>(7)?;
+                    let display_name = resolve_group_member_display_name(
+                        group_alias.as_deref(),
+                        user_alias.as_deref(),
+                        nickname.as_deref(),
+                        username.as_deref(),
+                        user_id,
+                    );
                     Ok(StoredGroupMember {
                         group_id: row.get::<_, i64>(0)? as u64,
-                        user_id: row.get::<_, i64>(1)? as u64,
+                        user_id,
                         role: row.get::<_, i32>(2)?,
                         status: row.get::<_, i32>(3)?,
-                        alias: row.get::<_, Option<String>>(4)?,
-                        is_muted: row.get::<_, i32>(5)? != 0,
-                        joined_at: row.get::<_, i64>(6)?,
-                        version: row.get::<_, i64>(7)?,
-                        updated_at: row.get::<_, i64>(8)?,
+                        alias: group_alias,
+                        username,
+                        nickname,
+                        user_alias,
+                        display_name,
+                        avatar: row.get::<_, String>(8)?,
+                        user_type: row.get::<_, i32>(9)?,
+                        is_muted: row.get::<_, i32>(10)? != 0,
+                        joined_at: row.get::<_, i64>(11)?,
+                        version: row.get::<_, i64>(12)?,
+                        updated_at: row.get::<_, i64>(13)?,
                     })
                 },
             )
@@ -5217,7 +5260,10 @@ pub(crate) enum LegacyQueueKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_string, LegacyQueueKind, LocalStore, GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID};
+    use super::{
+        get_string, resolve_group_member_display_name, LegacyQueueKind, LocalStore,
+        GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID,
+    };
     use crate::{
         LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
         UpsertChannelInput, UpsertGroupInput, UpsertRemoteMessageInput,
@@ -5235,6 +5281,42 @@ mod tests {
             hex::encode(rand_bytes)
         ));
         LocalStore::open_at(dir).expect("open test store")
+    }
+
+    #[test]
+    fn group_member_display_name_uses_the_frozen_priority() {
+        assert_eq!(
+            resolve_group_member_display_name(
+                Some(" group alias "),
+                Some("user alias"),
+                Some("nickname"),
+                Some("username"),
+                7,
+            ),
+            "group alias"
+        );
+        assert_eq!(
+            resolve_group_member_display_name(
+                None,
+                Some("user alias"),
+                Some("nickname"),
+                Some("username"),
+                7,
+            ),
+            "user alias"
+        );
+        assert_eq!(
+            resolve_group_member_display_name(None, None, Some("nickname"), None, 7),
+            "nickname"
+        );
+        assert_eq!(
+            resolve_group_member_display_name(None, None, None, Some("username"), 7),
+            "username"
+        );
+        assert_eq!(
+            resolve_group_member_display_name(None, None, None, None, 7),
+            "7"
+        );
     }
 
     #[test]
@@ -7658,6 +7740,13 @@ mod tests {
             .expect("list group members");
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].user_id, 20001);
+        assert_eq!(members[0].display_name, "owner");
+        // delete_friend above removed this friend-only field; the public group
+        // projection must not resurrect or expose it.
+        assert_eq!(members[0].username, None);
+        assert_eq!(members[0].nickname.as_deref(), Some("Alice"));
+        assert_eq!(members[0].user_alias.as_deref(), Some("A"));
+        assert_eq!(members[0].avatar, "avatar://alice");
         assert_eq!(members[0].version, 1004);
         store
             .upsert_group_member(
@@ -7682,8 +7771,35 @@ mod tests {
         assert_eq!(members[0].role, 0);
         assert_eq!(members[0].status, 0);
         assert_eq!(members[0].alias.as_deref(), Some("owner"));
+        assert_eq!(members[0].display_name, "owner");
         assert!(!members[0].is_muted);
         assert_eq!(members[0].version, 1004);
+
+        // The view is a live JOIN, not denormalized member data. A profile
+        // update changes the projected name without rewriting group_member.
+        store
+            .upsert_user(
+                uid,
+                &crate::UpsertUserInput {
+                    user_id: 20001,
+                    username: Some("alice-2".to_string()),
+                    nickname: Some("Alice 2".to_string()),
+                    alias: Some("A2".to_string()),
+                    avatar: "avatar://alice-2".to_string(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: "c-alice".to_string(),
+                    version: 2000,
+                    updated_at: 2000,
+                },
+            )
+            .expect("update user projection");
+        let members = store
+            .list_group_members(uid, 30001, 20, 0)
+            .expect("list group members after user update");
+        assert_eq!(members[0].display_name, "owner");
+        assert_eq!(members[0].nickname.as_deref(), Some("Alice 2"));
+        assert_eq!(members[0].avatar, "avatar://alice-2");
         store
             .delete_group_member(uid, 30001, 20001)
             .expect("delete group member");
