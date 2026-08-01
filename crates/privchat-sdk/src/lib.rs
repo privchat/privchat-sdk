@@ -3119,11 +3119,7 @@ impl AuthenticateRetryDriver for ActorAuthenticateRetryDriver<'_> {
                 AuthenticateRetryOperation::Authenticate => {
                     let next_state = self.state.session_state.can(Action::Authenticate)?;
                     self.state
-                        .authenticate(
-                            self.user_id,
-                            self.token.clone(),
-                            self.device_id.clone(),
-                        )
+                        .authenticate(self.user_id, self.token.clone(), self.device_id.clone())
                         .await?;
                     self.state.session_state = next_state;
                     tracing::debug!(
@@ -8426,10 +8422,7 @@ impl State {
         let session_epoch = self.session_epoch;
 
         let _ = self.download_manager.submit(key, priority, async move {
-            let paths = match storage
-                .get_storage_paths_for_uid(owner_uid.clone())
-                .await
-            {
+            let paths = match storage.get_storage_paths_for_uid(owner_uid.clone()).await {
                 Ok(paths) => paths,
                 Err(error) => {
                     tracing::warn!(message_id, %error, "resolve thumbnail owner storage failed");
@@ -8452,7 +8445,11 @@ impl State {
                     }
                 }
                 let Some(ticket) = resolved else {
-                    tracing::warn!(message_id, file_id, "thumbnail ticket unavailable after retry");
+                    tracing::warn!(
+                        message_id,
+                        file_id,
+                        "thumbnail ticket unavailable after retry"
+                    );
                     return;
                 };
                 Some(ticket)
@@ -10674,7 +10671,10 @@ impl State {
         std::fs::create_dir_all(dir)?;
         let part_path = thumb_path.with_extension(format!(
             "{}.part",
-            thumb_path.extension().and_then(|ext| ext.to_str()).unwrap_or("thumb")
+            thumb_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("thumb")
         ));
         {
             let mut file = std::fs::File::create(&part_path)?;
@@ -15592,11 +15592,8 @@ impl PrivchatSdk {
         let uid = owner_uid
             .parse::<u64>()
             .map_err(|_| Error::InvalidState("active account uid is invalid".to_string()))?;
-        let key = media_download::MediaTaskKey::payload(
-            owner_uid,
-            status.session_epoch,
-            message_id,
-        );
+        let key =
+            media_download::MediaTaskKey::payload(owner_uid, status.session_epoch, message_id);
         let root = std::path::Path::new(self.data_dir.as_str());
         let target_dir =
             media_store::ensure_attachment_dir(root, uid, message_id as i64, created_at_ms)
@@ -15637,11 +15634,8 @@ impl PrivchatSdk {
         let uid = owner_uid
             .parse::<u64>()
             .map_err(|_| Error::InvalidState("active account uid is invalid".to_string()))?;
-        let key = media_download::MediaTaskKey::payload(
-            owner_uid,
-            status.session_epoch,
-            message_id,
-        );
+        let key =
+            media_download::MediaTaskKey::payload(owner_uid, status.session_epoch, message_id);
         let ticket = self.resolve_file_download(file_id).await?;
         let root = std::path::Path::new(self.data_dir.as_str());
         let target_dir =
@@ -15650,13 +15644,7 @@ impl PrivchatSdk {
         let payload_filename =
             media_store::payload_filename_with_fallback(&mime, filename_hint.as_deref());
         self.download_manager
-            .start_with_ticket(
-                self.clone(),
-                key,
-                ticket,
-                target_dir,
-                payload_filename,
-            )
+            .start_with_ticket(self.clone(), key, ticket, target_dir, payload_filename)
             .await
             .map_err(Error::InvalidState)
     }
@@ -15664,11 +15652,8 @@ impl PrivchatSdk {
     pub async fn pause_message_media_download(&self, message_id: u64) {
         if let Ok(status) = self.session_status().await {
             if let Some(uid) = status.account_uid {
-                let key = media_download::MediaTaskKey::payload(
-                    uid,
-                    status.session_epoch,
-                    message_id,
-                );
+                let key =
+                    media_download::MediaTaskKey::payload(uid, status.session_epoch, message_id);
                 self.download_manager.pause(self, &key).await;
             }
         }
@@ -15677,11 +15662,8 @@ impl PrivchatSdk {
     pub async fn resume_message_media_download(&self, message_id: u64) {
         if let Ok(status) = self.session_status().await {
             if let Some(uid) = status.account_uid {
-                let key = media_download::MediaTaskKey::payload(
-                    uid,
-                    status.session_epoch,
-                    message_id,
-                );
+                let key =
+                    media_download::MediaTaskKey::payload(uid, status.session_epoch, message_id);
                 self.download_manager.resume(self, &key).await;
             }
         }
@@ -15690,11 +15672,8 @@ impl PrivchatSdk {
     pub async fn cancel_message_media_download(&self, message_id: u64) {
         if let Ok(status) = self.session_status().await {
             if let Some(uid) = status.account_uid {
-                let key = media_download::MediaTaskKey::payload(
-                    uid,
-                    status.session_epoch,
-                    message_id,
-                );
+                let key =
+                    media_download::MediaTaskKey::payload(uid, status.session_epoch, message_id);
                 self.download_manager.cancel(self, &key).await;
             }
         }
@@ -15707,8 +15686,7 @@ impl PrivchatSdk {
         let Some(uid) = status.account_uid else {
             return MediaDownloadState::Idle;
         };
-        let key =
-            media_download::MediaTaskKey::payload(uid, status.session_epoch, message_id);
+        let key = media_download::MediaTaskKey::payload(uid, status.session_epoch, message_id);
         self.download_manager.get_state(&key).await
     }
 
@@ -18477,18 +18455,17 @@ mod tests {
     }
 
     use super::{
-        auth_request_timeout, channel_prefs_key, decode_channel_prefs,
-        decode_group_settings_cache, error_codes, execute_authenticate_with_retry,
-        group_settings_key, outbound_queue_ready,
-        plan_authenticate_transport, plan_connect, Action, AuthErrorKind,
-        AuthenticateRetryDriver, AuthenticateRetryFuture, AuthenticateRetryOperation,
-        AuthenticateTransportPlan, CanonicalTimelineEvent, Command,
-        ConnectPlan, ConnectionState, ContentMessageType, Error, ErrorCode, LoginResult,
-        MessageCachePolicy, NetworkHint, NewMessage, PresenceStatus, PrivchatConfig, PrivchatSdk,
-        Result, ResumeEscalationScope, ResumeFailureClass, ResumeFailureTarget, SdkEvent, ServerCommit,
-        SessionState, State, SyncCoordinator, UpsertChannelInput, UpsertFriendInput,
-        UpsertGroupInput, UpsertGroupMemberInput, UpsertMessageReactionInput,
-        UpsertRemoteMessageInput, UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
+        auth_request_timeout, channel_prefs_key, decode_channel_prefs, decode_group_settings_cache,
+        error_codes, execute_authenticate_with_retry, group_settings_key, outbound_queue_ready,
+        plan_authenticate_transport, plan_connect, Action, AuthErrorKind, AuthenticateRetryDriver,
+        AuthenticateRetryFuture, AuthenticateRetryOperation, AuthenticateTransportPlan,
+        CanonicalTimelineEvent, Command, ConnectPlan, ConnectionState, ContentMessageType, Error,
+        ErrorCode, LoginResult, MessageCachePolicy, NetworkHint, NewMessage, PresenceStatus,
+        PrivchatConfig, PrivchatSdk, Result, ResumeEscalationScope, ResumeFailureClass,
+        ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State, SyncCoordinator,
+        UpsertChannelInput, UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput,
+        UpsertMessageReactionInput, UpsertRemoteMessageInput, UpsertUserInput,
+        NETWORK_DISCONNECTED_MESSAGE,
     };
     use crate::local_store::LocalStore;
     use crate::receive_pipeline::ReceivePipeline;
@@ -19315,10 +19292,7 @@ mod tests {
     }
 
     impl ScriptedAuthenticateDriver {
-        fn new(
-            reconnect_results: Vec<Result<()>>,
-            authenticate_results: Vec<Result<()>>,
-        ) -> Self {
+        fn new(reconnect_results: Vec<Result<()>>, authenticate_results: Vec<Result<()>>) -> Self {
             Self {
                 reconnect_results: reconnect_results.into(),
                 authenticate_results: authenticate_results.into(),
@@ -19374,10 +19348,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn authenticate_retry_sequence_reconnects_once_after_missing_response() {
-        let mut driver = ScriptedAuthenticateDriver::new(
-            vec![Ok(())],
-            vec![Err(unanswered_auth()), Ok(())],
-        );
+        let mut driver =
+            ScriptedAuthenticateDriver::new(vec![Ok(())], vec![Err(unanswered_auth()), Ok(())]);
         execute_authenticate_with_retry(&mut driver, false)
             .await
             .expect("second authenticate");

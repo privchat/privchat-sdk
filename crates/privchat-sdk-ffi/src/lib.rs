@@ -3184,7 +3184,6 @@ fn map_upsert_channel_extra(v: UpsertChannelExtraInput) -> SdkUpsertChannelExtra
     }
 }
 
-
 fn map_stored_message(v: SdkStoredMessage) -> StoredMessage {
     let body = map_message_content(privchat_sdk::message_content::project_stored_message(&v));
     let (display_content, mut reply_to_message_id, mut mentioned_user_ids) =
@@ -7421,7 +7420,6 @@ impl PrivchatClient {
         Ok(resp)
     }
 
-
     pub async fn send_queue_set_enabled(&self, enabled: bool) -> Result<(), PrivchatFfiError> {
         self.send_queue_enabled.store(enabled, Ordering::Relaxed);
         Ok(())
@@ -7641,9 +7639,6 @@ impl PrivchatClient {
             .await
             .map_err(PrivchatFfiError::from)
     }
-
-
-
 
     pub async fn create_local_message(&self, input: NewMessage) -> Result<u64, PrivchatFfiError> {
         self.inner

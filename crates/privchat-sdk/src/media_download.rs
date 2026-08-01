@@ -131,7 +131,11 @@ impl DownloadManager {
     }
 
     pub(crate) async fn get_state(&self, key: &MediaTaskKey) -> MediaDownloadState {
-        let guard = self.inner.entries.lock().expect("download manager poisoned");
+        let guard = self
+            .inner
+            .entries
+            .lock()
+            .expect("download manager poisoned");
         guard
             .get(key)
             .map(|h| h.state.clone())
@@ -146,7 +150,11 @@ impl DownloadManager {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut entries = self.inner.entries.lock().expect("download manager poisoned");
+        let mut entries = self
+            .inner
+            .entries
+            .lock()
+            .expect("download manager poisoned");
         if entries.contains_key(&key)
             || entries.len() >= MAX_TRACKED_DOWNLOADS
             || (priority == DownloadPriority::Background
@@ -203,7 +211,11 @@ impl DownloadManager {
     /// so account switching can invalidate work before committing the new owner.
     pub(crate) fn cancel_all_scoped(&self) {
         let entries = {
-            let mut guard = self.inner.entries.lock().expect("download manager poisoned");
+            let mut guard = self
+                .inner
+                .entries
+                .lock()
+                .expect("download manager poisoned");
             guard.drain().map(|(_, entry)| entry).collect::<Vec<_>>()
         };
         for entry in entries {
@@ -258,7 +270,11 @@ impl DownloadManager {
         target_dir: PathBuf,
         payload_filename: String,
     ) -> Result<(), String> {
-        let mut guard = self.inner.entries.lock().expect("download manager poisoned");
+        let mut guard = self
+            .inner
+            .entries
+            .lock()
+            .expect("download manager poisoned");
         if guard.contains_key(&key) {
             return Ok(());
         }
@@ -336,7 +352,11 @@ impl DownloadManager {
     }
 
     pub(crate) async fn pause(&self, _sdk: &PrivchatSdk, key: &MediaTaskKey) {
-        let guard = self.inner.entries.lock().expect("download manager poisoned");
+        let guard = self
+            .inner
+            .entries
+            .lock()
+            .expect("download manager poisoned");
         let Some(h) = guard.get(key) else {
             return;
         };
@@ -349,7 +369,11 @@ impl DownloadManager {
     }
 
     pub(crate) async fn resume(&self, _sdk: &PrivchatSdk, key: &MediaTaskKey) {
-        let guard = self.inner.entries.lock().expect("download manager poisoned");
+        let guard = self
+            .inner
+            .entries
+            .lock()
+            .expect("download manager poisoned");
         let Some(h) = guard.get(key) else {
             return;
         };
@@ -362,7 +386,11 @@ impl DownloadManager {
 
     pub(crate) async fn cancel(&self, sdk: &PrivchatSdk, key: &MediaTaskKey) {
         let entry = {
-            let mut guard = self.inner.entries.lock().expect("download manager poisoned");
+            let mut guard = self
+                .inner
+                .entries
+                .lock()
+                .expect("download manager poisoned");
             guard.remove(key)
         };
         let Some(entry) = entry else { return };
@@ -377,14 +405,22 @@ impl DownloadManager {
     }
 
     fn set_state(&self, key: &MediaTaskKey, state: MediaDownloadState) {
-        let mut guard = self.inner.entries.lock().expect("download manager poisoned");
+        let mut guard = self
+            .inner
+            .entries
+            .lock()
+            .expect("download manager poisoned");
         if let Some(h) = guard.get_mut(key) {
             h.state = state;
         }
     }
 
     fn remove_if_current(&self, key: &MediaTaskKey, task_id: u64) {
-        let mut guard = self.inner.entries.lock().expect("download manager poisoned");
+        let mut guard = self
+            .inner
+            .entries
+            .lock()
+            .expect("download manager poisoned");
         if guard.get(key).map(|entry| entry.task_id) == Some(task_id) {
             guard.remove(key);
         }
