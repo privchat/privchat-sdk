@@ -50,6 +50,10 @@ enum StorageCmd {
         uid: String,
         resp: oneshot::Sender<Result<()>>,
     },
+    LoadBootstrapCompleted {
+        uid: String,
+        resp: oneshot::Sender<Result<bool>>,
+    },
     UpdateAccessToken {
         uid: String,
         access_token: String,
@@ -617,6 +621,15 @@ impl StorageHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(StorageCmd::ClearSession { uid, resp: resp_tx })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// bootstrap 水位的独立读法：不要求凭证还在（退出登录后仍读得到）。
+    pub async fn load_bootstrap_completed(&self, uid: String) -> Result<bool> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::LoadBootstrapCompleted { uid, resp: resp_tx })
             .map_err(|_| Error::ActorClosed)?;
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
@@ -2118,6 +2131,9 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::ClearSession { uid, resp } => {
             let _ = resp.send(store.clear_session(&uid));
+        }
+        StorageCmd::LoadBootstrapCompleted { uid, resp } => {
+            let _ = resp.send(store.load_bootstrap_completed(&uid));
         }
         StorageCmd::UpdateAccessToken {
             uid,

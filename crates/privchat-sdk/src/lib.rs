@@ -8016,6 +8016,15 @@ impl State {
             // 等网络 sync 才出会话；② 后续 run_bootstrap_sync 被迫走全量而非增量 resume。
             // full_rebuild_required() 仍是安全网：本地 store 需重建时即便标记为 true 也会走全量。
             self.bootstrap_completed = existing.bootstrap_completed;
+        } else {
+            // 没有快照 ≠ 没同步过。退出登录只删凭证，账号的 bootstrap 水位仍在盘上，
+            // 只是读不进快照里了。不在这里补读，同一个账号重新登录就会被当成新账号
+            // 跑一遍全量 bootstrap——本地库明明还是全的。
+            self.bootstrap_completed = self
+                .storage
+                .load_bootstrap_completed(uid.clone())
+                .await
+                .unwrap_or(false);
         }
         if existing_session.is_some() {
             self.storage
@@ -15229,10 +15238,23 @@ impl PrivchatSdk {
                                     let loaded = state.storage.load_session(uid.clone()).await;
                                     match (saved, loaded) {
                                         (Ok(()), Ok(snapshot)) => {
+                                            // 水位单独读，不跟凭证绑定。
+                                            //
+                                            // 退出登录只删凭证，盘上的 bootstrap 水位还在；
+                                            // 但快照要求 access_token 存在，于是这里以前
+                                            // 一律 `unwrap_or(false)` —— 再登录同一个账号
+                                            // 就把整份本地库当没同步过重跑全量，用户盯着
+                                            // 「数据初始化中」十几秒。退出登录不是注销账号。
+                                            let completed = match snapshot {
+                                                Some(s) => s.bootstrap_completed,
+                                                None => state
+                                                    .storage
+                                                    .load_bootstrap_completed(uid.clone())
+                                                    .await
+                                                    .unwrap_or(false),
+                                            };
                                             state.current_uid = Some(uid);
-                                            state.bootstrap_completed = snapshot
-                                                .map(|s| s.bootstrap_completed)
-                                                .unwrap_or(false);
+                                            state.bootstrap_completed = completed;
                                             Ok(())
                                         }
                                         (Err(e), _) => Err(e),

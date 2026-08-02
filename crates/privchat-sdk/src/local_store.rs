@@ -868,7 +868,16 @@ impl LocalStore {
         Ok(())
     }
 
-    fn load_bootstrap_completed(&self, uid: &str) -> Result<bool> {
+    /// 读账号的 bootstrap 水位——**不经过 session 快照**。
+    ///
+    /// 这个标志单独存在账号 META 树里，退出登录（[`Self::clear_session`]）只删凭证、
+    /// 从不删它。但它此前唯一的对外读法是 `load_session()?.bootstrap_completed`，
+    /// 而那个快照要求 access_token 还在——于是退出登录之后，盘上仍然存在的水位就
+    /// 再也读不出来，同一个账号重新登录一律 `unwrap_or(false)`，把整份完好的本地库
+    /// 当成没同步过重跑一遍全量，用户盯着「数据初始化中」十几秒。
+    ///
+    /// 退出登录不是注销账号。真要清数据走 `wipe_user_full`。
+    pub fn load_bootstrap_completed(&self, uid: &str) -> Result<bool> {
         let meta = self.account_tree(uid, ACCOUNT_TREE_META)?;
         if let Some(v) = meta
             .get(K_BOOTSTRAP_COMPLETED)
@@ -5308,6 +5317,48 @@ mod tests {
             hex::encode(rand_bytes)
         ));
         LocalStore::open_at(dir).expect("open test store")
+    }
+
+    /// 退出登录不是注销账号：凭证清掉了，bootstrap 水位必须还读得出来。
+    ///
+    /// 这条水位决定下次登录走增量还是全量。它一直单独存在 META 树里、`clear_session`
+    /// 也从不删它，可唯一的读法要求 access_token 还在——于是退出后它就"消失"了，
+    /// 同一个账号重新登录被当成没同步过，750 人的群连同 761 个会话重跑一遍全量，
+    /// 用户盯着「数据初始化中」十几秒。真机实测 15.9s，修完 0.5s。
+    #[test]
+    fn logging_out_keeps_the_bootstrap_watermark() {
+        let store = test_store();
+        let uid = "100000156";
+        store
+            .save_login(
+                uid,
+                &LoginResult {
+                    user_id: 100_000_156,
+                    token: "token".to_string(),
+                    device_id: "device".to_string(),
+                    refresh_token: None,
+                    expires_at: 0,
+                },
+            )
+            .expect("save login");
+        store
+            .set_bootstrap_completed(uid, true)
+            .expect("mark bootstrap completed");
+
+        store.clear_session(uid).expect("logout clears credentials");
+
+        // 凭证没了（这正是退出登录该做的）……
+        assert!(
+            store.load_session(uid).expect("load session").is_none(),
+            "logout must drop the credentials",
+        );
+        // ……但水位还在，所以再登录只做增量。
+        assert!(
+            store
+                .load_bootstrap_completed(uid)
+                .expect("load bootstrap watermark"),
+            "logout must not look like a fresh account",
+        );
     }
 
     #[test]
