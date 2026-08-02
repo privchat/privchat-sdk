@@ -899,6 +899,23 @@ fn emit_sequenced_event(
     let _ = event_tx.send(event);
 }
 
+
+/// 服务端实体同步下发的是 **DB 角色编码**（Owner=0 / Admin=1 / Member=2），
+/// 而本地 `group_member` 表与 UI 契约用的是**相反**的一套（owner=2 / member=0，
+/// 见 `privchat-ui` 的 `GroupMemberEntry.isOwner`）。
+///
+/// 两套编码历史上就是反的（CHANNEL_SPEC §3.2 已登记为遗留）。原样落库会让
+/// **每个普通成员都变成群主、群主变成普通成员**——群管理入口全乱。
+fn server_role_to_local(role: Option<i32>) -> i32 {
+    match role {
+        Some(0) => 2, // server Owner  -> local owner
+        Some(1) => 1, // Admin 两边一致
+        Some(2) => 0, // server Member -> local member
+        // 未知/缺失一律按普通成员，绝不默认成群主。
+        _ => 0,
+    }
+}
+
 async fn stop_inbound_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
     if let Some(handle) = task.take() {
         if realtime_trace_enabled() {
@@ -5953,7 +5970,7 @@ impl State {
                         .upsert_group_member(UpsertGroupMemberInput {
                             group_id,
                             user_id,
-                            role: group_member.role.unwrap_or(2),
+                            role: server_role_to_local(group_member.role),
                             status: group_member.status.unwrap_or(0),
                             alias: group_member.alias,
                             is_muted: group_member.is_muted.unwrap_or(false),
@@ -19573,6 +19590,27 @@ mod tests {
         assert!(!State::transport_error_proves_disconnect(
             &TransportError::config_error("route", "unsupported")
         ));
+    }
+
+    use super::server_role_to_local;
+
+    /// 服务端与本地的角色编码是**相反**的两套。原样落库会让每个普通成员
+    /// 变成群主、群主变成普通成员——群管理入口在 App 上全乱。
+    ///
+    /// 这条测试是在把 App 的成员同步从「全量 list」切到「实体增量」之前立的：
+    /// 那条 apply 路径当时正是原样写入，只是还没有人调用它。
+    #[test]
+    fn server_roles_are_flipped_into_the_local_encoding() {
+        assert_eq!(server_role_to_local(Some(0)), 2, "服务端 Owner → 本地 owner(2)");
+        assert_eq!(server_role_to_local(Some(1)), 1, "Admin 两边一致");
+        assert_eq!(server_role_to_local(Some(2)), 0, "服务端 Member → 本地 member(0)");
+    }
+
+    /// 缺失/未知角色一律按普通成员——绝不能默认成群主，那是提权。
+    #[test]
+    fn an_unknown_role_never_becomes_an_owner() {
+        assert_eq!(server_role_to_local(None), 0);
+        assert_eq!(server_role_to_local(Some(99)), 0);
     }
 
     /// 「没拿到应答」必须是**可重试**的。
