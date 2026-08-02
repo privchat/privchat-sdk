@@ -564,6 +564,16 @@ pub enum SdkEvent {
         applied: usize,
         dropped_duplicates: usize,
     },
+    /// 分页同步中「又落库了一页」。宿主用它在首屏进度条的本族区间内往前爬。
+    ///
+    /// 与 [`SdkEvent::SyncEntitiesApplied`] 是不同的事：那个表示**一族同步完成**，
+    /// 而首次登录里第一族自己就占掉整轮六成时间，只有族级事件的话进度条会先停 9 秒
+    /// 再跳完。
+    SyncEntityPageApplied {
+        entity_type: String,
+        /// 从 1 起算的页序号。总页数事先不可知，宿主据此做保守估计。
+        page: u32,
+    },
     SyncEntityChanged {
         entity_type: String,
         entity_id: String,
@@ -4131,19 +4141,54 @@ impl State {
     /// bootstrap into 1,000 host recompositions/list refresh attempts. The
     /// authoritative rows are already committed before this event is queued;
     /// consumers only need one signal to reread the projection.
+    /// 分页同步的页级进度。
+    ///
+    /// 只走事件通道、不进 pending_events：后者要等整条命令跑完才 drain，而那正是我们
+    /// 要打破的静止。
+    fn emit_sync_page_progress(&self, entity_type: &str, page: usize) {
+        let event = SdkEvent::SyncEntityPageApplied {
+            entity_type: entity_type.to_string(),
+            page: page as u32,
+        };
+        if let (Some(tx), Some(history), Some(seq)) =
+            (&self.event_tx, &self.event_history, &self.event_seq)
+        {
+            emit_sequenced_event(tx, history, seq, self.event_history_limit, event);
+        } else if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event);
+        }
+    }
+
     fn queue_sync_summary_event(
         &mut self,
         event_entity_type: String,
         event_scope: Option<String>,
         applied: usize,
     ) {
-        self.pending_events.push(SdkEvent::SyncEntitiesApplied {
+        let event = SdkEvent::SyncEntitiesApplied {
             entity_type: event_entity_type,
             scope: event_scope,
             queued: self.last_sync_queued,
             applied,
             dropped_duplicates: self.last_sync_dropped_duplicates,
-        });
+        };
+        // 立刻送出，不进 pending_events。
+        //
+        // pending_events 要等当前命令整个跑完才被 actor 循环 drain，而首次登录的
+        // bootstrap 是一条长命令：六族的完成事件会一起攒到最后才发。宿主拿它画进度条，
+        // 于是十几秒里一直显示 0%，然后直接消失——比没有进度条更像卡死。
+        if let (Some(tx), Some(history), Some(seq)) =
+            (&self.event_tx, &self.event_history, &self.event_seq)
+        {
+            emit_sequenced_event(tx, history, seq, self.event_history_limit, event);
+            return;
+        }
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event);
+            return;
+        }
+        // 没接事件通道（单测等场景）时退回排队，保持原有可观测性。
+        self.pending_events.push(event);
     }
 
     fn push_connection_transition_event(
@@ -8097,6 +8142,12 @@ impl State {
             total_queued += stats.queued_items;
             total_dropped += stats.dropped_duplicates;
 
+            // 每页报一次，宿主用它在「本族区间」内往前爬。
+            //
+            // 没有这个事件，首屏进度条会在第一族上停 9 秒不动：整轮同步六成时间花在
+            // 联系人那一族，而族级事件要等它整个跑完才发。页事件让用户看得出还在动。
+            self.emit_sync_page_progress(&entity_type_for_apply, fetched_pages);
+
             if !response.has_more {
                 break response.next_version;
             }
@@ -9686,9 +9737,17 @@ impl State {
                             entity_type, count
                         );
                     }
+                    // 每族报一次完成，宿主据此画首屏进度条。首次登录要等十几秒，中间
+                    // 没有信号的话用户分不出「在同步」和「卡死」。
+                    //
+                    // 必须无条件发，不能只在 count > 0 时发：某族本来就没有增量时
+                    // count = 0，但它确实已经同步过了，跳过会让进度永远差这一格。
+                    self.queue_sync_summary_event(entity_type.to_string(), None, count);
                 }
                 Err(e) if Self::is_unsupported_entity_error(&e) => {
                     self.log_unsupported_sync_skip("bootstrap sync", entity_type, None, &e);
+                    // 服务端不支持的族也算走过了，否则老服务端上进度永远到不了 100%。
+                    self.queue_sync_summary_event(entity_type.to_string(), None, 0);
                 }
                 Err(e) => return Err(e),
             }
@@ -20085,6 +20144,31 @@ mod tests {
             ]
         );
         assert!(!State::BOOTSTRAP_ENTITY_ORDER.contains(&"group_member"));
+    }
+
+    /// 宿主的首屏进度条按「已完成族数 / 总族数」画，所以 bootstrap 每走完一族都必须
+    /// 报一次，且不能因为该族没有增量（count = 0）就跳过——跳了进度就永远差一格，
+    /// 停在 83% 不动，看起来正是「卡住了」。
+    #[test]
+    fn bootstrap_reports_one_summary_per_entity_family() {
+        let src = include_str!("lib.rs");
+        let loop_start = src
+            .find("for entity_type in Self::BOOTSTRAP_ENTITY_ORDER {")
+            .expect("bootstrap loop");
+        let loop_end = src[loop_start..]
+            .find("\n        }\n")
+            .map(|off| loop_start + off)
+            .expect("bootstrap loop end");
+        let body = &src[loop_start..loop_end];
+        assert_eq!(
+            body.matches("queue_sync_summary_event").count(),
+            2,
+            "Ok 与 unsupported 两条分支都要上报进度"
+        );
+        assert!(
+            !body.contains("if count > 0"),
+            "不能只在有增量时上报"
+        );
     }
 
     #[test]

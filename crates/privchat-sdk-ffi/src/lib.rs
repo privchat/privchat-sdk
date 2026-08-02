@@ -1515,6 +1515,11 @@ pub enum SdkEvent {
         applied: u64,
         dropped_duplicates: u64,
     },
+    /// 分页同步中「又落库了一页」；宿主用它在首屏进度条的本族区间内往前爬。
+    SyncEntityPageApplied {
+        entity_type: String,
+        page: u32,
+    },
     SyncEntityChanged {
         entity_type: String,
         entity_id: String,
@@ -2531,6 +2536,9 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             applied: applied as u64,
             dropped_duplicates: dropped_duplicates as u64,
         },
+        privchat_sdk::SdkEvent::SyncEntityPageApplied { entity_type, page } => {
+            SdkEvent::SyncEntityPageApplied { entity_type, page }
+        }
         privchat_sdk::SdkEvent::SyncEntityChanged {
             entity_type,
             entity_id,
@@ -2830,6 +2838,11 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "queued": queued,
             "applied": applied,
             "dropped_duplicates": dropped_duplicates
+        }),
+        SdkEvent::SyncEntityPageApplied { entity_type, page } => json!({
+            "type": "sync_entity_page_applied",
+            "entity_type": entity_type,
+            "page": page
         }),
         SdkEvent::SyncEntityChanged {
             entity_type,
@@ -5176,15 +5189,25 @@ impl PrivchatClient {
     pub async fn fetch_group_members_remote(
         &self,
         group_id: u64,
-        _page: Option<u32>,
-        _page_size: Option<u32>,
+        page: Option<u32>,
+        page_size: Option<u32>,
     ) -> Result<GroupMemberRemoteList, PrivchatFfiError> {
+        // 协议已支持分页（limit=None 即全量，老客户端行为）。这两个参数一直预留着
+        // 却没接线，于是九宫格头像要前 9 个人也会拉走整份花名册——750 人群 126 KB。
+        // page 从 1 起算；缺 page_size 时不分页，避免把「只给了页码」曲解成第一页。
+        let limit = page_size;
+        let offset = match (page, page_size) {
+            (Some(p), Some(size)) if p > 1 => Some((p - 1) * size),
+            _ => None,
+        };
         let resp: GroupMemberListResponse = rpc_call_typed(
             &self.inner,
             routes::group_member::LIST,
             &GroupMemberListRequest {
                 group_id,
                 user_id: 0,
+                limit,
+                offset,
             },
         )
         .await?;
