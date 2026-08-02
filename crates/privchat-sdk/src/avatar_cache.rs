@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 
 use crate::storage_actor::StorageHandle;
 use crate::{emit_sequenced_event, SdkEvent, SequencedSdkEvent};
@@ -136,13 +136,33 @@ struct CacheState {
     verified: HashSet<String>,
 }
 
+const MAX_CONCURRENT_AVATAR_CACHE_JOBS: usize = 3;
+
 /// 头像缓存管理器（挂在 actor `State` 上；Clone 共享同一份去重状态）。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct AvatarCacheManager {
     inner: Arc<StdMutex<CacheState>>,
+    limiter: Arc<Semaphore>,
+}
+
+impl Default for AvatarCacheManager {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(CacheState::default())),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_AVATAR_CACHE_JOBS)),
+        }
+    }
 }
 
 impl AvatarCacheManager {
+    #[cfg(test)]
+    pub(crate) fn inflight_len(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.inflight.len())
+            .unwrap_or(0)
+    }
+
     /// 确保 `user_id` 当前 `avatar_url` 已缓存到本地。
     ///
     /// 同步快速路径：空/非 http URL、进程内已验证、或已在下载中 ⇒ 直接返回，
@@ -172,9 +192,21 @@ impl AvatarCacheManager {
             st.inflight.insert(key.clone());
         }
         let mgr = self.clone();
+        let limiter = self.limiter.clone();
+        let owner_uid = self_uid.to_string();
         let url = url.to_string();
         tokio::spawn(async move {
-            let ok = run_ensure(&storage, &sinks, user_id, &url).await;
+            let permit = match limiter.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if let Ok(mut st) = mgr.inner.lock() {
+                        st.inflight.remove(&key);
+                    }
+                    return;
+                }
+            };
+            let ok = run_ensure(&storage, &sinks, &owner_uid, user_id, &url).await;
+            drop(permit);
             if let Ok(mut st) = mgr.inner.lock() {
                 st.inflight.remove(&key);
                 if ok {
@@ -189,11 +221,15 @@ impl AvatarCacheManager {
 async fn run_ensure(
     storage: &StorageHandle,
     sinks: &AvatarEventSinks,
+    owner_uid: &str,
     user_id: u64,
     url: &str,
 ) -> bool {
     // 读 user 行当前缓存态。行不存在（upsert 被 version 门控拒绝等）直接放弃。
-    let row = match storage.get_user_avatar_cache(user_id).await {
+    let row = match storage
+        .get_user_avatar_cache_scoped(owner_uid.to_string(), user_id)
+        .await
+    {
         Ok(Some(row)) => row,
         Ok(None) => return false,
         Err(e) => {
@@ -207,7 +243,10 @@ async fn run_ensure(
     {
         return true;
     }
-    let paths = match storage.get_storage_paths().await {
+    let paths = match storage
+        .get_storage_paths_for_uid(owner_uid.to_string())
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[SDK.avatar] get storage paths failed user_id={user_id}: {e}");
@@ -223,7 +262,12 @@ async fn run_ensure(
     }
     let dest_str = dest.to_string_lossy().to_string();
     match storage
-        .set_user_avatar_cache(user_id, url.to_string(), dest_str.clone())
+        .set_user_avatar_cache_scoped(
+            owner_uid.to_string(),
+            user_id,
+            url.to_string(),
+            dest_str.clone(),
+        )
         .await
     {
         Ok(true) => {

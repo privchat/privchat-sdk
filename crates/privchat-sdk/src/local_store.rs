@@ -77,6 +77,24 @@ const ACCOUNT_TREE_AUTH: &str = "auth";
 const ACCOUNT_TREE_KV: &str = "kv";
 const PENDING_TIMELINE_MUTATION_PREFIX: &str = "__pending_timeline_mutation__:v1";
 
+const UPSERT_USER_SQL: &str = "INSERT INTO user (
+        user_id, username, nickname, alias, avatar,
+        user_type, is_deleted, channel_id, version, updated_at
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+     ON CONFLICT(user_id) DO UPDATE SET
+        username=CASE
+            WHEN excluded.username IS NULL OR excluded.username = ''
+            THEN user.username ELSE excluded.username END,
+        nickname=excluded.nickname,
+        alias=excluded.alias,
+        avatar=excluded.avatar,
+        user_type=excluded.user_type,
+        is_deleted=excluded.is_deleted,
+        channel_id=excluded.channel_id,
+        version=excluded.version,
+        updated_at=excluded.updated_at
+     WHERE excluded.version >= user.version";
+
 const K_SCHEMA_VERSION: &[u8] = b"schema_version";
 const K_DEVICE_ID: &[u8] = b"device_id";
 const K_INSTALL_SECRET: &[u8] = b"install_secret";
@@ -2866,24 +2884,33 @@ impl LocalStore {
 
     pub fn upsert_user(&self, uid: &str, input: &UpsertUserInput) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
+        Self::execute_upsert_user(&conn, input)?;
+        Ok(())
+    }
+
+    /// Apply one authoritative user-sync page in one SQLite transaction.
+    ///
+    /// A fresh large account can contain thousands of related users. Committing
+    /// every row separately monopolizes the DB actor for minutes and prevents
+    /// channels/messages from being read after `CriticalReady`.
+    pub fn batch_upsert_users(&self, uid: &str, inputs: &[UpsertUserInput]) -> Result<()> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn_for_user(uid)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("batch upsert users begin tx: {e}")))?;
+        for input in inputs {
+            Self::execute_upsert_user(&tx, input)?;
+        }
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("batch upsert users commit: {e}")))
+    }
+
+    fn execute_upsert_user(conn: &Connection, input: &UpsertUserInput) -> Result<()> {
         conn.execute(
-            "INSERT INTO user (
-                user_id, username, nickname, alias, avatar,
-                user_type, is_deleted, channel_id, version, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(user_id) DO UPDATE SET
-                username=CASE
-                    WHEN excluded.username IS NULL OR excluded.username = ''
-                    THEN user.username ELSE excluded.username END,
-                nickname=excluded.nickname,
-                alias=excluded.alias,
-                avatar=excluded.avatar,
-                user_type=excluded.user_type,
-                is_deleted=excluded.is_deleted,
-                channel_id=excluded.channel_id,
-                version=excluded.version,
-                updated_at=excluded.updated_at
-             WHERE excluded.version >= user.version",
+            UPSERT_USER_SQL,
             params![
                 input.user_id as i64,
                 input.username,
@@ -7844,6 +7871,41 @@ mod tests {
             .list_channel_members(uid, 30001, 2, 20, 0)
             .expect("list channel members after delete");
         assert!(ch_members_after.is_empty());
+    }
+
+    #[test]
+    fn batch_upsert_users_materializes_a_large_identity_page_in_one_call() {
+        let store = test_store();
+        let uid = "batch-users";
+        let inputs: Vec<_> = (1..=1_000)
+            .map(|user_id| crate::UpsertUserInput {
+                user_id,
+                username: Some(format!("user-{user_id}")),
+                nickname: Some(format!("User {user_id}")),
+                alias: None,
+                avatar: String::new(),
+                user_type: 0,
+                is_deleted: false,
+                channel_id: String::new(),
+                version: user_id as i64,
+                updated_at: user_id as i64,
+            })
+            .collect();
+
+        store
+            .batch_upsert_users(uid, &inputs)
+            .expect("batch upsert users");
+
+        let first = store
+            .get_user_by_id(uid, 1)
+            .expect("read first")
+            .expect("first exists");
+        let last = store
+            .get_user_by_id(uid, 1_000)
+            .expect("read last")
+            .expect("last exists");
+        assert_eq!(first.nickname.as_deref(), Some("User 1"));
+        assert_eq!(last.nickname.as_deref(), Some("User 1000"));
     }
 
     #[test]

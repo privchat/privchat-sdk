@@ -287,6 +287,15 @@ impl SyncCoordinator {
         self.snapshot.updated_at_ms = now_ms;
     }
 
+    /// Start background convergence after a grace window so the host can read
+    /// its first channel/message projections immediately after CriticalReady.
+    pub(crate) fn schedule_convergence(&mut self, now_ms: i64, grace_ms: i64) {
+        self.convergence_attempt = 0;
+        self.convergence_next_retry_at_ms = Some(now_ms.saturating_add(grace_ms.max(0)));
+        self.snapshot.convergence = Convergence::Scanning;
+        self.snapshot.updated_at_ms = now_ms;
+    }
+
     /// Phase 3 失败只影响后台维度，但必须真正排下退避截止点。
     pub(crate) fn backoff_convergence(&mut self, now_ms: i64) -> (u32, i64) {
         self.convergence_attempt = self.convergence_attempt.saturating_add(1);
@@ -573,6 +582,16 @@ mod tests {
             second_deadline - deadline >= first_delay,
             "repeated convergence failures did not increase the backoff"
         );
+    }
+
+    #[test]
+    fn convergence_grace_keeps_background_work_off_the_first_ready_frame() {
+        let mut coordinator = SyncCoordinator::new();
+        coordinator.schedule_convergence(10_000, 5_000);
+
+        assert!(!coordinator.convergence_retry_ready(14_999));
+        assert!(coordinator.convergence_retry_ready(15_000));
+        assert_eq!(coordinator.convergence(), Convergence::Scanning);
     }
 
     #[test]

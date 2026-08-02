@@ -102,7 +102,6 @@ enum StorageCmd {
         input: UpsertRemoteMessageInput,
         resp: oneshot::Sender<Result<UpsertRemoteMessageResult>>,
     },
-    #[allow(dead_code)]
     BatchUpsertRemoteMessages {
         inputs: Vec<UpsertRemoteMessageInput>,
         resp: oneshot::Sender<Vec<Result<UpsertRemoteMessageResult>>>,
@@ -349,11 +348,17 @@ enum StorageCmd {
         input: UpsertUserInput,
         resp: oneshot::Sender<Result<()>>,
     },
-    GetUserAvatarCache {
+    BatchUpsertUsers {
+        inputs: Vec<UpsertUserInput>,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    GetUserAvatarCacheScoped {
+        owner_uid: String,
         user_id: u64,
         resp: oneshot::Sender<Result<Option<UserAvatarCacheRow>>>,
     },
-    SetUserAvatarCache {
+    SetUserAvatarCacheScoped {
+        owner_uid: String,
         user_id: u64,
         url: String,
         local_path: String,
@@ -755,7 +760,6 @@ impl StorageHandle {
 
     /// Batch upsert remote messages in a single SQLite transaction.
     /// Returns a Vec of results, one per input, in the same order.
-    #[allow(dead_code)]
     pub async fn batch_upsert_remote_messages(
         &self,
         inputs: Vec<UpsertRemoteMessageInput>,
@@ -1446,11 +1450,27 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    /// AVATAR_CACHE_SPEC P1: 读 user 行头像缓存状态。
-    pub async fn get_user_avatar_cache(&self, user_id: u64) -> Result<Option<UserAvatarCacheRow>> {
+    pub async fn batch_upsert_users(&self, inputs: Vec<UpsertUserInput>) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::GetUserAvatarCache {
+            .send(StorageCmd::BatchUpsertUsers {
+                inputs,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    /// AVATAR_CACHE_SPEC P1: 读 user 行头像缓存状态。
+    pub async fn get_user_avatar_cache_scoped(
+        &self,
+        owner_uid: String,
+        user_id: u64,
+    ) -> Result<Option<UserAvatarCacheRow>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::GetUserAvatarCacheScoped {
+                owner_uid,
                 user_id,
                 resp: resp_tx,
             })
@@ -1459,15 +1479,17 @@ impl StorageHandle {
     }
 
     /// AVATAR_CACHE_SPEC P1: 下载成功后落库；返回 false = avatar URL 已再变，未写。
-    pub async fn set_user_avatar_cache(
+    pub async fn set_user_avatar_cache_scoped(
         &self,
+        owner_uid: String,
         user_id: u64,
         url: String,
         local_path: String,
     ) -> Result<bool> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::SetUserAvatarCache {
+            .send(StorageCmd::SetUserAvatarCacheScoped {
+                owner_uid,
                 user_id,
                 url,
                 local_path,
@@ -2616,21 +2638,36 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         StorageCmd::UpsertUser { input, resp } => {
             with_uid!(resp, |uid| store.upsert_user(&uid, &input));
         }
-        StorageCmd::GetUserAvatarCache { user_id, resp } => {
-            with_uid!(resp, |uid| store.get_user_avatar_cache(&uid, user_id));
+        StorageCmd::BatchUpsertUsers { inputs, resp } => {
+            with_uid!(resp, |uid| store.batch_upsert_users(&uid, &inputs));
         }
-        StorageCmd::SetUserAvatarCache {
+        StorageCmd::GetUserAvatarCacheScoped {
+            owner_uid,
+            user_id,
+            resp,
+        } => {
+            let result = match store.load_current_uid() {
+                Ok(Some(uid)) if uid == owner_uid => store.get_user_avatar_cache(&uid, user_id),
+                Ok(_) => Ok(None),
+                Err(e) => Err(e),
+            };
+            let _ = resp.send(result);
+        }
+        StorageCmd::SetUserAvatarCacheScoped {
+            owner_uid,
             user_id,
             url,
             local_path,
             resp,
         } => {
-            with_uid!(resp, |uid| store.set_user_avatar_cache(
-                &uid,
-                user_id,
-                &url,
-                &local_path
-            ));
+            let result = match store.load_current_uid() {
+                Ok(Some(uid)) if uid == owner_uid => {
+                    store.set_user_avatar_cache(&uid, user_id, &url, &local_path)
+                }
+                Ok(_) => Ok(false),
+                Err(e) => Err(e),
+            };
+            let _ = resp.send(result);
         }
         StorageCmd::ForceSetUserAvatarCache {
             user_id,

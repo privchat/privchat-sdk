@@ -1675,6 +1675,12 @@ struct HistHydratedState {
     hydrated: bool,
 }
 
+fn should_hydrate_latest_window(hydrated: bool, _local_row_count: usize) -> bool {
+    // A realtime push can create local rows before the first history fetch. Row count is
+    // therefore not evidence that the latest window is contiguous.
+    !hydrated
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageCachePolicyConfig {
     pub per_channel_budget_bytes: u32,
@@ -3301,6 +3307,28 @@ fn plan_anti_entropy_page(
     plan
 }
 
+async fn run_preemptible_background<F>(
+    foreground_wakeup: &tokio::sync::Notify,
+    work: F,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = foreground_wakeup.notified() => None,
+        result = work => Some(result),
+    }
+}
+
+fn timeline_reason_for_message(realtime: bool) -> &'static str {
+    if realtime {
+        "realtime_message"
+    } else {
+        "sync_entity"
+    }
+}
+
 struct State {
     config: PrivchatConfig,
     /// 共享句柄。`TransportClient::request_with_options` 取的是 `&self`，
@@ -4088,6 +4116,27 @@ impl State {
     ) {
         self.pending_events
             .extend(self.last_sync_entity_events.iter().cloned());
+        self.pending_events.push(SdkEvent::SyncEntitiesApplied {
+            entity_type: event_entity_type,
+            scope: event_scope,
+            queued: self.last_sync_queued,
+            applied,
+            dropped_duplicates: self.last_sync_dropped_duplicates,
+        });
+    }
+
+    /// Phase 2 publishes one batch invalidation per entity family.
+    ///
+    /// Replaying every `SyncEntityChanged` item across FFI turns a 1,000-user
+    /// bootstrap into 1,000 host recompositions/list refresh attempts. The
+    /// authoritative rows are already committed before this event is queued;
+    /// consumers only need one signal to reread the projection.
+    fn queue_sync_summary_event(
+        &mut self,
+        event_entity_type: String,
+        event_scope: Option<String>,
+        applied: usize,
+    ) {
         self.pending_events.push(SdkEvent::SyncEntitiesApplied {
             entity_type: event_entity_type,
             scope: event_scope,
@@ -5723,6 +5772,7 @@ impl State {
                 }
             }
             "user" => {
+                let mut user_inputs = Vec::with_capacity(items.len());
                 for item in items {
                     let payload = item
                         .payload
@@ -5735,33 +5785,34 @@ impl State {
                         continue;
                     }
                     let avatar = Self::json_get_string(&payload, &["avatar"]).unwrap_or_default();
-                    self.storage
-                        .upsert_user(UpsertUserInput {
-                            user_id,
-                            username: Self::json_get_string(&payload, &["username"]),
-                            nickname: Self::json_get_string(&payload, &["nickname", "name"]),
-                            alias: Self::json_get_string(&payload, &["alias"]),
-                            avatar: avatar.clone(),
-                            user_type: Self::json_get_i32(&payload, &["user_type", "type"])
-                                .unwrap_or(0),
-                            is_deleted: item.deleted
-                                || Self::json_get_bool(&payload, &["is_deleted"]).unwrap_or(false),
-                            channel_id: Self::json_get_string(&payload, &["channel_id"])
-                                .unwrap_or_default(),
-                            version: item.version as i64,
-                            updated_at: Self::json_get_i64(&payload, &["updated_at", "version"])
-                                .unwrap_or(item.version as i64),
-                        })
-                        .await?;
-                    if !item.deleted {
-                        self.ensure_avatar_cached(user_id, &avatar);
-                    }
+                    user_inputs.push(UpsertUserInput {
+                        user_id,
+                        username: Self::json_get_string(&payload, &["username"]),
+                        nickname: Self::json_get_string(&payload, &["nickname", "name"]),
+                        alias: Self::json_get_string(&payload, &["alias"]),
+                        avatar: avatar.clone(),
+                        user_type: Self::json_get_i32(&payload, &["user_type", "type"])
+                            .unwrap_or(0),
+                        is_deleted: item.deleted
+                            || Self::json_get_bool(&payload, &["is_deleted"]).unwrap_or(false),
+                        channel_id: Self::json_get_string(&payload, &["channel_id"])
+                            .unwrap_or_default(),
+                        version: item.version as i64,
+                        updated_at: Self::json_get_i64(&payload, &["updated_at", "version"])
+                            .unwrap_or(item.version as i64),
+                    });
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "user".to_string(),
                         entity_id: item.entity_id.clone(),
                         deleted: item.deleted,
                     });
                 }
+                self.storage.batch_upsert_users(user_inputs).await?;
+                // A global user page can contain thousands of identities. Their metadata is a
+                // readiness dependency; downloading every avatar is not. Eager cache jobs flood
+                // the single storage actor and can trap an opened conversation behind minutes of
+                // cache bookkeeping. Visible/profile/friend paths still call
+                // `ensure_avatar_cached` on demand.
             }
             "group" => {
                 for item in items {
@@ -6384,7 +6435,12 @@ impl State {
                             channel_id,
                             channel_type,
                             message_id,
-                            reason: "sync_entity".to_string(),
+                            // The host must distinguish a live delivery (notification +
+                            // immediate projection) from background history convergence
+                            // (coalesced reread). Treating both as the same event caused each
+                            // repaired message to be read three times across FFI.
+                            reason: timeline_reason_for_message(bump_unread_on_incoming)
+                                .to_string(),
                         });
                     }
                     // 回显 vs 新消息：以 server_message_id 是否已存在本地（inserted_new）为准，
@@ -8283,19 +8339,20 @@ impl State {
         canonical.to_upsert_input(2, mime_type)
     }
 
-    async fn store_history_item(
-        &mut self,
-        item: &MessageHistoryItem,
-        channel_type: i32,
-    ) -> Result<u64> {
-        Ok(self
-            .storage
-            .upsert_remote_message_with_result(Self::history_item_to_upsert_input(
-                item,
-                channel_type,
-            ))
+    async fn store_history_items<'a, I>(&self, items: I, channel_type: i32) -> Result<Vec<u64>>
+    where
+        I: IntoIterator<Item = &'a MessageHistoryItem>,
+    {
+        let inputs = items
+            .into_iter()
+            .map(|item| Self::history_item_to_upsert_input(item, channel_type))
+            .collect();
+        self.storage
+            .batch_upsert_remote_messages(inputs)
             .await?
-            .message_id)
+            .into_iter()
+            .map(|result| result.map(|stored| stored.message_id))
+            .collect()
     }
 
     /// 回填式拉取频道历史：RPC → 逐条落库 → 返回响应（spec §6：get 结果必须回填，
@@ -8317,10 +8374,8 @@ impl State {
             .rpc_call_typed(routes::message_history::GET, &req)
             .await?;
         let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
-        for item in &resp.messages {
-            self.store_history_item(item, normalized_channel_type)
-                .await?;
-        }
+        self.store_history_items(resp.messages.iter(), normalized_channel_type)
+            .await?;
         Ok(resp)
     }
 
@@ -8344,15 +8399,14 @@ impl State {
             .rpc_call_typed(routes::message_history::AROUND, &req)
             .await?;
         let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
-        for item in resp
-            .before_messages
-            .iter()
-            .chain(std::iter::once(&resp.anchor_message))
-            .chain(resp.after_messages.iter())
-        {
-            self.store_history_item(item, normalized_channel_type)
-                .await?;
-        }
+        self.store_history_items(
+            resp.before_messages
+                .iter()
+                .chain(std::iter::once(&resp.anchor_message))
+                .chain(resp.after_messages.iter()),
+            normalized_channel_type,
+        )
+        .await?;
         Ok(resp)
     }
 
@@ -8684,17 +8738,12 @@ impl State {
         }
 
         let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        let message_ids = self
+            .store_history_items(resp.messages.iter(), normalized_channel_type)
+            .await?;
         let mut applied = 0usize;
-        for item in resp.messages {
+        for (item, message_id) in resp.messages.into_iter().zip(message_ids) {
             let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
-            let message_id = self
-                .storage
-                .upsert_remote_message_with_result(Self::history_item_to_upsert_input(
-                    &item,
-                    normalized_channel_type,
-                ))
-                .await?
-                .message_id;
             let _ = self
                 .update_channel_last_message(
                     item.channel_id,
@@ -8967,9 +9016,12 @@ impl State {
     /// 「整个账号都收敛了」，两者语义天差地别。据此判定 Converged 会在扫到
     /// 第一页干净数据时就过早宣布收敛完成。
     async fn run_anti_entropy_once(&mut self) -> Result<AntiEntropyPage> {
-        const PAGE_SIZE: usize = 100;
-        const WIFI_DIFFERENCE_BUDGET: usize = 8;
-        const CELLULAR_DIFFERENCE_BUDGET: usize = 4;
+        // This runs inline on the SDK actor. Keep each slice small enough that
+        // a channel/message command arriving just after the tick is not trapped
+        // behind a large scan. Throughput comes from repeated ticks, not a burst.
+        const PAGE_SIZE: usize = 25;
+        const WIFI_DIFFERENCE_BUDGET: usize = 1;
+        const CELLULAR_DIFFERENCE_BUDGET: usize = 1;
 
         if self.session_state != SessionState::Authenticated || !self.bootstrap_completed {
             return Ok(AntiEntropyPage::idle());
@@ -9124,7 +9176,7 @@ impl State {
             match self.sync_entities(entity_type.to_string(), None).await {
                 Ok(applied) => {
                     stats.entity_types_synced += 1;
-                    self.queue_last_sync_events(entity_type.to_string(), None, applied);
+                    self.queue_sync_summary_event(entity_type.to_string(), None, applied);
                 }
                 Err(e) if Self::is_unsupported_entity_error(&e) => {
                     self.log_unsupported_sync_skip("resume sync", entity_type, None, &e);
@@ -9172,9 +9224,10 @@ impl State {
         // stats 交给 Phase 3：ResumeSyncCompleted 只在真正全量收敛后发一次。
         // 在这里发过一次是漏删——那会让宿主以为整轮结束，而收敛才刚开始。
         self.convergence_run = Some(stats);
-        self.sync_coordinator.set_convergence(
-            crate::sync_coordinator::Convergence::Scanning,
+        const CONVERGENCE_START_GRACE_MS: i64 = 5_000;
+        self.sync_coordinator.schedule_convergence(
             chrono::Utc::now().timestamp_millis(),
+            CONVERGENCE_START_GRACE_MS,
         );
         Ok(())
     }
@@ -9585,6 +9638,15 @@ impl State {
         Ok(applied)
     }
 
+    const BOOTSTRAP_ENTITY_ORDER: [&str; 6] = [
+        "friend",
+        "group",
+        "channel",
+        "user",
+        "channel_read_cursor",
+        "user_block",
+    ];
+
     async fn execute_bootstrap_sync(&mut self) -> Result<()> {
         if self.session_state != SessionState::Authenticated {
             return Err(Error::InvalidState(
@@ -9615,15 +9677,7 @@ impl State {
                 core_entities, optional_entities
             );
         }
-        let order = [
-            "friend",
-            "group",
-            "channel",
-            "user",
-            "channel_read_cursor",
-            "user_block",
-        ];
-        for entity_type in order {
+        for entity_type in Self::BOOTSTRAP_ENTITY_ORDER {
             match self.sync_entities(entity_type.to_string(), None).await {
                 Ok(count) => {
                     if actor_logs_enabled() {
@@ -9640,52 +9694,10 @@ impl State {
             }
         }
 
-        // Scoped member sync (best effort but still inside bootstrap critical path):
-        // - group_member scoped by group_id
-        // NOTE:
-        //   ENTITY_SYNC_V1 core controlled enum is `group_member`.
-        //   `channel_member` is not guaranteed by current server deployment and is not
-        //   part of old stable bootstrap path, so we do not treat it as bootstrap core.
-        let mut group_offset = 0usize;
-        let group_page_size = 500usize;
-        loop {
-            let groups = self
-                .storage
-                .list_groups(group_page_size, group_offset)
-                .await?;
-            if groups.is_empty() {
-                break;
-            }
-            for group in groups.iter() {
-                let scope = group.group_id.to_string();
-                match self
-                    .sync_entities("group_member".to_string(), Some(scope))
-                    .await
-                {
-                    Ok(count) => {
-                        if actor_logs_enabled() {
-                            eprintln!(
-                                "[SDK.actor] bootstrap sync entity=group_member scope=group:{} count={}",
-                                group.group_id, count
-                            );
-                        }
-                    }
-                    Err(e) if Self::is_unsupported_entity_error(&e) => {
-                        self.log_unsupported_sync_skip(
-                            "bootstrap sync",
-                            "group_member",
-                            Some(format!("group:{}", group.group_id)),
-                            &e,
-                        );
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            if groups.len() < group_page_size {
-                break;
-            }
-            group_offset += group_page_size;
-        }
+        // Full rosters are not a readiness dependency. The authoritative `user`
+        // projection already covers referenced identities; roster membership is
+        // hydrated on demand by member/settings surfaces. Iterating every group
+        // here makes first login O(group_count) and traps conversation reads.
         self.bootstrap_completed = true;
         if let Some(uid) = &self.current_uid {
             self.storage
@@ -11934,6 +11946,9 @@ pub struct PrivchatSdk {
     /// 见 [State::switch_requested]：切换账号前先记一笔并叫醒 actor，让正在跑的同步让出。
     switch_requested: Arc<AtomicU64>,
     switch_wakeup: Arc<tokio::sync::Notify>,
+    /// Interactive timeline reads preempt Phase 3 convergence. A pending notify
+    /// permit survives the small check/start race around the background pass.
+    foreground_wakeup: Arc<tokio::sync::Notify>,
     startup_error: Arc<StdMutex<Option<Error>>>,
     snowflake: Arc<snowflake_me::Snowflake>,
     presence_cache: Arc<StdMutex<HashMap<u64, PresenceStatus>>>,
@@ -12024,6 +12039,8 @@ impl PrivchatSdk {
         let switch_requested_actor = switch_requested_sdk.clone();
         let switch_processed_actor = switch_processed_sdk.clone();
         let switch_wakeup_actor = switch_wakeup_sdk.clone();
+        let foreground_wakeup_sdk = Arc::new(tokio::sync::Notify::new());
+        let foreground_wakeup_actor = foreground_wakeup_sdk.clone();
         let actor_snowflake = snowflake.clone();
         let actor_task = runtime_provider.spawn(async move {
             if actor_logs_enabled() {
@@ -12236,7 +12253,20 @@ impl PrivchatSdk {
                                 chrono::Utc::now().timestamp_millis(),
                             )
                         {
-                            match state.run_anti_entropy_once().await {
+                            // A conversation open is foreground work. If it arrives while a
+                            // batch/difference RPC is in flight, cancel this idempotent pass and
+                            // return to the command loop instead of making the UI wait for the
+                            // background network timeout. `notify_one` retains a permit across
+                            // the check/start race above.
+                            let convergence = run_preemptible_background(
+                                &foreground_wakeup_actor,
+                                state.run_anti_entropy_once(),
+                            )
+                            .await;
+                            let Some(convergence) = convergence else {
+                                continue;
+                            };
+                            match convergence {
                                 // 只有「完整扫过一圈 + 没有留下未修的 stale」才算收敛。
                                 // 用「本页修了 0 条」判定会在扫到第一页干净数据时就
                                 // 过早宣布完成，后面的频道再也不会被检查。
@@ -15427,6 +15457,7 @@ impl PrivchatSdk {
             supervised_sync_running: Arc::new(AtomicBool::new(false)),
             switch_requested: switch_requested_sdk,
             switch_wakeup: switch_wakeup_sdk,
+            foreground_wakeup: foreground_wakeup_sdk,
             startup_error,
             snowflake,
             presence_cache,
@@ -16710,6 +16741,7 @@ impl PrivchatSdk {
         offset: usize,
     ) -> Result<Vec<StoredMessage>> {
         self.ensure_running()?;
+        self.foreground_wakeup.notify_one();
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::ListMessages {
@@ -16735,6 +16767,7 @@ impl PrivchatSdk {
         after_limit: usize,
     ) -> Result<Vec<StoredMessage>> {
         self.ensure_running()?;
+        self.foreground_wakeup.notify_one();
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::ListMessagesAround {
@@ -16758,6 +16791,7 @@ impl PrivchatSdk {
         offset: usize,
     ) -> Result<TimelineSnapshot> {
         self.ensure_running()?;
+        self.foreground_wakeup.notify_one();
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::QueryTimelineSnapshot {
@@ -16885,6 +16919,7 @@ impl PrivchatSdk {
         limit: Option<u32>,
     ) -> Result<privchat_protocol::rpc::message::history::MessageHistoryResponse> {
         self.ensure_running()?;
+        self.foreground_wakeup.notify_one();
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::FetchChannelHistory {
@@ -16993,19 +17028,15 @@ impl PrivchatSdk {
                 .unwrap_or(true)
         };
 
-        // 1. 先读本地。有内容就直接渲染，不打网络——冷启动秒开靠的就是这一步。
+        // 1. 先读本地。UI can publish this cache before awaiting this method, but local
+        // rows do not prove that the latest window was hydrated: a realtime push may have
+        // inserted exactly one newest row on a fresh device.
         let local = self
             .list_messages(channel_id, channel_type, limit as usize, 0)
             .await?;
-        if !local.is_empty() {
-            return Ok(OpenConversationPage {
-                messages: local,
-                has_more_before: read_has_more(self.kv_get_local(gap_key).await?),
-                fetched_from_server: false,
-            });
-        }
 
-        // 2. 本地空。补过一次且结果就是空 → 这是个真的空会话，不再空转。
+        // 2. Hydration is state-driven, not row-count-driven. This also distinguishes a
+        // genuinely empty hydrated conversation from a conversation never fetched.
         let hydrated_key = format!("__hist_hydrated__:{channel_type}:{channel_id}");
         let hydrated = self
             .kv_get_local(hydrated_key.clone())
@@ -17013,19 +17044,32 @@ impl PrivchatSdk {
             .and_then(|b| serde_json::from_slice::<HistHydratedState>(&b).ok())
             .map(|s| s.hydrated)
             .unwrap_or(false);
-        if hydrated {
+        if !should_hydrate_latest_window(hydrated, local.len()) {
             return Ok(OpenConversationPage {
-                messages: Vec::new(),
-                has_more_before: false,
+                messages: local,
+                has_more_before: read_has_more(self.kv_get_local(gap_key).await?),
                 fetched_from_server: false,
             });
         }
 
-        // 3. 从没补过 → 拉最新一页。`before = None` 即「最新」，服务端本来就支持，
+        // 3. 从没补过 → 拉最新一页，即使本地已有 realtime 消息。`before = None` 即「最新」，
         //    与上滑翻页复用同一个 RPC（回填带真实 pts，SDK-HISTORY-2 已做 upsert）。
-        let resp = self
+        let resp = match self
             .fetch_channel_history(channel_id, channel_type, None, Some(limit))
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            // Local-first means a transient network failure must not erase an already
+            // rendered cache. Do not mark hydrated; the next open will retry.
+            Err(_) if !local.is_empty() => {
+                return Ok(OpenConversationPage {
+                    messages: local,
+                    has_more_before: read_has_more(self.kv_get_local(gap_key).await?),
+                    fetched_from_server: false,
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
         // 只有网络这一步成功了才落 hydrated：失败就落的话，一次超时会让这个会话
         // 永远显示「暂无聊天内容」，再也不会重试。
@@ -18804,8 +18848,44 @@ mod tests {
         (state, dir)
     }
 
-    use super::{plan_anti_entropy_page, AntiEntropyObservation, AntiEntropyPage};
+    use super::{
+        plan_anti_entropy_page, run_preemptible_background, should_hydrate_latest_window,
+        timeline_reason_for_message, AntiEntropyObservation, AntiEntropyPage,
+    };
     use crate::sync_coordinator::{Readiness, SyncRunKind};
+
+    #[test]
+    fn latest_window_hydration_is_not_inferred_from_local_row_count() {
+        assert!(should_hydrate_latest_window(false, 0));
+        assert!(
+            should_hydrate_latest_window(false, 1),
+            "a realtime row must not suppress first-window history hydration"
+        );
+        assert!(!should_hydrate_latest_window(true, 0));
+        assert!(!should_hydrate_latest_window(true, 50));
+    }
+
+    #[test]
+    fn live_and_background_message_events_have_distinct_reasons() {
+        assert_eq!(timeline_reason_for_message(true), "realtime_message");
+        assert_eq!(timeline_reason_for_message(false), "sync_entity");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_foreground_read_preempts_a_background_pass() {
+        let wakeup = tokio::sync::Notify::new();
+        wakeup.notify_one();
+
+        let result =
+            run_preemptible_background(&wakeup, std::future::pending::<Result<AntiEntropyPage>>())
+                .await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            run_preemptible_background(&wakeup, std::future::ready(7)).await,
+            Some(7)
+        );
+    }
 
     /// 收敛判定：`Ok(0)` 曾被当成「全账号收敛」，但它只代表本页修了 0 条。
     /// 游标还停在中间时宣布 Converged，后面的频道就再也不会被检查。
@@ -19455,6 +19535,34 @@ mod tests {
         assert!(!Error::Auth("token expired".to_string()).is_retryable());
     }
 
+    /// 服务端的**终局拒绝**必须是不可重试的——对称于上一条。
+    ///
+    /// 同样出自一次生产事故：服务端把「附件已被别的消息占用」这种终局判定包进了
+    /// `DatabaseError(7)`，而 7 属于可重试段。客户端于是每十几秒重试一次，一条图片
+    /// 消息卡了好几天：既不成功、也不失败、用户连重发的机会都没有。
+    ///
+    /// 服务端已改判为 `OperationConflict`；这里钉住客户端这一侧的判据，
+    /// 免得哪天有人把业务码顺手塞进可重试白名单。
+    #[test]
+    fn a_terminal_server_rejection_is_not_retried_forever() {
+        let rejected = Error::Server {
+            code: ErrorCode::OperationConflict as u32,
+            message: "ATTACHMENT_BINDING_REJECTED ... already bound to another business"
+                .to_string(),
+        };
+        assert!(
+            !rejected.is_retryable(),
+            "终局拒绝重试多少次都是同一个结果，必须出队并标记 failed 让用户重发",
+        );
+
+        // 对照：数据库真的抖了一下是可重试的——这条不能被上面那条误伤。
+        assert!(Error::Server {
+            code: ErrorCode::DatabaseError as u32,
+            message: "connection reset".to_string(),
+        }
+        .is_retryable());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_request_timeout_does_not_tear_down_an_authenticated_session() {
         let (mut state, dir) = new_seeded_state("request-timeout-keeps-session").await;
@@ -19892,6 +20000,91 @@ mod tests {
         ));
         assert!(State::should_persist_sync_cursor("friend", None));
         assert!(State::should_persist_sync_cursor("channel", None));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn critical_sync_publishes_one_summary_instead_of_per_user_events() {
+        let (mut state, dir) = new_seeded_state("critical-sync-summary").await;
+        state.last_sync_queued = 1_000;
+        state.last_sync_entity_events = (1..=1_000)
+            .map(|id| SdkEvent::SyncEntityChanged {
+                entity_type: "user".to_string(),
+                entity_id: id.to_string(),
+                deleted: false,
+            })
+            .collect();
+
+        state.queue_sync_summary_event("user".to_string(), None, 1_000);
+
+        assert_eq!(state.pending_events.len(), 1);
+        assert!(matches!(
+            state.pending_events.first(),
+            Some(SdkEvent::SyncEntitiesApplied {
+                entity_type,
+                applied: 1_000,
+                ..
+            }) if entity_type == "user"
+        ));
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn global_user_sync_does_not_eagerly_cache_every_avatar() {
+        let (mut state, dir) = new_seeded_state("global-user-sync-no-avatar-flood").await;
+        let items: Vec<_> = (1..=1_000)
+            .map(|user_id| SyncEntityItem {
+                entity_id: user_id.to_string(),
+                version: user_id,
+                deleted: false,
+                payload: Some(serde_json::json!({
+                    "user_id": user_id,
+                    "username": format!("user-{user_id}"),
+                    "nickname": format!("User {user_id}"),
+                    "avatar": format!("https://example.invalid/{user_id}.png")
+                })),
+            })
+            .collect();
+
+        state
+            .apply_sync_entities("user", None, &items, false)
+            .await
+            .expect("materialize global user page");
+
+        assert_eq!(
+            state.avatar_cache.inflight_len(),
+            0,
+            "identity sync must not enqueue one avatar job per related user"
+        );
+        assert_eq!(
+            state
+                .storage
+                .get_user_by_id(1_000)
+                .await
+                .expect("read last user")
+                .and_then(|user| user.nickname)
+                .as_deref(),
+            Some("User 1000")
+        );
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bootstrap_plan_is_constant_sized_and_excludes_full_group_rosters() {
+        assert_eq!(
+            State::BOOTSTRAP_ENTITY_ORDER,
+            [
+                "friend",
+                "group",
+                "channel",
+                "user",
+                "channel_read_cursor",
+                "user_block",
+            ]
+        );
+        assert!(!State::BOOTSTRAP_ENTITY_ORDER.contains(&"group_member"));
     }
 
     #[test]
@@ -21306,7 +21499,7 @@ mod tests {
         for (server_message_id, pts, expected_unread) in
             [(896001_u64, 10_i64, 0), (896002_u64, 30_i64, 1)]
         {
-            state
+            let events = state
                 .apply_sync_entities(
                     "message",
                     None,
@@ -21330,6 +21523,10 @@ mod tests {
                 )
                 .await
                 .expect("apply realtime message");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SdkEvent::TimelineUpdated { reason, .. } if reason == "realtime_message"
+            )));
 
             let channel = state
                 .storage
@@ -21339,6 +21536,35 @@ mod tests {
                 .expect("channel exists");
             assert_eq!(channel.unread_count, expected_unread, "pts={pts}");
         }
+
+        let history_events = state
+            .apply_sync_entities(
+                "message",
+                None,
+                &[SyncEntityItem {
+                    entity_id: "896003".to_string(),
+                    version: 40,
+                    deleted: false,
+                    payload: Some(serde_json::json!({
+                        "server_message_id": 896003,
+                        "channel_id": channel_id,
+                        "channel_type": channel_type,
+                        "from_uid": 20001,
+                        "message_type": 0,
+                        "content": "history-message",
+                        "status": 2,
+                        "pts": 40,
+                        "order_seq": 40
+                    })),
+                }],
+                false,
+            )
+            .await
+            .expect("apply history message");
+        assert!(history_events.iter().any(|event| matches!(
+            event,
+            SdkEvent::TimelineUpdated { reason, .. } if reason == "sync_entity"
+        )));
 
         state.storage.shutdown();
         let _ = std::fs::remove_dir_all(dir);
