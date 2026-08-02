@@ -900,20 +900,17 @@ fn emit_sequenced_event(
 }
 
 
-/// 服务端实体同步下发的是 **DB 角色编码**（Owner=0 / Admin=1 / Member=2），
-/// 而本地 `group_member` 表与 UI 契约用的是**相反**的一套（owner=2 / member=0，
-/// 见 `privchat-ui` 的 `GroupMemberEntry.isOwner`）。
+/// 线上角色 → 本地 `group_member.role`。
 ///
-/// 两套编码历史上就是反的（CHANNEL_SPEC §3.2 已登记为遗留）。原样落库会让
-/// **每个普通成员都变成群主、群主变成普通成员**——群管理入口全乱。
+/// 自 `V20260803120000__group_member_role_canonical` 起，本地表用的**就是**
+/// 协议权威编码（[`GroupMemberRole`]：Member=0/Owner=1/Admin=2），所以这里不再
+/// 有编号翻转——只剩一次「解析」：把线上来的裸整数收敛成枚举，未知一律 Member。
+///
+/// 之所以还留这个函数而不是直接 `unwrap_or(0)`：**裸整数不该直接落库**。
+/// 一个没走枚举的 role 值，就是下一次「普通成员变群主」的入口。
 fn server_role_to_local(role: Option<i32>) -> i32 {
-    match role {
-        Some(0) => 2, // server Owner  -> local owner
-        Some(1) => 1, // Admin 两边一致
-        Some(2) => 0, // server Member -> local member
-        // 未知/缺失一律按普通成员，绝不默认成群主。
-        _ => 0,
-    }
+    use privchat_protocol::rpc::group::role::GroupMemberRole;
+    GroupMemberRole::from_wire_i32(role.unwrap_or_default()).to_wire_i32()
 }
 
 async fn stop_inbound_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
@@ -19594,16 +19591,16 @@ mod tests {
 
     use super::server_role_to_local;
 
-    /// 服务端与本地的角色编码是**相反**的两套。原样落库会让每个普通成员
-    /// 变成群主、群主变成普通成员——群管理入口在 App 上全乱。
+    /// 本地存的就是协议编码（Member=0/Owner=1/Admin=2），不再翻转。
     ///
-    /// 这条测试是在把 App 的成员同步从「全量 list」切到「实体增量」之前立的：
-    /// 那条 apply 路径当时正是原样写入，只是还没有人调用它。
+    /// 这条测试保留下来的意义是**钉住"落库的值必须经过枚举"**：
+    /// 早先这里原样写入服务端裸整数，而两套编号当时是反的——
+    /// 每个普通成员都会变成群主。
     #[test]
-    fn server_roles_are_flipped_into_the_local_encoding() {
-        assert_eq!(server_role_to_local(Some(0)), 2, "服务端 Owner → 本地 owner(2)");
-        assert_eq!(server_role_to_local(Some(1)), 1, "Admin 两边一致");
-        assert_eq!(server_role_to_local(Some(2)), 0, "服务端 Member → 本地 member(0)");
+    fn roles_are_stored_in_the_protocol_encoding() {
+        assert_eq!(server_role_to_local(Some(0)), 0, "member");
+        assert_eq!(server_role_to_local(Some(1)), 1, "owner");
+        assert_eq!(server_role_to_local(Some(2)), 2, "admin");
     }
 
     /// 缺失/未知角色一律按普通成员——绝不能默认成群主，那是提权。

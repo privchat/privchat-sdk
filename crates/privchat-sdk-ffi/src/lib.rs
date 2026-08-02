@@ -1275,12 +1275,12 @@ where
         .map_err(PrivchatFfiError::from)
 }
 
+/// 线上角色字符串 → 协议权威编码（Member=0/Owner=1/Admin=2）。
+///
+/// 不要在这里再手写 match：`GroupMemberRole` 是全系统唯一定义，
+/// 大小写兼容与「未知一律 Member」的语义都在它里面。
 fn parse_group_role_to_code(role: &str) -> i32 {
-    match role.to_ascii_lowercase().as_str() {
-        "owner" => 2,
-        "admin" | "administrator" => 1,
-        _ => 0,
-    }
+    privchat_protocol::rpc::group::role::GroupMemberRole::from_wire_str(role).to_wire_i32()
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -5215,13 +5215,9 @@ impl PrivchatClient {
         let mut out_members = Vec::with_capacity(resp.members.len());
         for entry in &resp.members {
             let user_id = entry.user_id;
-            // 本地 group_member 表与 UI 契约的 role 编码:owner=2 / admin=1 / member=0
-            // (与生产 DB privchat_group_members.role 一致)。
-            let role = match entry.role.to_ascii_lowercase().as_str() {
-                "owner" => 2,
-                "admin" => 1,
-                _ => 0,
-            };
+            // 本地表与 UI 都用协议权威编码（Member=0/Owner=1/Admin=2），
+            // 见 `GroupMemberRole`；本地库由 V20260803120000 迁移换过来。
+            let role = parse_group_role_to_code(&entry.role);
             let status = 0;
             // Group alias and global nickname are separate identity domains.
             // Older code stored profile.nickname into group_member.alias, which
