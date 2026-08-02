@@ -7764,6 +7764,25 @@ impl PrivchatClient {
         })
     }
 
+    /// SDK-HISTORY-7 §15.9：给所有未隐藏会话补首屏。
+    ///
+    /// `open_conversation` 只在用户点进去时才补，于是换设备/重装后的列表是「点一个补一个，
+    /// 不点就一直空着」。换设备本来就该把该看的先备齐。
+    ///
+    /// **必须在 CriticalReady / SYNC_READY 之后再起**，绝不能进启动关键路径。
+    /// 已补过的会话零网络跳过，所以每次启动都调一次是廉价且幂等的。
+    /// `max_channels = 0` 表示不限。
+    /// 起一轮扫补，**立刻返回**；`false` = 已经有一轮在跑。
+    ///
+    /// 刻意不是 async：uniffi 的 async 桥在自己的 foreign executor 上 poll future，
+    /// 那里没有 Tokio runtime，扫补里的 `sleep` 会 panic「no reactor running」。
+    /// 扫补跑在 SDK 自己的 runtime 上，结果进日志，不回传宿主——宿主本来也只需要
+    /// 即发即忘。
+    pub fn start_first_screen_hydration(&self, limit: u32, max_channels: u32) -> bool {
+        self.inner
+            .start_first_screen_hydration(limit, max_channels as usize)
+    }
+
     /// 以 anchor 为轴的本地上下文窗口（显示排序；spec §5 跳转渲染原语）。
     /// 通常先调 get_messages_around 完成服务端回填，再用本方法从本地读窗口渲染。
     pub async fn list_local_messages_around(

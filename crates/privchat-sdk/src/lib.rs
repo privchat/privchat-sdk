@@ -1684,6 +1684,21 @@ pub struct OpenConversationPage {
     pub fetched_from_server: bool,
 }
 
+/// 首屏扫补一轮的结果（SDK-HISTORY-7 §15.9）。诊断用，不参与渲染。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FirstScreenSweepReport {
+    /// 本轮看过的未隐藏会话数。
+    pub scanned: usize,
+    /// 真的打了网络补上首屏的会话数。
+    pub hydrated: usize,
+    /// 已经补过、直接跳过的会话数（不打网络）。
+    pub skipped: usize,
+    /// 补失败的会话数。失败**不**标记 hydrated，下一轮或用户打开时会重试。
+    pub failed: usize,
+    /// 是否因为 shutdown / 切账号提前停了。
+    pub cancelled: bool,
+}
+
 /// per-channel 历史 gap 水位持久化态（KV `__hist_gap__:<ct>:<cid>`，§2.5.1 V1 最小契约）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistGapState {
@@ -12025,6 +12040,9 @@ pub struct PrivchatSdk {
     task_registry: TaskRegistry,
     shutting_down: Arc<AtomicBool>,
     supervised_sync_running: Arc<AtomicBool>,
+    /// 首屏扫补是否已在跑。宿主每次进入 SYNC_READY 都会踢一脚，重连/切前台会踢很多次；
+    /// 没有这道闸，几百个会话的扫补会被并发起好几轮，互相抢 actor。
+    first_screen_sweep_running: Arc<AtomicBool>,
     /// 见 [State::switch_requested]：切换账号前先记一笔并叫醒 actor，让正在跑的同步让出。
     switch_requested: Arc<AtomicU64>,
     switch_wakeup: Arc<tokio::sync::Notify>,
@@ -15562,6 +15580,7 @@ impl PrivchatSdk {
             task_registry,
             shutting_down: Arc::new(AtomicBool::new(false)),
             supervised_sync_running: Arc::new(AtomicBool::new(false)),
+            first_screen_sweep_running: Arc::new(AtomicBool::new(false)),
             switch_requested: switch_requested_sdk,
             switch_wakeup: switch_wakeup_sdk,
             foreground_wakeup: foreground_wakeup_sdk,
@@ -17207,6 +17226,146 @@ impl PrivchatSdk {
         })
     }
 
+    /// 这个会话补过首屏了吗（KV，重启后仍然有效）。
+    async fn is_first_screen_hydrated(&self, channel_id: u64, channel_type: i32) -> bool {
+        self.kv_get_local(format!("__hist_hydrated__:{channel_type}:{channel_id}"))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice::<HistHydratedState>(&b).ok())
+            .map(|s| s.hydrated)
+            .unwrap_or(false)
+    }
+
+    /// 给**所有未隐藏会话**补首屏（SDK-HISTORY-7 §15.9）。
+    ///
+    /// `open_conversation` 只在用户点进某个会话时才补，于是新设备/重装后的会话列表是这样的：
+    /// 每个会话都空着，点一个补一个，不点就永远空着。用户看到的是「先空一下再刷出消息」，
+    /// 而没点过的会话在离线时什么都没有。换设备本来就该把该看的先备齐。
+    ///
+    /// 几条硬约束：
+    /// - **绝不在启动关键路径上**（SDK_SYNC_RESUME_SPEC Phase 2）。调用方必须在
+    ///   `CriticalReady` / `SYNC_READY` 之后再起它，失败也不得影响任何全局可用状态。
+    /// - **按 `list_channels` 的顺序**（置顶 → 最近活跃），用户最可能打开的先补。
+    /// - **逐个补、补一个歇一下**：SDK 是单 actor，RPC 在 actor 循环里串行执行。不歇的话
+    ///   几百个会话会把 actor 占满，发消息、退出登录这些命令排不上队——那正是把退出登录
+    ///   卡死的同一个坑。
+    /// - **已补过的直接跳过**，只读本地 KV，不打网络；所以重复调用是廉价且幂等的。
+    /// - **单个会话失败不中断整轮**，也不标记 hydrated，下次自然重试。
+    ///
+    /// `max_channels = 0` 表示不限。
+    pub async fn hydrate_conversation_first_screens(
+        &self,
+        limit: u32,
+        max_channels: usize,
+    ) -> Result<FirstScreenSweepReport> {
+        /// 两次网络补齐之间的间隔。给 actor 留出处理用户操作的缝隙。
+        const PACE: Duration = Duration::from_millis(80);
+        /// 每次向本地库要多少个会话。
+        const PAGE: usize = 200;
+
+        self.ensure_running()?;
+        let mut report = FirstScreenSweepReport::default();
+        let mut offset = 0usize;
+
+        loop {
+            if self.shutting_down.load(Ordering::Acquire) {
+                report.cancelled = true;
+                break;
+            }
+            let channels = self.list_channels(PAGE, offset).await?;
+            if channels.is_empty() {
+                break;
+            }
+            offset += channels.len();
+
+            for channel in channels {
+                if self.shutting_down.load(Ordering::Acquire) {
+                    report.cancelled = true;
+                    return Ok(report);
+                }
+                if max_channels != 0 && report.scanned >= max_channels {
+                    return Ok(report);
+                }
+                report.scanned += 1;
+
+                if self
+                    .is_first_screen_hydrated(channel.channel_id, channel.channel_type)
+                    .await
+                {
+                    report.skipped += 1;
+                    continue;
+                }
+
+                match self
+                    .open_conversation(channel.channel_id, channel.channel_type, limit)
+                    .await
+                {
+                    Ok(_) => report.hydrated += 1,
+                    // 一个会话补不上（没权限/服务端报错/网络抖动）不该让其余会话陪葬。
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::debug!(
+                            channel_id = channel.channel_id,
+                            error = %error,
+                            "first-screen hydration failed; will retry later",
+                        );
+                    }
+                }
+                tokio::time::sleep(PACE).await;
+            }
+        }
+        Ok(report)
+    }
+
+    /// 起一轮首屏扫补，**立刻返回**（SDK-HISTORY-7 §15.9）。
+    ///
+    /// 宿主要的就是即发即忘，而且这条路径**不能**让调用方 await：
+    /// uniffi 的 async 桥在它自己的 foreign executor 上 poll future，那里没有 Tokio
+    /// runtime 上下文，`tokio::time::sleep` 会直接 panic「no reactor running」——
+    /// 真机实测第一版就是这么失败的（`hydrateConversationFirstScreens failed:
+    /// there is no reactor running`）。扫补必须跑在 SDK 自己的 runtime 上。
+    ///
+    /// 返回 `false` = 已经有一轮在跑，这次不重复起。宿主每次进 SYNC_READY 都会踢一脚，
+    /// 重连/切前台会踢很多次，没有这道闸就是几百个会话被并发扫好几轮。
+    pub fn start_first_screen_hydration(&self, limit: u32, max_channels: usize) -> bool {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return false;
+        }
+        if self
+            .first_screen_sweep_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        let sdk = self.clone();
+        let running = self.first_screen_sweep_running.clone();
+        let handle = self._runtime_provider.spawn(async move {
+            match sdk
+                .hydrate_conversation_first_screens(limit, max_channels)
+                .await
+            {
+                Ok(report) => tracing::info!(
+                    scanned = report.scanned,
+                    hydrated = report.hydrated,
+                    skipped = report.skipped,
+                    failed = report.failed,
+                    cancelled = report.cancelled,
+                    "first-screen hydration sweep finished",
+                ),
+                // 扫补是尽力而为的后台工作：整轮失败也不得影响任何已可用状态。
+                Err(error) => {
+                    tracing::warn!(error = %error, "first-screen hydration sweep aborted")
+                }
+            }
+            running.store(false, Ordering::Release);
+        });
+        let _ = self.task_registry.track(handle);
+        true
+    }
+
     /// jump-to-message 上下文（spec §5）：before/anchor/after 完整消息已回填本地库。
     pub async fn fetch_messages_around(
         &self,
@@ -18611,6 +18770,7 @@ mod tests {
         plan_authenticate_transport, plan_connect, Action, AuthErrorKind, AuthenticateRetryDriver,
         AuthenticateRetryFuture, AuthenticateRetryOperation, AuthenticateTransportPlan,
         CanonicalTimelineEvent, Command, ConnectPlan, ConnectionState, ContentMessageType, Error,
+        HistHydratedState,
         ErrorCode, LoginResult, MessageCachePolicy, NetworkHint, NewMessage, PresenceStatus,
         PrivchatConfig, PrivchatSdk, Result, ResumeEscalationScope, ResumeFailureClass,
         ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State, SyncCoordinator,
@@ -18800,6 +18960,109 @@ mod tests {
                 .map(|a| a.uid.as_str()),
             Some("10001"),
         );
+    }
+
+    async fn seed_channel(sdk: &PrivchatSdk, channel_id: u64, last_msg_timestamp: i64) {
+        sdk.upsert_channel(UpsertChannelInput {
+            channel_id,
+            channel_type: 2,
+            channel_name: format!("group-{channel_id}"),
+            channel_remark: String::new(),
+            avatar: String::new(),
+            unread_count: 0,
+            top: 0,
+            mute: 0,
+            last_msg_timestamp,
+            last_local_message_id: 0,
+            last_msg_content: String::new(),
+            version: 1,
+            peer_user_id: None,
+        })
+        .await
+        .expect("seed channel");
+    }
+
+    async fn mark_first_screen_hydrated(sdk: &PrivchatSdk, channel_id: u64) {
+        sdk.kv_put_local(
+            format!("__hist_hydrated__:2:{channel_id}"),
+            serde_json::to_vec(&HistHydratedState { hydrated: true }).expect("encode"),
+        )
+        .await
+        .expect("mark hydrated");
+    }
+
+    /// 已经补过首屏的会话必须**零网络**跳过。
+    ///
+    /// 这是整轮扫补可以反复调用的前提：换设备第一次跑完之后，后面每次启动再跑一遍
+    /// 只是几百次本地 KV 读。若这里退化成打网络，每次冷启动就是几百个 RPC。
+    /// 测试里没有服务端，所以「没打网络」是可断言的——真去打就会记进 failed。
+    #[tokio::test(flavor = "current_thread")]
+    async fn hydration_sweep_skips_conversations_already_hydrated() {
+        let (sdk, _dir) = new_seeded_sdk("sweep-skip").await;
+        for (i, channel_id) in [8001u64, 8002, 8003].iter().enumerate() {
+            seed_channel(&sdk, *channel_id, 1_700_000_000_000 + i as i64).await;
+            mark_first_screen_hydrated(&sdk, *channel_id).await;
+        }
+
+        let report = sdk
+            .hydrate_conversation_first_screens(30, 0)
+            .await
+            .expect("sweep");
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.skipped, 3);
+        assert_eq!(report.hydrated, 0);
+        assert_eq!(
+            report.failed, 0,
+            "an already-hydrated conversation must not touch the network",
+        );
+    }
+
+    /// 一个会话补不上，其余的照补。
+    ///
+    /// 扫补要走完几百个会话，中间必然有取不到的（没权限、服务端报错、网络抖动）。
+    /// 早期实现用 `?` 直接把错误抛出去，第一个失败就结束整轮——排在后面的会话
+    /// 永远轮不到，而且失败得静悄悄。这里没有服务端，所以三个都会失败，
+    /// 断言的是**三个都被尝试过**。
+    #[tokio::test(flavor = "current_thread")]
+    async fn hydration_sweep_survives_a_conversation_that_cannot_be_fetched() {
+        let (sdk, _dir) = new_seeded_sdk("sweep-partial-failure").await;
+        for (i, channel_id) in [9001u64, 9002, 9003].iter().enumerate() {
+            seed_channel(&sdk, *channel_id, 1_700_000_000_000 + i as i64).await;
+        }
+
+        let report = sdk
+            .hydrate_conversation_first_screens(30, 0)
+            .await
+            .expect("a sweep never fails as a whole");
+
+        assert_eq!(report.scanned, 3, "every conversation must be attempted");
+        assert_eq!(report.failed, 3);
+        assert_eq!(report.hydrated, 0);
+        // 失败的不许标记成已补过，否则这个会话再也不会重试。
+        for channel_id in [9001u64, 9002, 9003] {
+            assert!(
+                !sdk.is_first_screen_hydrated(channel_id, 2).await,
+                "a failed fetch must stay retryable",
+            );
+        }
+    }
+
+    /// `max_channels` 是真的上界（给弱网/大账号留一个分批的口子）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn hydration_sweep_honours_the_channel_budget() {
+        let (sdk, _dir) = new_seeded_sdk("sweep-budget").await;
+        for (i, channel_id) in [7001u64, 7002, 7003, 7004].iter().enumerate() {
+            seed_channel(&sdk, *channel_id, 1_700_000_000_000 + i as i64).await;
+            mark_first_screen_hydrated(&sdk, *channel_id).await;
+        }
+
+        let report = sdk
+            .hydrate_conversation_first_screens(30, 2)
+            .await
+            .expect("sweep");
+
+        assert_eq!(report.scanned, 2);
     }
 
     /// 成功路径：切过去之后当前账号确实变了，且新账号的 bootstrap 状态被装载。
