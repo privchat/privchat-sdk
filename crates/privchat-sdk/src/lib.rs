@@ -15195,7 +15195,19 @@ impl PrivchatSdk {
                         // actor 改 uid 不等于切换账号：transport / inbound / 订阅 /
                         // 缓存 全都还属于上一个账号，改完就是跨账号状态污染。
                         // 活跃会话要换账号走 SwitchLocalAccount。
-                        let result = if matches!(
+                        let result = if state.current_uid.as_deref() == Some(uid.as_str()) {
+                            // 已经就是这个账号：幂等成功，不是错误。
+                            //
+                            // 宿主冷启动时会无条件调一次本命令来选定账号，而 Activity
+                            // 重建并不杀进程——session 很可能还停在 Authenticated。
+                            // 之前不分青红皂白按「活跃会话」拒掉，于是每次启动都死在
+                            // 这一行：宿主报「切换账号失败」并停在登录页，重新登录还是
+                            // 同一条路，用户只能卸载重装。
+                            //
+                            // 上面那条防护要防的是**换到别的账号**，同一个 uid 不存在
+                            // 跨账号污染，没有理由拒绝。
+                            Ok(())
+                        } else if matches!(
                             state.session_state,
                             SessionState::Connected
                                 | SessionState::LoggedIn
@@ -18739,6 +18751,33 @@ mod tests {
             Some("10001"),
         );
         assert!(sdk.is_bootstrap_completed().await.expect("query bootstrap"));
+    }
+
+    /// 冷启动会无条件调 set_current_uid 选定账号，而 Activity 重建不杀进程——
+    /// session 可能还停在活跃态。同一个 uid 必须幂等成功，否则每次启动都卡在这里：
+    /// 宿主报「切换账号失败」停在登录页，重新登录还是同一条路，用户只能卸载重装。
+    #[tokio::test(flavor = "current_thread")]
+    async fn selecting_the_account_already_current_is_idempotent() {
+        let (sdk, _dir) = new_seeded_sdk("set-uid-idempotent").await;
+
+        // 首次选定（此时 session 尚未活跃）。
+        sdk.set_current_uid("10001".to_string())
+            .await
+            .expect("first select");
+
+        // 再选一次同一个账号：即使 session 已经活跃也必须成功。
+        sdk.set_current_uid("10001".to_string())
+            .await
+            .expect("selecting the same account again must not fail");
+
+        let accounts = sdk.list_local_accounts().await.expect("list accounts");
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|a| a.is_active)
+                .map(|a| a.uid.as_str()),
+            Some("10001"),
+        );
     }
 
     /// 成功路径：切过去之后当前账号确实变了，且新账号的 bootstrap 状态被装载。
