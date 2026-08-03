@@ -569,6 +569,9 @@ impl MultiAccountManager {
             &GroupMemberListRequest {
                 group_id,
                 user_id: 0,
+                // None = 全量，与协议加分页前的行为一致（smoke 要校验完整名单）。
+                limit: None,
+                offset: None,
             },
         )
         .await

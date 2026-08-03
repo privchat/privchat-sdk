@@ -4878,38 +4878,24 @@ impl LocalStore {
                 Error::Storage(format!("project channel cursor query existing unread: {e}"))
             })?;
 
-        let unread_total: i64 = if let Some(current) = existing_unread {
-            std::cmp::max(0, current.saturating_sub(newly_read_unread_count))
-        } else {
-            tx.query_row(
-                "SELECT COUNT(1)
-                 FROM message m
-                 WHERE m.channel_id = ?1
-                   AND m.channel_type = ?2
-                   AND m.from_uid != ?3
-                   AND COALESCE(m.pts, 0) > ?4",
-                params![
-                    channel_id as i64,
-                    channel_type,
-                    uid_num as i64,
-                    effective_read_pts as i64
-                ],
-                |r| r.get(0),
+        // 会话行只能由 channel 实体同步创建（CLIENT_UI_SPEC §3.1：会话列表主数据源是
+        // channel 表）。read cursor 是读状态的 projection（READ_STATUS_SPEC §6），不是会话
+        // 的来源——这里曾是 `INSERT ... ON CONFLICT`，给尚无 channel 实体的频道凭空造出
+        // 只有 id/type/unread 的裸行，列表上就是一条无名无头像的会话。
+        //
+        // 频道实体还没到就不投影 unread：读水位已经落在 channel_extra.keep_pts，实体到达时
+        // upsert_channel 会带上服务端的 unread baseline，不丢状态。
+        if let Some(current) = existing_unread {
+            let unread_total = std::cmp::max(0, current.saturating_sub(newly_read_unread_count));
+            tx.execute(
+                "UPDATE channel
+                    SET unread_count = ?2,
+                        updated_at = ?3
+                  WHERE channel_id = ?1",
+                params![channel_id as i64, unread_total as i32, now_ms],
             )
-            .map_err(|e| {
-                Error::Storage(format!("project channel cursor query unread_total: {e}"))
-            })?
-        };
-
-        tx.execute(
-            "INSERT INTO channel (channel_id, channel_type, unread_count, updated_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(channel_id) DO UPDATE SET
-                unread_count=excluded.unread_count,
-                updated_at=excluded.updated_at",
-            params![channel_id as i64, channel_type, unread_total as i32, now_ms],
-        )
-        .map_err(|e| Error::Storage(format!("project channel cursor upsert channel: {e}")))?;
+            .map_err(|e| Error::Storage(format!("project channel cursor update channel: {e}")))?;
+        }
         tx.commit()
             .map_err(|e| Error::Storage(format!("project channel cursor commit tx: {e}")))?;
         Ok(())
@@ -7168,6 +7154,30 @@ mod tests {
         let channel_id = 700_u64;
         let channel_type = 1_i32;
 
+        // 会话行来自 channel 实体同步，不是 cursor 投影建出来的（见
+        // cursor_projection_never_materializes_a_channel_row）。这里先把实体落地，
+        // 才是真实链路上 unread 投影发生的前提。
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id,
+                    channel_type,
+                    channel_name: "c-700".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 3,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 0,
+                    last_local_message_id: 0,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: None,
+                },
+            )
+            .expect("upsert channel 700");
+
         let m1 = store
             .upsert_remote_message_with_result(
                 uid,
@@ -7319,6 +7329,121 @@ mod tests {
             .expect("extra m3 after")
             .expect("extra m3 after exists");
         assert_eq!(m3_after.readed, 1);
+    }
+
+    /// 写入侧修好之后，已经躺在老用户设备上的裸行还得清掉，否则列表看起来跟没修一样。
+    /// 判据必须精确到「只被 cursor 投影碰过」，这条测试盯的就是别删过头。
+    #[test]
+    fn the_migration_drops_only_cursor_materialized_channels() {
+        use rusqlite::Connection;
+
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-mig-cursor-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db_path = dir.join("legacy.db");
+        let mut conn = Connection::open(&db_path).expect("open");
+        super::embedded::migrations::runner()
+            .set_target(refinery::Target::Version(20_260_803_120_000))
+            .run(&mut conn)
+            .expect("migrate to the version right before the cleanup");
+
+        conn.execute_batch(
+            "-- 1: cursor 投影造的裸行——要删
+             INSERT INTO channel (channel_id, channel_type, unread_count, version,
+                                  channel_name, channel_remark, avatar, created_at, updated_at)
+             VALUES (1, 1, 3, 0, '', '', '', 0, 0);
+
+             -- 2: 实体同步来的正常群——version 非 0，保留
+             INSERT INTO channel (channel_id, channel_type, unread_count, version,
+                                  channel_name, channel_remark, avatar, created_at, updated_at)
+             VALUES (2, 2, 0, 7, '真群', '', 'a.png', 0, 0);
+
+             -- 3: 实体同步来的 DM，展示字段恰好全空——但 version 非 0，不许误删
+             INSERT INTO channel (channel_id, channel_type, unread_count, version,
+                                  channel_name, channel_remark, avatar, created_at, updated_at)
+             VALUES (3, 1, 0, 12, '', '', '', 0, 0);",
+        )
+        .expect("seed channels");
+
+        super::embedded::migrations::runner()
+            .run(&mut conn)
+            .expect("run the cleanup migration");
+
+        let survivors: Vec<i64> = conn
+            .prepare("SELECT channel_id FROM channel ORDER BY channel_id")
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, i64>(0))
+                    .and_then(|rows| rows.collect())
+            })
+            .expect("list survivors");
+        assert_eq!(
+            survivors,
+            vec![2, 3],
+            "只删 cursor 造的裸行；实体同步来的会话一条都不能少"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 会话列表的主数据源是 channel 表（CLIENT_UI_SPEC §3.1），会话行只能由 channel 实体
+    /// 同步创建。read cursor 是读状态 projection（READ_STATUS_SPEC §6），不许拿它去物化会话。
+    ///
+    /// 这条曾经是线上现象：某账号在服务端 `privchat_user_channels` 里 0 行（不再属于任何
+    /// 频道），但 `privchat_channel_read_cursor` 还留着 8 行历史游标。游标同步下来后，投影
+    /// 里的 `INSERT ... ON CONFLICT` 给每条游标造了一个只有 id/type/unread 的裸 channel 行，
+    /// 列表上就是 8 条无名、无头像、点不开的会话。
+    #[test]
+    fn cursor_projection_never_materializes_a_channel_row() {
+        let store = test_store();
+        let uid = "10007002";
+        let channel_id = 7002_u64;
+        let channel_type = 1_i32;
+
+        store
+            .upsert_remote_message_with_result(
+                uid,
+                &UpsertRemoteMessageInput {
+                    server_message_id: 970201,
+                    local_message_id: 0,
+                    channel_id,
+                    channel_type,
+                    timestamp: 1_700_000_000_001,
+                    from_uid: 20002,
+                    message_type: 1,
+                    content: "orphan".to_string(),
+                    status: 2,
+                    searchable_word: "orphan".to_string(),
+                    setting: 0,
+                    pts: 10,
+                    order_seq: 10,
+                    extra: "{}".to_string(),
+                    timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
+                    mime_type: None,
+                },
+            )
+            .expect("insert orphan message");
+
+        store
+            .project_channel_read_cursor(uid, channel_id, channel_type, 10)
+            .expect("project cursor without channel entity");
+
+        let listed = store.list_channels(uid, 50, 0).expect("list channels");
+        assert!(
+            listed.iter().all(|c| c.channel_id != channel_id),
+            "没有 channel 实体的频道不该出现在会话列表里，实际列出了 {:?}",
+            listed.iter().map(|c| c.channel_id).collect::<Vec<_>>()
+        );
+
+        // 读水位仍然落了盘：实体到达时接着用，不是丢状态换干净。
+        let extra = store
+            .get_channel_extra(uid, channel_id, channel_type)
+            .expect("get channel extra")
+            .expect("channel extra exists");
+        assert_eq!(extra.keep_pts, 10);
     }
 
     #[test]

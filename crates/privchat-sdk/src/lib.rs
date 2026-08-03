@@ -4523,6 +4523,18 @@ impl State {
         self.pending_events.clear();
     }
 
+    /// 会话的归属人要变了：作废上一个账号的会话作用域状态。
+    ///
+    /// 返回是否真的清理过（同一个 uid 重新握手不算换人，什么都不做）。
+    fn reset_if_owner_changed(&mut self, uid: &str, now_ms: i64) -> bool {
+        if self.current_uid.as_deref().map_or(false, |cur| cur != uid) {
+            self.reset_session_scoped_state(now_ms);
+            true
+        } else {
+            false
+        }
+    }
+
     fn set_message_cache_policy(&mut self, policy: MessageCachePolicy) {
         self.message_cache_policy = policy;
         self.channel_message_cache.clear();
@@ -8020,6 +8032,17 @@ impl State {
             return Err(Error::Auth(format!("[{}] {}", code, message)));
         }
         let uid = user_id.to_string();
+        // 换人了：旧账号的会话作用域状态一律作废（与 SwitchLocalAccount 的 ④ 同一套清理）。
+        //
+        // 最要命的一项是 sync_coordinator 的 readiness。不重置的话新账号沿用上一个账号的
+        // 「已就绪」：宿主看到 Ready 就跳过 bootstrap，而本地优先读又被 bootstrap gate 挡回
+        // （`run_bootstrap_sync required before local-first operations`）——两头落空，界面上
+        // 就永远停在**上一个账号**的会话列表，直到冷启动才恢复正常。真机上表现为切/加账号后
+        // 看到别人的会话标题和消息预览，属于跨账号数据泄露。
+        //
+        // 「添加账号 → 登录另一个身份」走的是裸 authenticate，不经过 SwitchLocalAccount，
+        // 所以那套清理必须在这里也做一遍。
+        self.reset_if_owner_changed(&uid, chrono::Utc::now().timestamp_millis());
         // authenticate() 的职责只是用当前 access_token 握手；不应覆盖 login/register 写入的
         // refresh_token 或过期时间。若该用户已有会话，只原子刷新 access_token；否则才走
         // save_login（用于外部认证首次 handshake，无 refresh_token）。
@@ -19439,6 +19462,71 @@ mod tests {
         );
         // actor loop 的丢弃判据就是这个不等式。
         assert!(stale_epoch != state.inbound_epoch);
+    }
+
+    /// 「添加账号 → 登录另一个身份」不走 SwitchLocalAccount，只走裸 authenticate。
+    /// 那条路同样是换人，同样必须作废上一个账号的会话作用域状态。
+    ///
+    /// 漏掉的后果在真机上实测过：新账号沿用上一个账号的 `readiness = Ready`，宿主看到
+    /// Ready 就跳过 bootstrap，而本地优先读又被 bootstrap gate 挡回
+    /// （`run_bootstrap_sync required before local-first operations`）。两头落空，界面上
+    /// 就停在**上一个账号**的会话列表——标题、消息预览、未读全是别人的，直到冷启动才恢复。
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticating_as_someone_else_drops_the_previous_owners_session_state() {
+        let (mut state, _dir) = new_seeded_state("auth-owner-change").await;
+        // 上一个账号已经同步完成，协调器停在 Ready。
+        state.sync_coordinator.begin(SyncRunKind::Bootstrap, 0).unwrap();
+        state.sync_coordinator.complete(SyncRunKind::Bootstrap, 0);
+        assert_eq!(
+            state.sync_coordinator.snapshot().readiness,
+            Readiness::Ready,
+            "前置条件没成立：上一个账号本该是 Ready",
+        );
+
+        let cleaned = state.reset_if_owner_changed("20002", 1_000);
+
+        assert!(cleaned, "换了 uid 却没清理");
+        assert_ne!(
+            state.sync_coordinator.snapshot().readiness,
+            Readiness::Ready,
+            "新账号沿用了上一个账号的 Ready：它会跳过自己的 bootstrap，然后被 gate 挡住本地读",
+        );
+    }
+
+    /// 上面两条只测了 `reset_if_owner_changed` 本身，把它从 `authenticate` 里删掉两条照样绿。
+    /// 缺口就在「有没有接上」，而这正是当初出事的地方，所以在源码层面钉住调用点。
+    #[test]
+    fn owner_change_cleanup_is_wired_into_authenticate() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("async fn authenticate(&mut self, user_id: u64")
+            .expect("authenticate 签名变了，改这里的锚点");
+        let body = &src[start..];
+        let end = body
+            .find("\n    async fn sync_entities")
+            .expect("authenticate 后面那个函数变了，改这里的锚点");
+        assert!(
+            body[..end].contains("reset_if_owner_changed("),
+            "authenticate 没有作废上一个账号的会话状态：换账号后界面会停在别人的会话列表",
+        );
+    }
+
+    /// 同一个账号重新握手（token 刷新、断线重连）不是换人，不能把它的会话状态清掉——
+    /// 那会让每次刷新 token 都退化成一次冷启动。
+    #[tokio::test(flavor = "current_thread")]
+    async fn re_authenticating_as_the_same_user_keeps_the_session_state() {
+        let (mut state, _dir) = new_seeded_state("auth-same-owner").await;
+        state.sync_coordinator.begin(SyncRunKind::Bootstrap, 0).unwrap();
+        state.sync_coordinator.complete(SyncRunKind::Bootstrap, 0);
+
+        let cleaned = state.reset_if_owner_changed("10001", 1_000);
+
+        assert!(!cleaned, "同一个账号重新握手被当成了换人");
+        assert_eq!(
+            state.sync_coordinator.snapshot().readiness,
+            Readiness::Ready,
+            "同账号重新握手不该丢掉已经就绪的同步状态",
+        );
     }
 
     /// A 的同步失败不得把 B 拖进重连：切换会撤销自动重连意图并清空退避。
