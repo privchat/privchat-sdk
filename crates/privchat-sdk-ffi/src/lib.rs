@@ -4458,11 +4458,17 @@ impl PrivchatClient {
     /// 注意这里清的是**凭证**（`clear_local_state`），不是本地数据：退出登录不是
     /// 注销账号，本地库留着，同一个账号再登录只做增量。要真删数据走 `wipe_user_full`。
     pub async fn logout(&self) -> Result<(), PrivchatFfiError> {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            self.auth_logout_remote(),
-        )
-        .await;
+        // ⚠️ 这里**不能**用 `tokio::time::timeout` / `sleep` 之类需要计时器的东西。
+        //
+        // uniffi 的 async 桥在它自己的 foreign executor 上 poll 本方法，那里没有 Tokio
+        // runtime 上下文；计时器会 panic，而 panic 跨 FFI 边界会直接 abort 整个进程
+        // ——iOS 模拟器上实测崩过一次。同文件的 `poll_wait` 早就用
+        // `Handle::try_current()` 守着这件事，是同一个坑。
+        //
+        // 远端注销本来也不需要在这里设上界：`Command::RpcCall` 在 actor 里已经包了
+        // 20s 超时；而「actor 太忙、命令排不上队」那种卡死，已经在宿主层解决——
+        // 点退出立刻回登录页，收尾在后台跑完，用户不再等这条链。
+        let _ = self.auth_logout_remote().await;
         let _ = self.clear_local_state().await;
         self.disconnect().await
     }
