@@ -1404,6 +1404,9 @@ impl LocalStore {
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
+            // 已存在的行同样要吃下撤回标记：先收到普通推送、之后才回填到这条已被撤回
+            // 的消息，是完全正常的顺序。放在闭包里，所有 update 路径共用一处。
+            Self::apply_remote_revoke_flag(conn, row_id as u64, input)?;
             Ok(())
         };
 
@@ -1493,10 +1496,46 @@ impl LocalStore {
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
+        let message_id = conn.last_insert_rowid() as u64;
+        Self::apply_remote_revoke_flag(&conn, message_id, input)?;
         Ok(UpsertRemoteMessageResult {
-            message_id: conn.last_insert_rowid() as u64,
+            message_id,
             inserted_new: true,
         })
+    }
+
+    /// 把远端说的「这条已撤回」落到 `message_extra.revoke`。
+    ///
+    /// 撤回状态不在 `message` 表上，而历史回填只写 `message`——于是撤回的消息在本地是
+    /// 「未撤回 + 空内容」，聊天页画出一个只有时间的空气泡，会话列表预览也是空的。
+    ///
+    /// **只写不清**：撤回是单向的，本地已经标了撤回就不许被一次回填翻回去
+    /// （回填响应比本地 revoke 推送旧是完全正常的顺序）。
+    fn apply_remote_revoke_flag(
+        conn: &rusqlite::Connection,
+        message_id: u64,
+        input: &UpsertRemoteMessageInput,
+    ) -> Result<()> {
+        if !input.revoked {
+            return Ok(());
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO message_extra (
+                message_id, channel_id, channel_type, revoke, extra_version
+            ) VALUES (?1, ?2, ?3, 1, ?4)
+            ON CONFLICT(message_id) DO UPDATE SET
+                revoke=1,
+                extra_version=MAX(message_extra.extra_version, excluded.extra_version)",
+            params![
+                message_id as i64,
+                input.channel_id as i64,
+                input.channel_type,
+                now_ms,
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("mark remote message revoked: {e}")))?;
+        Ok(())
     }
 
     /// Batch upsert remote messages within a single SQLite transaction.
@@ -1652,6 +1691,7 @@ impl LocalStore {
                 ],
             )
             .map_err(|e| Error::Storage(format!("update remote message: {e}")))?;
+            Self::apply_remote_revoke_flag(tx, row_id as u64, input)?;
             Ok(())
         };
 
@@ -1739,8 +1779,10 @@ impl LocalStore {
             ],
         )
         .map_err(|e| Error::Storage(format!("insert remote message: {e}")))?;
+        let message_id = tx.last_insert_rowid() as u64;
+        Self::apply_remote_revoke_flag(tx, message_id, input)?;
         Ok(UpsertRemoteMessageResult {
-            message_id: tx.last_insert_rowid() as u64,
+            message_id,
             inserted_new: true,
         })
     }
@@ -2362,7 +2404,12 @@ impl LocalStore {
                 (SELECT NULLIF(u2.avatar, '') FROM \"user\" u2 WHERE u2.user_id = CASE WHEN c.channel_type = 1 THEN COALESCE(
                     c.peer_user_id,
                     CASE WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> '' THEN CAST(c.channel_name AS INTEGER) ELSE NULL END
-                ) ELSE NULL END LIMIT 1) AS peer_avatar_url
+                ) ELSE NULL END LIMIT 1) AS peer_avatar_url,
+                    -- 最后一条消息是否已撤回。原来这两个字段在行映射里被写死成 false，
+                    -- SQL 压根没查——于是撤回消息的会话在列表里没有任何预览：内容被
+                    -- 服务端清空了（spec 的占位契约），而客户端又不知道该显示「已撤回」。
+                    COALESCE((SELECT me.revoke FROM message_extra me WHERE me.message_id = lm.id), 0)
+                        AS resolved_last_msg_revoked
              FROM channel c
              -- P1-17：last message 三个字段一次取齐（原来 3 个独立相关子查询各扫
              -- 一遍索引，且并发写入下可能取到不同消息）。timeline 优先语义不变。
@@ -2405,7 +2452,7 @@ impl LocalStore {
                     peer_username: row.get::<_, Option<String>>(16)?,
                     peer_avatar_url: row.get::<_, Option<String>>(17)?,
                 last_message_type: None,
-                last_message_is_revoked: false,
+                last_message_is_revoked: row.get::<_, i32>(18).unwrap_or(0) != 0,
                 })
             },
         )
@@ -2529,7 +2576,12 @@ impl LocalStore {
                     (SELECT NULLIF(u2.avatar, '') FROM \"user\" u2 WHERE u2.user_id = CASE WHEN c.channel_type = 1 THEN COALESCE(
                         c.peer_user_id,
                         CASE WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> '' THEN CAST(c.channel_name AS INTEGER) ELSE NULL END
-                    ) ELSE NULL END LIMIT 1) AS peer_avatar_url
+                    ) ELSE NULL END LIMIT 1) AS peer_avatar_url,
+                    -- 最后一条消息是否已撤回。原来这两个字段在行映射里被写死成 false，
+                    -- SQL 压根没查——于是撤回消息的会话在列表里没有任何预览：内容被
+                    -- 服务端清空了（spec 的占位契约），而客户端又不知道该显示「已撤回」。
+                    COALESCE((SELECT me.revoke FROM message_extra me WHERE me.message_id = lm.id), 0)
+                        AS resolved_last_msg_revoked
                  FROM channel c
                  -- P1-17：last message 三个字段一次取齐（原来每行 3 个相关子查询各扫
                  -- 一遍索引，低端机上列表刷新的主要成本；且并发写入下三个子查询可能
@@ -2586,7 +2638,7 @@ impl LocalStore {
                     peer_username: row.get::<_, Option<String>>(16)?,
                     peer_avatar_url: row.get::<_, Option<String>>(17)?,
                     last_message_type: None,
-                    last_message_is_revoked: false,
+                    last_message_is_revoked: row.get::<_, i32>(18).unwrap_or(0) != 0,
                 })
             })
             .map_err(|e| Error::Storage(format!("query list channels: {e}")))?;
@@ -6252,6 +6304,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("upsert remote row")
@@ -6298,6 +6351,7 @@ mod tests {
             order_seq: 1,
             extra: "{}".to_string(),
             mime_type: None,
+            revoked: false,
         };
         let created_at = || {
             store
@@ -6461,6 +6515,7 @@ mod tests {
             extra: "{}".to_string(),
             timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             mime_type: None,
+            revoked: false,
         };
 
         store
@@ -6550,6 +6605,7 @@ mod tests {
                         extra: "{}".to_string(),
                         timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                         mime_type: None,
+                        revoked: false,
                     },
                 )
                 .expect("upsert");
@@ -6607,6 +6663,116 @@ mod tests {
         );
     }
 
+    /// 历史回填必须带上撤回标记（spec MESSAGE_HISTORY §16 / MESSAGE_SPEC 撤回占位）。
+    ///
+    /// 撤回状态存在 `message_extra.revoke`，而回填只写 `message` 表，标记整条丢掉。
+    /// 本地于是成了「未撤回 + 空内容」，聊天页画出一个只有时间的空气泡，会话列表预览
+    /// 也是空的。生产实测：批次二验收群 6 条消息里 4 条撤回的全部空白。
+    #[test]
+    fn backfilled_history_keeps_the_revoked_flag() {
+        let store = test_store();
+        let uid = "10021";
+        let input = |server_message_id: u64, revoked: bool| UpsertRemoteMessageInput {
+            server_message_id,
+            local_message_id: 0,
+            channel_id: 900,
+            channel_type: 2,
+            timestamp: 1_700_000_000_000,
+            timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
+            from_uid: 4242,
+            message_type: 0,
+            content: String::new(),
+            status: 2,
+            pts: 10,
+            setting: 0,
+            order_seq: 10,
+            searchable_word: String::new(),
+            extra: "{}".to_string(),
+            mime_type: None,
+            revoked,
+        };
+
+        // **必须走批量入口**：历史回填用的是 batch_upsert_remote_messages，它内部是
+        // 另一份实现（upsert_one_in_tx）。第一版这个测试调的是单条 API，于是修复只
+        // 打在单条路径上、测试照样绿，而真机上撤回消息依旧是空白气泡。
+        let revoked_id = store
+            .batch_upsert_remote_messages(uid, &[input(900001, true)])
+            .remove(0)
+            .expect("upsert revoked")
+            .message_id;
+        let loaded = store
+            .get_message_by_id(uid, revoked_id)
+            .expect("load")
+            .expect("exists");
+        assert!(loaded.revoked, "回填的撤回消息必须标成已撤回");
+
+        // 撤回是单向的：之后再来一次「未撤回」的回填不许把它翻回去
+        // （回填响应比本地 revoke 推送旧是完全正常的顺序）。
+        store
+            .batch_upsert_remote_messages(uid, &[input(900001, false)])
+            .remove(0)
+            .expect("re-upsert");
+        let again = store
+            .get_message_by_id(uid, revoked_id)
+            .expect("load again")
+            .expect("still exists");
+        assert!(again.revoked, "已撤回不许被一次回填清掉");
+
+        // 没撤回的消息不该被误标。
+        let normal_id = store
+            .batch_upsert_remote_messages(uid, &[input(900002, false)])
+            .remove(0)
+            .expect("upsert normal")
+            .message_id;
+        assert!(
+            !store
+                .get_message_by_id(uid, normal_id)
+                .expect("load normal")
+                .expect("normal exists")
+                .revoked
+        );
+
+        // 会话列表也要知道最后一条被撤回了，否则预览是空的：内容被服务端清空
+        // （占位契约），而列表又不知道该显示「已撤回」——现网就是这样一条空预览。
+        // 让撤回的这条成为时间线上最后一条（pts 更大）。
+        let mut tail = input(900003, true);
+        tail.pts = 30;
+        tail.order_seq = 30;
+        store
+            .batch_upsert_remote_messages(uid, &[tail])
+            .remove(0)
+            .expect("upsert revoked tail");
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 900,
+                    channel_type: 2,
+                    channel_name: "revoked-tail".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 0,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1_700_000_000_000,
+                    last_local_message_id: 0,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: None,
+                },
+            )
+            .expect("upsert channel");
+        let listed = store.list_channels(uid, 50, 0).expect("list channels");
+        let row = listed
+            .iter()
+            .find(|c| c.channel_id == 900)
+            .expect("channel listed");
+        assert!(
+            row.last_message_is_revoked,
+            "最后一条已撤回，会话列表必须知道（否则预览空白）",
+        );
+    }
+
     #[test]
     fn upsert_remote_message_is_idempotent_by_server_message_id() {
         let store = test_store();
@@ -6632,6 +6798,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("upsert first")
@@ -6663,6 +6830,7 @@ mod tests {
                     extra: "{\"k\":1}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("upsert second")
@@ -6727,6 +6895,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("merge self echo")
@@ -6757,6 +6926,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert self message from another device")
@@ -6814,6 +6984,7 @@ mod tests {
                         searchable_word: String::new(),
                         extra: String::new(),
                         mime_type: None,
+                        revoked: false,
                         timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     },
                 )
@@ -6877,6 +7048,7 @@ mod tests {
                         searchable_word: String::new(),
                         extra: String::new(),
                         mime_type: None,
+                        revoked: false,
                         timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     },
                 )
@@ -6960,6 +7132,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert newer")
@@ -6985,6 +7158,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("replay older")
@@ -7064,6 +7238,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert message 1");
@@ -7087,6 +7262,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert self message");
@@ -7217,6 +7393,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert m1")
@@ -7241,6 +7418,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert m2")
@@ -7265,6 +7443,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert m3")
@@ -7289,6 +7468,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert self")
@@ -7442,6 +7622,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert orphan message");
@@ -7640,6 +7821,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert self message");
@@ -7760,6 +7942,7 @@ mod tests {
                     extra: "{}".to_string(),
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                     mime_type: None,
+                    revoked: false,
                 },
             )
             .expect("insert local materialized message");

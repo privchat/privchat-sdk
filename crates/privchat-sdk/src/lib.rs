@@ -1578,6 +1578,13 @@ pub struct UpsertRemoteMessageInput {
     pub extra: String,
     /// 媒体 MIME 类型（从 content/extra 中提取）
     pub mime_type: Option<String>,
+    /// 这条消息在服务端已被撤回。
+    ///
+    /// 撤回状态存在 `message_extra.revoke`，而这个 input 原本没有这个字段——于是历史
+    /// 回填只写 `message` 表，撤回标记整条丢掉。本地就成了「未撤回 + 空内容」，聊天页
+    /// 画出一个只有时间的空气泡，会话列表预览也是空的。生产实测：批次二验收群 6 条
+    /// 消息里 4 条撤回的全是空白。
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21544,6 +21551,7 @@ mod tests {
                 searchable_word: "hello".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                revoked: false,
                 timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
@@ -21683,6 +21691,7 @@ mod tests {
                 searchable_word: "m1".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                revoked: false,
                 timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
@@ -21705,6 +21714,7 @@ mod tests {
                 searchable_word: "m2".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                revoked: false,
                 timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
@@ -21727,6 +21737,7 @@ mod tests {
                 searchable_word: "m3".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                revoked: false,
                 timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
@@ -21835,6 +21846,7 @@ mod tests {
                     searchable_word: format!("m{pts}"),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    revoked: false,
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 })
                 .await
@@ -21938,6 +21950,7 @@ mod tests {
                     searchable_word: format!("m{pts}"),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    revoked: false,
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 })
                 .await
@@ -22216,6 +22229,7 @@ mod tests {
                 searchable_word: "peer".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                revoked: false,
                 timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
@@ -22238,6 +22252,7 @@ mod tests {
                 searchable_word: "self".to_string(),
                 extra: "{}".to_string(),
                 mime_type: None,
+                revoked: false,
                 timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
             })
             .await
@@ -22416,6 +22431,7 @@ mod tests {
                     searchable_word: "materialized message".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    revoked: false,
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
@@ -22715,6 +22731,7 @@ mod tests {
                     searchable_word: "cursor message 1".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    revoked: false,
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
@@ -22738,6 +22755,7 @@ mod tests {
                     searchable_word: "cursor message 2".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    revoked: false,
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
@@ -23099,6 +23117,7 @@ mod tests {
                     searchable_word: "revoke target".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    revoked: false,
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )
@@ -23184,6 +23203,7 @@ mod tests {
                     searchable_word: "reaction target".to_string(),
                     extra: "{}".to_string(),
                     mime_type: None,
+                    revoked: false,
                     timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                 },
             )

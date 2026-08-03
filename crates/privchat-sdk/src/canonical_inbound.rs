@@ -256,6 +256,7 @@ impl CanonicalInboundMessage {
             extra: self.extra.clone(),
             timestamp_precision: self.sent_at_precision,
             mime_type,
+            revoked: self.revoked,
         }
     }
 }
