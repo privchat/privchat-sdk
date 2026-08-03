@@ -2327,7 +2327,9 @@ impl LocalStore {
                 c.channel_remark,
                 c.avatar,
                 unread_count, top, mute,
-                COALESCE(lm.created_at, NULLIF(c.last_msg_timestamp, 0), c.updated_at, 0)
+                -- 与 list_channels 同一套语义：没有消息就没有时间（spec §16），
+                -- 不拿 c.updated_at（行被写过的时间）冒充最后消息时间。
+                COALESCE(lm.created_at, NULLIF(c.last_msg_timestamp, 0), 0)
                     AS resolved_last_msg_timestamp,
                 COALESCE(lm.id, c.last_local_message_id) AS resolved_last_local_message_id,
                 COALESCE(lm.content, c.last_msg_content, '') AS resolved_last_msg_content,
@@ -2493,7 +2495,12 @@ impl LocalStore {
                     c.channel_remark,
                     c.avatar,
                     unread_count, top, mute,
-                    COALESCE(lm.created_at, NULLIF(c.last_msg_timestamp, 0), c.updated_at, 0)
+                    -- 排序键是**最后一条消息的时间**，没有消息就没有时间（spec §16）。
+                    -- 原来兜底到 c.updated_at，而那是「这行本地被写过」的时间：新装或全量
+                    -- 同步会把所有频道的 updated_at 刷成「现在」，于是一堆从来没说过话的
+                    -- 会话集体排到列表最上面、且没有预览——看起来完全像「聊天记录没加载
+                    -- 出来」。生产实测：11 个空 DM 的时间戳落在同一个 25ms 窗口里。
+                    COALESCE(lm.created_at, NULLIF(c.last_msg_timestamp, 0), 0)
                         AS resolved_last_msg_timestamp,
                     COALESCE(lm.id, c.last_local_message_id) AS resolved_last_local_message_id,
                     COALESCE(lm.content, c.last_msg_content, '') AS resolved_last_msg_content,
@@ -2540,7 +2547,19 @@ impl LocalStore {
                          m.id DESC
                      LIMIT 1
                  )
+                 -- 零消息 DM 不进会话列表（spec MESSAGE_HISTORY §16）。
+                 --
+                 -- 好友申请通过时 ensureDirectChannel 会建出 DM，它可能一条消息都没有。
+                 -- 这种会话在服务端也是空的，请求多少次 history 都返回空——它不属于
+                 -- 「历史没同步下来」，而是**根本没有历史**。好友关系体现在联系人列表，
+                 -- 不该占会话列表的位置；用户从联系人点进去照样能打开空聊天页。
+                 --
+                 -- 判据用 resolved 时间戳而不是「本地有没有消息行」：新设备上消息还没补
+                 -- 下来，但服务端投影给了 last_msg_timestamp，那种会话必须留在列表里。
+                 --
+                 -- 群不适用：刚被拉进的群还没人说话，从列表里藏掉就等于没有入口。
                  WHERE COALESCE(c.is_deleted, 0) = 0
+                   AND (c.channel_type <> 1 OR resolved_last_msg_timestamp > 0)
                  ORDER BY c.top DESC, resolved_last_msg_timestamp DESC, c.channel_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
@@ -7444,6 +7463,62 @@ mod tests {
             .expect("get channel extra")
             .expect("channel extra exists");
         assert_eq!(extra.keep_pts, 10);
+    }
+
+    /// 零消息 DM 不进会话列表，且没有消息就没有排序位置（spec MESSAGE_HISTORY §16）。
+    ///
+    /// 生产实测的形状：新装 App 后全量同步把每个频道的 `updated_at` 刷成「现在」，
+    /// 而排序键兜底到 `updated_at`，于是 11 个从来没说过话的 DM 集体排到列表顶端、
+    /// 一条预览都没有——看起来完全像「聊天记录没加载出来」，实际服务端本来就是空的。
+    #[test]
+    fn empty_dm_stays_out_of_the_channel_list() {
+        let store = test_store();
+        let uid = "10011";
+        let mut upsert = |channel_id: u64, channel_type: i32, ts: i64, name: &str| {
+            store
+                .upsert_channel(
+                    uid,
+                    &UpsertChannelInput {
+                        channel_id,
+                        channel_type,
+                        channel_name: name.to_string(),
+                        channel_remark: String::new(),
+                        avatar: String::new(),
+                        unread_count: 0,
+                        top: 0,
+                        mute: 0,
+                        last_msg_timestamp: ts,
+                        last_local_message_id: 0,
+                        last_msg_content: if ts > 0 { "hi".to_string() } else { String::new() },
+                        version: 1,
+                        peer_user_id: None,
+                    },
+                )
+                .expect("upsert channel");
+        };
+
+        // 有过消息的 DM：留在列表里。
+        upsert(1, 1, 1_700_000_000_000, "dm-with-history");
+        // 从来没有消息的 DM（好友通过后建出来的空会话）：不进列表。
+        upsert(2, 1, 0, "dm-empty");
+        // 没人说过话的群：仍然要能看见，否则刚被拉进的群没有任何入口。
+        upsert(3, 2, 0, "group-empty");
+
+        let listed = store.list_channels(uid, 50, 0).expect("list channels");
+        let ids: Vec<u64> = listed.iter().map(|c| c.channel_id).collect();
+        assert!(ids.contains(&1), "有历史的 DM 必须在列表里");
+        assert!(!ids.contains(&2), "零消息 DM 不进会话列表");
+        assert!(ids.contains(&3), "零消息群仍然要有入口");
+
+        // 空群没有最后消息时间，不许拿行的写入时间冒充。
+        let empty_group = listed
+            .iter()
+            .find(|c| c.channel_id == 3)
+            .expect("group listed");
+        assert_eq!(
+            empty_group.last_msg_timestamp, 0,
+            "没有消息就没有时间，不能兜底到 updated_at",
+        );
     }
 
     #[test]
