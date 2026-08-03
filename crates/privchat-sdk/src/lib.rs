@@ -20239,6 +20239,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    /// CLIENT_SESSION_RESILIENCE_SPEC §2.1：传输断了要自己排下一次重连，
+    /// 不能等外部再来敲门——没有外部触发时，一次断线就永远停在断开。
+    async fn losing_the_transport_arms_the_next_reconnect() {
+        let (mut state, dir) = new_seeded_state("reconnect-armed-on-loss").await;
+        state.should_auto_reconnect = true;
+        state.session_state = SessionState::Authenticated;
+        state.next_reconnect_at = None;
+
+        let transition = state.apply_transport_health(false);
+
+        assert!(transition.is_some(), "transport loss must be observable");
+        assert_eq!(state.session_state, SessionState::New);
+        assert!(
+            state.next_reconnect_at.is_some(),
+            "losing the transport must arm a retry; without it nothing ever reconnects",
+        );
+        drop(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    /// 显式 disconnect 是「用户不想在线了」，不该偷偷重连回去。
+    async fn a_deliberate_disconnect_does_not_arm_a_retry() {
+        let (mut state, dir) = new_seeded_state("reconnect-not-armed-when-off").await;
+        state.should_auto_reconnect = false;
+        state.session_state = SessionState::Authenticated;
+        state.next_reconnect_at = None;
+
+        state.apply_transport_health(false);
+
+        assert!(
+            state.next_reconnect_at.is_none(),
+            "auto-reconnect is off; nothing should be scheduled",
+        );
+        drop(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    /// §2.1：网络恢复要立刻重试，不必等退避到期。
+    ///
+    /// 退避到第 5 次已经是 30s，离线还会抬到 ≥60s。网络明明回来了却让用户干等一分钟，
+    /// 表现出来就是「联网了但一直连不上」。
+    async fn network_coming_back_cancels_the_remaining_backoff() {
+        let (mut state, dir) = new_seeded_state("reconnect-network-back").await;
+        state.should_auto_reconnect = true;
+        state.session_state = SessionState::New;
+        state.network_hint = NetworkHint::Offline;
+        state.reconnect_attempt = 5;
+        state.schedule_next_reconnect();
+
+        let far = state
+            .next_reconnect_at
+            .expect("armed")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            far >= Duration::from_secs(30),
+            "offline backoff should be long, got {far:?}",
+        );
+
+        // 网络回来。
+        state.mark_reconnect_ready_now();
+
+        let now_delay = state
+            .next_reconnect_at
+            .expect("re-armed")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            now_delay < Duration::from_millis(50),
+            "recovery must retry immediately, got {now_delay:?}",
+        );
+        assert_eq!(state.reconnect_attempt, 0, "backoff must reset on recovery");
+        drop(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn offline_reconnect_deadline_is_baked_stable_not_recomputed() {
         let (mut state, dir) = new_seeded_state("offline-reconnect-deadline").await;
         state.session_state = SessionState::New;
