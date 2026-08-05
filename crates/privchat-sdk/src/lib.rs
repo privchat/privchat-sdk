@@ -14416,6 +14416,8 @@ impl PrivchatSdk {
                         let _ = resp.send(());
                     }
                     Command::CreateLocalAttachmentPlaceholder { input, local_message_id, resp } => {
+                        let channel_id = input.channel_id;
+                        let channel_type = input.channel_type;
                         let result = match state.current_uid_required() {
                             Ok(_) => {
                                 let lid = match local_message_id {
@@ -14434,6 +14436,34 @@ impl PrivchatSdk {
                             },
                             Err(e) => Err(e),
                         };
+                        // 占位一落库就通知宿主，气泡在**选完文件的那一刻**出现。
+                        //
+                        // 附件发送分两步：先建占位（这里），再 materialize（拷贝/转码/抽帧）
+                        // 后 finalize。以前只有 finalize 才 emit，宿主要等整个准备走完才知道
+                        // 有这条消息——图片几百毫秒察觉不到，视频要读元信息+拷贝+抽缩略图，
+                        // 几秒起步。用户看到的就是「点了没反应，过一会才冒出发送中」，然后
+                        // 报「视频发不出去」，而消息其实一直在正常发送。
+                        //
+                        // 事务提交后才发：落库失败时不该出现一条并不存在的气泡。
+                        if let Ok(message_id) = result.as_ref() {
+                            state.invalidate_channel_cache_with_reason(
+                                channel_id,
+                                channel_type,
+                                "create_local_attachment_placeholder",
+                            );
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::TimelineUpdated {
+                                    channel_id,
+                                    channel_type,
+                                    message_id: *message_id,
+                                    reason: "local_create".to_string(),
+                                },
+                            );
+                        }
                         let _ = resp.send(result);
                     }
                     Command::FinalizeAttachmentAndEnqueue {
@@ -20925,6 +20955,55 @@ mod tests {
         );
         assert_eq!(classification, ResumeFailureClass::FatalProtocolError);
         assert_eq!(scope, ResumeEscalationScope::ChannelScopedResync);
+    }
+
+    /// 附件的「发送中」气泡必须在**占位落库那一刻**就出现，而不是等准备走完。
+    ///
+    /// 附件发送是两步：先建占位，再 materialize（拷贝/转码/抽帧）后 finalize。以前只有
+    /// finalize 才 emit TimelineUpdated，宿主要等整个准备结束才知道有这条消息。图片几百
+    /// 毫秒察觉不到，视频要读元信息 + 拷贝 + 抽缩略图，几秒起步——用户看到的是「点了没
+    /// 反应，过一会才冒出发送中」，于是报「视频发不出去」，而消息其实一直在正常发送。
+    #[tokio::test(flavor = "current_thread")]
+    async fn creating_an_attachment_placeholder_shows_the_bubble_right_away() {
+        let (sdk, _dir) = new_seeded_sdk("attachment-placeholder-event").await;
+        let mut rx = sdk.subscribe_events();
+
+        let message_id = sdk
+            .create_local_attachment_placeholder(
+                NewMessage {
+                    channel_id: 4242,
+                    channel_type: 1,
+                    from_uid: 10001,
+                    message_type: ContentMessageType::Video.as_u32() as i32,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create placeholder");
+
+        let mut seen = None;
+        for _ in 0..8 {
+            let next = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+            let Ok(Ok(evt)) = next else { break };
+            if let SdkEvent::TimelineUpdated {
+                channel_id,
+                message_id: id,
+                ..
+            } = evt
+            {
+                if id == message_id {
+                    seen = Some(channel_id);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            seen,
+            Some(4242),
+            "占位落库后没有 TimelineUpdated：宿主要等 materialize 走完才画得出气泡",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
