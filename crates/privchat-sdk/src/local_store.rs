@@ -2305,17 +2305,22 @@ impl LocalStore {
                 c.channel_id,
                 c.channel_type,
                 CASE
+                        -- DM 标题：只用真实身份，**任何分支都不回退 uid**
+                        -- （spec CLIENT_GLOBAL_STATE_AND_IDENTITY_STORE_SPEC §27.5）。
+                        -- 名字拿不到就返回空串，由 UI 显示 typed loading 占位，等 user
+                        -- 实体到达后自然刷新——宁可显示「加载中」，也不给用户看一串数字。
                         WHEN c.channel_type = 1 THEN COALESCE(
                             (
                                 SELECT COALESCE(
                                     NULLIF(u.alias, ''),
                                     NULLIF(u.nickname, ''),
-                                    NULLIF(u.username, ''),
-                                    CAST(peer.peer_user_id AS TEXT)
+                                    NULLIF(u.username, '')
                                 )
                                 FROM (
                                     SELECT COALESCE(
                                         c.peer_user_id,
+                                        -- 存量兼容：老版本把对端 uid 写进了 channel_name。
+                                        -- 这里只拿它**反推对端身份**去 JOIN，绝不当名字显示。
                                         CASE
                                             WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
                                             THEN CAST(c.channel_name AS INTEGER)
@@ -2330,6 +2335,9 @@ impl LocalStore {
                             ),
                             CASE
                                 WHEN NULLIF(c.channel_name, '') IN ('1', '__system_1__') THEN NULL
+                                -- 纯数字的 channel_name 是存量脏数据（老版本写进去的 uid），
+                                -- 不是名字。当成「没有名字」处理。
+                                WHEN c.channel_name GLOB '[0-9]*' THEN NULL
                                 ELSE NULLIF(c.channel_name, '')
                             END,
                             ''
@@ -2479,17 +2487,22 @@ impl LocalStore {
                     c.channel_id,
                     c.channel_type,
                     CASE
+                        -- DM 标题：只用真实身份，**任何分支都不回退 uid**
+                        -- （spec CLIENT_GLOBAL_STATE_AND_IDENTITY_STORE_SPEC §27.5）。
+                        -- 名字拿不到就返回空串，由 UI 显示 typed loading 占位，等 user
+                        -- 实体到达后自然刷新——宁可显示「加载中」，也不给用户看一串数字。
                         WHEN c.channel_type = 1 THEN COALESCE(
                             (
                                 SELECT COALESCE(
                                     NULLIF(u.alias, ''),
                                     NULLIF(u.nickname, ''),
-                                    NULLIF(u.username, ''),
-                                    CAST(peer.peer_user_id AS TEXT)
+                                    NULLIF(u.username, '')
                                 )
                                 FROM (
                                     SELECT COALESCE(
                                         c.peer_user_id,
+                                        -- 存量兼容：老版本把对端 uid 写进了 channel_name。
+                                        -- 这里只拿它**反推对端身份**去 JOIN，绝不当名字显示。
                                         CASE
                                             WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
                                             THEN CAST(c.channel_name AS INTEGER)
@@ -2504,6 +2517,9 @@ impl LocalStore {
                             ),
                             CASE
                                 WHEN NULLIF(c.channel_name, '') IN ('1', '__system_1__') THEN NULL
+                                -- 纯数字的 channel_name 是存量脏数据（老版本写进去的 uid），
+                                -- 不是名字。当成「没有名字」处理。
+                                WHEN c.channel_name GLOB '[0-9]*' THEN NULL
                                 ELSE NULLIF(c.channel_name, '')
                             END,
                             ''
@@ -5359,7 +5375,7 @@ mod tests {
     };
     use crate::{
         LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
-        UpsertChannelInput, UpsertGroupInput, UpsertRemoteMessageInput,
+        UpsertChannelInput, UpsertGroupInput, UpsertRemoteMessageInput, UpsertUserInput,
     };
     use rand::RngCore;
     use rusqlite::params;
@@ -5416,6 +5432,153 @@ mod tests {
                 .expect("load bootstrap watermark"),
             "logout must not look like a fresh account",
         );
+    }
+
+    /// DM 标题**任何情况下不得回退到 uid**
+    /// （spec CLIENT_GLOBAL_STATE_AND_IDENTITY_STORE_SPEC §27.5）。
+    ///
+    /// 2026-08-08 生产反馈：邀请码注册的新用户进主界面，和邀请人的会话标题是一串
+    /// `100000007`。链路是——补全链绑定邀请码时服务端才建好友和 DM，欢迎消息先于对端
+    /// user 实体到达，本地会话行由这条消息就地建出来，名字位置被填进了 uid。
+    /// 服务端其实是按约定发空串的（"宁可显示加载中也不显示一串数字"），是客户端自己
+    /// 一层层把 uid 补了回去。
+    #[test]
+    fn a_dm_without_a_known_peer_shows_no_name_rather_than_the_uid() {
+        let store = test_store();
+        let uid = "100000200";
+        // 对端 user 实体还没同步到本地——这正是新注册用户进主界面那一刻的状态。
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 4381,
+                    channel_type: 1,
+                    channel_name: String::new(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 1,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 1,
+                    last_msg_content: "hi".to_string(),
+                    version: 1,
+                    peer_user_id: Some(100_000_007),
+                },
+            )
+            .expect("upsert channel");
+
+        let listed = store.list_channels(uid, 10, 0).expect("list channels");
+        let dm = listed.iter().find(|c| c.channel_id == 4381).expect("dm row");
+        assert_eq!(dm.channel_name, "", "名字未知时留空，绝不返回 uid");
+        assert!(
+            !dm.channel_name.contains("100000007"),
+            "对端 uid 绝不能出现在标题里，实际='{}'",
+            dm.channel_name
+        );
+    }
+
+    /// 对端 user 实体一到，标题立刻是真名——不需要重启，也不需要额外的全量同步。
+    #[test]
+    fn the_dm_title_becomes_the_real_name_once_the_peer_lands() {
+        let store = test_store();
+        let uid = "100000200";
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 4381,
+                    channel_type: 1,
+                    channel_name: String::new(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 1,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 1,
+                    last_msg_content: "hi".to_string(),
+                    version: 1,
+                    peer_user_id: Some(100_000_007),
+                },
+            )
+            .expect("upsert channel");
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 100_000_007,
+                    username: Some("fujie95".to_string()),
+                    nickname: Some("福姐九五".to_string()),
+                    alias: None,
+                    avatar: String::new(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 1,
+                    updated_at: 1,
+                },
+            )
+            .expect("upsert user");
+
+        let listed = store.list_channels(uid, 10, 0).expect("list channels");
+        let dm = listed.iter().find(|c| c.channel_id == 4381).expect("dm row");
+        assert_eq!(dm.channel_name, "福姐九五");
+    }
+
+    /// 存量脏数据：老版本把对端 uid 写进了 `channel_name`。
+    /// 它只能用来**反推对端身份**去 JOIN，绝不能当名字显示。
+    #[test]
+    fn a_legacy_row_with_a_uid_in_the_name_column_still_never_shows_it() {
+        let store = test_store();
+        let uid = "100000200";
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 4382,
+                    channel_type: 1,
+                    // 老版本的写法：uid 当名字
+                    channel_name: "100000007".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 0,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 1,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: None,
+                },
+            )
+            .expect("upsert channel");
+
+        let before = store.list_channels(uid, 10, 0).expect("list channels");
+        let dm = before.iter().find(|c| c.channel_id == 4382).expect("dm row");
+        assert_eq!(dm.channel_name, "", "存量 uid 名字当成「没有名字」");
+
+        // 但它仍然要能反推出对端，等 user 实体到了标题就对了。
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 100_000_007,
+                    username: Some("fujie95".to_string()),
+                    nickname: Some("福姐九五".to_string()),
+                    alias: None,
+                    avatar: String::new(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 1,
+                    updated_at: 1,
+                },
+            )
+            .expect("upsert user");
+        let after = store.list_channels(uid, 10, 0).expect("list channels");
+        let dm = after.iter().find(|c| c.channel_id == 4382).expect("dm row");
+        assert_eq!(dm.channel_name, "福姐九五", "存量行也要能自愈");
     }
 
     #[test]

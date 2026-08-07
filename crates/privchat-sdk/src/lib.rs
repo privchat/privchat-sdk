@@ -11917,6 +11917,9 @@ impl State {
             .map(|c| c.last_msg_content.clone())
             .unwrap_or_default();
         let prev_last_msg_timestamp = existing.as_ref().map(|c| c.last_msg_timestamp).unwrap_or(0);
+        // 只有「这条消息就地建出新会话行」时才由这里定对端；已存在的行不碰
+        // （upsert SQL 用 COALESCE 保留已存值）。
+        let mut new_channel_peer_user_id: Option<u64> = None;
         let (channel_name, channel_remark, avatar, top, mute, unread_count) =
             if let Some(c) = existing {
                 (
@@ -11938,22 +11941,34 @@ impl State {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or_default();
                 // channel_type 客户端约定：1=DM，2=群，其它=房间。
-                let inferred_name = if channel_type == 1 {
-                    // 系统会话不特判(uid 只是部署事实):名字统一走 user 实体解析链,
-                    // 这里仅留 uid 文本兜底,由上层按 username/user_type 本地化。
+                //
+                // **名字一律留空**，DM 和群一样。名字的真源是 user / group 实体，
+                // 这里知道的只有 uid——把 uid 写进 channel_name 就是把一串数字写成了
+                // 「名字」：列表查询看到非空的 channel_name 就直接拿去显示，用户看到的
+                // 是 `100000007`。邀请码注册的新用户第一眼看到的就是这个（欢迎消息
+                // 先于对端 user 实体到达，本地会话行由这条消息就地建出来）。
+                //
+                // 群那条分支早就踩过同一个坑（见下方保留的注释），DM 这条一直没跟上。
+                // 服务端也是这个约定：`channel_service` 的自包含投影在名字缺失时发空串，
+                // 注释写着「宁可显示加载中也不显示一串数字」。
+                //
+                // 对端身份改存到 `peer_user_id` 结构化字段——那才是它该待的地方，
+                // 列表查询据此 JOIN user 表拿真名，user 实体一到名字自然就对了。
+                let inferred_peer_user_id = if channel_type == 1 {
                     match from_uid {
-                        Some(uid) if uid > 0 && uid != current_uid => uid.to_string(),
-                        _ => String::new(),
+                        Some(uid) if uid > 0 && uid != current_uid => Some(uid),
+                        _ => None,
                     }
                 } else {
                     // 群/房间的名字来自 group 实体（entity sync），这里绝不能拿 channel_id
                     // 当名字：它会被写进 channel.channel_name，而频道列表查询对群会优先取
                     // channel_name，于是真正的群名（即便随后同步到）被永久盖住，标题卡在裸 id。
                     // 留空，交给查询回落到 group.name / 成员名。
-                    String::new()
+                    None
                 };
+                new_channel_peer_user_id = inferred_peer_user_id;
                 (
-                    inferred_name,
+                    String::new(),
                     String::new(),
                     String::new(),
                     0,
@@ -12051,8 +12066,9 @@ impl State {
                 // Keep the existing channel entity version so later sync_entities(channel)
                 // payloads can still apply top/mute/name changes from the server.
                 version: existing_version,
-                // 非同步路径不触碰对端：upsert SQL 用 COALESCE 保留已存 peer_user_id。
-                peer_user_id: None,
+                // 已存在的行不触碰对端（upsert SQL 用 COALESCE 保留已存值）；
+                // 新建的 DM 行在这里把对端存进结构化字段，列表查询据此 JOIN user 拿真名。
+                peer_user_id: new_channel_peer_user_id,
             })
             .await?;
         Ok(())
