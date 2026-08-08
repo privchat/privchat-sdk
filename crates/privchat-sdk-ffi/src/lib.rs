@@ -380,6 +380,8 @@ pub struct ProfileUpdateInput {
 pub struct PrivacySettingsView {
     pub user_id: u64,
     pub allow_add_by_group: bool,
+    /// 名片分享添加。老 server 不下发时按 true（放开）处理，与其它开关的缺省一致。
+    pub allow_add_by_card: bool,
     pub allow_search_by_phone: bool,
     pub allow_search_by_username: bool,
     pub allow_search_by_email: bool,
@@ -525,6 +527,7 @@ pub struct KeyValueEntry {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AccountPrivacyUpdateInput {
     pub allow_add_by_group: Option<bool>,
+    pub allow_add_by_card: Option<bool>,
     pub allow_search_by_phone: Option<bool>,
     pub allow_search_by_username: Option<bool>,
     pub allow_search_by_email: Option<bool>,
@@ -6235,6 +6238,7 @@ impl PrivchatClient {
         Ok(PrivacySettingsView {
             user_id: resp.user_id,
             allow_add_by_group: resp.allow_add_by_group,
+            allow_add_by_card: resp.allow_add_by_card,
             allow_search_by_phone: resp.allow_search_by_phone,
             allow_search_by_username: resp.allow_search_by_username,
             allow_search_by_email: resp.allow_search_by_email,
@@ -6251,6 +6255,7 @@ impl PrivchatClient {
     ) -> Result<bool, PrivchatFfiError> {
         let mut req = AccountPrivacyUpdateRequest {
             allow_add_by_group: payload.allow_add_by_group,
+            allow_add_by_card: payload.allow_add_by_card,
             allow_search_by_phone: payload.allow_search_by_phone,
             allow_search_by_username: payload.allow_search_by_username,
             allow_search_by_email: payload.allow_search_by_email,
@@ -6915,6 +6920,11 @@ impl PrivchatClient {
                 allow_search: payload.allow_search,
                 join_policy: payload.join_policy,
                 all_muted: payload.all_muted,
+                // 只读群 / 禁止转发暂不经 FFI 透传：这两项目前由 web / h5 的群管理页
+                // 直接调 RPC 设置。要加到 FFI 输入记录得改 uniffi ABI，会波及 app 构建，
+                // 单独一轮做。传 None = 不修改，不会把服务端已有的值覆盖掉。
+                allow_member_post: None,
+                forbid_forward: None,
                 max_members: payload.max_members,
                 announcement: payload.announcement,
                 description: payload.description,
@@ -7595,6 +7605,8 @@ impl PrivchatClient {
                 reply_to_message_id: options.in_reply_to_message_id.map(|id| id.to_string()),
                 mentioned_user_ids: has_mentions.then_some(options.mentioned_user_ids),
                 message_source: None,
+                // 转发来源只由服务端在创建副本时写入；本地发送路径永远没有它。
+                forward_origin: None,
             };
             input.content = serde_json::to_string(&envelope).map_err(|e| {
                 PrivchatFfiError::from(SdkError::Serialization(format!(
