@@ -10457,6 +10457,8 @@ impl State {
             reply_to_message_id: None,
             mentioned_user_ids: None,
             message_source: None,
+            // 转发来源由服务端投影下发；本地构造的信封没有来源。
+            forward_origin: None,
         });
 
         if let Some(content_json) = Self::decode_legacy_message_envelope(&content) {
@@ -16788,6 +16790,8 @@ impl PrivchatSdk {
                 Some(options.mentioned_user_ids)
             },
             message_source: None,
+            // 转发来源由服务端投影下发；本地构造的信封没有来源。
+            forward_origin: None,
         };
         let extra = serde_json::to_string(&envelope).map_err(|e| {
             Error::Serialization(format!("encode structured message envelope: {e}"))
