@@ -2532,7 +2532,7 @@ enum Command {
         body_json: String,
         resp: oneshot::Sender<Result<String>>,
     },
-    ResendExistingFile {
+    ReuseExistingAttachment {
         source_file_id: u64,
         resp: oneshot::Sender<Result<UploadedFileInfo>>,
     },
@@ -11271,7 +11271,7 @@ impl State {
     ///
     /// 🔴 用的是**服务端算出的** `sha256`，不是本地重算的。重新加密会产出另一串
     /// 字节，那按定义就是另一个物理文件，预检必然不命中。
-    pub async fn resend_existing_file(&mut self, source_file_id: u64) -> Result<UploadedFileInfo> {
+    pub async fn reuse_existing_attachment(&mut self, source_file_id: u64) -> Result<UploadedFileInfo> {
         let payload = FileGetUrlRequest {
             file_id: source_file_id,
             // 服务端从鉴权上下文填真实 uid，客户端传 0。
@@ -11291,7 +11291,10 @@ impl State {
                 detail.original_filename.clone(),
                 detail.file_size as i64,
                 detail.mime_type.clone(),
-                "file".to_string(),
+                // 🔴 不能一律报 "file"：服务端按类型定限额和校验，图片/视频报成
+                // 普通文件等于绕开那套闸门。类型只能由 mime 推，因为 get_url
+                // 不下发 file_type——这条一旦下发了就改读它。
+                file_type_from_mime(&detail.mime_type).to_string(),
                 Some(&sha256),
             )
             .await?;
@@ -13642,12 +13645,12 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
-                    Command::ResendExistingFile {
+                    Command::ReuseExistingAttachment {
                         source_file_id,
                         resp,
                     } => {
                         let result = match state.require_authenticated() {
-                            Ok(()) => state.resend_existing_file(source_file_id).await,
+                            Ok(()) => state.reuse_existing_attachment(source_file_id).await,
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -16508,11 +16511,11 @@ impl PrivchatSdk {
     /// 再发一份**已经在服务端**的附件：换到自己的 `file_id`，一个字节都不上传。
     ///
     /// 「转发一张图」就是这个 + 一条普通图片消息。没有转发协议，也没有转发消息类型。
-    pub async fn resend_existing_file(&self, source_file_id: u64) -> Result<UploadedFileInfo> {
+    pub async fn reuse_existing_attachment(&self, source_file_id: u64) -> Result<UploadedFileInfo> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(Command::ResendExistingFile {
+            .send(Command::ReuseExistingAttachment {
                 source_file_id,
                 resp: resp_tx,
             })
@@ -23677,3 +23680,33 @@ mod tests {
     }
 }
 pub mod message_content;
+
+/// 服务端按 `file_type` 定限额与校验，所以复用时必须报**真实类型**。
+///
+/// `file/get_url` 只下发 mime，不下发 file_type，这里只能推；等它下发了就直接读，
+/// 别把这张表留成第二处真源。
+fn file_type_from_mime(mime: &str) -> &'static str {
+    match mime.split('/').next().unwrap_or_default() {
+        "image" => "image",
+        "video" => "video",
+        "audio" => "voice",
+        _ => "file",
+    }
+}
+
+#[cfg(test)]
+mod file_type_from_mime_tests {
+    use super::file_type_from_mime;
+
+    #[test]
+    fn maps_media_families_and_falls_back_to_file() {
+        // 报错类型 = 绕过服务端按类型设的限额与校验，所以这几条都得钉住。
+        assert_eq!(file_type_from_mime("image/png"), "image");
+        assert_eq!(file_type_from_mime("video/mp4"), "video");
+        assert_eq!(file_type_from_mime("audio/ogg"), "voice");
+        assert_eq!(file_type_from_mime("application/pdf"), "file");
+        // 空/畸形 mime 不许 panic，也不许悄悄升级成媒体类型。
+        assert_eq!(file_type_from_mime(""), "file");
+        assert_eq!(file_type_from_mime("image"), "image");
+    }
+}

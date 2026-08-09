@@ -26,7 +26,7 @@
 //!
 //! 🔴 这里刻意**不**验「同一张图片封两次会命中」，因为按设计它不会：每次封装用
 //! 新的随机 CEK/nonce，密文不同 ⇒ 摘要不同 ⇒ 两个物理文件。那是正确行为，不是缺陷。
-//! 复用只发生在客户端手里已经有一份服务端认得的内容时，也就是 `resend_existing_file`。
+//! 复用只发生在客户端手里已经有一份服务端认得的内容时，也就是 `reuse_existing_attachment`。
 //!
 //! 跑法（需要本机 server 起着）：
 //! ```bash
@@ -107,7 +107,7 @@ async fn main() -> BoxResult<()> {
 
     // ---------------------------------------------------------------- 场景 3
     println!("\n4) 秒传取用：换自己的 file_id，正文零字节");
-    let reused = sdk.resend_existing_file(id_a.parse::<u64>()?).await?;
+    let reused = sdk.reuse_existing_attachment(id_a.parse::<u64>()?).await?;
     println!("   file_id={} url={}", reused.file_id, reused.file_url);
     assert_ne!(
         reused.file_id, id_a,
