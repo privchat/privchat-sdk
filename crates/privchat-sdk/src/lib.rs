@@ -11257,6 +11257,46 @@ impl State {
         })
     }
 
+    /// 再次发送一份**已有**的附件：不下载、不重新压缩、不重新加密、不上传正文。
+    ///
+    /// 这就是「转发一张图」在本产品里的全部实现——没有转发 RPC，也没有转发消息
+    /// 类型。拿到自己的 `file_id` 之后，按普通 image/video/file 消息发送。
+    ///
+    /// 🔴 用的是**服务端算出的** `sha256`，不是本地重算的。重新加密会产出另一串
+    /// 字节，那按定义就是另一个物理文件，预检必然不命中。
+    pub async fn resend_existing_file(&mut self, source_file_id: u64) -> Result<UploadedFileInfo> {
+        let payload = FileGetUrlRequest {
+            file_id: source_file_id,
+            // 服务端从鉴权上下文填真实 uid，客户端传 0。
+            user_id: 0,
+        };
+        let detail: FileGetUrlResponse =
+            self.rpc_call_typed(routes::file::GET_URL, &payload).await?;
+
+        let sha256 = detail.sha256.clone().filter(|d| d.len() == 64).ok_or_else(|| {
+            // 老记录的摘要是 `hash:<u64>` 那种旧格式，用不了；只能重新走完整上传。
+            Error::Serialization("file has no reusable content digest".to_string())
+        })?;
+
+        let token = self
+            .request_upload_token(
+                0,
+                detail.original_filename.clone(),
+                detail.file_size as i64,
+                detail.mime_type.clone(),
+                "file".to_string(),
+                Some(&sha256),
+            )
+            .await?;
+        if !token.already_exists {
+            // 服务端刚说有、这会儿又说没有：通常是那份物理文件已被清掉。
+            return Err(Error::Transport(
+                "server no longer holds these bytes".to_string(),
+            ));
+        }
+        self.claim_existing_file(&token.token, &sha256).await
+    }
+
     /// 秒传命中：拿 token 换**自己的** file_id，一个字节都不传。
     async fn claim_existing_file(&mut self, token: &str, sha256: &str) -> Result<UploadedFileInfo> {
         let value: serde_json::Value = self
