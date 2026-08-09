@@ -822,17 +822,20 @@ pub struct LinkPreviewResult {
 pub type LinkPreviewHook =
     Arc<dyn Fn(&str) -> std::result::Result<LinkPreviewResult, String> + Send + Sync>;
 
+/// 一次上传（或秒传取用）之后，**属于当前用户的**那条文件记录。
+///
+/// 两条路径返回的是同一个东西：秒传只是省掉了传字节，拿到的 `file_id` 一样是自己的。
 #[derive(Debug, Clone)]
-struct UploadedFileInfo {
-    file_id: String,
-    storage_source_id: u32,
-    file_url: String,
-    thumbnail_url: Option<String>,
-    file_size: u64,
-    original_size: Option<u64>,
-    width: Option<u32>,
-    height: Option<u32>,
-    mime_type: String,
+pub struct UploadedFileInfo {
+    pub file_id: String,
+    pub storage_source_id: u32,
+    pub file_url: String,
+    pub thumbnail_url: Option<String>,
+    pub file_size: u64,
+    pub original_size: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub mime_type: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2528,6 +2531,10 @@ enum Command {
         route: String,
         body_json: String,
         resp: oneshot::Sender<Result<String>>,
+    },
+    ResendExistingFile {
+        source_file_id: u64,
+        resp: oneshot::Sender<Result<UploadedFileInfo>>,
     },
     Transfer {
         channel_id: u64,
@@ -13635,6 +13642,16 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
+                    Command::ResendExistingFile {
+                        source_file_id,
+                        resp,
+                    } => {
+                        let result = match state.require_authenticated() {
+                            Ok(()) => state.resend_existing_file(source_file_id).await,
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::RpcCall {
                         route,
                         body_json,
@@ -16481,6 +16498,22 @@ impl PrivchatSdk {
                 route,
                 body,
                 timeout_ms,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 再发一份**已经在服务端**的附件：换到自己的 `file_id`，一个字节都不上传。
+    ///
+    /// 「转发一张图」就是这个 + 一条普通图片消息。没有转发协议，也没有转发消息类型。
+    pub async fn resend_existing_file(&self, source_file_id: u64) -> Result<UploadedFileInfo> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::ResendExistingFile {
+                source_file_id,
                 resp: resp_tx,
             })
             .await
