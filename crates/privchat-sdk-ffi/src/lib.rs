@@ -7443,6 +7443,10 @@ impl PrivchatClient {
             mime_type: payload.mime_type,
             file_type: payload.file_type,
             business_type: payload.business_type,
+            // 秒传预检还没接：要用它必须先加密拿到最终 blob、对**那串字节**求 SHA-256，
+    // 再来申请 token。现在顺序相反，此时还没有可报的摘要。
+            sha256: None,
+            transform_version: 0,
         };
         req.user_id = 0;
         let resp: FileRequestUploadTokenResponse =

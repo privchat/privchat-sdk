@@ -11106,6 +11106,11 @@ impl State {
             mime_type,
             file_type,
             business_type: "message".to_string(),
+            // 秒传预检还没接：要用它必须先把顺序倒过来——先加密拿到最终 blob、
+            // 对**那串字节**求 SHA-256、再来申请 token。现在是先申请再加密，
+            // 此时还没有可报的摘要，所以留空走完整上传。
+            sha256: None,
+            transform_version: 0,
         };
         let response: FileRequestUploadTokenResponse = self
             .rpc_call_typed(routes::file::REQUEST_UPLOAD_TOKEN, &payload)
