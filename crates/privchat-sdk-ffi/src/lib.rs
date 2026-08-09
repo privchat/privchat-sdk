@@ -7605,8 +7605,6 @@ impl PrivchatClient {
                 reply_to_message_id: options.in_reply_to_message_id.map(|id| id.to_string()),
                 mentioned_user_ids: has_mentions.then_some(options.mentioned_user_ids),
                 message_source: None,
-                // 转发来源只由服务端在创建副本时写入；本地发送路径永远没有它。
-                forward_origin: None,
             };
             input.content = serde_json::to_string(&envelope).map_err(|e| {
                 PrivchatFfiError::from(SdkError::Serialization(format!(
