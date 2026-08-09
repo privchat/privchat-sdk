@@ -1161,6 +1161,8 @@ impl TestPhases {
                 group_id,
                 alice_id,
                 privchat_protocol::rpc::GroupSettingsPatch {
+                    allow_member_post: None,
+                    forbid_forward: None,
                     join_need_approval: Some(true),
                     member_can_invite: Some(true),
                     all_muted: None,

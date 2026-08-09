@@ -11098,6 +11098,9 @@ impl State {
         file_size: i64,
         mime_type: String,
         file_type: String,
+        // **最终待上传 blob** 的 SHA-256（加密之后那串字节）。
+        // `None` = 不参与秒传，照常完整上传。
+        sha256: Option<&str>,
     ) -> Result<FileRequestUploadTokenResponse> {
         let payload = FileRequestUploadTokenRequest {
             user_id,
@@ -11106,10 +11109,7 @@ impl State {
             mime_type,
             file_type,
             business_type: "message".to_string(),
-            // 秒传预检还没接：要用它必须先把顺序倒过来——先加密拿到最终 blob、
-            // 对**那串字节**求 SHA-256、再来申请 token。现在是先申请再加密，
-            // 此时还没有可报的摘要，所以留空走完整上传。
-            sha256: None,
+            sha256: sha256.map(str::to_string),
             transform_version: 0,
         };
         let response: FileRequestUploadTokenResponse = self
@@ -11128,19 +11128,34 @@ impl State {
         Ok(response)
     }
 
+    /// 明文 → **最终待上传 blob**：加密一次，算一次摘要，之后都用它。
+    ///
+    /// 🔴 顺序不能反。秒传按「最终上传字节」判重，而加密用的是随机 CEK/nonce——
+    /// 预检之后再加密一次，字节就变了、摘要也变了，本来就不该命中。
+    /// 所以这里产出的 blob 必须留住：上传用它，重试也用它。
+    fn seal_for_upload(data: &[u8]) -> Result<(Vec<u8>, String, String)> {
+        use sha2::Digest as _;
+
+        // 附件加密 v1（ATTACHMENT_ENCRYPTION_SPEC）：整文件 AES-256-GCM，
+        // 密文 blob = nonce||ct||tag。对象存储只存密文。CEK 不进日志。
+        let (blob, cek_b64) = crate::attachment_crypto::encrypt_attachment(data)
+            .map_err(|e| Error::Serialization(format!("attachment encrypt failed: {e}")))?;
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        hasher.update(&blob);
+        Ok((blob, cek_b64, hex::encode(hasher.finalize())))
+    }
+
     async fn upload_file_bytes(
         &self,
         upload_url: &str,
         upload_token: &str,
         filename: &str,
         mime_type: &str,
-        data: Vec<u8>,
+        // 🔴 已经封好的那个 blob，**不在这里再加密一次**：重新加密会产出另一串字节，
+        // 与 prepare 时报的摘要对不上，服务端会拒；重试同理必须复用同一个 blob。
+        blob: Vec<u8>,
+        cek_b64: String,
     ) -> Result<UploadedFileInfo> {
-        // 附件加密 v1（ATTACHMENT_ENCRYPTION_SPEC）：所有聊天附件（图片/视频/文件/语音/缩略图，
-        // 均经此统一上传点）整文件 AES-256-GCM 加密；上传密文 blob = nonce||ct||tag，
-        // multipart 带 encryption_version=1 + cek(base64url)。对象存储只存密文。CEK 不进日志。
-        let (blob, cek_b64) = crate::attachment_crypto::encrypt_attachment(&data)
-            .map_err(|e| Error::Serialization(format!("attachment encrypt failed: {e}")))?;
         let part = reqwest::multipart::Part::bytes(blob)
             .file_name(filename.to_string())
             .mime_str(mime_type)
@@ -11168,8 +11183,19 @@ impl State {
             .json::<serde_json::Value>()
             .await
             .map_err(|e| Error::Serialization(format!("decode upload response: {e}")))?;
-        // server `SERVICE_RESPONSE_ENVELOPE_SPEC` v1.1：所有 HTTP 接口统一 `{code, message, data}`。
-        // upload 响应也走信封；业务字段在 `data` 子对象里。
+        Self::parse_uploaded_file_info(&envelope, mime_type)
+    }
+
+    /// 把上传 / 秒传取用的响应解析成同一个结构。
+    ///
+    /// 两条路径的响应形状在服务端就是逐字段一致的，这里也只写一份——
+    /// 写两份解析，迟早有一份先于另一份腐坏。
+    fn parse_uploaded_file_info(
+        envelope: &serde_json::Value,
+        fallback_mime: &str,
+    ) -> Result<UploadedFileInfo> {
+        // server `SERVICE_RESPONSE_ENVELOPE_SPEC` v1.1：HTTP 接口统一 `{code, message, data}`；
+        // RPC 直接给业务对象。两种都收。
         let code = envelope.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
         if code != 0 {
             let message = envelope
@@ -11180,7 +11206,7 @@ impl State {
                 "upload failed: code={code} message={message}"
             )));
         }
-        let value = envelope.get("data").cloned().unwrap_or(envelope);
+        let value = envelope.get("data").cloned().unwrap_or_else(|| envelope.clone());
         let file_id = value
             .get("file_id")
             .and_then(|v| {
@@ -11216,7 +11242,7 @@ impl State {
         let resp_mime = value
             .get("mime_type")
             .and_then(|v| v.as_str())
-            .unwrap_or(mime_type)
+            .unwrap_or(fallback_mime)
             .to_string();
         Ok(UploadedFileInfo {
             file_id,
@@ -11229,6 +11255,62 @@ impl State {
             height,
             mime_type: resp_mime,
         })
+    }
+
+    /// 秒传命中：拿 token 换**自己的** file_id，一个字节都不传。
+    async fn claim_existing_file(&mut self, token: &str, sha256: &str) -> Result<UploadedFileInfo> {
+        let value: serde_json::Value = self
+            .rpc_call_json(
+                "file/claim_existing".to_string(),
+                serde_json::json!({ "token": token, "sha256": sha256 }),
+            )
+            .await?;
+        Self::parse_uploaded_file_info(&value, "application/octet-stream")
+    }
+
+    /// 发一份附件：**封装一次** → 预检 → 命中就换 id，未命中才传那同一个 blob。
+    ///
+    /// 顺序是整件事的关键：秒传按「最终上传字节」判重，而加密用随机 CEK/nonce，
+    /// 所以必须先封装、对封装结果求摘要，再拿这个摘要去预检。预检之后重新加密，
+    /// 字节就变了，命中率恒为 0。
+    async fn send_one_attachment(
+        &mut self,
+        user_id: u64,
+        filename: String,
+        mime_type: String,
+        file_type: String,
+        plaintext: Vec<u8>,
+    ) -> Result<(UploadedFileInfo, String)> {
+        let (blob, cek_b64, sha256) = Self::seal_for_upload(&plaintext)?;
+        let token = self
+            .request_upload_token(
+                user_id,
+                filename.clone(),
+                // 🔴 报的是**封装后**的字节数，与摘要同一口径。
+                blob.len() as i64,
+                mime_type.clone(),
+                file_type,
+                Some(&sha256),
+            )
+            .await?;
+
+        if token.already_exists {
+            // 服务端已经有这串字节：一个字节都不传，换一个属于自己的 file_id。
+            let info = self.claim_existing_file(&token.token, &sha256).await?;
+            return Ok((info, token.token));
+        }
+
+        let info = self
+            .upload_file_bytes(
+                &token.upload_url,
+                &token.token,
+                &filename,
+                &mime_type,
+                blob,
+                cek_b64,
+            )
+            .await?;
+        Ok((info, token.token))
     }
 
     async fn upload_callback(
@@ -11632,27 +11714,18 @@ impl State {
                 "[SDK.actor] process_outbound_file: uploading thumbnail size={}",
                 thumb_size
             );
-            let thumb_token = self
-                .request_upload_token(
-                    message.from_uid,
-                    thumb_name.clone(),
-                    thumb_size,
-                    thumb_mime.clone(),
-                    "image".to_string(),
-                )
-                .await?;
             let thumb_bytes = std::fs::read(&thumb_path)
                 .map_err(|e| Error::Storage(format!("read thumb file failed: {e}")))?;
-            let uploaded_thumb = self
-                .upload_file_bytes(
-                    &thumb_token.upload_url,
-                    &thumb_token.token,
-                    &thumb_name,
-                    &thumb_mime,
+            let (uploaded_thumb, thumb_token) = self
+                .send_one_attachment(
+                    message.from_uid,
+                    thumb_name.clone(),
+                    thumb_mime.clone(),
+                    "image".to_string(),
                     thumb_bytes,
                 )
                 .await?;
-            self.upload_callback(message.from_uid, &thumb_token.token, &uploaded_thumb)
+            self.upload_callback(message.from_uid, &thumb_token, &uploaded_thumb)
                 .await?;
             Some(uploaded_thumb)
         } else {
@@ -11663,30 +11736,17 @@ impl State {
             "[SDK.actor] process_outbound_file: requesting upload token for main file size={}",
             upload_payload.len()
         );
-        let token = self
-            .request_upload_token(
+        let (uploaded, main_token) = self
+            .send_one_attachment(
                 message.from_uid,
                 upload_filename.clone(),
-                upload_payload.len() as i64,
                 mime_type.clone(),
                 file_type.clone(),
-            )
-            .await?;
-        eprintln!(
-            "[SDK.actor] process_outbound_file: uploading main file to {}",
-            token.upload_url
-        );
-        let uploaded = self
-            .upload_file_bytes(
-                &token.upload_url,
-                &token.token,
-                &upload_filename,
-                &mime_type,
                 upload_payload,
             )
             .await?;
         eprintln!("[SDK.actor] process_outbound_file: upload callback");
-        self.upload_callback(message.from_uid, &token.token, &uploaded)
+        self.upload_callback(message.from_uid, &main_token, &uploaded)
             .await?;
 
         let uploaded_file_id = uploaded.file_id.parse::<u64>().map_err(|_| {

@@ -1182,10 +1182,13 @@ impl MultiAccountManager {
                     mime_type: mime.to_string(),
                     file_type: file_type.to_string(),
                     business_type: "message".to_string(),
+                sha256: None,
+                transform_version: 0,
                 },
             )
             .await?;
         Ok(FileRequestUploadTokenResponse {
+            already_exists: false,
             token: resp.token,
             upload_url: resp.upload_url,
             file_id: resp
@@ -1347,6 +1350,7 @@ impl MultiAccountManager {
             routes::privacy::UPDATE,
             &AccountPrivacyUpdateRequest {
                 allow_add_by_group: None,
+                allow_add_by_card: None,
                 allow_search_by_phone: None,
                 allow_search_by_username: None,
                 allow_search_by_email: None,

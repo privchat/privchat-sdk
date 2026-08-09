@@ -7443,8 +7443,8 @@ impl PrivchatClient {
             mime_type: payload.mime_type,
             file_type: payload.file_type,
             business_type: payload.business_type,
-            // 秒传预检还没接：要用它必须先加密拿到最终 blob、对**那串字节**求 SHA-256，
-    // 再来申请 token。现在顺序相反，此时还没有可报的摘要。
+            // 这个入口是给上层「自己准备好字节再传」用的，没有走 SDK 内部的封装步骤，
+    // 因此没有可报的最终 blob 摘要；不带摘要 = 照常完整上传（服务端兼容）。
             sha256: None,
             transform_version: 0,
         };
