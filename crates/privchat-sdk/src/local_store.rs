@@ -2300,14 +2300,22 @@ impl LocalStore {
             )));
         }
 
-        // payload 不写：普通消息 drain 读的是 `message.content`，outbox payload
-        // 那一列它压根不看（`drain` 里是 `_payload`）。往里塞东西只会让人以为
-        // 那才是发出去的内容。
+        // payload 那一列**不动**，于是转换后它留着的仍是这次 saga 的 JSON。
+        // 这不影响发送：普通消息 drain 读的是 `message.content`，payload 那列它
+        // 压根不看（`drain` 里签名就是 `_payload`）。
+        //
+        // 之所以不顺手清掉：它是这条消息走过复用路径的唯一痕迹，排查时有用。
+        // 但**别把它当成待发内容**——写 worker 的时候尤其别。
         let changed = tx
             .execute(
+                // 🔴 `retry_count` / `last_error` 必须一起清。复用阶段失败过几次的话，
+                // 不清就等于让普通发送**继承**上一阶段的退避——第一次失败直接跳到
+                // 最长那档；`last_error` 还会把一条早就过期的错误一路带下去，
+                // 排查时指向的是另一个阶段的问题。
                 "UPDATE outbox
                     SET command_type = 'message',
-                        status = 'pending', next_attempt_at = 0, updated_at = ?2
+                        status = 'pending', next_attempt_at = 0,
+                        retry_count = 0, last_error = NULL, updated_at = ?2
                   WHERE message_id = ?1 AND command_type = 'attachment_reuse'",
                 params![message_id as i64, now_ms],
             )
@@ -6159,6 +6167,42 @@ mod tests {
             .expect("read message")
             .expect("message exists");
         assert_eq!(stored.content, content);
+    }
+
+    /// 阶段切换必须把重试状态清零。
+    ///
+    /// 复用阶段失败几次很正常（预检 miss、token 过期、网络抖）。不清的话，普通
+    /// 发送第一次失败就直接吃最长那档退避，用户看着一条消息卡十几秒；`last_error`
+    /// 还会把上一阶段早就过期的错误一路带下去，排查时指向的根本不是当前问题。
+    #[test]
+    fn converting_clears_the_retry_state_of_the_previous_stage() {
+        let store = test_store();
+        let uid = "100000905";
+        let message_id = seed_reuse_task(&store, uid, 555_006, br#"{"v":1}"#);
+
+        // 复用阶段失败过几轮。
+        store
+            .outbox_bump_retry(uid, message_id, 999_999, "prepare failed")
+            .expect("bump retry");
+        store
+            .outbox_bump_retry(uid, message_id, 999_999, "claim failed")
+            .expect("bump retry again");
+
+        store
+            .convert_reuse_task_to_send(uid, message_id, "{}")
+            .expect("convert");
+
+        let conn = store.conn_for_user(uid).expect("conn");
+        let (retry_count, last_error, next_attempt_at): (i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT retry_count, last_error, next_attempt_at FROM outbox WHERE message_id = ?1",
+                params![message_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("outbox row");
+        assert_eq!(retry_count, 0, "🔴 普通发送不该继承上一阶段的退避档位");
+        assert_eq!(last_error, None, "🔴 上一阶段的错误不该被带下去");
+        assert_eq!(next_attempt_at, 0, "切换之后立即可发");
     }
 
     /// 已经切成普通发送的行，不能再被状态机改回去。

@@ -16563,9 +16563,17 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    /// 再发一份**已经在服务端**的附件：换到自己的 `file_id`，一个字节都不上传。
+    /// 换到**自己的** `file_id`：一个字节都不上传。
     ///
-    /// 「转发一张图」就是这个 + 一条普通图片消息。没有转发协议，也没有转发消息类型。
+    /// 🔴 **这不是发送入口，也不该成为发送入口。** 它直接做完
+    /// `get_url → prepare → claim` 三次网络往返，中间不落任何本地状态——崩在
+    /// claim 之后，服务端就多了一条谁都不认识的文件记录。
+    ///
+    /// 正确的对外入口是「创建本地消息 + `attachment_reuse` 任务（同一事务）」，
+    /// 由 outbox worker 驱动这几步并逐步落盘。worker 落地时这个方法降为内部
+    /// 网络步骤（`pub(crate)`）。
+    ///
+    /// 目前保持公开只为一件事：`examples/dedup` 用它验证服务端秒传契约。
     pub async fn reuse_existing_attachment(&self, source_file_id: u64) -> Result<UploadedFileInfo> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
