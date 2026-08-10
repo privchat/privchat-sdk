@@ -11571,9 +11571,14 @@ impl State {
     ///
     /// 判据用路径而不是另存一份标记：这个区分本身就是真的，不需要再维护一份可能
     /// 与事实不符的元数据。
-    fn source_is_already_managed(content: &str, user_root: &std::path::Path) -> bool {
+    fn managed_source_path(content: &str, user_root: &std::path::Path) -> Option<std::path::PathBuf> {
         let path = content.strip_prefix("file://").unwrap_or(content);
-        std::path::Path::new(path).starts_with(user_root.join("files"))
+        let path = std::path::Path::new(path);
+        path.starts_with(user_root.join("files")).then(|| path.to_path_buf())
+    }
+
+    fn source_is_already_managed(content: &str, user_root: &std::path::Path) -> bool {
+        Self::managed_source_path(content, user_root).is_some()
     }
 
     async fn process_outbound_file(
@@ -11651,8 +11656,29 @@ impl State {
                 source_height = Some(img.height());
             }
             let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
-            let (w, h, size) =
-                Self::generate_image_thumbnail_sync(&body_path, &canonical_thumb, 320, 85)?;
+            let managed_thumb = Self::managed_source_path(&message.content, &user_root)
+                .and_then(|source| source.parent().map(|dir| dir.join(media_store::THUMB_FILENAME)))
+                .filter(|path| path.exists());
+            let (w, h, size) = if let Some(source_thumb) = managed_thumb {
+                std::fs::copy(&source_thumb, &canonical_thumb)
+                    .map_err(|e| Error::Storage(format!("copy managed image thumbnail failed: {e}")))?;
+                let img = Self::decode_image_oriented(&canonical_thumb)
+                    .map_err(|e| Error::Storage(format!("decode managed image thumbnail failed: {e}")))?;
+                let size = std::fs::metadata(&canonical_thumb)
+                    .map_err(|e| Error::Storage(format!("stat managed image thumbnail failed: {e}")))?
+                    .len();
+                (img.width(), img.height(), size)
+            } else {
+                // 托管来源但没有现成缩略图时**照样生成**，不报错。
+                //
+                // 「没有缩略图」是正常状态：自动下载可能失败，`thumb_status=3`
+                // 本身就是正式态，老消息也可能压根没有独立缩略图。在这里硬报错，
+                // 这类转发就永久发不出去了。
+                //
+                // 而且生成缩略图不算「二次处理」——被转发的那个文件一个字节都没动，
+                // 缩略图是协议要求的另一件小产物。要避免的是对主文件重新压缩。
+                Self::generate_image_thumbnail_sync(&body_path, &canonical_thumb, 320, 85)?
+            };
             let _ = self
                 .storage
                 .update_thumb_status(message.message_id, 1)
@@ -11718,6 +11744,26 @@ impl State {
             let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
             let thumb_scratch = files_dir.join("thumb.src.jpg");
             let mut hook_used = false;
+            if source_is_managed {
+                if let Some(source_thumb) = Self::managed_source_path(&message.content, &user_root)
+                    .and_then(|source| source.parent().map(|dir| dir.join(media_store::THUMB_FILENAME)))
+                    .filter(|path| path.exists())
+                {
+                    std::fs::copy(&source_thumb, &canonical_thumb)
+                        .map_err(|e| Error::Storage(format!("copy managed video thumbnail failed: {e}")))?;
+                    hook_used = true;
+                    let _ = self.storage.update_thumb_status(message.message_id, 1).await;
+                    thumb_upload = Some((
+                        canonical_thumb.clone(),
+                        "image/webp".to_string(),
+                        media_store::THUMB_FILENAME.to_string(),
+                    ));
+                } else {
+                    // A video can be sent without a thumbnail. Do not create
+                    // a new one from an already managed artifact.
+                    hook_used = true;
+                }
+            }
             // Host (Kotlin/iOS) may have pre-generated thumb.webp during the send-prep
             // loading modal. If present, trust it: set thumb_status=1 and skip both the
             // sync hook and Plan 2 async path.
