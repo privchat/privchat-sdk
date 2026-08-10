@@ -7321,6 +7321,23 @@ impl State {
         Ok(processed)
     }
 
+    /// 清掉这条消息的封装缓存。
+    ///
+    /// 只在**本地确认已提交**（或这条消息已经终态失败）之后调用。早一步都不行：
+    /// 缓存没了，下一次重试就会重新随机加密，在服务端留下第二份物理文件。
+    async fn drop_attachment_sealed_caches(&self, msg: &StoredMessage) {
+        let Ok(paths) = self.storage.get_storage_paths().await else {
+            return;
+        };
+        let dir = media_store::get_message_dir(
+            &PathBuf::from(&paths.user_root),
+            msg.message_id as i64,
+            msg.created_at,
+        );
+        Self::drop_sealed_cache(&dir.join("body.sealed"));
+        Self::drop_sealed_cache(&dir.join("thumb.sealed"));
+    }
+
     async fn drain_attachment_outbox_once(&mut self, limit: usize) -> Result<usize> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let items = self
@@ -7380,6 +7397,8 @@ impl State {
                         });
                         return Err(err);
                     }
+                    // 本地确认已经提交，重试不会再回到上传那一步——现在才轮到清缓存。
+                    self.drop_attachment_sealed_caches(&msg).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: "dequeue".to_string(),
@@ -7412,6 +7431,7 @@ impl State {
                             );
                             break;
                         }
+                        self.drop_attachment_sealed_caches(&msg).await;
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
                             action: "dequeue_reconciled".to_string(),
@@ -7472,6 +7492,8 @@ impl State {
                         );
                         break;
                     }
+                    // 终态拒绝：不会再有重试，缓存留着只是占磁盘。
+                    self.drop_attachment_sealed_caches(&msg).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: format!("failed:{}", e),
@@ -11176,9 +11198,15 @@ impl State {
         // 密文 blob = nonce||ct||tag。对象存储只存密文。CEK 不进日志。
         let (blob, cek_b64) = crate::attachment_crypto::encrypt_attachment(data)
             .map_err(|e| Error::Serialization(format!("attachment encrypt failed: {e}")))?;
+        let sha256 = Self::sha256_hex(&blob);
+        Ok((blob, cek_b64, sha256))
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
         let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-        hasher.update(&blob);
-        Ok((blob, cek_b64, hex::encode(hasher.finalize())))
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
     }
 
     /// 一条 outbox 任务只封装**一次**，结果落盘；重试读回同一份。
@@ -11194,20 +11222,27 @@ impl State {
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, String, String)> {
         let meta_path = cache_path.with_extension("sealed.json");
+
+        // 🔴 metadata 是**提交标记**：它存在，才代表旁边那个 blob 写完了。
+        // 而且必须重算摘要——两个文件分两次 rename，中间崩一次就可能凑出
+        // 「新 blob + 旧 CEK/摘要」。那种组合每次上传都会被服务端拒，而且自己
+        // 好不了：每次重试都读回同一份对不上的缓存。
         if let (Ok(blob), Ok(meta_raw)) = (
             std::fs::read(cache_path),
             std::fs::read_to_string(&meta_path),
         ) {
             if let Ok(meta) = serde_json::from_str::<SealedCacheMeta>(&meta_raw) {
-                if !blob.is_empty() && meta.sha256.len() == 64 {
+                if !blob.is_empty() && Self::sha256_hex(&blob) == meta.sha256 {
                     return Ok((blob, meta.cek, meta.sha256));
                 }
             }
         }
 
         let (blob, cek_b64, sha256) = Self::seal_for_upload(plaintext)?;
-        // 先写临时文件再 rename：半截的缓存比没有缓存更糟——它会被当成有效的
-        // 封装结果读回去，然后上传一段截断的密文。
+
+        // 顺序不能变：先撤掉旧标记，再写 blob，最后立标记。
+        // 反过来的话，新 blob 落地而旧 metadata 还在的那一瞬间，缓存看着是完整的。
+        let _ = std::fs::remove_file(&meta_path);
         let tmp = cache_path.with_extension("sealed.tmp");
         std::fs::write(&tmp, &blob)
             .and_then(|_| std::fs::rename(&tmp, cache_path))
@@ -11951,11 +11986,10 @@ impl State {
             local_message_id,
             content.clone(),
         )?;
+        // 🔴 这里**不删**封装缓存。`direct_send_message` 返回成功只说明服务端收下了，
+        // 本地那笔 `outbox_ack_sent` 还没提交；它要是失败，outbox 行留着、下一轮重来，
+        // 而缓存已经没了 → 重新随机加密 → 又一份物理文件。清理放在 drain 确认之后。
         let resp = self.direct_send_message(req).await?;
-        // 到这里这条消息才算真的发出去了，重试不会再回到上传那一步。
-        // 在此之前删缓存，等于让下一次重试重新加密、再造一份物理文件。
-        Self::drop_sealed_cache(&files_dir.join("body.sealed"));
-        Self::drop_sealed_cache(&files_dir.join("thumb.sealed"));
         // 把带 width/height/file_id/thumbnail 的最终 content 回写发送端本地行。
         // 否则本地行停在入队时的初始 content（无尺寸），发送端自己的气泡读不到宽高、
         // 退化竖向默认 150×200（接收端拿的是 wire content，所以一直正常）。best-effort：
@@ -23779,25 +23813,72 @@ mod seal_once_tests {
         );
     }
 
-    /// 半截的缓存比没有缓存更糟：它会被当成有效结果读回去，然后传一段截断的密文。
+    /// 截断的密文必须被识破。
+    ///
+    /// 只看「blob 非空、摘要字符串够长」是不够的——那样一段被截断的密文会被当成
+    /// 有效缓存读回去，然后传上去。所以读回时重算 SHA-256 与 metadata 比对。
     #[test]
-    fn a_truncated_cache_is_not_trusted() {
+    fn a_truncated_blob_is_not_trusted() {
+        let dir = tmp_dir();
+        let cache = dir.join("body.sealed");
+        let plaintext = b"a payload long enough to truncate".to_vec();
+        let (good_blob, _, good_sha) = State::seal_once(&cache, &plaintext).expect("first seal");
+
+        // 写到一半崩了：blob 短了一截，metadata 还是完整的。
+        std::fs::write(&cache, &good_blob[..good_blob.len() / 2]).expect("truncate blob");
+
+        let (blob, _, sha) = State::seal_once(&cache, &plaintext).expect("reseal");
+        assert_eq!(
+            sha,
+            State::sha256_hex(&blob),
+            "🔴 返回的摘要必须真的对应返回的字节"
+        );
+        assert_ne!(sha, good_sha, "截断的缓存不能被当成有效结果沿用");
+        assert_eq!(
+            blob.len(),
+            good_blob.len(),
+            "重新封装出来的应该是完整密文，不是那半截"
+        );
+    }
+
+    /// 「新 blob + 旧 metadata」这种组合必须被识破。
+    ///
+    /// blob 和 metadata 分两次 rename，中间崩一次就可能凑出这种缓存。它每次上传
+    /// 都会被服务端拒（申报的摘要对不上真实字节），而且自己好不了——每轮重试读回
+    /// 的都是同一份对不上的东西。
+    #[test]
+    fn a_blob_that_does_not_match_its_metadata_is_rejected() {
+        let dir = tmp_dir();
+        let cache = dir.join("body.sealed");
+        let meta_path = cache.with_extension("sealed.json");
+
+        let (_, _, first_sha) = State::seal_once(&cache, b"first").expect("first seal");
+        let stale_meta = std::fs::read_to_string(&meta_path).expect("read meta");
+        // 换了 blob，metadata 留在上一轮。
+        State::drop_sealed_cache(&cache);
+        let (_, _, second_sha) = State::seal_once(&cache, b"second").expect("second seal");
+        assert_ne!(first_sha, second_sha);
+        std::fs::write(&meta_path, &stale_meta).expect("restore stale meta");
+
+        let (blob, _, sha) = State::seal_once(&cache, b"second").expect("reseal");
+        assert_eq!(sha, State::sha256_hex(&blob), "🔴 摘要必须对应真实字节");
+        assert_ne!(sha, first_sha, "🔴 不能沿用那份对不上的旧 metadata");
+    }
+
+    /// metadata 是提交标记：它不在，缓存就不算数。
+    #[test]
+    fn a_cache_without_its_commit_marker_is_ignored() {
         let dir = tmp_dir();
         let cache = dir.join("body.sealed");
         let plaintext = b"payload".to_vec();
-        let (good_blob, _, good_sha) = State::seal_once(&cache, &plaintext).expect("first seal");
+        let (_, _, good_sha) = State::seal_once(&cache, &plaintext).expect("first seal");
 
-        // 元数据没了 = 上次写到一半崩了。
-        std::fs::remove_file(cache.with_extension("sealed.json")).expect("drop meta");
-        let (blob, _, sha) = State::seal_once(&cache, &plaintext).expect("reseal");
-        assert_ne!(
-            (blob, sha),
-            (good_blob, good_sha),
-            "元数据缺失时必须重新封装，不能拿没有 CEK 的密文去传"
-        );
+        std::fs::remove_file(cache.with_extension("sealed.json")).expect("drop marker");
+        let (_, _, sha) = State::seal_once(&cache, &plaintext).expect("reseal");
+        assert_ne!(sha, good_sha, "没有 CEK 的密文传上去没人能解开");
         assert!(
             cache.with_extension("sealed.json").exists(),
-            "重新封装之后元数据要补齐"
+            "重新封装之后标记要补齐"
         );
     }
 
