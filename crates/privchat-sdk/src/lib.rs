@@ -11564,6 +11564,18 @@ impl State {
         content
     }
 
+    /// 这份文件是不是**接手后的成品**（收到的附件、被转发的原件）。
+    ///
+    /// 托管附件落在 `{user_root}/files/{yyyymm}/{message_id}/`（见
+    /// `media_store::get_message_dir`）。用户刚从相册选的文件在这之外。
+    ///
+    /// 判据用路径而不是另存一份标记：这个区分本身就是真的，不需要再维护一份可能
+    /// 与事实不符的元数据。
+    fn source_is_already_managed(content: &str, user_root: &std::path::Path) -> bool {
+        let path = content.strip_prefix("file://").unwrap_or(content);
+        std::path::Path::new(path).starts_with(user_root.join("files"))
+    }
+
     async fn process_outbound_file(
         &mut self,
         message: &StoredMessage,
@@ -11676,7 +11688,19 @@ impl State {
             )
             .map_err(|e| Error::Storage(format!("write media meta failed: {e}")))?;
         } else if file_type == "video" {
-            if let Some(hook) = self.video_process_hook.as_ref() {
+            // 🔴 来源已经在托管目录里 = 这是**接手后的成品**（收到的附件、转发的
+            // 原件），不再做第二次处理。转发一次压一次，几跳之后画质就没了，而且
+            // 每压一次字节都变，本来还能命中的秒传也一起失效。
+            //
+            // 判据是路径而不是另存一份标记：用户刚从相册选的文件在托管目录外，
+            // 收到并落盘的在里面，这个区分本身就是真的。
+            let source_is_managed = Self::source_is_already_managed(&message.content, &user_root);
+            if source_is_managed {
+                eprintln!(
+                    "[SDK.actor] process_outbound_file: source already managed, skipping re-compress"
+                );
+            }
+            if let Some(hook) = self.video_process_hook.as_ref().filter(|_| !source_is_managed) {
                 // Hook writes compressed output in place to `payload.{ext}`.
                 // On failure the implementation must leave the file untouched.
                 let compressed_ok =
@@ -23946,6 +23970,43 @@ mod ack_before_cache_release_tests {
         assert_eq!(queued, 0, "确认提交之后命令出队");
         assert!(!cache.exists(), "确认提交之后缓存要清掉");
         assert!(!cache.with_extension("sealed.json").exists());
+    }
+}
+
+/// 接手后的成品不再做第二次处理。
+#[cfg(test)]
+mod already_managed_source_tests {
+    use super::*;
+
+    #[test]
+    fn a_received_attachment_counts_as_managed() {
+        let root = std::path::Path::new("/data/users/100001");
+        // 收到并落盘的附件就在这个位置（media_store::get_message_dir）。
+        assert!(State::source_is_already_managed(
+            "/data/users/100001/files/202608/42/payload.mp4",
+            root
+        ));
+        // file:// 前缀是同一份东西。
+        assert!(State::source_is_already_managed(
+            "file:///data/users/100001/files/202608/42/payload.mp4",
+            root
+        ));
+    }
+
+    /// 🔴 用户刚选的文件必须照常压缩——判错这一边，所有新发的视频都不压了。
+    #[test]
+    fn a_freshly_picked_file_is_not_managed() {
+        let root = std::path::Path::new("/data/users/100001");
+        for path in [
+            "/private/var/mobile/Media/DCIM/100APPLE/IMG_0001.MOV",
+            "/tmp/whatever.mp4",
+            "/data/users/100002/files/202608/42/payload.mp4", // 别人的目录
+        ] {
+            assert!(
+                !State::source_is_already_managed(path, root),
+                "{path} 不该被当成接手后的成品"
+            );
+        }
     }
 }
 
