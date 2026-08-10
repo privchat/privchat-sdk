@@ -722,7 +722,7 @@ async fn run_download(
         // 见 `prune_sealed_caches`。
         if let Some(cek) = ticket.cek.as_deref() {
             if let Some(dir) = final_path.parent() {
-                write_sealed_cache(dir, &blob, cek);
+                write_sealed_cache(dir, sealed_cache_name(&final_path), &blob, cek);
             }
         }
         let _ = fs::remove_file(&part_path);
@@ -763,24 +763,41 @@ pub fn prune_sealed_caches(user_root: &std::path::Path, max_age: std::time::Dura
             continue;
         };
         for message in messages.flatten() {
-            let cache = message.path().join("body.sealed");
-            let Ok(meta) = fs::metadata(&cache) else {
-                continue;
-            };
-            // 用 mtime 而不是自建时间戳：少一份可能与事实不符的元数据。
-            let expired = meta
-                .modified()
-                .ok()
-                .and_then(|t| now.duration_since(t).ok())
-                .is_some_and(|age| age > max_age);
-            if expired {
-                let _ = fs::remove_file(&cache);
-                let _ = fs::remove_file(cache.with_extension("sealed.json"));
-                removed += 1;
+            for name in ["body.sealed", "thumb.sealed"] {
+                let cache = message.path().join(name);
+                let Ok(meta) = fs::metadata(&cache) else {
+                    continue;
+                };
+                // 用 mtime 而不是自建时间戳：少一份可能与事实不符的元数据。
+                let expired = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .is_some_and(|age| age > max_age);
+                if expired {
+                    let _ = fs::remove_file(&cache);
+                    let _ = fs::remove_file(cache.with_extension("sealed.json"));
+                    removed += 1;
+                }
             }
         }
     }
     removed
+}
+
+/// 这份下载下来的东西该占哪个缓存名。
+///
+/// 🔴 主文件和缩略图落在**同一个消息目录**里，共用一个名字的话，后下载完的那个
+/// 会把先下载完的覆盖掉——通常是缩略图覆盖主文件，于是转发主文件时缓存里躺着的
+/// 是缩略图的密文，摘要对不上，悄悄退回整传。没有任何报错。
+fn sealed_cache_name(final_path: &std::path::Path) -> &'static str {
+    if final_path.file_name().and_then(|name| name.to_str())
+        == Some(crate::media_store::THUMB_FILENAME)
+    {
+        "thumb.sealed"
+    } else {
+        "body.sealed"
+    }
 }
 
 /// 把刚下载到的密文存成发送侧能直接复用的封装缓存。
@@ -790,9 +807,9 @@ pub fn prune_sealed_caches(user_root: &std::path::Path, max_age: std::time::Dura
 /// 摘要并解密验证 CEK，所以这里写坏了不会被误用，只会退回照常封装。
 ///
 /// best-effort：写失败不影响下载本身，只是这次转发省不掉上传。
-fn write_sealed_cache(dir: &std::path::Path, blob: &[u8], cek: &str) {
+fn write_sealed_cache(dir: &std::path::Path, cache_name: &str, blob: &[u8], cek: &str) {
     use sha2::Digest as _;
-    let cache = dir.join("body.sealed");
+    let cache = dir.join(cache_name);
     let meta_path = cache.with_extension("sealed.json");
 
     // 与 seal_once 同序：先撤旧标记，再写 blob，最后立标记。
@@ -984,7 +1001,8 @@ mod sealed_cache_tests {
         let dir = message_dir(&root);
         let blob = b"nonce-and-ciphertext-and-tag".to_vec();
 
-        write_sealed_cache(&dir, &blob, "cek-under-test");
+        write_sealed_cache(&dir, "body.sealed", &blob, "cek-under-test");
+        write_sealed_cache(&dir, "thumb.sealed", b"thumb-blob", "thumb-cek");
 
         let cache = dir.join("body.sealed");
         assert_eq!(fs::read(&cache).expect("blob"), blob);
@@ -999,6 +1017,33 @@ mod sealed_cache_tests {
         let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
         hasher.update(&blob);
         assert_eq!(meta["sha256"], hex::encode(hasher.finalize()));
+        assert_eq!(fs::read(dir.join("thumb.sealed")).expect("thumb blob"), b"thumb-blob");
+        assert!(dir.join("thumb.sealed.json").exists());
+    }
+
+    /// 主文件和缩略图必须占不同的缓存名。
+    ///
+    /// 两者下载到同一个消息目录。共用一个名字的话后完成的覆盖先完成的，而且完全
+    /// 静默——发送侧只会发现摘要对不上，退回整传，看不出哪里错了。
+    #[test]
+    fn the_payload_and_its_thumbnail_do_not_share_a_cache_name() {
+        let dir = std::path::Path::new("/data/users/1/files/202608/42");
+        assert_eq!(
+            sealed_cache_name(&dir.join(crate::media_store::THUMB_FILENAME)),
+            "thumb.sealed"
+        );
+        for payload in ["payload.png", "payload.mp4", "payload.bin"] {
+            assert_eq!(
+                sealed_cache_name(&dir.join(payload)),
+                "body.sealed",
+                "{payload} 是主文件"
+            );
+        }
+        assert_ne!(
+            sealed_cache_name(&dir.join(crate::media_store::THUMB_FILENAME)),
+            sealed_cache_name(&dir.join("payload.png")),
+            "🔴 两者共用一个名字就会互相覆盖"
+        );
     }
 
     /// 过期的清掉，没过期的留着；明文成品和缩略图一律不碰。
@@ -1009,7 +1054,7 @@ mod sealed_cache_tests {
         let stale = root.join("files").join("202608").join("2");
         for dir in [&fresh, &stale] {
             fs::create_dir_all(dir).expect("create dir");
-            write_sealed_cache(dir, b"blob", "cek");
+            write_sealed_cache(dir, "body.sealed", b"blob", "cek");
             fs::write(dir.join("payload.png"), b"plaintext").expect("write plaintext");
             fs::write(dir.join("thumb.webp"), b"thumb").expect("write thumb");
         }

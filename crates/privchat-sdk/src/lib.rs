@@ -11582,15 +11582,16 @@ impl State {
         content: &str,
         user_root: &std::path::Path,
         files_dir: &std::path::Path,
+        cache_name: &str,
     ) -> std::path::PathBuf {
-        let own = files_dir.join("body.sealed");
+        let own = files_dir.join(cache_name);
         let Some(source) = Self::managed_source_path(content, user_root) else {
             return own;
         };
         let Some(dir) = source.parent() else {
             return own;
         };
-        let inherited = dir.join("body.sealed");
+        let inherited = dir.join(cache_name);
         // 两个文件都在才算数：`seal_once` 把 metadata 当提交标记，缺一个就当没有。
         if inherited.exists() && inherited.with_extension("sealed.json").exists() {
             inherited
@@ -12048,7 +12049,12 @@ impl State {
                     thumb_mime.clone(),
                     "image".to_string(),
                     thumb_bytes,
-                    &files_dir.join("thumb.sealed"),
+                    &Self::sealed_cache_for_send(
+                        &message.content,
+                        &user_root,
+                        &files_dir,
+                        "thumb.sealed",
+                    ),
                 )
                 .await?;
             self.upload_callback(message.from_uid, &thumb_token, &uploaded_thumb)
@@ -12069,7 +12075,12 @@ impl State {
                 mime_type.clone(),
                 file_type.clone(),
                 upload_payload,
-                &Self::sealed_cache_for_send(&message.content, &user_root, &files_dir),
+                &Self::sealed_cache_for_send(
+                    &message.content,
+                    &user_root,
+                    &files_dir,
+                    "body.sealed",
+                ),
             )
             .await?;
         eprintln!("[SDK.actor] process_outbound_file: upload callback");
@@ -24111,7 +24122,8 @@ mod already_managed_source_tests {
             State::sealed_cache_for_send(
                 &source_file.display().to_string(),
                 &root,
-                &own_dir
+                &own_dir,
+                "body.sealed",
             ),
             own_dir.join("body.sealed"),
         );
@@ -24122,7 +24134,8 @@ mod already_managed_source_tests {
             State::sealed_cache_for_send(
                 &source_file.display().to_string(),
                 &root,
-                &own_dir
+                &own_dir,
+                "body.sealed",
             ),
             own_dir.join("body.sealed"),
             "缺提交标记的半份缓存不能拿来用"
@@ -24134,14 +24147,20 @@ mod already_managed_source_tests {
             State::sealed_cache_for_send(
                 &source_file.display().to_string(),
                 &root,
-                &own_dir
+                &own_dir,
+                "body.sealed",
             ),
             source_dir.join("body.sealed"),
         );
 
         // 相册新选的文件在托管目录之外，永远用自己的目录。
         assert_eq!(
-            State::sealed_cache_for_send("/tmp/from-camera-roll.png", &root, &own_dir),
+            State::sealed_cache_for_send(
+                "/tmp/from-camera-roll.png",
+                &root,
+                &own_dir,
+                "body.sealed",
+            ),
             own_dir.join("body.sealed"),
         );
     }
