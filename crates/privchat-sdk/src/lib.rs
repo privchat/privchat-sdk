@@ -838,6 +838,16 @@ pub struct UploadedFileInfo {
     pub mime_type: String,
 }
 
+/// 「这份附件服务端已经有了」——发送时不必再传字节。
+///
+/// 只带 id：文件名、mime、尺寸这些仍由 `file/get_url` 下发，客户端不自己记一份。
+#[derive(Debug, Clone, Copy)]
+struct ExistingAttachmentSource {
+    file_id: u64,
+    /// 与 `file_id` 相同时视为没有独立缩略图（同一份内容只 claim 一次）。
+    thumbnail_file_id: Option<u64>,
+}
+
 /// 封装缓存的伴生元数据：密文本身在旁边那个文件里。
 ///
 /// CEK 落在本机托管目录，与明文同一信任域——它本来就是给这台设备重试用的。
@@ -11564,12 +11574,238 @@ impl State {
         content
     }
 
+    /// 附件的来源。**同一条发送流程的两种输入**，不是两条流程。
+    ///
+    /// 队列还是那个 `attachment`，消息还是普通 image/video/file，没有转发命令、
+    /// 没有转发 RPC、没有来源关系。区别只在于「这些字节要不要传」：
+    ///
+    /// - `LocalBytes`：本机有文件 → 封装一次 → 预检 → 命中就 claim，否则上传。
+    /// - `ExistingFile`：服务端已经有 → 拿它自己算出的摘要去预检 → claim。
+    ///   一个字节都不传，也不需要先把文件下下来（claim 只要摘要 + 授权）。
+    fn parse_existing_attachment(extra: &str) -> Option<ExistingAttachmentSource> {
+        let envelope = serde_json::from_str::<serde_json::Value>(extra).ok()?;
+        let node = envelope.get("reuse_attachment")?;
+        let file_id = node.get("file_id").and_then(|v| v.as_u64())?;
+        Some(ExistingAttachmentSource {
+            file_id,
+            thumbnail_file_id: node
+                .get("thumbnail_file_id")
+                .and_then(|v| v.as_u64())
+                // 同一个 file_id 只 claim 一次：原图和缩略图指向同一份内容时，
+                // 两次 claim 会给同一个用户开出两条记录。
+                .filter(|id| *id != file_id),
+        })
+    }
+
+    /// 取得**自己的**那份文件句柄：拿服务端算出的摘要去预检，命中就 claim。
+    ///
+    /// 不下载 blob——claim 只要摘要和授权。只有老记录没有可用摘要时才回退，
+    /// 而回退是**真的**要把密文下下来再整传一遍：那会产生一次真实上传和一份新的
+    /// 物理文件，不是免费兜底。
+    async fn claim_or_reupload(
+        &mut self,
+        user_id: u64,
+        source_file_id: u64,
+        sealed_cache: &std::path::Path,
+    ) -> Result<UploadedFileInfo> {
+        let detail: FileGetUrlResponse = self
+            .rpc_call_typed(
+                routes::file::GET_URL,
+                &FileGetUrlRequest {
+                    file_id: source_file_id,
+                    // 服务端从鉴权上下文填真实 uid，客户端传 0。
+                    user_id: 0,
+                },
+            )
+            .await?;
+
+        let file_type = if detail.file_type.is_empty() {
+            "file".to_string()
+        } else {
+            detail.file_type.clone()
+        };
+        let filename = if detail.original_filename.is_empty() {
+            "file.bin".to_string()
+        } else {
+            detail.original_filename.clone()
+        };
+
+        if let Some(sha256) = detail.sha256.clone().filter(|d| d.len() == 64) {
+            let token = self
+                .request_upload_token(
+                    user_id,
+                    filename.clone(),
+                    detail.file_size as i64,
+                    detail.mime_type.clone(),
+                    file_type.clone(),
+                    Some(&sha256),
+                )
+                .await?;
+            if token.already_exists {
+                return self.claim_existing_file(&token.token, &sha256).await;
+            }
+            // 服务端刚说有、这会儿又说没有：那份物理文件已经被清掉了，只能重传。
+        }
+
+        // 回退：老记录的摘要是 `hash:<u64>` 那种旧格式，用不了。把密文下下来，
+        // 按普通上传重发一遍——一次真实上传，一份新的物理文件。
+        let blob = self.download_attachment_blob(&detail).await?;
+        let (info, _token) = self
+            .send_one_attachment(
+                user_id,
+                filename,
+                detail.mime_type.clone(),
+                file_type,
+                blob,
+                sealed_cache,
+            )
+            .await?;
+        Ok(info)
+    }
+
+    /// 回退路径专用：把服务端那份**密文**取回来。
+    ///
+    /// 取的是密文原样，不解密——重新加密会产出另一串字节，那按定义就是另一个
+    /// 物理文件，也就失去了「至少这一次重传之后还能命中」的机会。
+    async fn download_attachment_blob(&self, detail: &FileGetUrlResponse) -> Result<Vec<u8>> {
+        let response = reqwest::Client::new()
+            .get(&detail.file_url)
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("download attachment failed: {e}")))?;
+        if !response.status().is_success() {
+            return Err(Error::Transport(format!(
+                "download attachment failed: status={}",
+                response.status()
+            )));
+        }
+        response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| Error::Transport(format!("read attachment body failed: {e}")))
+    }
+
+    /// 服务端已有这份附件：换到自己的 file_id，然后照常发一条普通消息。
+    ///
+    /// 与本地文件那条路径的唯一区别是「字节不用传」。metadata 走同一个
+    /// `build_attachment_wire_content`，消息类型不变，出去的东西看不出它是复用来的
+    /// ——本来也不该看得出。
+    async fn process_existing_attachment(
+        &mut self,
+        message: &StoredMessage,
+        local_message_id: u64,
+        source: ExistingAttachmentSource,
+    ) -> Result<SendMessageResponse> {
+        let storage_paths = self.storage.get_storage_paths().await?;
+        let files_dir = media_store::get_message_dir(
+            &PathBuf::from(&storage_paths.user_root),
+            message.message_id as i64,
+            message.created_at,
+        );
+        std::fs::create_dir_all(&files_dir)
+            .map_err(|e| Error::Storage(format!("create files dir failed: {e}")))?;
+
+        let main = self
+            .claim_or_reupload(
+                message.from_uid,
+                source.file_id,
+                &files_dir.join("body.sealed"),
+            )
+            .await?;
+        // 缩略图是独立的一份内容，各自 claim；`parse_existing_attachment` 已经把
+        // 「与原图同一个 file_id」这种情况滤掉了，所以这里不会对同一份内容 claim 两次。
+        let thumbnail = match source.thumbnail_file_id {
+            Some(thumb_id) => Some(
+                self.claim_or_reupload(
+                    message.from_uid,
+                    thumb_id,
+                    &files_dir.join("thumb.sealed"),
+                )
+                .await?,
+            ),
+            None => None,
+        };
+
+        let main_file_id = main.file_id.parse::<u64>().map_err(|_| {
+            Error::Serialization(format!("claim response invalid file_id: {}", main.file_id))
+        })?;
+        let thumbnail_file_id = thumbnail
+            .as_ref()
+            .map(|t| {
+                t.file_id.parse::<u64>().map_err(|_| {
+                    Error::Serialization(format!(
+                        "claim response invalid thumbnail file_id: {}",
+                        t.file_id
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let file_type = Self::guess_file_type(
+            message.message_type,
+            main.file_url.as_str(),
+            &main.mime_type,
+        )
+        .to_string();
+        let content = serde_json::to_string(&Self::build_attachment_wire_content(
+            AttachmentWireInput {
+                file_type: &file_type,
+                file_id: main_file_id,
+                storage_source_id: main.storage_source_id,
+                file_size: main.file_size,
+                file_url: &main.file_url,
+                main_thumbnail_url: main.thumbnail_url.as_deref(),
+                thumbnail: thumbnail_file_id.map(|id| {
+                    (
+                        id,
+                        thumbnail
+                            .as_ref()
+                            .map(|t| t.file_url.as_str())
+                            .unwrap_or_default(),
+                    )
+                }),
+                filename: &message.content,
+                mime_type: &main.mime_type,
+                width: main.width,
+                height: main.height,
+                message_type: message.message_type,
+                extra: &message.extra,
+            },
+        ))
+        .map_err(|e| Error::Serialization(format!("encode attachment content: {e}")))?;
+
+        let req =
+            self.build_send_message_request_with_content(message, local_message_id, content.clone())?;
+        let resp = self.direct_send_message(req).await?;
+        if let Err(err) = self
+            .storage
+            .update_message_content(message.message_id, &content)
+            .await
+        {
+            eprintln!(
+                "[SDK.actor] update_message_content after reuse send failed: message_id={} err={err}",
+                message.message_id
+            );
+        }
+        Ok(resp)
+    }
+
     async fn process_outbound_file(
         &mut self,
         message: &StoredMessage,
         local_message_id: u64,
         payload: Vec<u8>,
     ) -> Result<SendMessageResponse> {
+        // 两种来源，同一条流程。服务端已经有这份文件时，这里既不读本地文件也不
+        // 上传字节——但出去的仍是一条普通 image/video/file 消息，走的仍是这个
+        // `attachment` 队列。
+        if let Some(source) = Self::parse_existing_attachment(&message.extra) {
+            return self
+                .process_existing_attachment(message, local_message_id, source)
+                .await;
+        }
+
         // 命令里不带文件字节。附件由 SDK 托管在本地，`message.content` 就是它的
         // 路径——把几十上百 MB 复制进 SQLite 只是同一份数据存两遍，还要跟着事务
         // 一起写。空 payload 因此是**正常情况**：从托管路径读。
@@ -23803,6 +24039,67 @@ pub mod message_content;
 /// 这是 `874b087` 那个修复真正要挡住的生产竞态：上传成功、ack 事务失败、outbox 行
 /// 留着重试——如果缓存这时已经被清掉，重试就会重新随机加密，在服务端留下第二份
 /// 物理文件；而第一次上传其实是成功的，那一份永远没人引用。
+/// 附件来源的识别：普通发送一律不受影响，同一份内容只 claim 一次。
+#[cfg(test)]
+mod existing_attachment_source_tests {
+    use super::*;
+
+    #[test]
+    fn an_ordinary_attachment_has_no_existing_source() {
+        // 绝大多数消息走的是本地文件那条路。这里判错一次，普通发图就会被当成
+        // 复用，去 claim 一个根本不存在的 file_id。
+        for extra in ["", "{}", r#"{"duration":7}"#, "not json at all"] {
+            assert!(
+                State::parse_existing_attachment(extra).is_none(),
+                "extra={extra:?} 不该被认成已有附件"
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_source_carries_both_ids() {
+        let source = State::parse_existing_attachment(
+            r#"{"reuse_attachment":{"file_id":4242,"thumbnail_file_id":4243}}"#,
+        )
+        .expect("recognised");
+        assert_eq!(source.file_id, 4242);
+        assert_eq!(source.thumbnail_file_id, Some(4243));
+    }
+
+    /// 🔴 原图和缩略图指向同一份内容时，只能 claim 一次。
+    ///
+    /// claim 两次会给同一个用户开出两条记录，第二条没有任何消息引用它。
+    #[test]
+    fn the_same_file_is_never_claimed_twice() {
+        let source = State::parse_existing_attachment(
+            r#"{"reuse_attachment":{"file_id":4242,"thumbnail_file_id":4242}}"#,
+        )
+        .expect("recognised");
+        assert_eq!(source.file_id, 4242);
+        assert_eq!(
+            source.thumbnail_file_id, None,
+            "同一个 file_id 不该被当成独立缩略图再 claim 一次"
+        );
+    }
+
+    #[test]
+    fn a_source_without_a_thumbnail_is_fine() {
+        let source =
+            State::parse_existing_attachment(r#"{"reuse_attachment":{"file_id":4242}}"#)
+                .expect("recognised");
+        assert_eq!(source.thumbnail_file_id, None);
+    }
+
+    /// 缺 file_id 的描述符不算数——否则会拿 0 去 claim。
+    #[test]
+    fn a_source_without_a_file_id_is_ignored() {
+        assert!(
+            State::parse_existing_attachment(r#"{"reuse_attachment":{"thumbnail_file_id":1}}"#)
+                .is_none()
+        );
+    }
+}
+
 #[cfg(test)]
 mod ack_before_cache_release_tests {
     use super::*;
