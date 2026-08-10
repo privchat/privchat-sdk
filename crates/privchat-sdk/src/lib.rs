@@ -11192,8 +11192,6 @@ impl State {
     /// 预检之后再加密一次，字节就变了、摘要也变了，本来就不该命中。
     /// 所以这里产出的 blob 必须留住：上传用它，重试也用它。
     fn seal_for_upload(data: &[u8]) -> Result<(Vec<u8>, String, String)> {
-        use sha2::Digest as _;
-
         // 附件加密 v1（ATTACHMENT_ENCRYPTION_SPEC）：整文件 AES-256-GCM，
         // 密文 blob = nonce||ct||tag。对象存储只存密文。CEK 不进日志。
         let (blob, cek_b64) = crate::attachment_crypto::encrypt_attachment(data)
@@ -11232,7 +11230,17 @@ impl State {
             std::fs::read_to_string(&meta_path),
         ) {
             if let Ok(meta) = serde_json::from_str::<SealedCacheMeta>(&meta_raw) {
-                if !blob.is_empty() && Self::sha256_hex(&blob) == meta.sha256 {
+                // 摘要对上只说明**字节**没坏。CEK 坏了而摘要还对（元数据被改、
+                // 或两个文件来自不同轮次）的话，传上去的密文没人解得开，服务端
+                // 拒了之后下一轮又读回同一份——永久失败。
+                //
+                // 解一次就能判：AES-GCM 的认证标签在密钥不对时直接失败。这只发生
+                // 在重试路径（首次封装根本不读缓存），多这一次解密换的是不会卡死。
+                if !blob.is_empty()
+                    && Self::sha256_hex(&blob) == meta.sha256
+                    && crate::attachment_crypto::decrypt_attachment(&blob, &meta.cek)
+                        .is_ok_and(|decoded| decoded == plaintext)
+                {
                     return Ok((blob, meta.cek, meta.sha256));
                 }
             }
@@ -23769,11 +23777,17 @@ pub mod message_content;
 mod seal_once_tests {
     use super::*;
 
+    /// 每次调用都是一个全新目录。
+    ///
+    /// 只用「微秒 + pid」是不够的：这些测试并行跑，同一微秒内的两次调用会拿到
+    /// 同一个目录，然后互相覆盖对方的缓存文件——表现为随机失败，看着像产品 bug。
     fn tmp_dir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "privchat-seal-once-{}-{}",
+            "privchat-seal-once-{}-{}-{}",
+            std::process::id(),
             chrono::Utc::now().timestamp_micros(),
-            std::process::id()
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("create tmp dir");
         dir
@@ -23863,6 +23877,41 @@ mod seal_once_tests {
         let (blob, _, sha) = State::seal_once(&cache, b"second").expect("reseal");
         assert_eq!(sha, State::sha256_hex(&blob), "🔴 摘要必须对应真实字节");
         assert_ne!(sha, first_sha, "🔴 不能沿用那份对不上的旧 metadata");
+    }
+
+    /// CEK 坏了但摘要还对：必须识破。
+    ///
+    /// 摘要只证明**字节**没坏。metadata 被改、或两个文件来自不同轮次时，会凑出
+    /// 「密文完好 + 密钥不对」——传上去没人解得开，服务端拒了之后下一轮又读回
+    /// 同一份，永久失败。AES-GCM 的认证标签能直接判出来，所以读缓存时解一次。
+    #[test]
+    fn a_cache_with_a_broken_cek_is_rejected() {
+        let dir = tmp_dir();
+        let cache = dir.join("body.sealed");
+        let meta_path = cache.with_extension("sealed.json");
+        let plaintext = b"a payload sealed under one key".to_vec();
+
+        let (_, good_cek, good_sha) = State::seal_once(&cache, &plaintext).expect("first seal");
+
+        // 换成另一次封装的 CEK：blob 一个字节没动，摘要照旧对得上。
+        let other_dir = tmp_dir();
+        let (_, other_cek, _) =
+            State::seal_once(&other_dir.join("other.sealed"), &plaintext).expect("other seal");
+        assert_ne!(good_cek, other_cek);
+        std::fs::write(
+            &meta_path,
+            serde_json::json!({ "cek": other_cek, "sha256": good_sha }).to_string(),
+        )
+        .expect("swap cek");
+
+        let (blob, cek, sha) = State::seal_once(&cache, &plaintext).expect("reseal");
+        assert_ne!(sha, good_sha, "🔴 CEK 对不上就必须重新封装，不能沿用");
+        assert_eq!(sha, State::sha256_hex(&blob));
+        assert_eq!(
+            crate::attachment_crypto::decrypt_attachment(&blob, &cek).expect("decrypt"),
+            plaintext,
+            "重新封装的结果必须自洽：这个 CEK 能解开这份密文"
+        );
     }
 
     /// metadata 是提交标记：它不在，缓存就不算数。
