@@ -838,6 +838,16 @@ pub struct UploadedFileInfo {
     pub mime_type: String,
 }
 
+/// 封装缓存的伴生元数据：密文本身在旁边那个文件里。
+///
+/// CEK 落在本机托管目录，与明文同一信任域——它本来就是给这台设备重试用的。
+/// **绝不进消息 metadata，也绝不进日志。**
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SealedCacheMeta {
+    cek: String,
+    sha256: String,
+}
+
 /// [`State::build_attachment_wire_content`] 的输入。
 ///
 /// 字段列全了不是啰嗦：少带一个，接收端就少一样渲染依据。宽高缺了气泡退化成正方形，
@@ -11171,6 +11181,58 @@ impl State {
         Ok((blob, cek_b64, hex::encode(hasher.finalize())))
     }
 
+    /// 一条 outbox 任务只封装**一次**，结果落盘；重试读回同一份。
+    ///
+    /// 🔴 不这样做的话，秒传对「重试」这个最常见的重复来源完全无效：加密用随机
+    /// CEK/nonce，重新封装出来的字节不同、摘要不同，预检必然 miss，于是同一条
+    /// 逻辑消息在服务端留下第二份物理文件。上一次上传如果其实成功了、只是响应
+    /// 丢了，那第二份就永远没人引用。
+    ///
+    /// 缓存随这条消息的托管目录一起存在，发送成功后由调用方删掉。
+    fn seal_once(
+        cache_path: &std::path::Path,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, String, String)> {
+        let meta_path = cache_path.with_extension("sealed.json");
+        if let (Ok(blob), Ok(meta_raw)) = (
+            std::fs::read(cache_path),
+            std::fs::read_to_string(&meta_path),
+        ) {
+            if let Ok(meta) = serde_json::from_str::<SealedCacheMeta>(&meta_raw) {
+                if !blob.is_empty() && meta.sha256.len() == 64 {
+                    return Ok((blob, meta.cek, meta.sha256));
+                }
+            }
+        }
+
+        let (blob, cek_b64, sha256) = Self::seal_for_upload(plaintext)?;
+        // 先写临时文件再 rename：半截的缓存比没有缓存更糟——它会被当成有效的
+        // 封装结果读回去，然后上传一段截断的密文。
+        let tmp = cache_path.with_extension("sealed.tmp");
+        std::fs::write(&tmp, &blob)
+            .and_then(|_| std::fs::rename(&tmp, cache_path))
+            .map_err(|e| Error::Storage(format!("write sealed cache failed: {e}")))?;
+        let meta = SealedCacheMeta {
+            cek: cek_b64.clone(),
+            sha256: sha256.clone(),
+        };
+        let meta_tmp = meta_path.with_extension("tmp");
+        std::fs::write(
+            &meta_tmp,
+            serde_json::to_string(&meta)
+                .map_err(|e| Error::Serialization(format!("encode sealed meta: {e}")))?,
+        )
+        .and_then(|_| std::fs::rename(&meta_tmp, &meta_path))
+        .map_err(|e| Error::Storage(format!("write sealed meta failed: {e}")))?;
+        Ok((blob, cek_b64, sha256))
+    }
+
+    /// 删掉封装缓存。发送真正完成之后才调用——在那之前任何一次重试都还需要它。
+    fn drop_sealed_cache(cache_path: &std::path::Path) {
+        let _ = std::fs::remove_file(cache_path);
+        let _ = std::fs::remove_file(cache_path.with_extension("sealed.json"));
+    }
+
     async fn upload_file_bytes(
         &self,
         upload_url: &str,
@@ -11306,8 +11368,10 @@ impl State {
         mime_type: String,
         file_type: String,
         plaintext: Vec<u8>,
+        // 封装结果缓存到哪儿。同一条 outbox 任务重试时读回它，绝不重新封装。
+        sealed_cache: &std::path::Path,
     ) -> Result<(UploadedFileInfo, String)> {
-        let (blob, cek_b64, sha256) = Self::seal_for_upload(&plaintext)?;
+        let (blob, cek_b64, sha256) = Self::seal_once(sealed_cache, &plaintext)?;
         let token = self
             .request_upload_token(
                 user_id,
@@ -11811,6 +11875,7 @@ impl State {
                     thumb_mime.clone(),
                     "image".to_string(),
                     thumb_bytes,
+                    &files_dir.join("thumb.sealed"),
                 )
                 .await?;
             self.upload_callback(message.from_uid, &thumb_token, &uploaded_thumb)
@@ -11831,6 +11896,7 @@ impl State {
                 mime_type.clone(),
                 file_type.clone(),
                 upload_payload,
+                &files_dir.join("body.sealed"),
             )
             .await?;
         eprintln!("[SDK.actor] process_outbound_file: upload callback");
@@ -11886,6 +11952,10 @@ impl State {
             content.clone(),
         )?;
         let resp = self.direct_send_message(req).await?;
+        // 到这里这条消息才算真的发出去了，重试不会再回到上传那一步。
+        // 在此之前删缓存，等于让下一次重试重新加密、再造一份物理文件。
+        Self::drop_sealed_cache(&files_dir.join("body.sealed"));
+        Self::drop_sealed_cache(&files_dir.join("thumb.sealed"));
         // 把带 width/height/file_id/thumbnail 的最终 content 回写发送端本地行。
         // 否则本地行停在入队时的初始 content（无尺寸），发送端自己的气泡读不到宽高、
         // 退化竖向默认 150×200（接收端拿的是 wire content，所以一直正常）。best-effort：
@@ -23659,6 +23729,91 @@ mod tests {
     }
 }
 pub mod message_content;
+
+/// 一条 outbox 任务只封装一次，重试读回同一份密文。
+#[cfg(test)]
+mod seal_once_tests {
+    use super::*;
+
+    fn tmp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-seal-once-{}-{}",
+            chrono::Utc::now().timestamp_micros(),
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create tmp dir");
+        dir
+    }
+
+    /// 🔴 这是秒传能不能对「重试」生效的全部关键。
+    ///
+    /// 每次重试重新加密的话，随机 CEK/nonce 会产出另一串字节、另一个摘要，预检
+    /// 必然 miss，同一条逻辑消息在服务端留下第二份物理文件。上一次上传如果其实
+    /// 成功了、只是响应丢了，那第二份就永远没人引用，也没人会清。
+    #[test]
+    fn a_retry_reuses_the_very_same_ciphertext() {
+        let dir = tmp_dir();
+        let cache = dir.join("body.sealed");
+        let plaintext = b"the same picture, sent twice".to_vec();
+
+        let (blob1, cek1, sha1) = State::seal_once(&cache, &plaintext).expect("first seal");
+        let (blob2, cek2, sha2) = State::seal_once(&cache, &plaintext).expect("retry");
+
+        assert_eq!(blob1, blob2, "🔴 重试必须上传同一串字节");
+        assert_eq!(sha1, sha2, "🔴 摘要不同就等于服务端多一份物理文件");
+        assert_eq!(cek1, cek2, "🔴 CEK 换了，接收端就解不开这份密文");
+    }
+
+    /// 不带缓存时每次封装都是新的——这正是为什么必须缓存。
+    #[test]
+    fn sealing_twice_without_the_cache_yields_different_bytes() {
+        let dir = tmp_dir();
+        let plaintext = b"the same picture, sent twice".to_vec();
+
+        let (_, _, sha_a) = State::seal_once(&dir.join("a.sealed"), &plaintext).expect("seal a");
+        let (_, _, sha_b) = State::seal_once(&dir.join("b.sealed"), &plaintext).expect("seal b");
+
+        assert_ne!(
+            sha_a, sha_b,
+            "随机 CEK/nonce 下同一份明文封两次本来就是两串不同的字节"
+        );
+    }
+
+    /// 半截的缓存比没有缓存更糟：它会被当成有效结果读回去，然后传一段截断的密文。
+    #[test]
+    fn a_truncated_cache_is_not_trusted() {
+        let dir = tmp_dir();
+        let cache = dir.join("body.sealed");
+        let plaintext = b"payload".to_vec();
+        let (good_blob, _, good_sha) = State::seal_once(&cache, &plaintext).expect("first seal");
+
+        // 元数据没了 = 上次写到一半崩了。
+        std::fs::remove_file(cache.with_extension("sealed.json")).expect("drop meta");
+        let (blob, _, sha) = State::seal_once(&cache, &plaintext).expect("reseal");
+        assert_ne!(
+            (blob, sha),
+            (good_blob, good_sha),
+            "元数据缺失时必须重新封装，不能拿没有 CEK 的密文去传"
+        );
+        assert!(
+            cache.with_extension("sealed.json").exists(),
+            "重新封装之后元数据要补齐"
+        );
+    }
+
+    /// 发送成功后缓存要清掉，不能让每条附件在磁盘上永久留一份密文副本。
+    #[test]
+    fn the_cache_is_dropped_once_the_send_completes() {
+        let dir = tmp_dir();
+        let cache = dir.join("body.sealed");
+        State::seal_once(&cache, b"payload").expect("seal");
+        assert!(cache.exists() && cache.with_extension("sealed.json").exists());
+
+        State::drop_sealed_cache(&cache);
+        assert!(!cache.exists(), "🔴 密文副本不能永久留在磁盘上");
+        assert!(!cache.with_extension("sealed.json").exists());
+    }
+}
 
 #[cfg(test)]
 mod attachment_wire_equivalence_tests {
