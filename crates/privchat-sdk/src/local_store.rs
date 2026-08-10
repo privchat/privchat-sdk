@@ -2300,12 +2300,12 @@ impl LocalStore {
             )));
         }
 
-        // payload 那一列**不动**，于是转换后它留着的仍是这次 saga 的 JSON。
-        // 这不影响发送：普通消息 drain 读的是 `message.content`，payload 那列它
-        // 压根不看（`drain` 里签名就是 `_payload`）。
+        // payload 清空。留着那段 saga JSON 只有坏处：token 已经用掉了，行的
+        // command_type 又变成了 `message`，读到的人得先判断这列到底属于哪个阶段。
+        // 当「排查痕迹」也站不住——发送成功时整行会被 `outbox_ack_sent` 删掉，
+        // 它根本活不到需要排查的时候。诊断该靠结构化日志。
         //
-        // 之所以不顺手清掉：它是这条消息走过复用路径的唯一痕迹，排查时有用。
-        // 但**别把它当成待发内容**——写 worker 的时候尤其别。
+        // 发送读的始终是 `message.content`（drain 里签名就是 `_payload`）。
         let changed = tx
             .execute(
                 // 🔴 `retry_count` / `last_error` 必须一起清。复用阶段失败过几次的话，
@@ -2313,7 +2313,7 @@ impl LocalStore {
                 // 最长那档；`last_error` 还会把一条早就过期的错误一路带下去，
                 // 排查时指向的是另一个阶段的问题。
                 "UPDATE outbox
-                    SET command_type = 'message',
+                    SET command_type = 'message', payload = X'',
                         status = 'pending', next_attempt_at = 0,
                         retry_count = 0, last_error = NULL, updated_at = ?2
                   WHERE message_id = ?1 AND command_type = 'attachment_reuse'",
@@ -6203,6 +6203,31 @@ mod tests {
         assert_eq!(retry_count, 0, "🔴 普通发送不该继承上一阶段的退避档位");
         assert_eq!(last_error, None, "🔴 上一阶段的错误不该被带下去");
         assert_eq!(next_attempt_at, 0, "切换之后立即可发");
+    }
+
+    /// 转换之后不许留着已消费 token 的 saga 状态。
+    #[test]
+    fn converting_clears_the_consumed_saga_payload() {
+        let store = test_store();
+        let uid = "100000906";
+        let message_id = seed_reuse_task(
+            &store,
+            uid,
+            555_007,
+            br#"{"v":1,"token":"tok-consumed","sha256":"deadbeef"}"#,
+        );
+
+        store
+            .convert_reuse_task_to_send(uid, message_id, "{}")
+            .expect("convert");
+
+        let (command_type, payload) = read_outbox(&store, uid, message_id);
+        assert_eq!(command_type, "message");
+        assert!(
+            payload.is_empty(),
+            "🔴 已消费的 token 不该留在一条普通消息命令上；实际={}",
+            String::from_utf8_lossy(&payload)
+        );
     }
 
     /// 已经切成普通发送的行，不能再被状态机改回去。
