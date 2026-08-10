@@ -11478,6 +11478,7 @@ impl State {
         {
             Self::merge_video_metadata(input.extra, &mut content);
         }
+
         content
     }
 
@@ -23827,6 +23828,58 @@ mod attachment_wire_equivalence_tests {
         }
     }
 
+    /// 带上 message_type / extra 的完整比对：Voice 与 Video 的合并分支只有在
+    /// message_type 对得上时才会执行，光换 `file_type` 字符串是走不到的。
+    fn check_typed(
+        file_type: &str,
+        thumbnail: Option<(u64, &str)>,
+        uploaded_thumbnail_url: Option<&str>,
+        width: Option<u32>,
+        height: Option<u32>,
+        message_type: i32,
+        extra: &str,
+    ) {
+        let mut expected = legacy_wire_content(
+            file_type,
+            7001,
+            3,
+            4096,
+            "http://cdn/7001.bin",
+            uploaded_thumbnail_url,
+            thumbnail,
+            "photo.png",
+            "image/png",
+            width,
+            height,
+        );
+        // 抽取前，两个 merge 就是紧跟在 json! 之后原样调用的。
+        if message_type == (privchat_protocol::message::ContentMessageType::Voice as i32) {
+            State::merge_voice_metadata(extra, &mut expected);
+        } else if message_type == (privchat_protocol::message::ContentMessageType::Video as i32) {
+            State::merge_video_metadata(extra, &mut expected);
+        }
+
+        let actual = State::build_attachment_wire_content(AttachmentWireInput {
+            file_type,
+            file_id: 7001,
+            storage_source_id: 3,
+            file_size: 4096,
+            file_url: "http://cdn/7001.bin",
+            main_thumbnail_url: uploaded_thumbnail_url,
+            thumbnail,
+            filename: "photo.png",
+            mime_type: "image/png",
+            width,
+            height,
+            message_type,
+            extra,
+        });
+        assert_eq!(
+            actual, expected,
+            "file_type={file_type} message_type={message_type} extra={extra}"
+        );
+    }
+
     fn check(
         file_type: &str,
         thumbnail: Option<(u64, &str)>,
@@ -23877,5 +23930,69 @@ mod attachment_wire_equivalence_tests {
         check("video", None, Some("http://cdn/legacy-thumb"), Some(1280), Some(720));
         check("file", None, None, None, None);
         check("voice", None, None, None, None);
+    }
+
+    #[test]
+    fn voice_merges_duration_from_extra() {
+        let voice = privchat_protocol::message::ContentMessageType::Voice as i32;
+        check_typed("voice", None, None, None, None, voice, r#"{"duration":7}"#);
+        // extra 里没有 duration 时协议要求补 1（0 秒语音条渲染不出来）。
+        check_typed("voice", None, None, None, None, voice, "");
+
+        // 光比对「新 == 旧」还不够：两边都不合并也能相等。所以直接钉住结果本身。
+        let content = State::build_attachment_wire_content(AttachmentWireInput {
+            file_type: "voice",
+            file_id: 7001,
+            storage_source_id: 3,
+            file_size: 4096,
+            file_url: "http://cdn/7001.bin",
+            main_thumbnail_url: None,
+            thumbnail: None,
+            filename: "clip.amr",
+            mime_type: "audio/amr",
+            width: None,
+            height: None,
+            message_type: voice,
+            extra: r#"{"duration":7}"#,
+        });
+        assert_eq!(content["duration"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn video_merges_duration_and_both_sizes_from_extra() {
+        let video = privchat_protocol::message::ContentMessageType::Video as i32;
+        let extra = r#"{"duration":42,"width":1920,"height":1080,
+                        "thumbnail_width":320,"thumbnail_height":180}"#;
+        check_typed(
+            "video",
+            Some((7002, "http://cdn/7002.bin")),
+            None,
+            Some(1280),
+            Some(720),
+            video,
+            extra,
+        );
+
+        let content = State::build_attachment_wire_content(AttachmentWireInput {
+            file_type: "video",
+            file_id: 7001,
+            storage_source_id: 3,
+            file_size: 4096,
+            file_url: "http://cdn/7001.bin",
+            main_thumbnail_url: None,
+            thumbnail: Some((7002, "http://cdn/7002.bin")),
+            filename: "clip.mp4",
+            mime_type: "video/mp4",
+            // 🔴 extra 里的尺寸必须**覆盖**这里传进来的：视频的权威尺寸来自抽帧那步。
+            width: Some(1280),
+            height: Some(720),
+            message_type: video,
+            extra,
+        });
+        assert_eq!(content["duration"], serde_json::json!(42));
+        assert_eq!(content["width"], serde_json::json!(1920));
+        assert_eq!(content["height"], serde_json::json!(1080));
+        assert_eq!(content["thumbnail_width"], serde_json::json!(320));
+        assert_eq!(content["thumbnail_height"], serde_json::json!(180));
     }
 }
