@@ -838,6 +838,12 @@ pub struct UploadedFileInfo {
     pub mime_type: String,
 }
 
+/// 收到的附件，密文再留多久。
+///
+/// 转发基本都发生在收到之后不久，所以给一周就够；过期之后再转发退回照常上传，
+/// 功能不受影响，只是那次省不掉带宽。留太久的代价是每个附件在设备上占双份。
+const SEALED_CACHE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+
 /// 封装缓存的伴生元数据：密文本身在旁边那个文件里。
 ///
 /// CEK 落在本机托管目录，与明文同一信任域——它本来就是给这台设备重试用的。
@@ -11564,6 +11570,35 @@ impl State {
         content
     }
 
+    /// 这次发送该用哪份封装缓存。
+    ///
+    /// 来源是接手后的成品时，用**源目录**里那份——它是收附件时留下的原始密文。
+    /// 复用它，秒传预检就能命中，一个字节都不用传；重新封装则会产出另一串字节，
+    /// 按定义就是另一个物理文件。
+    ///
+    /// 缓存过期或从来没有（老消息、下载时没留）就退回本条消息自己的目录，照常封装
+    /// 上传——功能不受影响，只是这次省不掉。
+    fn sealed_cache_for_send(
+        content: &str,
+        user_root: &std::path::Path,
+        files_dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let own = files_dir.join("body.sealed");
+        let Some(source) = Self::managed_source_path(content, user_root) else {
+            return own;
+        };
+        let Some(dir) = source.parent() else {
+            return own;
+        };
+        let inherited = dir.join("body.sealed");
+        // 两个文件都在才算数：`seal_once` 把 metadata 当提交标记，缺一个就当没有。
+        if inherited.exists() && inherited.with_extension("sealed.json").exists() {
+            inherited
+        } else {
+            own
+        }
+    }
+
     /// 这份文件是不是**接手后的成品**（收到的附件、被转发的原件）。
     ///
     /// 托管附件落在 `{user_root}/files/{yyyymm}/{message_id}/`（见
@@ -12034,7 +12069,7 @@ impl State {
                 mime_type.clone(),
                 file_type.clone(),
                 upload_payload,
-                &files_dir.join("body.sealed"),
+                &Self::sealed_cache_for_send(&message.content, &user_root, &files_dir),
             )
             .await?;
         eprintln!("[SDK.actor] process_outbound_file: upload callback");
@@ -13918,6 +13953,20 @@ impl PrivchatSdk {
                     Command::RunBootstrapSync { resp } => {
                         if actor_logs_enabled() {
                             eprintln!("[SDK.actor] loop: cmd run_bootstrap_sync");
+                        }
+                        // 顺手清一次过期的封装缓存。挂在这里是因为它每次登录都会走到，
+                        // 而这件事既不紧急、也不能永远不做——密文和明文各留一份，
+                        // 不清就一直是双份磁盘。
+                        if let Ok(paths) = state.storage.get_storage_paths().await {
+                            let removed = crate::media_download::prune_sealed_caches(
+                                &paths.user_root,
+                                SEALED_CACHE_RETENTION,
+                            );
+                            if removed > 0 {
+                                eprintln!(
+                                    "[SDK.media] pruned {removed} expired sealed cache(s)"
+                                );
+                            }
                         }
                         // 显式路径：解除退避窗口，并且要知道这一轮到底跑没跑。
                         //
@@ -24040,6 +24089,63 @@ mod already_managed_source_tests {
     }
 
     /// 🔴 用户刚选的文件必须照常压缩——判错这一边，所有新发的视频都不压了。
+    /// 转发一份收到的附件：用**源目录**里那份密文，不是本条消息自己的空目录。
+    ///
+    /// 挑错了就等于重新封装——另一串字节、另一个物理文件，秒传预检必然不命中，
+    /// 而且没有任何报错，只是每次转发都白传一遍。
+    #[test]
+    fn sending_on_a_received_file_inherits_its_sealed_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "privchat-inherit-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_micros()
+        ));
+        let source_dir = root.join("files").join("202608").join("7");
+        let own_dir = root.join("files").join("202608").join("8");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::create_dir_all(&own_dir).expect("own dir");
+        let source_file = source_dir.join("payload.png");
+
+        // 缓存还没落下来时，退回自己的目录照常封装。
+        assert_eq!(
+            State::sealed_cache_for_send(
+                &source_file.display().to_string(),
+                &root,
+                &own_dir
+            ),
+            own_dir.join("body.sealed"),
+        );
+
+        // 只有 blob 没有标记，同样不算数（`seal_once` 要求两者都在）。
+        std::fs::write(source_dir.join("body.sealed"), b"blob").expect("blob");
+        assert_eq!(
+            State::sealed_cache_for_send(
+                &source_file.display().to_string(),
+                &root,
+                &own_dir
+            ),
+            own_dir.join("body.sealed"),
+            "缺提交标记的半份缓存不能拿来用"
+        );
+
+        // 两个都在 → 继承源目录那份。
+        std::fs::write(source_dir.join("body.sealed.json"), b"{}").expect("meta");
+        assert_eq!(
+            State::sealed_cache_for_send(
+                &source_file.display().to_string(),
+                &root,
+                &own_dir
+            ),
+            source_dir.join("body.sealed"),
+        );
+
+        // 相册新选的文件在托管目录之外，永远用自己的目录。
+        assert_eq!(
+            State::sealed_cache_for_send("/tmp/from-camera-roll.png", &root, &own_dir),
+            own_dir.join("body.sealed"),
+        );
+    }
+
     #[test]
     fn a_freshly_picked_file_is_not_managed() {
         let root = std::path::Path::new("/data/users/100001");

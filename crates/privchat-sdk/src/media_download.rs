@@ -712,6 +712,19 @@ async fn run_download(
             .await;
             return;
         }
+        // 🔴 密文留一份。转发这份附件时可以直接拿它去预检并秒传——重新加密会
+        // 产出另一串字节，那按定义就是另一个物理文件，白传一遍。
+        //
+        // 落成 `seal_once` 认得的那套格式（blob + 同名 .sealed.json），发送侧
+        // 因此不需要任何「这是转发」的判断：它读到有效缓存就复用，读不到就照常封装。
+        //
+        // 明文成品照常保留给播放器/预览。两份都在，磁盘是双倍——所以有保留窗口，
+        // 见 `prune_sealed_caches`。
+        if let Some(cek) = ticket.cek.as_deref() {
+            if let Some(dir) = final_path.parent() {
+                write_sealed_cache(dir, &blob, cek);
+            }
+        }
         let _ = fs::remove_file(&part_path);
     }
 
@@ -728,6 +741,86 @@ async fn run_download(
         MediaDownloadState::Done { path: path_str },
     )
     .await;
+}
+
+/// 清掉过期的封装缓存。
+///
+/// 明文成品和密文各留一份，磁盘就是双倍——视频尤其明显。转发通常发生在收到之后
+/// 不久，所以给密文一个保留窗口；过期删掉，之后再转发就退回照常上传，功能不受
+/// 影响，只是那次省不掉。
+///
+/// 扫的是 `{user_root}/files/{yyyymm}/{message_id}/`，只认 `body.sealed` 这一对
+/// 文件，不碰明文成品和缩略图。
+pub fn prune_sealed_caches(user_root: &std::path::Path, max_age: std::time::Duration) -> usize {
+    let root = user_root.join("files");
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    let Ok(months) = fs::read_dir(&root) else {
+        return 0;
+    };
+    for month in months.flatten() {
+        let Ok(messages) = fs::read_dir(month.path()) else {
+            continue;
+        };
+        for message in messages.flatten() {
+            let cache = message.path().join("body.sealed");
+            let Ok(meta) = fs::metadata(&cache) else {
+                continue;
+            };
+            // 用 mtime 而不是自建时间戳：少一份可能与事实不符的元数据。
+            let expired = meta
+                .modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age > max_age);
+            if expired {
+                let _ = fs::remove_file(&cache);
+                let _ = fs::remove_file(cache.with_extension("sealed.json"));
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// 把刚下载到的密文存成发送侧能直接复用的封装缓存。
+///
+/// 格式与 `State::seal_once` 写出来的完全一致：`body.sealed` +
+/// `body.sealed.json`（`{cek, sha256}`）。一致是刻意的——发送侧读缓存时会重算
+/// 摘要并解密验证 CEK，所以这里写坏了不会被误用，只会退回照常封装。
+///
+/// best-effort：写失败不影响下载本身，只是这次转发省不掉上传。
+fn write_sealed_cache(dir: &std::path::Path, blob: &[u8], cek: &str) {
+    use sha2::Digest as _;
+    let cache = dir.join("body.sealed");
+    let meta_path = cache.with_extension("sealed.json");
+
+    // 与 seal_once 同序：先撤旧标记，再写 blob，最后立标记。
+    let _ = fs::remove_file(&meta_path);
+    let tmp = cache.with_extension("sealed.tmp");
+    if fs::write(&tmp, blob)
+        .and_then(|_| fs::rename(&tmp, &cache))
+        .is_err()
+    {
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    hasher.update(blob);
+    let meta = serde_json::json!({
+        "cek": cek,
+        "sha256": hex::encode(hasher.finalize()),
+    });
+    let meta_tmp = meta_path.with_extension("tmp");
+    if fs::write(&meta_tmp, meta.to_string())
+        .and_then(|_| fs::rename(&meta_tmp, &meta_path))
+        .is_err()
+    {
+        // 标记没立起来 = 缓存不算数（读侧要求两者都在），把 blob 也清掉，
+        // 免得白占磁盘。
+        let _ = fs::remove_file(&meta_tmp);
+        let _ = fs::remove_file(&cache);
+    }
 }
 
 async fn emit(
@@ -859,5 +952,84 @@ mod tests {
             std::future::pending(),
         ));
         manager.cancel_all_scoped();
+    }
+}
+
+#[cfg(test)]
+mod sealed_cache_tests {
+    use super::*;
+
+    fn tmp_root() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-sealed-cache-{}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_micros(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("create root");
+        dir
+    }
+
+    fn message_dir(root: &std::path::Path) -> std::path::PathBuf {
+        let dir = root.join("files").join("202608").join("42");
+        fs::create_dir_all(&dir).expect("create message dir");
+        dir
+    }
+
+    /// 写出来的东西必须是发送侧认得的那一套：两个文件都在，摘要对得上真实字节。
+    #[test]
+    fn the_cache_it_writes_is_the_one_the_sender_reads() {
+        let root = tmp_root();
+        let dir = message_dir(&root);
+        let blob = b"nonce-and-ciphertext-and-tag".to_vec();
+
+        write_sealed_cache(&dir, &blob, "cek-under-test");
+
+        let cache = dir.join("body.sealed");
+        assert_eq!(fs::read(&cache).expect("blob"), blob);
+        let meta: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(cache.with_extension("sealed.json")).expect("meta"),
+        )
+        .expect("parse meta");
+        assert_eq!(meta["cek"], "cek-under-test");
+        // 摘要必须是**真实字节**的摘要——写错了发送侧会当成损坏缓存丢弃，
+        // 表现就是转发永远省不掉上传，而且没有任何报错。
+        use sha2::Digest as _;
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        hasher.update(&blob);
+        assert_eq!(meta["sha256"], hex::encode(hasher.finalize()));
+    }
+
+    /// 过期的清掉，没过期的留着；明文成品和缩略图一律不碰。
+    #[test]
+    fn pruning_only_removes_expired_sealed_caches() {
+        let root = tmp_root();
+        let fresh = root.join("files").join("202608").join("1");
+        let stale = root.join("files").join("202608").join("2");
+        for dir in [&fresh, &stale] {
+            fs::create_dir_all(dir).expect("create dir");
+            write_sealed_cache(dir, b"blob", "cek");
+            fs::write(dir.join("payload.png"), b"plaintext").expect("write plaintext");
+            fs::write(dir.join("thumb.webp"), b"thumb").expect("write thumb");
+        }
+        // 把过期那份的 mtime 推回去。
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        filetime::set_file_mtime(
+            stale.join("body.sealed"),
+            filetime::FileTime::from_system_time(old),
+        )
+        .expect("backdate");
+
+        let removed = prune_sealed_caches(&root, std::time::Duration::from_secs(7 * 86_400));
+
+        assert_eq!(removed, 1);
+        assert!(!stale.join("body.sealed").exists(), "过期的密文要清掉");
+        assert!(!stale.join("body.sealed.json").exists(), "标记也一起清");
+        assert!(fresh.join("body.sealed").exists(), "没过期的要留着");
+        for dir in [&fresh, &stale] {
+            assert!(dir.join("payload.png").exists(), "🔴 明文成品不能碰");
+            assert!(dir.join("thumb.webp").exists(), "🔴 缩略图不能碰");
+        }
     }
 }
