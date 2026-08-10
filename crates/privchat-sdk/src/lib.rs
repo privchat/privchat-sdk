@@ -838,6 +838,29 @@ pub struct UploadedFileInfo {
     pub mime_type: String,
 }
 
+/// [`State::build_attachment_wire_content`] 的输入。
+///
+/// 字段列全了不是啰嗦：少带一个，接收端就少一样渲染依据。宽高缺了气泡退化成正方形，
+/// filename 缺了文件消息没有名字，thumbnail 缺了图片消息直接被服务端拒。
+struct AttachmentWireInput<'a> {
+    file_type: &'a str,
+    file_id: u64,
+    storage_source_id: u32,
+    file_size: u64,
+    file_url: &'a str,
+    /// 主文件上传响应自带的缩略图 URL；只在**没有**独立缩略图 file 时作 legacy 兜底。
+    main_thumbnail_url: Option<&'a str>,
+    /// 独立缩略图：`(file_id, file_url)`。图片没有它时会回退成引用主文件。
+    thumbnail: Option<(u64, &'a str)>,
+    filename: &'a str,
+    mime_type: &'a str,
+    width: Option<u32>,
+    height: Option<u32>,
+    message_type: i32,
+    /// 本地行的 `extra`：Voice/Video 的时长等 typed metadata 从这里合并进来。
+    extra: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MediaMeta {
     source: MediaSourceMeta,
@@ -11397,6 +11420,67 @@ impl State {
         Ok(())
     }
 
+    /// 附件消息的 wire content —— **唯一**一处构造。
+    ///
+    /// 两条路径都走它：本地文件上传完之后，和复用一份服务端已有附件时。分成两份写
+    /// 的话，接收端能不能渲染就取决于发送方走了哪条路——而那种分叉只会在用户手里
+    /// 被发现。
+    fn build_attachment_wire_content(input: AttachmentWireInput<'_>) -> serde_json::Value {
+        // 图片消息协议必须带缩略图引用（server 校验拒绝缺失）。缩略图未产出时把
+        // 原图 file 引用为缩略图（接收端按缩略图链路下载原图渲染），与 TS SDK 一致；
+        // 视频/文件不强制。
+        let (thumbnail_file_id, thumbnail_url) = match input.thumbnail {
+            Some((id, url)) => (Some(id), url.to_string()),
+            None if input.file_type == "image" => {
+                (Some(input.file_id), input.file_url.to_string())
+            }
+            None => (None, String::new()),
+        };
+
+        let mut content = if let Some(thumb_file_id) = thumbnail_file_id {
+            // Scheme B：缩略图也是独立 file，接收端走 thumbnail_file_id -> file/get_url -> cek
+            // 统一下载解密。**CEK 永不进消息 metadata**。thumbnail_url 仅作 legacy 明文 fallback。
+            serde_json::json!({
+                "file_type": input.file_type,
+                "file_id": input.file_id,
+                "thumbnail_file_id": thumb_file_id,
+                "filename": input.filename,
+                "mime_type": input.mime_type,
+                "storage_source_id": input.storage_source_id,
+                "file_size": input.file_size,
+                "file_url": input.file_url,
+                "thumbnail_url": thumbnail_url,
+                // 原图尺寸（客户端加密前解码得到）。加密后服务端拿不到密文图片尺寸，
+                // 必须客户端带上，否则接收端 UI 没法按原比例渲染气泡（只能正方形兜底）。
+                "width": input.width.unwrap_or(0),
+                "height": input.height.unwrap_or(0),
+            })
+        } else {
+            serde_json::json!({
+                "file_type": input.file_type,
+                "file_id": input.file_id,
+                "filename": input.filename,
+                "mime_type": input.mime_type,
+                "storage_source_id": input.storage_source_id,
+                "file_size": input.file_size,
+                "file_url": input.file_url,
+                "thumbnail_url": input.main_thumbnail_url,
+                "width": input.width.unwrap_or(0),
+                "height": input.height.unwrap_or(0),
+            })
+        };
+
+        // 按消息类型独立合并 metadata：Voice 与 Video 的协议形态不同，不共用逻辑。
+        if input.message_type == (privchat_protocol::message::ContentMessageType::Voice as i32) {
+            Self::merge_voice_metadata(input.extra, &mut content);
+        } else if input.message_type
+            == (privchat_protocol::message::ContentMessageType::Video as i32)
+        {
+            Self::merge_video_metadata(input.extra, &mut content);
+        }
+        content
+    }
+
     async fn process_outbound_file(
         &mut self,
         message: &StoredMessage,
@@ -11820,62 +11904,29 @@ impl State {
             })
             .transpose()?;
 
-        // 图片消息协议必须带缩略图引用(server 校验拒绝缺失)。缩略图未产出时把
-        // 原图 file 引用为缩略图(接收端按缩略图链路下载原图渲染),与 TS SDK 一致;
-        // 视频/文件不强制。
-        let (thumbnail_file_id_u64, fallback_thumb_url) = match thumbnail_file_id_u64 {
-            Some(id) => (Some(id), None),
-            None if file_type == "image" => {
-                (Some(uploaded_file_id), Some(uploaded.file_url.clone()))
-            }
-            None => (None, None),
-        };
-
-        let mut attachment_content = if let Some(thumb_file_id) = thumbnail_file_id_u64 {
-            let thumbnail_url = uploaded_thumbnail
-                .as_ref()
-                .map(|v| v.file_url.clone())
-                .or(fallback_thumb_url)
-                .unwrap_or_default();
-            // Scheme B：缩略图也是独立 file，接收端走 thumbnail_file_id -> file/get_url -> cek
-            // 统一下载解密。**CEK 永不进消息 metadata**。thumbnail_url 仅作 legacy 明文 fallback。
-            serde_json::json!({
-                "file_type": file_type,
-                "file_id": uploaded_file_id,
-                "thumbnail_file_id": thumb_file_id,
-                "filename": upload_filename,
-                "mime_type": mime_type,
-                "storage_source_id": uploaded.storage_source_id,
-                "file_size": uploaded.file_size,
-                "file_url": uploaded.file_url,
-                "thumbnail_url": thumbnail_url,
-                // 原图尺寸（客户端加密前解码得到）。加密后服务端拿不到密文图片尺寸，
-                // 必须客户端带上，否则接收端 UI 没法按原比例渲染气泡（只能正方形兜底）。
-                "width": source_width.unwrap_or(0),
-                "height": source_height.unwrap_or(0),
-            })
-        } else {
-            serde_json::json!({
-                "file_type": file_type,
-                "file_id": uploaded_file_id,
-                "filename": upload_filename,
-                "mime_type": mime_type,
-                "storage_source_id": uploaded.storage_source_id,
-                "file_size": uploaded.file_size,
-                "file_url": uploaded.file_url,
-                "thumbnail_url": uploaded.thumbnail_url,
-                "width": source_width.unwrap_or(0),
-                "height": source_height.unwrap_or(0),
-            })
-        };
-
-        // 按消息类型独立合并 metadata：Voice 与 Video 的协议形态不同，不共用逻辑。
-        let msg_type = message.message_type;
-        if msg_type == (privchat_protocol::message::ContentMessageType::Voice as i32) {
-            Self::merge_voice_metadata(&message.extra, &mut attachment_content);
-        } else if msg_type == (privchat_protocol::message::ContentMessageType::Video as i32) {
-            Self::merge_video_metadata(&message.extra, &mut attachment_content);
-        }
+        let attachment_content = Self::build_attachment_wire_content(AttachmentWireInput {
+            file_type: &file_type,
+            file_id: uploaded_file_id,
+            storage_source_id: uploaded.storage_source_id,
+            file_size: uploaded.file_size,
+            file_url: &uploaded.file_url,
+            main_thumbnail_url: uploaded.thumbnail_url.as_deref(),
+            thumbnail: thumbnail_file_id_u64.map(|id| {
+                (
+                    id,
+                    uploaded_thumbnail
+                        .as_ref()
+                        .map(|v| v.file_url.as_str())
+                        .unwrap_or_default(),
+                )
+            }),
+            filename: &upload_filename,
+            mime_type: &mime_type,
+            width: source_width,
+            height: source_height,
+            message_type: message.message_type,
+            extra: &message.extra,
+        });
         let content = serde_json::to_string(&attachment_content)
             .map_err(|e| Error::Serialization(format!("encode attachment content: {e}")))?;
         let req = self.build_send_message_request_with_content(
@@ -23711,5 +23762,120 @@ mod file_type_from_mime_tests {
         // 空/畸形 mime 不许 panic，也不许悄悄升级成媒体类型。
         assert_eq!(file_type_from_mime(""), "file");
         assert_eq!(file_type_from_mime("image"), "image");
+    }
+}
+
+/// 重构等价性：`build_attachment_wire_content` 的输出必须和抽取**之前**逐字段相同。
+///
+/// 预言机是从 `7bacee7` 里**原样抄下来**的旧表达式，不是照着新代码重新推的——
+/// 重新推一遍只会把同一个错误写两次，然后两边一起绿。
+#[cfg(test)]
+mod attachment_wire_equivalence_tests {
+    use super::*;
+
+    /// 抽取前的原始构造（privchat-sdk 7bacee7，`process_outbound_file` 内联段）。
+    fn legacy_wire_content(
+        file_type: &str,
+        uploaded_file_id: u64,
+        storage_source_id: u32,
+        file_size: u64,
+        file_url: &str,
+        uploaded_thumbnail_url: Option<&str>,
+        thumbnail: Option<(u64, &str)>,
+        upload_filename: &str,
+        mime_type: &str,
+        source_width: Option<u32>,
+        source_height: Option<u32>,
+    ) -> serde_json::Value {
+        let thumbnail_file_id_u64 = thumbnail.map(|(id, _)| id);
+        let (thumbnail_file_id_u64, fallback_thumb_url) = match thumbnail_file_id_u64 {
+            Some(id) => (Some(id), None),
+            None if file_type == "image" => (Some(uploaded_file_id), Some(file_url.to_string())),
+            None => (None, None),
+        };
+        if let Some(thumb_file_id) = thumbnail_file_id_u64 {
+            let thumbnail_url = thumbnail
+                .map(|(_, url)| url.to_string())
+                .or(fallback_thumb_url)
+                .unwrap_or_default();
+            serde_json::json!({
+                "file_type": file_type,
+                "file_id": uploaded_file_id,
+                "thumbnail_file_id": thumb_file_id,
+                "filename": upload_filename,
+                "mime_type": mime_type,
+                "storage_source_id": storage_source_id,
+                "file_size": file_size,
+                "file_url": file_url,
+                "thumbnail_url": thumbnail_url,
+                "width": source_width.unwrap_or(0),
+                "height": source_height.unwrap_or(0),
+            })
+        } else {
+            serde_json::json!({
+                "file_type": file_type,
+                "file_id": uploaded_file_id,
+                "filename": upload_filename,
+                "mime_type": mime_type,
+                "storage_source_id": storage_source_id,
+                "file_size": file_size,
+                "file_url": file_url,
+                "thumbnail_url": uploaded_thumbnail_url,
+                "width": source_width.unwrap_or(0),
+                "height": source_height.unwrap_or(0),
+            })
+        }
+    }
+
+    fn check(
+        file_type: &str,
+        thumbnail: Option<(u64, &str)>,
+        uploaded_thumbnail_url: Option<&str>,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) {
+        let expected = legacy_wire_content(
+            file_type,
+            7001,
+            3,
+            4096,
+            "http://cdn/7001.bin",
+            uploaded_thumbnail_url,
+            thumbnail,
+            "photo.png",
+            "image/png",
+            width,
+            height,
+        );
+        // message_type 取 Image：Voice/Video 的合并分支读的是本地 `extra`，
+        // 与本次抽取无关，单独覆盖。
+        let actual = State::build_attachment_wire_content(AttachmentWireInput {
+            file_type,
+            file_id: 7001,
+            storage_source_id: 3,
+            file_size: 4096,
+            file_url: "http://cdn/7001.bin",
+            main_thumbnail_url: uploaded_thumbnail_url,
+            thumbnail,
+            filename: "photo.png",
+            mime_type: "image/png",
+            width,
+            height,
+            message_type: privchat_protocol::message::ContentMessageType::Image as i32,
+            extra: "",
+        });
+        assert_eq!(actual, expected, "file_type={file_type} thumbnail={thumbnail:?}");
+    }
+
+    #[test]
+    fn matches_the_pre_extraction_output() {
+        // 有独立缩略图
+        check("image", Some((7002, "http://cdn/7002.bin")), None, Some(96), Some(64));
+        // 图片缺缩略图 → 必须回退引用主文件，否则服务端拒收
+        check("image", None, None, Some(96), Some(64));
+        // 视频/文件不强制缩略图，走无 thumbnail 分支
+        check("video", None, Some("http://cdn/legacy-thumb"), Some(1280), Some(720));
+        check("file", None, None, None, None);
+        check("voice", None, None, None, None);
     }
 }
