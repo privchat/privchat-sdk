@@ -2230,6 +2230,157 @@ impl LocalStore {
         Ok((channel_id, channel_type))
     }
 
+    /// 复用已有附件：**先**把消息行和可恢复的任务一起落库，之后才去做网络 claim。
+    ///
+    /// 顺序不能反。claim 是网络调用，本地事务包不住它；先 claim 再落库的话，
+    /// 崩在中间就是「服务端多了一条文件记录，本机没有任何东西知道它存在」——
+    /// 那条记录再也不会被任何消息引用，也没人会去清。
+    ///
+    /// 反过来先落库、崩在 claim 之前，重跑一次 claim 即可：服务端按
+    /// `claim_key_hash`（= SHA256(token)）幂等，重跑不会多出记录——**前提是
+    /// 重跑用的是同一张 token**，所以 token 一拿到就得进 `payload` 落库。
+    pub fn create_reuse_attachment_task(
+        &self,
+        uid: &str,
+        message_id: u64,
+        payload: &[u8],
+        route_key: &str,
+    ) -> Result<(u64, i32)> {
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("reuse task begin tx: {e}")))?;
+
+        let (channel_id, channel_type, snowflake): (u64, i32, i64) = tx
+            .query_row(
+                "SELECT channel_id, channel_type, local_message_id
+                 FROM message WHERE id = ?1",
+                params![message_id as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Storage(format!("reuse task lookup message: {e}")))?;
+        if snowflake <= 0 {
+            return Err(Error::MissingLocalMessageId { message_id });
+        }
+
+        tx.execute(
+            "UPDATE message SET status = 1, updated_at = ?2 WHERE id = ?1",
+            params![message_id as i64, now_ms],
+        )
+        .map_err(|e| Error::Storage(format!("reuse task mark sending: {e}")))?;
+
+        tx.execute(
+            "INSERT INTO outbox
+                 (command_id, command_type, message_id, channel_id, payload, route_key,
+                  status, retry_count, next_attempt_at, created_at, updated_at)
+             VALUES (?1, 'attachment_reuse', ?2, ?3, ?4, ?5, 'pending', 0, 0, ?6, ?6)
+             ON CONFLICT(command_id) DO UPDATE SET
+                 payload = excluded.payload,
+                 route_key = excluded.route_key,
+                 status = 'pending',
+                 next_attempt_at = 0,
+                 updated_at = excluded.updated_at",
+            params![
+                format!("msg:{snowflake}"),
+                message_id as i64,
+                channel_id as i64,
+                payload,
+                route_key,
+                now_ms
+            ],
+        )
+        .map_err(|e| Error::Storage(format!("reuse task insert command: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("reuse task commit: {e}")))?;
+        Ok((channel_id, channel_type))
+    }
+
+    /// 推进复用任务的状态：把新拿到的 token / sha256 / claimed_file_id 写回 `payload`。
+    ///
+    /// 每次网络往返之后**立刻**落一次。token 不落库就等于没有幂等：崩溃后重新
+    /// prepare 会拿到另一张 token，`claim_key_hash` 认不出来，于是又多一条文件记录。
+    ///
+    /// 带 `command_type` 条件是防止覆盖一个已经推进到普通发送的行——那一步之后
+    /// payload 是 wire 消息体，不再是状态机。
+    pub fn update_reuse_attachment_task(
+        &self,
+        uid: &str,
+        message_id: u64,
+        payload: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let changed = conn
+            .execute(
+                "UPDATE outbox
+                    SET payload = ?2, updated_at = ?3
+                  WHERE message_id = ?1 AND command_type = 'attachment_reuse'",
+                params![message_id as i64, payload, now_ms],
+            )
+            .map_err(|e| Error::Storage(format!("reuse task update payload: {e}")))?;
+        if changed == 0 {
+            return Err(Error::Storage(format!(
+                "reuse task for message {message_id} is gone or already converted"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 所有附件都 claim 完之后：写定最终 wire content，并把任务切换成**普通消息发送**。
+    ///
+    /// 一个事务里做完。分两步的话，中间崩一次就会留下「content 已是最终形态、
+    /// 但任务还挂在 reuse 状态机上」，下一轮又会把整套 claim 重跑一遍。
+    ///
+    /// 切过去之后就没有任何「转发」痕迹了——剩下的就是一条普通附件消息。
+    pub fn convert_reuse_task_to_send(
+        &self,
+        uid: &str,
+        message_id: u64,
+        content: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("reuse convert begin tx: {e}")))?;
+
+        tx.execute(
+            "UPDATE message
+                SET content = ?1, media_downloaded = 1, status = 1, updated_at = ?2
+              WHERE id = ?3",
+            params![content, now_ms, message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("reuse convert update message: {e}")))?;
+
+        let changed = tx
+            .execute(
+                "UPDATE outbox
+                    SET command_type = 'message', payload = ?2,
+                        status = 'pending', next_attempt_at = 0, updated_at = ?3
+                  WHERE message_id = ?1 AND command_type = 'attachment_reuse'",
+                params![message_id as i64, payload, now_ms],
+            )
+            .map_err(|e| Error::Storage(format!("reuse convert flip command: {e}")))?;
+        if changed == 0 {
+            return Err(Error::Storage(format!(
+                "reuse task for message {message_id} is gone or already converted"
+            )));
+        }
+
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("reuse convert commit: {e}")))?;
+        Ok(())
+    }
+
     pub fn max_message_pts(&self, uid: &str, channel_id: u64, channel_type: i32) -> Result<u64> {
         let conn = self.conn_for_user(uid)?;
         conn.query_row(
@@ -5952,6 +6103,120 @@ mod tests {
             .outbox_enqueue(uid, id, "message", 100, b"payload", None)
             .expect("enqueue");
         id
+    }
+
+    fn seed_reuse_message(store: &LocalStore, uid: &str, snowflake: u64) -> u64 {
+        let input = NewMessage {
+            channel_id: 900,
+            channel_type: 1,
+            from_uid: 200,
+            // Image：转发一张图之后它还是一条普通图片消息，没有转发消息类型。
+            message_type: 3,
+            content: String::new(),
+            searchable_word: String::new(),
+            setting: 0,
+            extra: "{}".to_string(),
+            mime_type: Some("image/png".to_string()),
+            media_downloaded: true,
+            thumb_status: 0,
+        };
+        store
+            .create_local_message(uid, &input, snowflake)
+            .expect("create local message")
+    }
+
+    fn read_outbox(store: &LocalStore, uid: &str, message_id: u64) -> (String, Vec<u8>) {
+        let conn = store.conn_for_user(uid).expect("conn");
+        conn.query_row(
+            "SELECT command_type, payload FROM outbox WHERE message_id = ?1",
+            params![message_id as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .expect("outbox row")
+    }
+
+    /// 复用附件的任务必须在**任何网络调用之前**就落库，而且崩溃后重跑要拿回
+    /// 同一张 token。
+    ///
+    /// token 是服务端幂等键的原像（`claim_key_hash = SHA256(token)`）。不落库的话，
+    /// 崩溃后重新 prepare 会得到另一张 token，服务端认不出这是同一次重试，于是
+    /// 又建一条文件记录——用户看不见，但它永远不会被任何消息引用，也没人会清。
+    #[test]
+    fn a_reuse_task_survives_a_crash_with_the_same_token() {
+        let store = test_store();
+        let uid = "100000900";
+        let message_id = seed_reuse_message(&store, uid, 555_001);
+
+        store
+            .create_reuse_attachment_task(uid, message_id, br#"{"v":1,"stage":"needs_prepare"}"#, "image")
+            .expect("create reuse task");
+
+        // prepare 拿到 token 之后立刻落库——这一步就是幂等的全部保障。
+        let with_token = br#"{"v":1,"stage":"claim_pending","token":"tok-abc","sha256":"deadbeef"}"#;
+        store
+            .update_reuse_attachment_task(uid, message_id, with_token)
+            .expect("persist token");
+
+        // 模拟进程重启：重开同一个库。
+        let reopened = LocalStore::open_at(store.base_dir().to_path_buf()).expect("reopen");
+        let (command_type, payload) = read_outbox(&reopened, uid, message_id);
+        assert_eq!(command_type, "attachment_reuse");
+        assert_eq!(
+            payload, with_token,
+            "🔴 重启后必须还能读到同一张 token；读不到就等于重新 prepare，服务端会多建一条记录"
+        );
+    }
+
+    /// claim 完成后切换成普通发送：content 与队列命令必须同一事务落定。
+    ///
+    /// 分两步的话，中间崩一次会留下「content 已是最终形态、任务还挂在 reuse 上」，
+    /// 下一轮把整套 claim 又跑一遍。
+    #[test]
+    fn converting_a_finished_reuse_task_writes_content_and_command_together() {
+        let store = test_store();
+        let uid = "100000901";
+        let message_id = seed_reuse_message(&store, uid, 555_002);
+        store
+            .create_reuse_attachment_task(uid, message_id, br#"{"v":1}"#, "image")
+            .expect("create reuse task");
+
+        let content = r#"{"file_type":"image","file_id":4242,"thumbnail_file_id":4243}"#;
+        store
+            .convert_reuse_task_to_send(uid, message_id, content, b"wire-payload")
+            .expect("convert");
+
+        let (command_type, payload) = read_outbox(&store, uid, message_id);
+        assert_eq!(command_type, "message", "🔴 切过去之后就是一条普通消息发送");
+        assert_eq!(payload, b"wire-payload");
+
+        let stored = store
+            .get_message_by_id(uid, message_id)
+            .expect("read message")
+            .expect("message exists");
+        assert_eq!(stored.content, content);
+    }
+
+    /// 已经切成普通发送的行，不能再被状态机改回去。
+    ///
+    /// 转换之后 payload 是 wire 消息体，不再是状态机。一个迟到的状态更新写进去，
+    /// 发出去的就是一段状态机 JSON。
+    #[test]
+    fn a_converted_task_rejects_further_state_updates() {
+        let store = test_store();
+        let uid = "100000902";
+        let message_id = seed_reuse_message(&store, uid, 555_003);
+        store
+            .create_reuse_attachment_task(uid, message_id, br#"{"v":1}"#, "image")
+            .expect("create reuse task");
+        store
+            .convert_reuse_task_to_send(uid, message_id, "{}", b"wire-payload")
+            .expect("convert");
+
+        let err = store.update_reuse_attachment_task(uid, message_id, br#"{"v":1,"stage":"late"}"#);
+        assert!(err.is_err(), "🔴 迟到的状态更新必须被拒，否则会覆盖掉 wire 消息体");
+
+        let (_, payload) = read_outbox(&store, uid, message_id);
+        assert_eq!(payload, b"wire-payload", "wire 消息体必须原封不动");
     }
 
     /// 从旧版本升级：sled 队列里还没发出的命令必须被搬进 outbox。
