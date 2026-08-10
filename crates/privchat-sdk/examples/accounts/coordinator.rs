@@ -120,6 +120,8 @@ impl TestCoordinator {
             .await;
         self.run_phase("phase43_outbox_survives_restart", TestPhases::phase43_outbox_survives_restart(manager).await)
             .await;
+        self.run_phase("phase44_reuse_existing_attachment_e2e", TestPhases::phase44_reuse_existing_attachment_e2e(manager).await)
+            .await;
         Ok(())
     }
 

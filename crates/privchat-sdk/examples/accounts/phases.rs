@@ -5117,6 +5117,382 @@ impl TestPhases {
     ///    被发了两次」。把一条已发成功的消息按原 `command_id` 重新入队再 drain，
     ///    要求服务端返回**同一个 server_message_id**、对端仍然只有一条。做不到的
     ///    话，每次崩在 ack 前，用户就会多收到一条重复消息。
+    /// 等一条本地消息真的发出去（status=2 且拿到 server_message_id）。
+    ///
+    /// status=3 是失败，立刻返回而不是等满——把服务端/上传的错误尽早暴露出来。
+    async fn await_sent(
+        manager: &MultiAccountManager,
+        who: &str,
+        channel_id: u64,
+        channel_type: i32,
+        message_id: u64,
+        timeout_secs: u64,
+    ) -> BoxResult<Option<privchat_sdk::StoredMessage>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            let rows = manager
+                .list_local_messages(who, channel_id, channel_type, 200)
+                .await?;
+            if let Some(row) = rows.iter().find(|m| m.message_id == message_id) {
+                if row.status == 2 && row.server_message_id.is_some_and(|id| id != 0) {
+                    return Ok(Some(row.clone()));
+                }
+                if row.status == 3 {
+                    return Ok(None);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    /// 等对端收到同一条 server_message_id。收到两条同 id 的算错。
+    async fn await_received(
+        manager: &MultiAccountManager,
+        who: &str,
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+        timeout_secs: u64,
+    ) -> BoxResult<Option<privchat_sdk::StoredMessage>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            manager.refresh_local_views(who).await?;
+            let rows = manager
+                .list_local_messages(who, channel_id, channel_type, 200)
+                .await?;
+            let hits: Vec<_> = rows
+                .iter()
+                .filter(|m| m.server_message_id == Some(server_message_id))
+                .collect();
+            if hits.len() > 1 {
+                return Err(boxed_err(&format!(
+                    "{who} 收到 {} 份 server_message_id={server_message_id}",
+                    hits.len()
+                )));
+            }
+            if let Some(row) = hits.first() {
+                return Ok(Some((*row).clone()));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    async fn file_url(
+        manager: &MultiAccountManager,
+        who: &str,
+        file_id: u64,
+    ) -> BoxResult<String> {
+        if file_id == 0 {
+            return Ok(String::new());
+        }
+        let detail: FileGetUrlResponse = manager
+            .rpc_typed(
+                who,
+                privchat_protocol::rpc::routes::file::GET_URL,
+                &FileGetUrlRequest { file_id, user_id: 0 },
+            )
+            .await?;
+        Ok(detail.file_url)
+    }
+
+    /// 复用一份服务端已有的附件，发一条**普通**图片消息给第三个人。
+    ///
+    /// 这就是产品里的「转发一张图」——没有转发协议，也没有转发消息类型。链路：
+    ///
+    /// ```text
+    /// alice --真图片--> bob        （普通附件上传）
+    /// bob  拿 file_id 走同一条附件队列 --普通 Image--> charlie
+    /// ```
+    ///
+    /// 关键断言是「这一步服务端一次上传请求都没收到」。它必须由**服务端自己的
+    /// 日志**来数，不能靠客户端走了哪个分支去推断——推断只能证明代码按预期跑，
+    /// 证明不了字节没上去。
+    pub async fn phase44_reuse_existing_attachment_e2e(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        // 服务端日志：每收到一次 /files/upload 就记一行 token 校验。
+        let log_path = match std::env::var("PRIVCHAT_SERVER_LOG") {
+            Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v),
+            _ => {
+                // 不 skip：跳过会被记成通过，而这条相位的全部价值就在那个计数上。
+                metrics.errors.push(
+                    "PRIVCHAT_SERVER_LOG 未设置：上传次数只能由服务端日志证明，不能靠客户端推断"
+                        .to_string(),
+                );
+                return Ok(PhaseResult {
+                    phase_name: "reuse-existing-attachment-e2e".to_string(),
+                    success: false,
+                    duration: start.elapsed(),
+                    details: "missing PRIVCHAT_SERVER_LOG".to_string(),
+                    metrics,
+                });
+            }
+        };
+        let uploads_seen = |path: &std::path::Path| -> usize {
+            std::fs::read_to_string(path)
+                .map(|body| body.matches("验证上传 token").count())
+                .unwrap_or(0)
+        };
+
+        let ab = manager
+            .cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("phase44 needs the alice<->bob direct channel"))?;
+        let bc = manager
+            .cached_direct_channel("bob", "charlie")
+            .ok_or_else(|| boxed_err("phase44 needs the bob<->charlie direct channel"))?;
+        let channel_type = DIRECT_SYNC_CHANNEL_TYPE as i32;
+        let image_type = privchat_protocol::message::ContentMessageType::Image as i32;
+
+        // ---------------- alice 发一张真图片给 bob ----------------
+        let source_path = manager.base_dir.join("phase44-source.png");
+        let img = image::RgbImage::from_fn(120, 80, |x, y| {
+            image::Rgb([(x * 2) as u8, 90, (y * 3) as u8])
+        });
+        image::DynamicImage::ImageRgb8(img).save(&source_path)?;
+
+        let alice_uid = manager.user_id("alice")?;
+        let alice = manager.sdk("alice")?;
+        let sent_id = alice
+            .create_local_attachment_placeholder(
+                privchat_sdk::NewMessage {
+                    channel_id: ab,
+                    channel_type,
+                    from_uid: alice_uid,
+                    message_type: image_type,
+                    content: source_path.display().to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: String::new(),
+                    mime_type: Some("image/png".to_string()),
+                    media_downloaded: true,
+                    thumb_status: 0,
+                },
+                None,
+            )
+            .await?;
+        alice
+            .finalize_attachment_and_enqueue(
+                sent_id,
+                source_path.display().to_string(),
+                0,
+                "image".to_string(),
+                Vec::new(),
+            )
+            .await?;
+        metrics.rpc_calls += 2;
+
+        let Some(alice_row) =
+            Self::await_sent(manager, "alice", ab, channel_type, sent_id, 40).await?
+        else {
+            metrics
+                .errors
+                .push(format!("alice 的图片消息 {sent_id} 没能发出去"));
+            return Ok(PhaseResult {
+                phase_name: "reuse-existing-attachment-e2e".to_string(),
+                success: false,
+                duration: start.elapsed(),
+                details: String::new(),
+                metrics,
+            });
+        };
+        let alice_server_id = alice_row.server_message_id.unwrap_or(0);
+
+        // ---------------- bob 收到，并且真的下得下来 ----------------
+        let Some(bob_row) =
+            Self::await_received(manager, "bob", ab, channel_type, alice_server_id, 15).await?
+        else {
+            metrics
+                .errors
+                .push(format!("bob 没收到 server_message_id={alice_server_id}"));
+            return Ok(PhaseResult {
+                phase_name: "reuse-existing-attachment-e2e".to_string(),
+                success: false,
+                duration: start.elapsed(),
+                details: String::new(),
+                metrics,
+            });
+        };
+        let meta = serde_json::from_str::<serde_json::Value>(&bob_row.extra)
+            .ok()
+            .and_then(|env| env.get("metadata").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let source_file_id = meta.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let source_thumb_id = meta
+            .get("thumbnail_file_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if source_file_id == 0 {
+            metrics.errors.push("bob 收到的图片没有 file_id".to_string());
+        }
+        let alice_url = Self::file_url(manager, "bob", source_file_id).await?;
+
+        // ---------------- bob 复用它发给 charlie ----------------
+        let uploads_before = uploads_seen(&log_path);
+        let bob_uid = manager.user_id("bob")?;
+        let bob = manager.sdk("bob")?;
+        // 尺寸从**源消息的 metadata** 里取——服务端存不了它（附件是加密上传的，
+        // 它解不出密文里的图片尺寸）。App 转发时手上正好有这份 metadata。
+        let reuse_extra = serde_json::json!({
+            "reuse_attachment": {
+                "file_id": source_file_id,
+                "thumbnail_file_id": source_thumb_id,
+                "width": meta.get("width").and_then(|v| v.as_u64()).unwrap_or(0),
+                "height": meta.get("height").and_then(|v| v.as_u64()).unwrap_or(0),
+            }
+        })
+        .to_string();
+        let forwarded_id = bob
+            .create_local_message_queued(
+                privchat_sdk::NewMessage {
+                    channel_id: bc,
+                    channel_type,
+                    from_uid: bob_uid,
+                    // 🔴 普通 Image：转发之后它还是一条普通图片消息。
+                    message_type: image_type,
+                    content: "photo.png".to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: reuse_extra,
+                    mime_type: Some("image/png".to_string()),
+                    // 本机没有这份文件的字节。
+                    media_downloaded: false,
+                    thumb_status: 0,
+                },
+                None,
+                "attachment",
+                Vec::new(),
+                Some("image".to_string()),
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+
+        let Some(forwarded_row) =
+            Self::await_sent(manager, "bob", bc, channel_type, forwarded_id, 40).await?
+        else {
+            metrics
+                .errors
+                .push(format!("bob 复用发送的消息 {forwarded_id} 没能发出去"));
+            return Ok(PhaseResult {
+                phase_name: "reuse-existing-attachment-e2e".to_string(),
+                success: false,
+                duration: start.elapsed(),
+                details: String::new(),
+                metrics,
+            });
+        };
+
+        // 🔴 整段复用过程，服务端不该收到任何一次上传请求。
+        let uploads_after = uploads_seen(&log_path);
+        if uploads_after != uploads_before {
+            metrics.errors.push(format!(
+                "复用不该产生上传：服务端多收到 {} 次 /files/upload",
+                uploads_after - uploads_before
+            ));
+        }
+
+        // ---------------- 断言这是一条普通消息、且拿到的是自己的记录 ----------------
+        let wire = serde_json::from_str::<serde_json::Value>(&forwarded_row.content)
+            .unwrap_or(serde_json::Value::Null);
+        for forbidden in ["forward", "forwarded_from", "source_message_id", "origin"] {
+            if wire.get(forbidden).is_some() {
+                metrics
+                    .errors
+                    .push(format!("普通图片消息里不该出现 `{forbidden}` 字段"));
+            }
+        }
+        if forwarded_row.message_type != image_type {
+            metrics.errors.push(format!(
+                "消息类型必须还是 Image，实际 {}",
+                forwarded_row.message_type
+            ));
+        }
+        let new_file_id = wire.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        if new_file_id == source_file_id {
+            metrics
+                .errors
+                .push("bob 必须拿到**自己的** file_id，而不是 alice 那条".to_string());
+        }
+        let new_url = Self::file_url(manager, "bob", new_file_id).await?;
+        if new_url != alice_url {
+            metrics.errors.push(format!(
+                "两条记录必须指向同一个物理文件：{new_url} vs {alice_url}"
+            ));
+        }
+
+        // ---------------- charlie 收到并能下载 ----------------
+        let forwarded_server_id = forwarded_row.server_message_id.unwrap_or(0);
+        let Some(charlie_row) =
+            Self::await_received(manager, "charlie", bc, channel_type, forwarded_server_id, 15)
+                .await?
+        else {
+            metrics
+                .errors
+                .push(format!("charlie 没收到 {forwarded_server_id}"));
+            return Ok(PhaseResult {
+                phase_name: "reuse-existing-attachment-e2e".to_string(),
+                success: false,
+                duration: start.elapsed(),
+                details: String::new(),
+                metrics,
+            });
+        };
+        let charlie_meta = serde_json::from_str::<serde_json::Value>(&charlie_row.extra)
+            .ok()
+            .and_then(|env| env.get("metadata").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        for (key, want) in [("width", 120u64), ("height", 80u64)] {
+            let got = charlie_meta.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+            if got != want {
+                metrics
+                    .errors
+                    .push(format!("charlie 侧 {key}={got}，源图是 {want}"));
+            }
+        }
+        for key in ["file_id", "thumbnail_file_id"] {
+            let id = charlie_meta.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+            if id == 0 {
+                metrics.errors.push(format!("charlie 侧缺 {key}"));
+                continue;
+            }
+            let url = Self::file_url(manager, "charlie", id).await?;
+            let body = reqwest::Client::new().get(&url).send().await?;
+            if !body.status().is_success() || body.bytes().await?.is_empty() {
+                metrics
+                    .errors
+                    .push(format!("charlie 下载 {key}={id} 失败"));
+            } else {
+                metrics.rpc_successes += 1;
+            }
+        }
+
+        // 「alice 删掉自己那条记录之后，bob 的仍然可用」这条属性不在这里验：
+        // 它是服务端存储层的事（删除时要看还有没有别人指着同一个 path），已经由
+        // `message_repo::atomic_dispatch_tests::a_referenced_file_cannot_be_deleted_by_its_uploader`
+        // 和 `tests/file_dedup_db_test.rs` 直接测在数据库上。而且 `file/delete`
+        // 根本没有 RPC 路由，从客户端也驱动不了——硬凑只会得到一条假测试。
+
+        let success = metrics.errors.is_empty();
+        Ok(PhaseResult {
+            phase_name: "reuse-existing-attachment-e2e".to_string(),
+            success,
+            duration: start.elapsed(),
+            details: format!(
+                "source_file_id={source_file_id} new_file_id={new_file_id} uploads_delta={}",
+                uploads_after - uploads_before
+            ),
+            metrics,
+        })
+    }
+
     pub async fn phase43_outbox_survives_restart(
         manager: &mut MultiAccountManager,
     ) -> BoxResult<PhaseResult> {

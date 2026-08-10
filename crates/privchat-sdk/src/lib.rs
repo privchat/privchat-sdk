@@ -846,6 +846,13 @@ struct ExistingAttachmentSource {
     file_id: u64,
     /// 与 `file_id` 相同时视为没有独立缩略图（同一份内容只 claim 一次）。
     thumbnail_file_id: Option<u64>,
+    /// 🔴 原图尺寸必须由描述符带过来，`file/get_url` 给不了。
+    ///
+    /// 服务端存的是 `width: None`——附件是加密上传的，它解不出密文里的图片尺寸。
+    /// 尺寸只存在于**源消息的 metadata** 里，而那正是复用方手上有的东西。
+    /// 不带的话接收端拿到 0×0，气泡只能按正方形兜底渲染。
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 /// 封装缓存的伴生元数据：密文本身在旁边那个文件里。
@@ -11586,6 +11593,12 @@ impl State {
         let envelope = serde_json::from_str::<serde_json::Value>(extra).ok()?;
         let node = envelope.get("reuse_attachment")?;
         let file_id = node.get("file_id").and_then(|v| v.as_u64())?;
+        let dimension = |key: &str| {
+            node.get(key)
+                .and_then(|v| v.as_u64())
+                .filter(|v| *v > 0)
+                .map(|v| v.min(u32::MAX as u64) as u32)
+        };
         Some(ExistingAttachmentSource {
             file_id,
             thumbnail_file_id: node
@@ -11594,6 +11607,8 @@ impl State {
                 // 同一个 file_id 只 claim 一次：原图和缩略图指向同一份内容时，
                 // 两次 claim 会给同一个用户开出两条记录。
                 .filter(|id| *id != file_id),
+            width: dimension("width"),
+            height: dimension("height"),
         })
     }
 
@@ -11767,8 +11782,9 @@ impl State {
                 }),
                 filename: &message.content,
                 mime_type: &main.mime_type,
-                width: main.width,
-                height: main.height,
+                // 尺寸取描述符带来的那份；claim 响应里没有（服务端根本没存）。
+                width: source.width.or(main.width),
+                height: source.height.or(main.height),
                 message_type: message.message_type,
                 extra: &message.extra,
             },
@@ -24080,6 +24096,28 @@ mod existing_attachment_source_tests {
             source.thumbnail_file_id, None,
             "同一个 file_id 不该被当成独立缩略图再 claim 一次"
         );
+    }
+
+    /// 🔴 尺寸必须由描述符带过来。
+    ///
+    /// 服务端存的是 `width: None`——附件加密上传，它解不出密文里的尺寸。丢了这两个
+    /// 数，接收端拿到 0×0，气泡退化成正方形。
+    #[test]
+    fn an_existing_source_carries_the_source_dimensions() {
+        let source = State::parse_existing_attachment(
+            r#"{"reuse_attachment":{"file_id":1,"width":120,"height":80}}"#,
+        )
+        .expect("recognised");
+        assert_eq!(source.width, Some(120));
+        assert_eq!(source.height, Some(80));
+
+        // 0 当成「没有」，别把它当真尺寸传下去。
+        let zeroed = State::parse_existing_attachment(
+            r#"{"reuse_attachment":{"file_id":1,"width":0,"height":0}}"#,
+        )
+        .expect("recognised");
+        assert_eq!(zeroed.width, None);
+        assert_eq!(zeroed.height, None);
     }
 
     #[test]
