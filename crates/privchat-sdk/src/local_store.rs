@@ -5158,7 +5158,9 @@ impl LocalStore {
         }
     }
 
-    fn derive_encryption_key(uid: &str) -> String {
+    /// 仅 crate 内可见：测试要用外部连接打开这个加密库（例如装一个
+    /// 故意让事务失败的 trigger）。派生规则本身不变。
+    pub(crate) fn derive_encryption_key(uid: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"privchat_sdk_encryption_key_v1");
         hasher.update(uid.as_bytes());

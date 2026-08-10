@@ -7326,7 +7326,11 @@ impl State {
     /// 只在**本地确认已提交**（或这条消息已经终态失败）之后调用。早一步都不行：
     /// 缓存没了，下一次重试就会重新随机加密，在服务端留下第二份物理文件。
     async fn drop_attachment_sealed_caches(&self, msg: &StoredMessage) {
-        let Ok(paths) = self.storage.get_storage_paths().await else {
+        Self::drop_attachment_sealed_caches_at(&self.storage, msg).await;
+    }
+
+    async fn drop_attachment_sealed_caches_at(storage: &StorageHandle, msg: &StoredMessage) {
+        let Ok(paths) = storage.get_storage_paths().await else {
             return;
         };
         let dir = media_store::get_message_dir(
@@ -7336,6 +7340,26 @@ impl State {
         );
         Self::drop_sealed_cache(&dir.join("body.sealed"));
         Self::drop_sealed_cache(&dir.join("thumb.sealed"));
+    }
+
+    /// 确认本地已提交，**然后**才释放封装缓存。
+    ///
+    /// 这两步的先后就是这个函数存在的全部理由：`outbox_ack_sent` 是一个事务，
+    /// 它失败的话 outbox 行还在、下一轮要重试，而重试需要那份密文。先清缓存就等于
+    /// 让重试重新随机加密，在服务端留下第二份物理文件。
+    ///
+    /// 抽成具名函数是为了能被真的测到——顺序写在 drain 中间时，只能靠人读代码。
+    async fn ack_attachment_and_release_cache(
+        storage: &StorageHandle,
+        msg: &StoredMessage,
+        server_message_id: u64,
+        message_seq: u32,
+    ) -> Result<()> {
+        storage
+            .outbox_ack_sent(msg.message_id, server_message_id, message_seq)
+            .await?;
+        Self::drop_attachment_sealed_caches_at(storage, msg).await;
+        Ok(())
     }
 
     async fn drain_attachment_outbox_once(&mut self, limit: usize) -> Result<usize> {
@@ -7380,10 +7404,13 @@ impl State {
                 Ok(resp) => {
                     // 附件与普通消息共用同一套持久化规则（见 normal 分支注释）：
                     // 一个事务里更新消息并删除 outbox 行，失败就整体回滚。
-                    if let Err(err) = self
-                        .storage
-                        .outbox_ack_sent(message_id, resp.server_message_id, resp.message_seq)
-                        .await
+                    if let Err(err) = Self::ack_attachment_and_release_cache(
+                        &self.storage,
+                        &msg,
+                        resp.server_message_id,
+                        resp.message_seq,
+                    )
+                    .await
                     {
                         let next_at = self.outbox_next_attempt_at(retry_count);
                         let _ = self
@@ -7397,8 +7424,6 @@ impl State {
                         });
                         return Err(err);
                     }
-                    // 本地确认已经提交，重试不会再回到上传那一步——现在才轮到清缓存。
-                    self.drop_attachment_sealed_caches(&msg).await;
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
                         action: "dequeue".to_string(),
@@ -23773,6 +23798,157 @@ mod tests {
 pub mod message_content;
 
 /// 一条 outbox 任务只封装一次，重试读回同一份密文。
+/// 本地确认没提交成功时，封装缓存必须留着。
+///
+/// 这是 `874b087` 那个修复真正要挡住的生产竞态：上传成功、ack 事务失败、outbox 行
+/// 留着重试——如果缓存这时已经被清掉，重试就会重新随机加密，在服务端留下第二份
+/// 物理文件；而第一次上传其实是成功的，那一份永远没人引用。
+#[cfg(test)]
+mod ack_before_cache_release_tests {
+    use super::*;
+
+    fn temp_root() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-ack-order-{}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_micros(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create root");
+        dir
+    }
+
+    /// 让 outbox 的删除必然失败。
+    ///
+    /// 用 trigger 而不是给 `StorageHandle` 开故障注入口子：不动生产抽象，而且失败点
+    /// 精确落在 `outbox_ack_sent` 的那条 DELETE 上，不会像改文件权限那样连带
+    /// WAL、目录权限、连接缓存一起变量。
+    /// 本地库是 SQLCipher 加密的，外部连接得先给 key，否则连表都看不见。
+    fn open_encrypted(db_path: &std::path::Path, uid: &str) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        conn.pragma_update(None, "key", &crate::local_store::LocalStore::derive_encryption_key(uid))
+            .expect("set db key");
+        conn
+    }
+
+    fn arm_ack_failure(db_path: &std::path::Path, uid: &str) {
+        let conn = open_encrypted(db_path, uid);
+        conn.execute_batch(
+            "CREATE TRIGGER block_outbox_delete BEFORE DELETE ON outbox
+             BEGIN SELECT RAISE(ABORT, 'ack failed on purpose'); END;",
+        )
+        .expect("arm trigger");
+    }
+
+    fn disarm_ack_failure(db_path: &std::path::Path, uid: &str) {
+        let conn = open_encrypted(db_path, uid);
+        conn.execute_batch("DROP TRIGGER block_outbox_delete;")
+            .expect("disarm trigger");
+    }
+
+    #[tokio::test]
+    async fn a_failed_ack_keeps_the_sealed_cache_for_the_retry() {
+        let root = temp_root();
+        let storage = StorageHandle::start_at(root.clone()).expect("start storage");
+        let uid = 100_000_777u64;
+        storage
+            .save_login(
+                uid.to_string(),
+                LoginResult {
+                    user_id: uid,
+                    token: "t".to_string(),
+                    device_id: "d".to_string(),
+                    refresh_token: None,
+                    expires_at: 0,
+                },
+            )
+            .await
+            .expect("save login");
+
+        let message_id = storage
+            .create_local_message_queued(
+                NewMessage {
+                    channel_id: 900,
+                    channel_type: 1,
+                    from_uid: uid,
+                    message_type: 3,
+                    content: "/tmp/pic.png".to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: "{}".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    media_downloaded: true,
+                    thumb_status: 0,
+                },
+                777_001,
+                "attachment",
+                Vec::new(),
+                Some("image".to_string()),
+            )
+            .await
+            .expect("create message + command");
+        let msg = storage
+            .get_message_by_id(message_id)
+            .await
+            .expect("read message")
+            .expect("message exists");
+
+        // 上传那一步已经跑过：封装缓存在这条消息的托管目录里。
+        let paths = storage.get_storage_paths().await.expect("paths");
+        let dir = media_store::get_message_dir(
+            &PathBuf::from(&paths.user_root),
+            msg.message_id as i64,
+            msg.created_at,
+        );
+        std::fs::create_dir_all(&dir).expect("create message dir");
+        let cache = dir.join("body.sealed");
+        let (first_blob, _, first_sha) =
+            State::seal_once(&cache, b"the picture bytes").expect("seal");
+
+        // ---- ack 失败 ----
+        arm_ack_failure(&paths.db_path, &uid.to_string());
+        let err = State::ack_attachment_and_release_cache(&storage, &msg, 555, 1).await;
+        assert!(err.is_err(), "trigger 必须让 ack 事务失败");
+
+        let conn = open_encrypted(&paths.db_path, &uid.to_string());
+        let queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE message_id = ?1",
+                rusqlite::params![message_id as i64],
+                |row| row.get(0),
+            )
+            .expect("count outbox");
+        assert_eq!(queued, 1, "事务回滚了，命令还在队列里等重试");
+        assert!(
+            cache.exists() && cache.with_extension("sealed.json").exists(),
+            "🔴 ack 没提交就清缓存，下一轮重试会重新加密、在服务端多留一份物理文件"
+        );
+
+        // ---- 重试：必须是同一串密文 ----
+        let (retry_blob, _, retry_sha) =
+            State::seal_once(&cache, b"the picture bytes").expect("reseal");
+        assert_eq!(retry_blob, first_blob, "🔴 重试必须上传同一串字节");
+        assert_eq!(retry_sha, first_sha);
+
+        // ---- ack 成功之后才轮到清理 ----
+        disarm_ack_failure(&paths.db_path, &uid.to_string());
+        State::ack_attachment_and_release_cache(&storage, &msg, 555, 1)
+            .await
+            .expect("ack commits");
+        let queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE message_id = ?1",
+                rusqlite::params![message_id as i64],
+                |row| row.get(0),
+            )
+            .expect("count outbox");
+        assert_eq!(queued, 0, "确认提交之后命令出队");
+        assert!(!cache.exists(), "确认提交之后缓存要清掉");
+        assert!(!cache.with_extension("sealed.json").exists());
+    }
+}
+
 #[cfg(test)]
 mod seal_once_tests {
     use super::*;
