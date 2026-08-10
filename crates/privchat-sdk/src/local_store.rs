@@ -2245,6 +2245,9 @@ impl LocalStore {
         &self,
         uid: &str,
         message_id: u64,
+        // CAS：发起这次网络调用时读到的那份 payload。它本身就是版本号——
+        // 不另造 `rev` 字段，少一个需要跟着同步的东西。
+        expected: &[u8],
         payload: &[u8],
     ) -> Result<()> {
         let conn = self.conn_for_user(uid)?;
@@ -2253,15 +2256,42 @@ impl LocalStore {
             .execute(
                 "UPDATE outbox
                     SET payload = ?2, updated_at = ?3
-                  WHERE message_id = ?1 AND command_type = 'attachment_reuse'",
-                params![message_id as i64, payload, now_ms],
+                  WHERE message_id = ?1 AND command_type = 'attachment_reuse'
+                    AND payload = ?4",
+                params![message_id as i64, payload, now_ms, expected],
             )
             .map_err(|e| Error::Storage(format!("reuse task update payload: {e}")))?;
-        if changed == 0 {
-            return Err(Error::Storage(format!(
-                "reuse task for message {message_id} is gone or already converted"
-            )));
+        if changed != 1 {
+            // 状态在这次网络往返期间被别人推进过（迟到的响应、并发的槽），
+            // 或者任务已经转换/消失。丢弃这次写回，让下一轮从最新状态重来。
+            return Err(Error::ReuseTaskConflict { message_id });
         }
+        Ok(())
+    }
+
+    /// 终态失败：源文件已被删或当前用户无权访问，重试多少次都一样。
+    ///
+    /// 消息置失败与删除任务同一事务——只做一半的话，要么用户看到一条永远
+    /// 「发送中」，要么队列里留着一条没人认领的命令。
+    pub fn fail_reuse_attachment_task(&self, uid: &str, message_id: u64) -> Result<()> {
+        let mut conn = self.conn_for_user(uid)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("reuse fail begin tx: {e}")))?;
+        tx.execute(
+            "UPDATE message SET status = 3, updated_at = ?2 WHERE id = ?1",
+            params![message_id as i64, now_ms],
+        )
+        .map_err(|e| Error::Storage(format!("reuse fail mark message: {e}")))?;
+        tx.execute(
+            "DELETE FROM outbox
+              WHERE message_id = ?1 AND command_type = 'attachment_reuse'",
+            params![message_id as i64],
+        )
+        .map_err(|e| Error::Storage(format!("reuse fail drop task: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("reuse fail commit: {e}")))?;
         Ok(())
     }
 
@@ -5475,7 +5505,7 @@ mod tests {
         GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID,
     };
     use crate::{
-        LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
+        Error, LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
         UpsertChannelInput, UpsertGroupInput, UpsertRemoteMessageInput, UpsertUserInput,
     };
     use rand::RngCore;
@@ -6129,7 +6159,12 @@ mod tests {
         // prepare 拿到 token 之后立刻落库——这一步就是幂等的全部保障。
         let with_token = br#"{"v":1,"stage":"claim_pending","token":"tok-abc","sha256":"deadbeef"}"#;
         store
-            .update_reuse_attachment_task(uid, message_id, with_token)
+            .update_reuse_attachment_task(
+                uid,
+                message_id,
+                br#"{"v":1,"stage":"needs_prepare"}"#,
+                with_token,
+            )
             .expect("persist token");
 
         // 模拟进程重启：重开同一个库。
@@ -6230,6 +6265,66 @@ mod tests {
         );
     }
 
+    /// 迟到的写回必须被 CAS 挡掉。
+    ///
+    /// 主文件和缩略图各自发起过网络调用；先回来的那个把整份 payload 写掉之后，
+    /// 后回来的那个手里拿的还是旧快照。不挡的话，它会把先回来那个的 token
+    /// 和 claimed_file_id 一起抹掉——重跑就是又一条文件记录。
+    #[test]
+    fn a_stale_write_back_is_rejected_by_the_cas() {
+        let store = test_store();
+        let uid = "100000907";
+        let original = br#"{"v":1,"stage":"needs_prepare"}"#;
+        let message_id = seed_reuse_task(&store, uid, 555_008, original);
+
+        // 主文件那一步先回来，推进了状态。
+        let after_main = br#"{"v":1,"main":{"token":"tok-main"}}"#;
+        store
+            .update_reuse_attachment_task(uid, message_id, original, after_main)
+            .expect("main step lands");
+
+        // 缩略图那一步手里还是最初的快照。
+        let stale = br#"{"v":1,"thumb":{"token":"tok-thumb"}}"#;
+        assert!(
+            matches!(
+                store.update_reuse_attachment_task(uid, message_id, original, stale),
+                Err(Error::ReuseTaskConflict { .. })
+            ),
+            "🔴 拿旧快照的写回必须被拒，否则会抹掉已经拿到的 token"
+        );
+
+        let (_, payload) = read_outbox(&store, uid, message_id);
+        assert_eq!(payload, after_main, "先落地的那一步必须原封不动");
+    }
+
+    /// 源文件已被删或无权访问：终态失败，消息置失败与删除任务同一事务。
+    #[test]
+    fn a_terminal_failure_marks_the_message_and_drops_the_task() {
+        let store = test_store();
+        let uid = "100000908";
+        let message_id = seed_reuse_task(&store, uid, 555_009, br#"{"v":1}"#);
+
+        store
+            .fail_reuse_attachment_task(uid, message_id)
+            .expect("fail");
+
+        let stored = store
+            .get_message_by_id(uid, message_id)
+            .expect("read message")
+            .expect("message exists");
+        assert_eq!(stored.status, 3, "🔴 不能留一条永远「发送中」");
+
+        let conn = store.conn_for_user(uid).expect("conn");
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE message_id = ?1",
+                params![message_id as i64],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(remaining, 0, "🔴 不能留一条没人认领的命令");
+    }
+
     /// 已经切成普通发送的行，不能再被状态机改回去。
     #[test]
     fn a_converted_task_rejects_further_state_updates() {
@@ -6243,7 +6338,12 @@ mod tests {
 
         assert!(
             store
-                .update_reuse_attachment_task(uid, message_id, br#"{"v":1,"stage":"late"}"#)
+                .update_reuse_attachment_task(
+                    uid,
+                    message_id,
+                    br#"{"v":1}"#,
+                    br#"{"v":1,"stage":"late"}"#
+                )
                 .is_err(),
             "🔴 迟到的状态更新必须被拒"
         );

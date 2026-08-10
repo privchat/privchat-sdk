@@ -2227,6 +2227,12 @@ pub struct LocalAccountSummary {
 
 #[derive(thiserror::Error, Debug, Clone, Serialize, Deserialize)]
 pub enum Error {
+    /// 复用任务的状态在这次网络往返期间被推进过（迟到的响应，或另一个槽）。
+    ///
+    /// 不是错误路径的终点：丢弃这次写回，下一轮从最新状态重来即可。
+    #[error("reuse task state moved on while message {message_id} was in flight")]
+    ReuseTaskConflict { message_id: u64 },
+
     #[error("transport error: {0}")]
     Transport(String),
     #[error("serialization error: {0}")]
@@ -2364,6 +2370,8 @@ impl Error {
             // 原样重发是安全的。漏掉它的代价是发送超时被当成永久失败：outbox 条目
             // 被 reject 并删除，用户的消息就此消失。
             Error::NotConnected | Error::Transport(_) | Error::RequestUnanswered { .. } => true,
+            // 状态被别人推进了而已，下一轮读最新状态继续。
+            Error::ReuseTaskConflict { .. } => true,
             Error::Server { code, .. } => is_retryable_server_code(*code),
             _ => false,
         }
@@ -2384,6 +2392,8 @@ impl Error {
             Error::InvalidState(_) => error_codes::INVALID_STATE,
             Error::AttachmentSourceMissing { .. } => error_codes::ATTACHMENT_SOURCE_MISSING,
             Error::SessionNotReady { .. } => error_codes::SESSION_NOT_READY,
+            // 纯粹的内部并发信号，宿主看不到——它只在 worker 内部被吞掉重来。
+            Error::ReuseTaskConflict { .. } => error_codes::INVALID_STATE,
             Error::Server { code, .. } => *code,
         }
     }
@@ -2403,6 +2413,7 @@ impl Error {
             // 专用码：UI 据此提示「源文件已不存在，请重新选择」，而不是笼统的失败。
             Error::AttachmentSourceMissing { .. } => ErrorCode::AttachmentSourceMissing as u32,
             Error::SessionNotReady { .. } => ErrorCode::SessionNotReady as u32,
+            Error::ReuseTaskConflict { .. } => ErrorCode::OperationNotAllowed as u32,
             Error::Server { code, .. } => *code,
         }
     }
@@ -3842,7 +3853,8 @@ impl State {
             Error::Transport(_)
             | Error::RequestUnanswered { .. }
             | Error::NotConnected
-            | Error::ActorClosed => ResumeFailureClass::RetryableTemporaryError,
+            | Error::ActorClosed
+            | Error::ReuseTaskConflict { .. } => ResumeFailureClass::RetryableTemporaryError,
             Error::Serialization(_) => ResumeFailureClass::FatalProtocolError,
             // 本地行缺幂等身份：重试或重连都救不回来，只能重建本地状态。
             Error::Storage(_) | Error::MissingLocalMessageId { .. } => {
