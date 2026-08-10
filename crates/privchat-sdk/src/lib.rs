@@ -11291,10 +11291,13 @@ impl State {
                 detail.original_filename.clone(),
                 detail.file_size as i64,
                 detail.mime_type.clone(),
-                // 🔴 不能一律报 "file"：服务端按类型定限额和校验，图片/视频报成
-                // 普通文件等于绕开那套闸门。类型只能由 mime 推，因为 get_url
-                // 不下发 file_type——这条一旦下发了就改读它。
-                file_type_from_mime(&detail.mime_type).to_string(),
+                // 类型的真源是服务端那一行，不是 mime：`audio/mp3` 可能是用户当
+                // 普通文件发的一首歌而不是语音条。老服务端不下发时才回退推导。
+                if detail.file_type.is_empty() {
+                    file_type_from_mime(&detail.mime_type).to_string()
+                } else {
+                    detail.file_type.clone()
+                },
                 Some(&sha256),
             )
             .await?;
@@ -23681,10 +23684,10 @@ mod tests {
 }
 pub mod message_content;
 
-/// 服务端按 `file_type` 定限额与校验，所以复用时必须报**真实类型**。
+/// 仅用于**老服务端**：它的 `file/get_url` 还不下发 `file_type`。
 ///
-/// `file/get_url` 只下发 mime，不下发 file_type，这里只能推；等它下发了就直接读，
-/// 别把这张表留成第二处真源。
+/// 新服务端下发真实类型，走那条。这里推不准是已知的——`audio/mp3` 既可能是语音条
+/// 也可能是当普通文件发的歌，mime 分不出来，所以它只是兼容兜底，不是判据。
 fn file_type_from_mime(mime: &str) -> &'static str {
     match mime.split('/').next().unwrap_or_default() {
         "image" => "image",

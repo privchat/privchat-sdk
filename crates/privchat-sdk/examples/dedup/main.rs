@@ -106,7 +106,16 @@ async fn main() -> BoxResult<()> {
     );
 
     // ---------------------------------------------------------------- 场景 3
-    println!("\n4) 秒传取用：换自己的 file_id，正文零字节");
+    println!("\n4) get_url 必须下发真实 file_type（客户端不许靠 mime 猜）");
+    let detail = get_url(&sdk, id_a.parse::<u64>()?).await?;
+    assert_eq!(
+        detail["file_type"].as_str(),
+        Some("file"),
+        "🔴 服务端要下发它自己记的类型；空串会把客户端逼回 mime 推导那张兜底表"
+    );
+
+    // ---------------------------------------------------------------- 场景 4
+    println!("\n5) 秒传取用：换自己的 file_id，正文零字节");
     let reused = sdk.reuse_existing_attachment(id_a.parse::<u64>()?).await?;
     println!("   file_id={} url={}", reused.file_id, reused.file_url);
     assert_ne!(
@@ -119,7 +128,7 @@ async fn main() -> BoxResult<()> {
     );
 
     // ---------------------------------------------------------------- 场景 4
-    println!("\n5) 不带摘要的老客户端 → 照常上传，不受影响");
+    println!("\n6) 不带摘要的老客户端 → 照常上传，不受影响");
     let blob_b = random_blob(ts.wrapping_add(7919));
     let token_b = request_token(&sdk, blob_b.len(), None).await?;
     assert_ne!(
@@ -133,7 +142,7 @@ async fn main() -> BoxResult<()> {
     println!("   file_id={} url={}", file_id(&file_b)?, url_b);
 
     // ---------------------------------------------------------------- 场景 5
-    println!("\n6) 重新封装同一份明文 → 密文变了，必须 miss（预期行为，不是缺陷）");
+    println!("\n7) 重新封装同一份明文 → 密文变了，必须 miss（预期行为，不是缺陷）");
     let resealed = random_blob(ts.wrapping_add(31337)); // 等价于换了随机 CEK/nonce
     let token_c = request_token(&sdk, resealed.len(), Some(&sha256_hex(&resealed))).await?;
     assert_eq!(
@@ -148,6 +157,16 @@ async fn main() -> BoxResult<()> {
 }
 
 // ---------------------------------------------------------------------------
+
+async fn get_url(sdk: &PrivchatSdk, file_id: u64) -> BoxResult<Value> {
+    Ok(serde_json::from_str(
+        &sdk.rpc_call(
+            "file/get_url".to_string(),
+            json!({ "file_id": file_id, "user_id": 0 }).to_string(),
+        )
+        .await?,
+    )?)
+}
 
 async fn request_token(sdk: &PrivchatSdk, size: usize, sha256: Option<&str>) -> BoxResult<Value> {
     let mut body = json!({
