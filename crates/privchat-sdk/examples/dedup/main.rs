@@ -26,7 +26,7 @@
 //!
 //! 🔴 这里刻意**不**验「同一张图片封两次会命中」，因为按设计它不会：每次封装用
 //! 新的随机 CEK/nonce，密文不同 ⇒ 摘要不同 ⇒ 两个物理文件。那是正确行为，不是缺陷。
-//! 复用只发生在客户端手里已经有一份服务端认得的内容时，也就是 `reuse_existing_attachment`。
+//! 命中只发生在客户端手里就是服务端已有的那串字节时。
 //!
 //! 跑法（需要本机 server 起着）：
 //! ```bash
@@ -116,14 +116,15 @@ async fn main() -> BoxResult<()> {
 
     // ---------------------------------------------------------------- 场景 4
     println!("\n5) 秒传取用：换自己的 file_id，正文零字节");
-    let reused = sdk.reuse_existing_attachment(id_a.parse::<u64>()?).await?;
-    println!("   file_id={} url={}", reused.file_id, reused.file_url);
+    let claimed = claim_existing(&sdk, &token_probe, &digest_a).await?;
+    let (claimed_id, claimed_url) = (file_id(&claimed)?, file_url(&claimed)?);
+    println!("   file_id={} url={}", claimed_id, claimed_url);
     assert_ne!(
-        reused.file_id, id_a,
+        claimed_id, id_a,
         "🔴 必须是**自己的**一条新记录，不是把源记录递回来"
     );
     assert_eq!(
-        reused.file_url, url_a,
+        claimed_url, url_a,
         "🔴 两条记录必须指向同一个物理文件——这就是「不重新上传」"
     );
 
@@ -157,6 +158,17 @@ async fn main() -> BoxResult<()> {
 }
 
 // ---------------------------------------------------------------------------
+
+async fn claim_existing(sdk: &PrivchatSdk, token: &Value, sha256: &str) -> BoxResult<Value> {
+    let body = json!({
+        "token": token["token"].as_str().ok_or("token response missing token")?,
+        "sha256": sha256,
+    });
+    Ok(serde_json::from_str(
+        &sdk.rpc_call("file/claim_existing".to_string(), body.to_string())
+            .await?,
+    )?)
+}
 
 async fn get_url(sdk: &PrivchatSdk, file_id: u64) -> BoxResult<Value> {
     Ok(serde_json::from_str(

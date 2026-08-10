@@ -2227,12 +2227,6 @@ pub struct LocalAccountSummary {
 
 #[derive(thiserror::Error, Debug, Clone, Serialize, Deserialize)]
 pub enum Error {
-    /// 复用任务的状态在这次网络往返期间被推进过（迟到的响应，或另一个槽）。
-    ///
-    /// 不是错误路径的终点：丢弃这次写回，下一轮从最新状态重来即可。
-    #[error("reuse task state moved on while message {message_id} was in flight")]
-    ReuseTaskConflict { message_id: u64 },
-
     #[error("transport error: {0}")]
     Transport(String),
     #[error("serialization error: {0}")]
@@ -2370,8 +2364,6 @@ impl Error {
             // 原样重发是安全的。漏掉它的代价是发送超时被当成永久失败：outbox 条目
             // 被 reject 并删除，用户的消息就此消失。
             Error::NotConnected | Error::Transport(_) | Error::RequestUnanswered { .. } => true,
-            // 状态被别人推进了而已，下一轮读最新状态继续。
-            Error::ReuseTaskConflict { .. } => true,
             Error::Server { code, .. } => is_retryable_server_code(*code),
             _ => false,
         }
@@ -2392,8 +2384,6 @@ impl Error {
             Error::InvalidState(_) => error_codes::INVALID_STATE,
             Error::AttachmentSourceMissing { .. } => error_codes::ATTACHMENT_SOURCE_MISSING,
             Error::SessionNotReady { .. } => error_codes::SESSION_NOT_READY,
-            // 纯粹的内部并发信号，宿主看不到——它只在 worker 内部被吞掉重来。
-            Error::ReuseTaskConflict { .. } => error_codes::INVALID_STATE,
             Error::Server { code, .. } => *code,
         }
     }
@@ -2413,7 +2403,6 @@ impl Error {
             // 专用码：UI 据此提示「源文件已不存在，请重新选择」，而不是笼统的失败。
             Error::AttachmentSourceMissing { .. } => ErrorCode::AttachmentSourceMissing as u32,
             Error::SessionNotReady { .. } => ErrorCode::SessionNotReady as u32,
-            Error::ReuseTaskConflict { .. } => ErrorCode::OperationNotAllowed as u32,
             Error::Server { code, .. } => *code,
         }
     }
@@ -2565,10 +2554,6 @@ enum Command {
         route: String,
         body_json: String,
         resp: oneshot::Sender<Result<String>>,
-    },
-    ReuseExistingAttachment {
-        source_file_id: u64,
-        resp: oneshot::Sender<Result<UploadedFileInfo>>,
     },
     Transfer {
         channel_id: u64,
@@ -3853,8 +3838,7 @@ impl State {
             Error::Transport(_)
             | Error::RequestUnanswered { .. }
             | Error::NotConnected
-            | Error::ActorClosed
-            | Error::ReuseTaskConflict { .. } => ResumeFailureClass::RetryableTemporaryError,
+            | Error::ActorClosed => ResumeFailureClass::RetryableTemporaryError,
             Error::Serialization(_) => ResumeFailureClass::FatalProtocolError,
             // 本地行缺幂等身份：重试或重连都救不回来，只能重建本地状态。
             Error::Storage(_) | Error::MissingLocalMessageId { .. } => {
@@ -11299,52 +11283,6 @@ impl State {
         })
     }
 
-    /// 再次发送一份**已有**的附件：不下载、不重新压缩、不重新加密、不上传正文。
-    ///
-    /// 这就是「转发一张图」在本产品里的全部实现——没有转发 RPC，也没有转发消息
-    /// 类型。拿到自己的 `file_id` 之后，按普通 image/video/file 消息发送。
-    ///
-    /// 🔴 用的是**服务端算出的** `sha256`，不是本地重算的。重新加密会产出另一串
-    /// 字节，那按定义就是另一个物理文件，预检必然不命中。
-    pub async fn reuse_existing_attachment(&mut self, source_file_id: u64) -> Result<UploadedFileInfo> {
-        let payload = FileGetUrlRequest {
-            file_id: source_file_id,
-            // 服务端从鉴权上下文填真实 uid，客户端传 0。
-            user_id: 0,
-        };
-        let detail: FileGetUrlResponse =
-            self.rpc_call_typed(routes::file::GET_URL, &payload).await?;
-
-        let sha256 = detail.sha256.clone().filter(|d| d.len() == 64).ok_or_else(|| {
-            // 老记录的摘要是 `hash:<u64>` 那种旧格式，用不了；只能重新走完整上传。
-            Error::Serialization("file has no reusable content digest".to_string())
-        })?;
-
-        let token = self
-            .request_upload_token(
-                0,
-                detail.original_filename.clone(),
-                detail.file_size as i64,
-                detail.mime_type.clone(),
-                // 类型的真源是服务端那一行，不是 mime：`audio/mp3` 可能是用户当
-                // 普通文件发的一首歌而不是语音条。老服务端不下发时才回退推导。
-                if detail.file_type.is_empty() {
-                    file_type_from_mime(&detail.mime_type).to_string()
-                } else {
-                    detail.file_type.clone()
-                },
-                Some(&sha256),
-            )
-            .await?;
-        if !token.already_exists {
-            // 服务端刚说有、这会儿又说没有：通常是那份物理文件已被清掉。
-            return Err(Error::Transport(
-                "server no longer holds these bytes".to_string(),
-            ));
-        }
-        self.claim_existing_file(&token.token, &sha256).await
-    }
-
     /// 秒传命中：拿 token 换**自己的** file_id，一个字节都不传。
     async fn claim_existing_file(&mut self, token: &str, sha256: &str) -> Result<UploadedFileInfo> {
         let value: serde_json::Value = self
@@ -13708,16 +13646,6 @@ impl PrivchatSdk {
                             Ok(()) => state
                                 .transfer_channel(channel_id, route, body, timeout_ms)
                                 .await,
-                            Err(e) => Err(e),
-                        };
-                        let _ = resp.send(result);
-                    }
-                    Command::ReuseExistingAttachment {
-                        source_file_id,
-                        resp,
-                    } => {
-                        let result = match state.require_authenticated() {
-                            Ok(()) => state.reuse_existing_attachment(source_file_id).await,
                             Err(e) => Err(e),
                         };
                         let _ = resp.send(result);
@@ -16568,30 +16496,6 @@ impl PrivchatSdk {
                 route,
                 body,
                 timeout_ms,
-                resp: resp_tx,
-            })
-            .await
-            .map_err(|_| self.actor_channel_error())?;
-        resp_rx.await.map_err(|_| self.actor_channel_error())?
-    }
-
-    /// 换到**自己的** `file_id`：一个字节都不上传。
-    ///
-    /// 🔴 **这不是发送入口，也不该成为发送入口。** 它直接做完
-    /// `get_url → prepare → claim` 三次网络往返，中间不落任何本地状态——崩在
-    /// claim 之后，服务端就多了一条谁都不认识的文件记录。
-    ///
-    /// 正确的对外入口是「创建本地消息 + `attachment_reuse` 任务（同一事务）」，
-    /// 由 outbox worker 驱动这几步并逐步落盘。worker 落地时这个方法降为内部
-    /// 网络步骤（`pub(crate)`）。
-    ///
-    /// 目前保持公开只为一件事：`examples/dedup` 用它验证服务端秒传契约。
-    pub async fn reuse_existing_attachment(&self, source_file_id: u64) -> Result<UploadedFileInfo> {
-        self.ensure_running()?;
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(Command::ReuseExistingAttachment {
-                source_file_id,
                 resp: resp_tx,
             })
             .await
@@ -23756,40 +23660,6 @@ mod tests {
 }
 pub mod message_content;
 
-/// 仅用于**老服务端**：它的 `file/get_url` 还不下发 `file_type`。
-///
-/// 新服务端下发真实类型，走那条。这里推不准是已知的——`audio/mp3` 既可能是语音条
-/// 也可能是当普通文件发的歌，mime 分不出来，所以它只是兼容兜底，不是判据。
-fn file_type_from_mime(mime: &str) -> &'static str {
-    match mime.split('/').next().unwrap_or_default() {
-        "image" => "image",
-        "video" => "video",
-        "audio" => "voice",
-        _ => "file",
-    }
-}
-
-#[cfg(test)]
-mod file_type_from_mime_tests {
-    use super::file_type_from_mime;
-
-    #[test]
-    fn maps_media_families_and_falls_back_to_file() {
-        // 报错类型 = 绕过服务端按类型设的限额与校验，所以这几条都得钉住。
-        assert_eq!(file_type_from_mime("image/png"), "image");
-        assert_eq!(file_type_from_mime("video/mp4"), "video");
-        assert_eq!(file_type_from_mime("audio/ogg"), "voice");
-        assert_eq!(file_type_from_mime("application/pdf"), "file");
-        // 空/畸形 mime 不许 panic，也不许悄悄升级成媒体类型。
-        assert_eq!(file_type_from_mime(""), "file");
-        assert_eq!(file_type_from_mime("image"), "image");
-    }
-}
-
-/// 重构等价性：`build_attachment_wire_content` 的输出必须和抽取**之前**逐字段相同。
-///
-/// 预言机是从 `7bacee7` 里**原样抄下来**的旧表达式，不是照着新代码重新推的——
-/// 重新推一遍只会把同一个错误写两次，然后两边一起绿。
 #[cfg(test)]
 mod attachment_wire_equivalence_tests {
     use super::*;
