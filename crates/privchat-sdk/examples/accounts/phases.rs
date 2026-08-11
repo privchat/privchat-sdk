@@ -5312,7 +5312,8 @@ impl TestPhases {
         // bob 收到并把主文件下载到本地托管目录——这一步产生的密文缓存正是秒传的本钱。
         let bob_root = manager.base_dir.join("bob");
         let Some(bob_row) = Self::wait_for_downloaded_attachment(
-            manager, "bob", ab, channel_type, alice_server_id, &bob_root, bob_uid, &mut metrics,
+            manager, "bob", ab, channel_type, alice_server_id, &bob_root, bob_uid,
+            "payload.png", "image/png", &mut metrics,
         )
         .await?
         else {
@@ -5324,7 +5325,12 @@ impl TestPhases {
             ));
         };
 
-        let bob_local = Some(Self::managed_payload_path(&bob_root, bob_uid, &bob_row));
+        let bob_local = Some(Self::managed_payload_path(
+            &bob_root,
+            bob_uid,
+            &bob_row,
+            "payload.png",
+        ));
         let Some(bob_local) = bob_local.filter(|p| p.exists()) else {
             return Ok(phase_fail(
                 "resend-received-attachment",
@@ -5464,6 +5470,10 @@ impl TestPhases {
         server_message_id: u64,
         user_root: &std::path::Path,
         uid: u64,
+        payload_filename: &str,
+        // 🔴 落盘文件名由 mime 决定，不能靠接收行的 `mime_type`：它可能是空的，
+        // 兜底成 image/png 会把视频存成 payload.png，后面就再也找不到了。
+        mime: &str,
         metrics: &mut PhaseMetrics,
     ) -> BoxResult<Option<privchat_sdk::StoredMessage>> {
         let deadline = std::time::Instant::now() + Duration::from_secs(25);
@@ -5484,7 +5494,8 @@ impl TestPhases {
                 // 存在时会退化去扫目录，扫到的可能是 `body.sealed`（密文副本）或
                 // `thumb.webp.part`（缩略图下载到一半）——把它当原图发出去，服务端
                 // 直接拒（这正是本条 phase 早先偶发失败的真因）。
-                let landed = Self::managed_payload_path(user_root, uid, &row).exists();
+                let landed =
+                    Self::managed_payload_path(user_root, uid, &row, payload_filename).exists();
                 if landed {
                     metrics.rpc_successes += 1;
                     return Ok(Some(row));
@@ -5500,7 +5511,7 @@ impl TestPhases {
                             .start_message_media_download_by_file_id(
                                 row.message_id,
                                 file_id,
-                                row.mime_type.clone().unwrap_or_else(|| "image/png".to_string()),
+                                mime.to_string(),
                                 None,
                                 row.created_at,
                             )
@@ -5511,9 +5522,37 @@ impl TestPhases {
                 }
             }
             if std::time::Instant::now() >= deadline {
-                metrics
-                    .errors
-                    .push(format!("{who} never downloaded server_message_id={server_message_id}"));
+                let rows = manager
+                    .list_local_messages(who, channel_id, channel_type, 200)
+                    .await?;
+                let row = rows
+                    .iter()
+                    .find(|m| m.server_message_id == Some(server_message_id));
+                let dir = row.map(|r| {
+                    privchat_sdk::media_store::get_canonical_message_dir(
+                        user_root,
+                        uid,
+                        r.message_id as i64,
+                        r.created_at,
+                    )
+                });
+                let listing = dir
+                    .as_ref()
+                    .and_then(|d| std::fs::read_dir(d).ok())
+                    .map(|it| {
+                        it.flatten()
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|| "(no directory)".to_string());
+                metrics.errors.push(format!(
+                    "{who} never downloaded server_message_id={server_message_id}: \
+started={started} expected={payload_filename} dir={:?} contents=[{listing}] extra={}",
+                    dir,
+                    row.map(|r| r.extra.chars().take(240).collect::<String>())
+                        .unwrap_or_default(),
+                ));
                 return Ok(None);
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -5546,6 +5585,189 @@ impl TestPhases {
         removed
     }
 
+    /// 重发一份收到的**视频**：不再压一遍。
+    ///
+    /// 「转发不二次处理」在图片上看不出来，视频上是肉眼可见的画质损失：压一次
+    /// 就掉一档，转几手就糊了。判据用**计数 hook**（`set_video_process_hook` 是产品
+    /// 接口，这里只是数它被调了几次，不改行为）：
+    ///
+    /// - alice 从托管目录**外**发（用户刚选的文件）→ 压缩被调用一次，这是应该的
+    /// - bob 拿收到的托管文件重发 → 压缩**一次都不许调**，主文件也不重传
+    ///
+    /// 素材是真视频（`fixtures/tiny.mp4`，H.264 160x120 1 秒），不是假字节：
+    /// 假字节连不进真实媒体路径，测了也说明不了问题。
+    pub async fn phase46_resend_video_is_not_recompressed(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+        let channel_type = DIRECT_SYNC_CHANNEL_TYPE as i32;
+
+        Self::ensure_friends(manager, "alice", "bob", &mut metrics).await?;
+        let ab = manager.get_or_create_direct_channel("alice", "bob").await?;
+        let alice_uid = manager.user_id("alice")?;
+        let bob_uid = manager.user_id("bob")?;
+
+        let video = include_bytes!("fixtures/tiny.mp4").to_vec();
+
+        // 两端都装上计数 hook：报告「没压」（返回 false）并原样留下文件，
+        // 这样计数反映的是**调用与否**，不掺进真实转码的行为差异。
+        let alice_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bob_compress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bob_thumbnail = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        manager
+            .sdk("alice")?
+            .set_video_process_hook(Some(Self::counting_hook(alice_calls.clone(), None)))
+            .await?;
+        manager
+            .sdk("bob")?
+            .set_video_process_hook(Some(Self::counting_hook(
+                bob_compress.clone(),
+                Some(bob_thumbnail.clone()),
+            )))
+            .await?;
+
+        let video_type = privchat_protocol::message::ContentMessageType::Video as i32;
+        let Some(alice_sent) = Self::send_one_fidelity_attachment(
+            manager, "alice", ab, channel_type, alice_uid, "假期.mp4", "video/mp4",
+            video_type, Some("海边"), &video, None, &mut metrics,
+        )
+        .await?
+        else {
+            return Ok(phase_fail(
+                "resend-video-not-recompressed",
+                start.elapsed(),
+                "alice could not send the source video",
+                metrics,
+            ));
+        };
+        let first_compress = alice_calls.load(std::sync::atomic::Ordering::Relaxed);
+        if first_compress == 0 {
+            // 首发必须走压缩，否则下面「重发没压」什么都证明不了——两边都是 0。
+            metrics.errors.push(
+                "🔴 the first send of a freshly picked video must go through compression; \
+the hook was never called, so this phase would prove nothing".to_string(),
+            );
+        }
+
+        let alice_server_id = alice_sent.server_message_id.unwrap_or(0);
+        let bob_root = manager.base_dir.join("bob");
+        let Some(bob_row) = Self::wait_for_downloaded_attachment(
+            manager, "bob", ab, channel_type, alice_server_id, &bob_root, bob_uid,
+            "payload.mp4", "video/mp4", &mut metrics,
+        )
+        .await?
+        else {
+            return Ok(phase_fail(
+                "resend-video-not-recompressed",
+                start.elapsed(),
+                "bob never downloaded the video",
+                metrics,
+            ));
+        };
+        let bob_local = Self::managed_payload_path(&bob_root, bob_uid, &bob_row, "payload.mp4");
+        if !bob_local.exists() {
+            return Ok(phase_fail(
+                "resend-video-not-recompressed",
+                start.elapsed(),
+                "bob has no local video to resend",
+                metrics,
+            ));
+        }
+        let before_bytes = std::fs::read(&bob_local)?;
+        let before = manager.sdk("bob")?.attachment_transfer_stats();
+        bob_compress.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let Some(bob_sent) = Self::send_one_fidelity_attachment(
+            manager, "bob", ab, channel_type, bob_uid, "假期.mp4", "video/mp4",
+            video_type, Some("海边"), &[], Some(bob_local.as_path()), &mut metrics,
+        )
+        .await?
+        else {
+            return Ok(phase_fail(
+                "resend-video-not-recompressed",
+                start.elapsed(),
+                "bob could not resend the video",
+                metrics,
+            ));
+        };
+
+        let compress_calls = bob_compress.load(std::sync::atomic::Ordering::Relaxed);
+        if compress_calls != 0 {
+            metrics.errors.push(format!(
+                "🔴 resending a received video must not compress it again ({compress_calls} calls) — \
+every pass costs quality and changes the bytes, which also kills the dedup"
+            ));
+        }
+        let after_bytes = std::fs::read(&bob_local)?;
+        if after_bytes != before_bytes {
+            metrics.errors.push(format!(
+                "🔴 the managed video changed on disk during the resend ({} -> {} bytes)",
+                before_bytes.len(),
+                after_bytes.len()
+            ));
+        }
+        let after = manager.sdk("bob")?.attachment_transfer_stats();
+        if after.body_uploads != before.body_uploads {
+            metrics.errors.push(format!(
+                "resent video body was uploaded again: {} -> {}",
+                before.body_uploads, after.body_uploads
+            ));
+        }
+        if after.claims <= before.claims {
+            metrics.errors.push("the resent video should have claimed the existing content".to_string());
+        }
+        if bob_sent.message_type != video_type {
+            metrics.errors.push(format!(
+                "resend changed the message type to {} (a video must stay a video)",
+                bob_sent.message_type
+            ));
+        }
+        let wire = Self::sent_attachment_wire(&bob_sent);
+        if Self::wire_display_name(&wire) != "假期.mp4" {
+            metrics.errors.push(format!(
+                "resend lost the video's name: {:?}",
+                Self::wire_display_name(&wire)
+            ));
+        }
+
+        let success = metrics.errors.is_empty();
+        Ok(PhaseResult {
+            phase_name: "resend-video-not-recompressed".to_string(),
+            success,
+            duration: start.elapsed(),
+            details: format!(
+                "first_send_compress_calls={first_compress} resend_compress_calls={compress_calls} \
+resend_body_uploads={} resend_claims={} bytes_unchanged={}",
+                after.body_uploads - before.body_uploads,
+                after.claims - before.claims,
+                after_bytes == before_bytes
+            ),
+            metrics,
+        })
+    }
+
+    /// 只数调用次数的 video hook：报告「没有处理」并原样留下文件。
+    fn counting_hook(
+        compress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        thumbnail: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> privchat_sdk::VideoProcessHook {
+        std::sync::Arc::new(move |op, _input, _meta, _output| {
+            match op {
+                privchat_sdk::MediaProcessOp::Compress => {
+                    compress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                privchat_sdk::MediaProcessOp::Thumbnail => {
+                    if let Some(t) = thumbnail.as_ref() {
+                        t.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            // false = 没处理，文件原样。计数反映调用与否，不掺真实转码的行为差异。
+            Ok(false)
+        })
+    }
+
     /// 托管目录里那个**主文件**的精确路径。
     ///
     /// 同一个目录里还有 `body.sealed`（秒传用的密文副本）和 `thumb.webp[.part]`
@@ -5554,6 +5776,7 @@ impl TestPhases {
         user_root: &std::path::Path,
         uid: u64,
         row: &privchat_sdk::StoredMessage,
+        payload_filename: &str,
     ) -> std::path::PathBuf {
         privchat_sdk::media_store::get_canonical_message_dir(
             user_root,
@@ -5561,7 +5784,7 @@ impl TestPhases {
             row.message_id as i64,
             row.created_at,
         )
-        .join("payload.png")
+        .join(payload_filename)
     }
 
     /// 好友关系是发消息的前置。已经是好友就什么都不做。

@@ -240,6 +240,10 @@ impl TestCoordinator {
             self.run_phase("phase45_resend_received_attachment", TestPhases::phase45_resend_received_attachment(manager).await)
                 .await;
         }
+        if self.enabled("phase46_resend_video_is_not_recompressed") {
+            self.run_phase("phase46_resend_video_is_not_recompressed", TestPhases::phase46_resend_video_is_not_recompressed(manager).await)
+                .await;
+        }
         if self.enabled("phase43_outbox_survives_restart") {
             self.run_phase("phase43_outbox_survives_restart", TestPhases::phase43_outbox_survives_restart(manager).await)
                 .await;
