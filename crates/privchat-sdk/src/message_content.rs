@@ -143,12 +143,33 @@ pub fn project_stored_message(message: &StoredMessage) -> MessageContentProjecti
         // 附件的说明文字是消息内容的一部分，跟图片一起显示。
         body.text = caption;
         body.entities = scan_entities(&body.text, &body.mentioned_user_ids);
+    } else if is_attachment_placeholder(message.message_type, &body.text) {
+        // 🔴 `[图片]` 不是用户写的字，是没有说明文字时给会话列表看的占位文案
+        // （TS/Web 也按这个约定发）。当成 caption 的话，重发一次就凭空多出一句
+        // 「[图片]」，再发一次还会叠上去。
+        body.text.clear();
+        body.entities.clear();
     } else if looks_like_json(&body.text) {
         // Non-text renderers consume typed fields. An unsupported renderer must not expose JSON.
         body.text.clear();
         body.entities.clear();
     }
     body
+}
+
+/// 这条正文是不是「没有说明文字」时的占位文案。
+///
+/// 只对附件类消息成立：文本消息里用户真的可以就发「[图片]」三个字。
+fn is_attachment_placeholder(message_type: i32, text: &str) -> bool {
+    use privchat_protocol::message::ContentMessageType;
+    let placeholder = match message_type {
+        t if t == ContentMessageType::Voice as i32 => "[语音]",
+        t if t == ContentMessageType::Image as i32 => "[图片]",
+        t if t == ContentMessageType::Video as i32 => "[视频]",
+        t if t == ContentMessageType::File as i32 => "[文件]",
+        _ => return false,
+    };
+    text.trim() == placeholder
 }
 
 fn kind_name(value: i32) -> &'static str {
@@ -201,9 +222,16 @@ fn parse_object(raw: &str) -> Option<Value> {
         .ok()
         .filter(Value::is_object)
 }
+/// 这段正文是不是原始 JSON 载荷。
+///
+/// 🔴 只看首字符是不是 `{`/`[` 是不够的：`[加班] 看这张` 这种正经说明文字也以 `[`
+/// 开头，会被当成载荷整段清掉。判据是「能不能解析成 JSON」。
 fn looks_like_json(value: &str) -> bool {
     let trimmed = value.trim_start();
-    trimmed.starts_with('{') || trimmed.starts_with('[')
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return false;
+    }
+    serde_json::from_str::<Value>(trimmed).is_ok()
 }
 fn value_string(v: &Value) -> Option<String> {
     v.as_str()
@@ -383,6 +411,14 @@ mod tests {
 mod caption_projection_tests {
     use super::*;
 
+    /// 收方拿到的形态：`content` 是 wire envelope 的正文（caption 或占位文案），
+    /// 附件描述在 `extra.metadata` 里。
+    fn received(content: &str, metadata_extra: &str) -> StoredMessage {
+        let mut m = attachment(metadata_extra);
+        m.content = content.to_string();
+        m
+    }
+
     fn attachment(extra: &str) -> StoredMessage {
         StoredMessage {
             message_id: 1,
@@ -391,7 +427,8 @@ mod caption_projection_tests {
             channel_id: 10,
             channel_type: 1,
             from_uid: 7,
-            message_type: 1, // image
+            // 🔴 Image = 2。之前写 1 还注释成 image，测的其实是语音消息。
+            message_type: privchat_protocol::message::ContentMessageType::Image as i32,
             content: r#"{"file_id":42,"file_url":"http://cdn/a.jpg"}"#.to_string(),
             status: 0,
             created_at: 0,
@@ -421,5 +458,56 @@ mod caption_projection_tests {
     fn without_a_caption_the_json_is_not_exposed() {
         let body = project_stored_message(&attachment(r#"{"file_name":"a.jpg"}"#));
         assert_eq!(body.text, "");
+    }
+
+    /// 🔴 收方看到的正文是 `[图片]` —— 那是占位文案，不是用户写的字。
+    /// 把它当 caption，重发一次就凭空多出一句「[图片]」。
+    #[test]
+    fn a_placeholder_is_not_a_caption() {
+        let body = project_stored_message(&received(
+            "[图片]",
+            r#"{"content":"[图片]","metadata":{"file_id":42,"file_name":"a.jpg"}}"#,
+        ));
+        assert_eq!(body.text, "");
+    }
+
+    /// 真的写了说明文字的那条，正文照常是那句话。
+    #[test]
+    fn a_received_caption_is_kept() {
+        let body = project_stored_message(&received(
+            "周末爬山",
+            r#"{"content":"周末爬山","metadata":{"file_id":42,"file_name":"a.jpg"},"caption":"周末爬山"}"#,
+        ));
+        assert_eq!(body.text, "周末爬山");
+    }
+
+    /// 🔴 以 `[` 开头的说明文字不是 JSON 载荷，不许整段清掉。
+    #[test]
+    fn a_caption_may_start_with_a_bracket() {
+        let body = project_stored_message(&received(
+            "[加班] 看这张",
+            r#"{"content":"[加班] 看这张","metadata":{"file_id":42,"file_name":"a.jpg"}}"#,
+        ));
+        assert_eq!(body.text, "[加班] 看这张");
+    }
+
+    /// 原始载荷仍然不能泄露成正文。
+    #[test]
+    fn a_raw_payload_is_still_hidden() {
+        let body = project_stored_message(&received(
+            r#"{"file_id":42,"file_url":"http://cdn/a.jpg"}"#,
+            r#"{"metadata":{"file_id":42}}"#,
+        ));
+        assert_eq!(body.text, "");
+    }
+
+    /// 文本消息里「[图片]」就是用户真发的三个字，不许清掉。
+    #[test]
+    fn a_text_message_may_literally_say_that() {
+        let mut m = attachment("{}");
+        m.message_type = privchat_protocol::message::ContentMessageType::Text as i32;
+        m.content = "[图片]".to_string();
+        let body = project_stored_message(&m);
+        assert_eq!(body.text, "[图片]");
     }
 }
