@@ -34,8 +34,12 @@ async fn main() -> BoxResult<()> {
     // Never proxy localhost smoke traffic — default a loopback no_proxy unless
     // the caller already set one.
     if std::env::var_os("NO_PROXY").is_none() && std::env::var_os("no_proxy").is_none() {
-        std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
-        std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
+        // 🔴 内网段也要绕过代理：真机调试时服务端会广播局域网地址（config.toml 的
+        // `[file]` base urls），上传就走 192.168.x.x —— 只豁免 loopback 的话，
+        // 那几条附件用例会被本机代理拦下，看起来像产品坏了。
+        let bypass = "127.0.0.1,localhost,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12";
+        std::env::set_var("NO_PROXY", bypass);
+        std::env::set_var("no_proxy", bypass);
     }
 
     println!("\nPrivChat SDK Multi-Account Example (accounts)");
