@@ -3497,6 +3497,8 @@ fn timeline_reason_for_message(realtime: bool) -> &'static str {
 }
 
 struct State {
+    /// 见 [`PrivchatSdk::attachment_transfer_stats`]：正文到底传没传字节。
+    attachment_transfers: Arc<AttachmentTransferCounters>,
     config: PrivchatConfig,
     /// 共享句柄。`TransportClient::request_with_options` 取的是 `&self`，
     /// 内部又是 `Arc<Transport>`——所以后台任务可以**自己**发请求，不必占用 actor。
@@ -11467,6 +11469,13 @@ impl State {
         blob: Vec<u8>,
         cek_b64: String,
     ) -> Result<UploadedFileInfo> {
+        // 缩略图走同一个上传接口，靠规范文件名区分（media_store::payload_filename）。
+        let counter = if filename.starts_with("thumb") {
+            &self.attachment_transfers.thumbnail_uploads
+        } else {
+            &self.attachment_transfers.body_uploads
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let part = reqwest::multipart::Part::bytes(blob)
             .file_name(filename.to_string())
             .mime_str(mime_type)
@@ -11570,6 +11579,9 @@ impl State {
 
     /// 秒传命中：拿 token 换**自己的** file_id，一个字节都不传。
     async fn claim_existing_file(&mut self, token: &str, sha256: &str) -> Result<UploadedFileInfo> {
+        self.attachment_transfers
+            .claims
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let value: serde_json::Value = self
             .rpc_call_json(
                 "file/claim_existing".to_string(),
@@ -12602,8 +12614,34 @@ impl State {
     }
 }
 
+/// 附件正文传输计数（诊断用；也是「秒传到底有没有省下带宽」的唯一可信判据）。
+#[derive(Debug, Default)]
+pub struct AttachmentTransferCounters {
+    /// 秒传取用次数：换到自己的 file_id，正文零字节。
+    pub claims: AtomicU64,
+    /// 真正把**主文件**字节传上去的次数。
+    pub body_uploads: AtomicU64,
+    /// 真正把**缩略图**字节传上去的次数。缩略图是本地重新生成的派生物，
+    /// 每次生成都是新字节，所以它不会命中秒传——这是已知代价，单独计数免得
+    /// 被算进「主文件没省下带宽」。
+    pub thumbnail_uploads: AtomicU64,
+}
+
+/// [`PrivchatSdk::attachment_transfer_stats`] 的快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachmentTransferStats {
+    pub claims: u64,
+    pub body_uploads: u64,
+    pub thumbnail_uploads: u64,
+}
+
 #[derive(Clone)]
 pub struct PrivchatSdk {
+    /// 附件正文的传输计数：秒传命中一次 +1 claim，真传字节一次 +1 upload。
+    ///
+    /// 这是唯一能回答「这次转发到底传没传字节」的地方——服务端也按内容哈希复用
+    /// 物理路径，所以「两条记录指向同一个 file_url」**不能**证明没上传。
+    attachment_transfers: Arc<AttachmentTransferCounters>,
     tx: mpsc::Sender<Command>,
     event_tx: broadcast::Sender<SdkEvent>,
     event_seq: Arc<AtomicU64>,
@@ -12635,6 +12673,27 @@ pub struct PrivchatSdk {
 }
 
 impl PrivchatSdk {
+    /// 附件正文的传输计数。
+    ///
+    /// 🔴 「秒传省了带宽」只能在这里证明：服务端**也**按内容哈希复用物理路径，
+    /// 所以「两条记录指向同一个 file_url」并不意味着客户端没上传。
+    pub fn attachment_transfer_stats(&self) -> AttachmentTransferStats {
+        AttachmentTransferStats {
+            claims: self
+                .attachment_transfers
+                .claims
+                .load(std::sync::atomic::Ordering::Relaxed),
+            body_uploads: self
+                .attachment_transfers
+                .body_uploads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            thumbnail_uploads: self
+                .attachment_transfers
+                .thumbnail_uploads
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
     fn is_timeline_like_event(event: &SdkEvent) -> bool {
         matches!(
             event,
@@ -12707,6 +12766,8 @@ impl PrivchatSdk {
             });
         // 账号切换的「让出」通道：计数器记事实，Notify 负责叫醒。见 State::switch_requested。
         let switch_requested_sdk = Arc::new(AtomicU64::new(0));
+        let attachment_transfers_sdk = Arc::new(AttachmentTransferCounters::default());
+        let attachment_transfers_actor = attachment_transfers_sdk.clone();
         let switch_processed_sdk = Arc::new(AtomicU64::new(0));
         let switch_wakeup_sdk = Arc::new(tokio::sync::Notify::new());
         let switch_requested_actor = switch_requested_sdk.clone();
@@ -12746,6 +12807,7 @@ impl PrivchatSdk {
                 None
             };
             let mut state = State {
+                attachment_transfers: attachment_transfers_actor,
                 config,
                 transport: None,
                 transport_events: Arc::new(tokio::sync::Mutex::new(None)),
@@ -16188,6 +16250,7 @@ impl PrivchatSdk {
         task_registry.track(actor_task);
 
         Self {
+            attachment_transfers: attachment_transfers_sdk,
             tx,
             event_tx,
             event_seq,
@@ -19791,6 +19854,7 @@ mod tests {
         let mut config = PrivchatConfig::default();
         config.data_dir = dir.display().to_string();
         let state = State {
+            attachment_transfers: Arc::new(crate::AttachmentTransferCounters::default()),
             config,
             transport: None,
             transport_events: Arc::new(tokio::sync::Mutex::new(None)),

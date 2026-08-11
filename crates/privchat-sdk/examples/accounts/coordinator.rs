@@ -120,6 +120,8 @@ impl TestCoordinator {
             .await;
         self.run_phase("phase44_attachment_fidelity_e2e", TestPhases::phase44_attachment_fidelity_e2e(manager).await)
             .await;
+        self.run_phase("phase45_resend_received_attachment", TestPhases::phase45_resend_received_attachment(manager).await)
+            .await;
         self.run_phase("phase43_outbox_survives_restart", TestPhases::phase43_outbox_survives_restart(manager).await)
             .await;
         Ok(())

@@ -5177,6 +5177,7 @@ impl TestPhases {
         for (display_name, mime, message_type, caption, bytes) in &cases {
             let sent = match Self::send_one_fidelity_attachment(
                 manager,
+                "alice",
                 channel_id,
                 channel_type,
                 alice_uid,
@@ -5185,6 +5186,7 @@ impl TestPhases {
                 *message_type,
                 *caption,
                 bytes,
+                None,
                 &mut metrics,
             )
             .await?
@@ -5248,10 +5250,310 @@ impl TestPhases {
         })
     }
 
+    /// 收到一份附件后再发出去：不重传字节，缓存没了就照常整传。
+    ///
+    /// 这才是用户说的「转发」：alice 发给 bob，bob 把**同一份内容**发给 charlie。
+    /// bob 手上是自己下载下来的那串密文，服务端已经存过它，所以：
+    ///
+    /// - bob 拿到的是**自己的** file_id（记录归自己），但 file_url 指向同一个物理文件
+    ///   —— 一个字节都没重传。缩略图同理。
+    /// - 把 bob 的封装缓存删掉再发一次，密文变了、服务端没见过，必须退回整传，
+    ///   而且**照样发得出去**（这条链断了的话，转发会永久卡住）。
+    /// - 全程走普通发送接口：没有 forward RPC，也没有第二条上传路径。
+    pub async fn phase45_resend_received_attachment(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+        let channel_type = DIRECT_SYNC_CHANNEL_TYPE as i32;
+
+        let ab = manager
+            .cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("phase45 needs the alice<->bob direct channel"))?;
+        // 重发进 alice↔bob 这条会话：bob 给陌生人 charlie 直发会被服务端按陌生人
+        // 策略拒掉（10004），那是另一条规则，跟这里要证的事无关——收件人是谁不影响
+        // 「自己的 file_id / 同一个物理文件 / 零重传」。
+        let target = ab;
+        let alice_uid = manager.user_id("alice")?;
+        let bob_uid = manager.user_id("bob")?;
+
+        // 真 PNG：接收端要解码它做缩略图。
+        let img = image::RgbImage::from_fn(64, 48, |x, y| image::Rgb([(x * 3) as u8, 40, (y * 5) as u8]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut buf, image::ImageFormat::Png)?;
+        let png = buf.into_inner();
+
+        let Some(alice_sent) = Self::send_one_fidelity_attachment(
+            manager, "alice", ab, channel_type, alice_uid, "原图.png", "image/png",
+            privchat_protocol::message::ContentMessageType::Image as i32,
+            Some("原始说明"), &png, None, &mut metrics,
+        )
+        .await?
+        else {
+            return Ok(phase_fail(
+                "resend-received-attachment",
+                start.elapsed(),
+                "alice could not send the source attachment",
+                metrics,
+            ));
+        };
+        let alice_wire = Self::sent_attachment_wire(&alice_sent);
+        let alice_file_url = alice_wire.get("file_url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let alice_file_id = alice_wire.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let alice_server_id = alice_sent.server_message_id.unwrap_or(0);
+
+        // bob 收到并把主文件下载到本地托管目录——这一步产生的密文缓存正是秒传的本钱。
+        let bob_root = manager.base_dir.join("bob");
+        let Some(bob_row) = Self::wait_for_downloaded_attachment(
+            manager, "bob", ab, channel_type, alice_server_id, &bob_root, bob_uid, &mut metrics,
+        )
+        .await?
+        else {
+            return Ok(phase_fail(
+                "resend-received-attachment",
+                start.elapsed(),
+                "bob never downloaded the attachment",
+                metrics,
+            ));
+        };
+
+        let bob_local = privchat_sdk::media_store::resolve_attachment_path(
+            &bob_root,
+            bob_uid,
+            bob_row.message_id as i64,
+            bob_row.created_at,
+            Some("payload.png"),
+        );
+        let Some(bob_local) = bob_local.filter(|p| p.exists()) else {
+            return Ok(phase_fail(
+                "resend-received-attachment",
+                start.elapsed(),
+                "bob has no local file to resend",
+                metrics,
+            ));
+        };
+        // 🔴 判据是**客户端传没传字节**，不是「两条记录指不指向同一个 file_url」：
+        // 服务端也按内容哈希复用物理路径，所以 url 相同并不代表省下了带宽
+        // （拿掉客户端秒传后 url 照样相同，实测过）。
+        let before = manager.sdk("bob")?.attachment_transfer_stats();
+
+        // bob 重新发一次：普通附件发送，源就是他自己那份托管文件。
+        let Some(bob_sent) = Self::send_one_fidelity_attachment(
+            manager, "bob", target, channel_type, bob_uid, "原图.png", "image/png",
+            privchat_protocol::message::ContentMessageType::Image as i32,
+            Some("原始说明"), &[], Some(bob_local.as_path()), &mut metrics,
+        )
+        .await?
+        else {
+            return Ok(phase_fail(
+                "resend-received-attachment",
+                start.elapsed(),
+                "bob could not resend the attachment",
+                metrics,
+            ));
+        };
+        let bob_wire = Self::sent_attachment_wire(&bob_sent);
+        let bob_file_url = bob_wire.get("file_url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let bob_file_id = bob_wire.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        if bob_file_id == 0 || bob_file_id == alice_file_id {
+            metrics.errors.push(format!(
+                "resend must own its record: bob file_id={bob_file_id}, alice file_id={alice_file_id}"
+            ));
+        }
+        let after_resend = manager.sdk("bob")?.attachment_transfer_stats();
+        if after_resend.body_uploads != before.body_uploads {
+            metrics.errors.push(format!(
+                "🔴 resending content the server already has must not send the body again: body uploads {} -> {}",
+                before.body_uploads, after_resend.body_uploads
+            ));
+        }
+        // 🔴 已知代价：缩略图是本地重新生成的，字节每次都不同，永远命中不了秒传。
+        // 图片小、缩略图更小，所以先按现状钉住；真要省掉它，得在重发时复用
+        // 收到的那张 thumb 而不是重新生成。
+        if after_resend.thumbnail_uploads != before.thumbnail_uploads + 1 {
+            metrics.errors.push(format!(
+                "thumbnail upload count changed shape: {} -> {} (expected exactly one regenerated thumbnail)",
+                before.thumbnail_uploads, after_resend.thumbnail_uploads
+            ));
+        }
+        if after_resend.claims <= before.claims {
+            metrics.errors.push(format!(
+                "🔴 the resend should have claimed the existing content: claims {} -> {}",
+                before.claims, after_resend.claims
+            ));
+        }
+        if bob_file_url.is_empty() || bob_file_url != alice_file_url {
+            metrics.errors.push(format!(
+                "the claimed record must point at the same physical file: bob {bob_file_url:?} vs alice {alice_file_url:?}"
+            ));
+        }
+        if bob_sent.message_type != alice_sent.message_type {
+            metrics.errors.push("resend changed the message type".to_string());
+        }
+        if Self::wire_display_name(&bob_wire) != "原图.png" {
+            metrics
+                .errors
+                .push(format!("resend lost the name: {:?}", Self::wire_display_name(&bob_wire)));
+        }
+
+        // 缓存没了 → 换一串密文 → 服务端没见过 → 必须退回整传，而且照样发得出去。
+        let removed = Self::drop_sealed_caches_under(&bob_root.join("users").join(bob_uid.to_string()));
+        let Some(fallback_sent) = Self::send_one_fidelity_attachment(
+            manager, "bob", target, channel_type, bob_uid, "原图.png", "image/png",
+            privchat_protocol::message::ContentMessageType::Image as i32,
+            None, &[], Some(bob_local.as_path()), &mut metrics,
+        )
+        .await?
+        else {
+            return Ok(phase_fail(
+                "resend-received-attachment",
+                start.elapsed(),
+                "🔴 without a sealed cache the resend must fall back to a normal upload, not fail",
+                metrics,
+            ));
+        };
+        let fallback_wire = Self::sent_attachment_wire(&fallback_sent);
+        let fallback_url = fallback_wire.get("file_url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if fallback_url.is_empty() {
+            metrics
+                .errors
+                .push("fallback upload produced no file reference".to_string());
+        }
+        let after_fallback = manager.sdk("bob")?.attachment_transfer_stats();
+        if after_fallback.body_uploads <= after_resend.body_uploads {
+            // 缓存没了只能重新封装，密文必然不同，服务端不可能已经有它——
+            // 这一趟必须真的把字节传上去，而且照样发得出去。
+            metrics.errors.push(format!(
+                "🔴 without the sealed cache the body must actually be uploaded: body uploads {} -> {}",
+                after_resend.body_uploads, after_fallback.body_uploads
+            ));
+        }
+        if removed == 0 {
+            metrics
+                .errors
+                .push("no sealed cache was removed - the fallback leg proves nothing".to_string());
+        }
+
+        let success = metrics.errors.is_empty();
+        Ok(PhaseResult {
+            phase_name: "resend-received-attachment".to_string(),
+            success,
+            duration: start.elapsed(),
+            details: format!(
+                "alice_file_id={alice_file_id} bob_file_id={bob_file_id} shared_url={} resend_body_uploads={} resend_claims={} fallback_body_uploads={} sealed_caches_removed={removed}",
+                bob_file_url == alice_file_url,
+                after_resend.body_uploads - before.body_uploads,
+                after_resend.claims - before.claims,
+                after_fallback.body_uploads - after_resend.body_uploads
+            ),
+            metrics,
+        })
+    }
+
+    /// 等某人收到指定 server_message_id 的附件，并把主文件下载到本地。
+    async fn wait_for_downloaded_attachment(
+        manager: &mut MultiAccountManager,
+        who: &str,
+        channel_id: u64,
+        channel_type: i32,
+        server_message_id: u64,
+        user_root: &std::path::Path,
+        uid: u64,
+        metrics: &mut PhaseMetrics,
+    ) -> BoxResult<Option<privchat_sdk::StoredMessage>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        let mut started = false;
+        loop {
+            manager.refresh_local_views(who).await?;
+            let rows = manager
+                .list_local_messages(who, channel_id, channel_type, 200)
+                .await?;
+            if let Some(row) = rows
+                .iter()
+                .find(|m| m.server_message_id == Some(server_message_id))
+                .cloned()
+            {
+                // `media_downloaded` 那个标记是 App 层收工时自己写的，SDK 不代劳；
+                // 这里只认「托管目录里真有这个文件」。
+                // 🔴 必须指定 payload 文件名：同一个目录里还躺着 `body.sealed`
+                // （留着给秒传用的密文副本），不指定就会把密文当原图。
+                let landed = privchat_sdk::media_store::resolve_attachment_path(
+                    user_root,
+                    uid,
+                    row.message_id as i64,
+                    row.created_at,
+                    Some("payload.png"),
+                )
+                .is_some_and(|p| p.exists());
+                if landed {
+                    metrics.rpc_successes += 1;
+                    return Ok(Some(row));
+                }
+                if !started {
+                    let meta = serde_json::from_str::<serde_json::Value>(&row.extra)
+                        .ok()
+                        .and_then(|v| v.get("metadata").cloned())
+                        .unwrap_or(serde_json::Value::Null);
+                    if let Some(file_id) = meta.get("file_id").and_then(|v| v.as_u64()) {
+                        manager
+                            .sdk(who)?
+                            .start_message_media_download_by_file_id(
+                                row.message_id,
+                                file_id,
+                                row.mime_type.clone().unwrap_or_else(|| "image/png".to_string()),
+                                None,
+                                row.created_at,
+                            )
+                            .await?;
+                        started = true;
+                        metrics.rpc_calls += 1;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                metrics
+                    .errors
+                    .push(format!("{who} never downloaded server_message_id={server_message_id}"));
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    /// 删掉某个用户目录下所有封装缓存，返回删了几个。
+    fn drop_sealed_caches_under(root: &std::path::Path) -> usize {
+        fn walk(dir: &std::path::Path, removed: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, removed);
+                } else if path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|n| n.contains(".sealed"))
+                {
+                    if std::fs::remove_file(&path).is_ok() {
+                        *removed += 1;
+                    }
+                }
+            }
+        }
+        let mut removed = 0;
+        walk(root, &mut removed);
+        removed
+    }
+
     /// 发一条附件并等它真的发出去。返回发送后的本地行。
     #[allow(clippy::too_many_arguments)]
     async fn send_one_fidelity_attachment(
         manager: &mut MultiAccountManager,
+        // 🔴 谁发就用谁的连接：拿别人的会话发、payload 里写自己的 uid，
+        // 服务端会按冒充拒掉（PermissionDenied），而且拒得对。
+        who: &str,
         channel_id: u64,
         channel_type: i32,
         from_uid: u64,
@@ -5260,12 +5562,21 @@ impl TestPhases {
         message_type: i32,
         caption: Option<&str>,
         bytes: &[u8],
+        // 已经在托管目录里的源文件。给了就直接用它——**这才是重发的真实形态**：
+        // 把字节抄到别处，SDK 会当成新素材重新封装，密文一变，秒传永远不命中。
+        managed_source: Option<&std::path::Path>,
         metrics: &mut PhaseMetrics,
     ) -> BoxResult<Option<privchat_sdk::StoredMessage>> {
-        let source_path = manager
-            .base_dir
-            .join(format!("phase44-{}", display_name.replace('/', "_")));
-        std::fs::write(&source_path, bytes)?;
+        let source_path = match managed_source {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let p = manager
+                    .base_dir
+                    .join(format!("phase44-{}", display_name.replace('/', "_")));
+                std::fs::write(&p, bytes)?;
+                p
+            }
+        };
 
         let extra = serde_json::json!({
             "file_name": display_name,
@@ -5274,8 +5585,8 @@ impl TestPhases {
         })
         .to_string();
 
-        let alice = manager.sdk("alice")?;
-        let message_id = alice
+        let sender = manager.sdk(who)?;
+        let message_id = sender
             .create_local_attachment_placeholder(
                 privchat_sdk::NewMessage {
                     channel_id,
@@ -5300,7 +5611,8 @@ impl TestPhases {
             t if t == privchat_protocol::message::ContentMessageType::Video as i32 => "video",
             _ => "file",
         };
-        alice
+        manager
+            .sdk(who)?
             .finalize_attachment_and_enqueue(
                 message_id,
                 source_path.display().to_string(),
@@ -5314,7 +5626,7 @@ impl TestPhases {
         let deadline = std::time::Instant::now() + Duration::from_secs(40);
         loop {
             let rows = manager
-                .list_local_messages("alice", channel_id, channel_type, 200)
+                .list_local_messages(who, channel_id, channel_type, 200)
                 .await?;
             if let Some(row) = rows.iter().find(|m| m.message_id == message_id) {
                 if row.status == 2 && row.server_message_id.is_some_and(|id| id != 0) {
