@@ -5273,9 +5273,10 @@ impl TestPhases {
         let mut metrics = PhaseMetrics::default();
         let channel_type = DIRECT_SYNC_CHANNEL_TYPE as i32;
 
-        let ab = manager
-            .cached_direct_channel("alice", "bob")
-            .ok_or_else(|| boxed_err("phase45 needs the alice<->bob direct channel"))?;
+        // 自备前置：单跑这一条（PRIVCHAT_PHASES=phase45）时前面的 phase 没跑过，
+        // 好友关系和会话都得自己建，否则会撞上陌生人策略。
+        Self::ensure_friends(manager, "alice", "bob", &mut metrics).await?;
+        let ab = manager.get_or_create_direct_channel("alice", "bob").await?;
         // 重发进 alice↔bob 这条会话：bob 给陌生人 charlie 直发会被服务端按陌生人
         // 策略拒掉（10004），那是另一条规则，跟这里要证的事无关——收件人是谁不影响
         // 「自己的 file_id / 同一个物理文件 / 零重传」。
@@ -5323,13 +5324,7 @@ impl TestPhases {
             ));
         };
 
-        let bob_local = privchat_sdk::media_store::resolve_attachment_path(
-            &bob_root,
-            bob_uid,
-            bob_row.message_id as i64,
-            bob_row.created_at,
-            Some("payload.png"),
-        );
+        let bob_local = Some(Self::managed_payload_path(&bob_root, bob_uid, &bob_row));
         let Some(bob_local) = bob_local.filter(|p| p.exists()) else {
             return Ok(phase_fail(
                 "resend-received-attachment",
@@ -5420,11 +5415,14 @@ impl TestPhases {
             ));
         };
         let fallback_wire = Self::sent_attachment_wire(&fallback_sent);
-        let fallback_url = fallback_wire.get("file_url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        if fallback_url.is_empty() {
-            metrics
-                .errors
-                .push("fallback upload produced no file reference".to_string());
+        // 🔴 判据是 file_id，不是 file_url：本地行的 wire 描述按类型落在 content 或
+        // extra 两处，file_url 只在其中一处出现，读得早了还可能没回写完
+        // （这正是这条 phase 早先偶发失败的原因，不是产品问题）。
+        let fallback_file_id = fallback_wire.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        if fallback_file_id == 0 {
+            metrics.errors.push(format!(
+                "fallback upload produced no file reference: wire={fallback_wire}"
+            ));
         }
         let after_fallback = manager.sdk("bob")?.attachment_transfer_stats();
         if after_fallback.body_uploads <= after_resend.body_uploads {
@@ -5482,16 +5480,11 @@ impl TestPhases {
             {
                 // `media_downloaded` 那个标记是 App 层收工时自己写的，SDK 不代劳；
                 // 这里只认「托管目录里真有这个文件」。
-                // 🔴 必须指定 payload 文件名：同一个目录里还躺着 `body.sealed`
-                // （留着给秒传用的密文副本），不指定就会把密文当原图。
-                let landed = privchat_sdk::media_store::resolve_attachment_path(
-                    user_root,
-                    uid,
-                    row.message_id as i64,
-                    row.created_at,
-                    Some("payload.png"),
-                )
-                .is_some_and(|p| p.exists());
+                // 🔴 只认这一个精确路径。`resolve_attachment_path` 在指定文件名不
+                // 存在时会退化去扫目录，扫到的可能是 `body.sealed`（密文副本）或
+                // `thumb.webp.part`（缩略图下载到一半）——把它当原图发出去，服务端
+                // 直接拒（这正是本条 phase 早先偶发失败的真因）。
+                let landed = Self::managed_payload_path(user_root, uid, &row).exists();
                 if landed {
                     metrics.rpc_successes += 1;
                     return Ok(Some(row));
@@ -5551,6 +5544,104 @@ impl TestPhases {
         let mut removed = 0;
         walk(root, &mut removed);
         removed
+    }
+
+    /// 托管目录里那个**主文件**的精确路径。
+    ///
+    /// 同一个目录里还有 `body.sealed`（秒传用的密文副本）和 `thumb.webp[.part]`
+    /// （缩略图，下载中会有 `.part`）。挑错文件就等于发错内容。
+    fn managed_payload_path(
+        user_root: &std::path::Path,
+        uid: u64,
+        row: &privchat_sdk::StoredMessage,
+    ) -> std::path::PathBuf {
+        privchat_sdk::media_store::get_canonical_message_dir(
+            user_root,
+            uid,
+            row.message_id as i64,
+            row.created_at,
+        )
+        .join("payload.png")
+    }
+
+    /// 好友关系是发消息的前置。已经是好友就什么都不做。
+    async fn ensure_friends(
+        manager: &mut MultiAccountManager,
+        a: &str,
+        b: &str,
+        metrics: &mut PhaseMetrics,
+    ) -> BoxResult<()> {
+        let b_id = manager.user_id(b)?;
+        if manager.check_friend(a, b_id).await?.is_friend {
+            return Ok(());
+        }
+        manager.search_then_apply_friend(a, b).await?;
+        metrics.rpc_calls += 1;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = manager.pending_friend_requests(b).await?;
+            let a_id = manager.user_id(a)?;
+            if pending.requests.iter().any(|r| r.from_user_id == a_id) {
+                manager.accept_friend_request(b, a_id).await?;
+                metrics.rpc_calls += 1;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(boxed_err(format!("{a}->{b} friend request never arrived")));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !manager.check_friend(a, b_id).await?.is_friend {
+            if std::time::Instant::now() >= deadline {
+                return Err(boxed_err(format!("{a}/{b} never became friends")));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        Ok(())
+    }
+
+    /// 附件发不出去时的现场。
+    ///
+    /// 🔴 只报「status=3」等于什么都没说：下次再红还得从头查。把能拿到的都带上——
+    /// 两个 id、本地状态、出站队列有没有残留、传输计数、封装缓存在不在。
+    async fn attachment_failure_report(
+        manager: &mut MultiAccountManager,
+        who: &str,
+        row: &privchat_sdk::StoredMessage,
+        source_path: &std::path::Path,
+    ) -> String {
+        let sdk = match manager.sdk(who) {
+            Ok(s) => s,
+            Err(e) => return format!("(no sdk for {who}: {e})"),
+        };
+        let stats = sdk.attachment_transfer_stats();
+        let queued = sdk
+            .peek_outbound_files(200)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .filter(|q| q.message_id == row.message_id)
+                    .count()
+            })
+            .unwrap_or(usize::MAX);
+        let sealed = source_path.with_file_name("body.sealed");
+        format!(
+            "account={who} message_id={} server_message_id={:?} status={} channel={}/{} \
+outbox_rows_for_this_message={queued} claims={} body_uploads={} thumbnail_uploads={} \
+source={} sealed_cache={} extra={}",
+            row.message_id,
+            row.server_message_id,
+            row.status,
+            row.channel_id,
+            row.channel_type,
+            stats.claims,
+            stats.body_uploads,
+            stats.thumbnail_uploads,
+            source_path.display(),
+            if sealed.exists() { "present" } else { "absent" },
+            row.extra.chars().take(200).collect::<String>(),
+        )
     }
 
     /// 发一条附件并等它真的发出去。返回发送后的本地行。
@@ -5640,16 +5731,28 @@ impl TestPhases {
                     return Ok(Some(row.clone()));
                 }
                 if row.status == 3 {
-                    metrics
-                        .errors
-                        .push(format!("{display_name}: send failed (status=3)"));
+                    metrics.errors.push(format!(
+                        "{display_name}: send failed — {}",
+                        Self::attachment_failure_report(manager, who, row, &source_path).await
+                    ));
                     return Ok(None);
                 }
             }
             if std::time::Instant::now() >= deadline {
+                let last = manager
+                    .list_local_messages(who, channel_id, channel_type, 200)
+                    .await?
+                    .into_iter()
+                    .find(|m| m.message_id == message_id);
+                let detail = match last.as_ref() {
+                    Some(row) => {
+                        Self::attachment_failure_report(manager, who, row, &source_path).await
+                    }
+                    None => "the local row disappeared".to_string(),
+                };
                 metrics
                     .errors
-                    .push(format!("{display_name}: never reached sent"));
+                    .push(format!("{display_name}: never reached sent — {detail}"));
                 return Ok(None);
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
