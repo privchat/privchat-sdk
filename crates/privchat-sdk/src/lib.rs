@@ -11634,6 +11634,25 @@ impl State {
     /// 两条路径都走它：本地文件上传完之后，和复用一份服务端已有附件时。分成两份写
     /// 的话，接收端能不能渲染就取决于发送方走了哪条路——而那种分叉只会在用户手里
     /// 被发现。
+    /// 消息里该显示的文件名。
+    ///
+    /// 上传用的名字是规范化过的 `payload.{ext}`——那是磁盘布局，不是内容。用户看见的
+    /// 应该是这份文件本来的名字，它由客户端在建占位符时写进 `extra.file_name`
+    /// （见 protocol 的 `LocalAttachmentMetadata`）。没有就退回上传名。
+    ///
+    /// 🔴 只取最后一段：名字可能来自远端消息，不许带路径。
+    fn wire_display_filename(extra: &str, upload_filename: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(extra)
+            .ok()
+            .and_then(|v| {
+                v.get("file_name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s).trim().to_string())
+            })
+            .filter(|s| !s.is_empty() && s != "." && s != "..")
+            .unwrap_or_else(|| upload_filename.to_string())
+    }
+
     fn build_attachment_wire_content(input: AttachmentWireInput<'_>) -> serde_json::Value {
         // 图片消息协议必须带缩略图引用（server 校验拒绝缺失）。缩略图未产出时把
         // 原图 file 引用为缩略图（接收端按缩略图链路下载原图渲染），与 TS SDK 一致；
@@ -12242,7 +12261,8 @@ impl State {
                         .unwrap_or_default(),
                 )
             }),
-            filename: &upload_filename,
+            // 传的是 payload.{ext}，显示的是它本来的名字。
+            filename: &Self::wire_display_filename(&message.extra, &upload_filename),
             mime_type: &mime_type,
             width: source_width,
             height: source_height,
@@ -24687,6 +24707,50 @@ mod seal_once_tests {
         State::drop_sealed_cache(&cache);
         assert!(!cache.exists(), "🔴 密文副本不能永久留在磁盘上");
         assert!(!cache.with_extension("sealed.json").exists());
+    }
+}
+
+/// 消息里显示哪个文件名。
+#[cfg(test)]
+mod wire_display_filename_tests {
+    use super::*;
+
+    /// 🔴 `payload.pdf` 是磁盘布局。用户发的是「合同.pdf」，对端就该看到「合同.pdf」——
+    /// 转发一份收到的附件时尤其明显：本地缓存叫 `42.pdf`，名字只能从 extra 里来。
+    #[test]
+    fn the_original_name_wins_over_the_upload_name() {
+        let extra = r#"{"file_name":"合同.pdf","mime_type":"application/pdf"}"#;
+        assert_eq!(
+            State::wire_display_filename(extra, "payload.pdf"),
+            "合同.pdf"
+        );
+    }
+
+    #[test]
+    fn without_one_the_upload_name_is_used() {
+        assert_eq!(State::wire_display_filename("{}", "payload.pdf"), "payload.pdf");
+        assert_eq!(State::wire_display_filename("", "payload.pdf"), "payload.pdf");
+        assert_eq!(
+            State::wire_display_filename(r#"{"file_name":"  "}"#, "payload.pdf"),
+            "payload.pdf"
+        );
+    }
+
+    /// 名字可能是从别人的消息里带过来的，不许携带路径。
+    #[test]
+    fn a_name_cannot_carry_a_path() {
+        assert_eq!(
+            State::wire_display_filename(r#"{"file_name":"../../etc/passwd"}"#, "payload.bin"),
+            "passwd"
+        );
+        assert_eq!(
+            State::wire_display_filename(r#"{"file_name":"a/b/c.jpg"}"#, "payload.jpg"),
+            "c.jpg"
+        );
+        assert_eq!(
+            State::wire_display_filename(r#"{"file_name":".."}"#, "payload.bin"),
+            "payload.bin"
+        );
     }
 }
 
