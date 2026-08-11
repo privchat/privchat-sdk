@@ -10658,8 +10658,10 @@ impl State {
                             })
                     })
                     .unwrap_or("file");
-                envelope.content =
-                    Self::attachment_placeholder_text(message.message_type, file_type).to_string();
+                // 带说明文字的附件，正文就是那句话；没有才退回 `[图片]` 这类占位文案。
+                envelope.content = Self::attachment_caption(&message.extra).unwrap_or_else(|| {
+                    Self::attachment_placeholder_text(message.message_type, file_type).to_string()
+                });
                 envelope.metadata = Some(content_json);
             }
         }
@@ -11043,6 +11045,17 @@ impl State {
     ///
     /// 与「发送入口决定消息类型，MIME 不反推」原则一致：只有 File 消息才允许
     /// 靠 MIME 推回 `[图片]`/`[视频]` 这种预览文案。
+    /// 附件的说明文字，写在本地元数据里（protocol 的 `LocalAttachmentMetadata::caption`）。
+    fn attachment_caption(extra: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(extra)
+            .ok()?
+            .get("caption")?
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     fn attachment_placeholder_text(message_type: i32, file_type: &str) -> &'static str {
         use privchat_protocol::message::ContentMessageType;
         if message_type == ContentMessageType::Voice as i32 {
@@ -24707,6 +24720,28 @@ mod seal_once_tests {
         State::drop_sealed_cache(&cache);
         assert!(!cache.exists(), "🔴 密文副本不能永久留在磁盘上");
         assert!(!cache.with_extension("sealed.json").exists());
+    }
+}
+
+/// 附件的说明文字。
+#[cfg(test)]
+mod attachment_caption_tests {
+    use super::*;
+
+    /// 「图片配一句话」是**一条**消息：正文就是那句话，不是 `[图片]`。
+    #[test]
+    fn a_caption_becomes_the_message_text() {
+        let extra = r#"{"file_name":"a.jpg","mime_type":"image/jpeg","caption":"周末爬山"}"#;
+        assert_eq!(State::attachment_caption(extra).as_deref(), Some("周末爬山"));
+    }
+
+    /// 没写说明的附件仍然退回占位文案，会话列表才有东西显示。
+    #[test]
+    fn without_one_the_placeholder_stays() {
+        assert_eq!(State::attachment_caption(r#"{"file_name":"a.jpg"}"#), None);
+        assert_eq!(State::attachment_caption(r#"{"caption":"   "}"#), None);
+        assert_eq!(State::attachment_caption(""), None);
+        assert_eq!(State::attachment_caption("not json"), None);
     }
 }
 

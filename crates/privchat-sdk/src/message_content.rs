@@ -139,6 +139,10 @@ pub fn project_stored_message(message: &StoredMessage) -> MessageContentProjecti
             body.text = value;
         }
         body.entities = scan_entities(&body.text, &body.mentioned_user_ids);
+    } else if let Some(caption) = string_at(&sources, &["caption"]) {
+        // 附件的说明文字是消息内容的一部分，跟图片一起显示。
+        body.text = caption;
+        body.entities = scan_entities(&body.text, &body.mentioned_user_ids);
     } else if looks_like_json(&body.text) {
         // Non-text renderers consume typed fields. An unsupported renderer must not expose JSON.
         body.text.clear();
@@ -372,5 +376,50 @@ mod tests {
         unsupported.message_type = 2;
         let body = project_stored_message(&unsupported);
         assert!(body.text.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod caption_projection_tests {
+    use super::*;
+
+    fn attachment(extra: &str) -> StoredMessage {
+        StoredMessage {
+            message_id: 1,
+            server_message_id: None,
+            local_message_id: None,
+            channel_id: 10,
+            channel_type: 1,
+            from_uid: 7,
+            message_type: 1, // image
+            content: r#"{"file_id":42,"file_url":"http://cdn/a.jpg"}"#.to_string(),
+            status: 0,
+            created_at: 0,
+            updated_at: 0,
+            extra: extra.to_string(),
+            revoked: false,
+            revoked_by: None,
+            mime_type: Some("image/jpeg".to_string()),
+            media_downloaded: true,
+            thumb_status: 1,
+            delivered: false,
+            pts: None,
+        }
+    }
+
+    /// 🔴 附件的说明文字要跟图片一起显示；以前这一支一律清空 text，配的话就没了。
+    #[test]
+    fn a_caption_is_projected_as_the_message_text() {
+        let body = project_stored_message(&attachment(
+            r#"{"file_name":"a.jpg","caption":"周末爬山"}"#,
+        ));
+        assert_eq!(body.text, "周末爬山");
+    }
+
+    /// 没有说明时仍然不能把附件 JSON 泄露成正文。
+    #[test]
+    fn without_a_caption_the_json_is_not_exposed() {
+        let body = project_stored_message(&attachment(r#"{"file_name":"a.jpg"}"#));
+        assert_eq!(body.text, "");
     }
 }

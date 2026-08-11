@@ -851,6 +851,8 @@ pub struct SendMessageOptionsInput {
 pub struct LocalAttachmentMetadataInput {
     pub file_name: String,
     pub mime_type: String,
+    /// 随附件一起发出的说明文字。发送时它就是消息正文。
+    pub caption: Option<String>,
     pub duration: Option<u32>,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -5560,109 +5562,6 @@ impl PrivchatClient {
         Ok(true)
     }
 
-    /// 把指定本地消息转发到目标频道。
-    ///
-    /// 内部做两件事：
-    /// 1. 克隆源消息的 `content / message_type / mime_type / extra`，用当前登录用户作为 `from_uid`，
-    ///    通过 `enqueue_local_message` 创建新本地行并加入出站队列（走正常发送链路）。
-    /// 2. 若源消息带附件（`mime_type` 非空），则把源消息目录下的所有文件整体复制到新消息目录，
-    ///    并把 `media_downloaded` 置为 true，让 UI 立即看到本地缩略图 / 文件。
-    ///
-    /// 调用方负责限制不可转发的类型（比如 VOICE / 撤回消息）——SDK 会拒绝撤回消息但不做类型过滤。
-    /// 可选的 note 文本由调用方自行追加 `send_message` 调用，本接口不负责。
-    ///
-    /// 返回新消息的 `message_id`（本地 rowid）。
-    pub async fn forward_message(
-        &self,
-        src_message_id: u64,
-        target_channel_id: u64,
-        target_channel_type: i32,
-    ) -> Result<u64, PrivchatFfiError> {
-        let src = self
-            .inner
-            .get_message_by_id(src_message_id)
-            .await
-            .map_err(PrivchatFfiError::from)?
-            .ok_or_else(|| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                detail: format!("source message not found: {}", src_message_id),
-            })?;
-
-        if src.revoked {
-            return Err(PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::OperationNotAllowed as u32,
-                detail: "cannot forward a revoked message".to_string(),
-            });
-        }
-
-        let from_uid = self.require_current_user_id().await?;
-
-        let input = NewMessage {
-            channel_id: target_channel_id,
-            channel_type: target_channel_type,
-            from_uid,
-            message_type: src.message_type,
-            content: src.content.clone(),
-            searchable_word: String::new(),
-            setting: 0,
-            extra: src.extra.clone(),
-            mime_type: src.mime_type.clone(),
-            media_downloaded: false,
-            thumb_status: src.thumb_status,
-        };
-        let new_message_id = self.enqueue_local_message(input).await?;
-
-        // 复制附件文件（若有）。任意一步失败都不回滚已创建的消息，仅让 UI 缺少本地缓存。
-        if src.mime_type.is_some() {
-            let data_dir = self.config.lock().unwrap().data_dir.clone();
-            let root = std::path::Path::new(&data_dir);
-            let src_dir = privchat_sdk::media_store::get_canonical_message_dir(
-                root,
-                from_uid,
-                src.message_id as i64,
-                src.created_at,
-            );
-            let new_created_at = self
-                .inner
-                .get_message_by_id(new_message_id)
-                .await
-                .map_err(PrivchatFfiError::from)?
-                .map(|m| m.created_at)
-                .unwrap_or(src.created_at);
-            if let Ok(dst_dir) = privchat_sdk::media_store::ensure_attachment_dir(
-                root,
-                from_uid,
-                new_message_id as i64,
-                new_created_at,
-            ) {
-                let mut copied_any = false;
-                if src_dir.exists() {
-                    if let Ok(entries) = std::fs::read_dir(&src_dir) {
-                        for entry in entries.flatten() {
-                            let src_path = entry.path();
-                            if src_path.is_file() {
-                                if let Some(name) = src_path.file_name() {
-                                    let dst_path = dst_dir.join(name);
-                                    if std::fs::copy(&src_path, &dst_path).is_ok() {
-                                        copied_any = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if copied_any {
-                    let _ = self
-                        .inner
-                        .update_media_downloaded(new_message_id, true)
-                        .await;
-                }
-            }
-        }
-
-        Ok(new_message_id)
-    }
-
     pub async fn add_reaction(
         &self,
         server_message_id: u64,
@@ -7444,7 +7343,7 @@ impl PrivchatClient {
             file_type: payload.file_type,
             business_type: payload.business_type,
             // 这个入口是给上层「自己准备好字节再传」用的，没有走 SDK 内部的封装步骤，
-    // 因此没有可报的最终 blob 摘要；不带摘要 = 照常完整上传（服务端兼容）。
+            // 因此没有可报的最终 blob 摘要；不带摘要 = 照常完整上传（服务端兼容）。
             sha256: None,
             transform_version: 0,
         };
@@ -7635,6 +7534,10 @@ impl PrivchatClient {
         let metadata = privchat_protocol::message::LocalAttachmentMetadata {
             file_name: metadata.file_name,
             mime_type: metadata.mime_type,
+            caption: metadata
+                .caption
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             duration: metadata.duration,
             width: metadata.width,
             height: metadata.height,
