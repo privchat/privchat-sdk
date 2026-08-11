@@ -844,6 +844,69 @@ pub struct UploadedFileInfo {
 /// 功能不受影响，只是那次省不掉带宽。留太久的代价是每个附件在设备上占双份。
 const SEALED_CACHE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
 
+/// 生产实现：直接转调真实的 RPC / HTTP。
+///
+/// 只是把参数拢在一处，让 `plan_attachment_upload` 不必知道它们。
+struct LiveAttachmentUploadIo<'a> {
+    state: &'a mut State,
+    user_id: u64,
+    filename: String,
+    mime_type: String,
+    file_type: String,
+    blob: Vec<u8>,
+    cek_b64: String,
+}
+
+impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
+    async fn prepare(&mut self, digest: Option<&str>) -> Result<FileRequestUploadTokenResponse> {
+        self.state
+            .request_upload_token(
+                self.user_id,
+                self.filename.clone(),
+                // 报的是**封装后**的字节数，与摘要同一口径。
+                self.blob.len() as i64,
+                self.mime_type.clone(),
+                self.file_type.clone(),
+                digest,
+            )
+            .await
+    }
+
+    async fn claim(&mut self, token: &str, digest: &str) -> Result<UploadedFileInfo> {
+        self.state.claim_existing_file(token, digest).await
+    }
+
+    async fn upload(
+        &mut self,
+        token: &FileRequestUploadTokenResponse,
+    ) -> Result<UploadedFileInfo> {
+        self.state
+            .upload_file_bytes(
+                &token.upload_url,
+                &token.token,
+                &self.filename,
+                &self.mime_type,
+                self.blob.clone(),
+                self.cek_b64.clone(),
+            )
+            .await
+    }
+}
+
+/// 一次附件上传要用到的三个动作。
+///
+/// 存在的理由只有一个：让 `plan_attachment_upload` 的次序可被测试驱动。
+/// 生产实现直接转调真实的 RPC/HTTP。
+trait AttachmentUploadIo {
+    /// 申请上传 token。`digest` 为 `None` 表示这次不参与秒传，就是要传字节。
+    async fn prepare(&mut self, digest: Option<&str>) -> Result<FileRequestUploadTokenResponse>;
+    /// 秒传取用：换一个属于自己的 file_id，不传正文。
+    async fn claim(&mut self, token: &str, digest: &str) -> Result<UploadedFileInfo>;
+    /// 传字节。
+    async fn upload(&mut self, token: &FileRequestUploadTokenResponse)
+        -> Result<UploadedFileInfo>;
+}
+
 /// 封装缓存的伴生元数据：密文本身在旁边那个文件里。
 ///
 /// CEK 落在本机托管目录，与明文同一信任域——它本来就是给这台设备重试用的。
@@ -11238,6 +11301,43 @@ impl State {
         hex::encode(hasher.finalize())
     }
 
+    /// 一次附件发送要按什么次序跟服务端打交道。
+    ///
+    /// 抽出来是为了**能被测到**：这段的价值全在次序和入参上——第一次带摘要、
+    /// claim 没成时第二次**不带**摘要、两次上传用的是同一个已封装的 blob。
+    /// 写在发送函数里的话，这些只能靠读代码确认。
+    ///
+    /// 三个动作由 `io` 提供：生产是真实的 RPC/HTTP，测试是记录调用的假实现。
+    /// 这里不碰网络，也不碰文件。
+    async fn plan_attachment_upload<Io: AttachmentUploadIo>(
+        io: &mut Io,
+        sha256: &str,
+    ) -> Result<(UploadedFileInfo, String)> {
+        // 第一次带摘要，给服务端说「这串字节我已经有了」的机会。
+        let token = io.prepare(Some(sha256)).await?;
+
+        if token.already_exists {
+            match io.claim(&token.token, sha256).await {
+                Ok(info) => return Ok((info, token.token)),
+                // 🔴 秒传没成 → 照常上传，不是发送失败。预检说「有」而 claim 拿不到
+                // 会正常发生：那份内容的记录里没有一条是这个人现在读得到的，或者
+                // 候选在这中间失效了。
+                Err(e) if Self::claim_miss_should_reupload(&e) => {
+                    eprintln!("[SDK.actor] claim missed, falling back to a normal upload: {e}");
+                    // 🔴 第二次**不带**摘要。带着的话服务端还会说「已经有了」，
+                    // 又绕回 claim —— 转成死循环。
+                    let token = io.prepare(None).await?;
+                    let info = io.upload(&token).await?;
+                    return Ok((info, token.token));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let info = io.upload(&token).await?;
+        Ok((info, token.token))
+    }
+
     /// claim 失败是不是「服务端拿不到那份内容」这一种——只有它该退回整传。
     ///
     /// 服务端把「没有这份内容」和「有但你无权」说成同一句话（否则这个接口就是
@@ -11462,70 +11562,18 @@ impl State {
         sealed_cache: &std::path::Path,
     ) -> Result<(UploadedFileInfo, String)> {
         let (blob, cek_b64, sha256) = Self::seal_once(sealed_cache, &plaintext)?;
-        let token = self
-            .request_upload_token(
-                user_id,
-                filename.clone(),
-                // 🔴 报的是**封装后**的字节数，与摘要同一口径。
-                blob.len() as i64,
-                mime_type.clone(),
-                file_type.clone(),
-                Some(&sha256),
-            )
-            .await?;
-
-        if token.already_exists {
-            // 服务端已经有这串字节：一个字节都不传，换一个属于自己的 file_id。
-            match self.claim_existing_file(&token.token, &sha256).await {
-                Ok(info) => return Ok((info, token.token)),
-                // 🔴 秒传没成——**照常上传**，不是发送失败。
-                //
-                // 预检说「有」，claim 却拿不到，是正常会发生的事：那份内容对应的
-                // 记录里没有一条是这个人现在读得到的，或者候选在这中间失效了。
-                // 服务端把它和「根本没有这份内容」说成同一句话（否则接口会变成
-                // 文件存在性探测器），所以客户端只能凭这个信号退回整传。
-                //
-                // 只有这一种错误退回。Validation / Forbidden / ServiceUnavailable
-                // 各有各的含义：参数不对、真的无权、瞬时竞争该重试——把它们一并
-                // 当成「传一遍」会把真问题盖掉，也会白传一遍字节。
-                Err(e) if Self::claim_miss_should_reupload(&e) => {
-                    eprintln!(
-                        "[SDK.actor] claim missed, falling back to a normal upload: {e}"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // 走到这里有两条来路：预检未命中，或者命中了但 claim 没拿到。
-        // 两种都用**同一个已封装好的 blob** 重新要一张普通 token 再传——重新封装
-        // 会产出另一串字节，白白让服务端多存一份。
-        let token = if token.already_exists {
-            self.request_upload_token(
-                user_id,
-                filename.clone(),
-                blob.len() as i64,
-                mime_type.clone(),
-                file_type,
-                // 不带摘要：这一次就是要传字节，不要再进秒传分支。
-                None,
-            )
-            .await?
-        } else {
-            token
+        let mut io = LiveAttachmentUploadIo {
+            state: self,
+            user_id,
+            filename,
+            mime_type,
+            file_type,
+            // 🔴 同一个 blob 供两次上传共用（预检未命中 / claim 没成都用它）。
+            // 重新封装会产出另一串字节，白让服务端多存一份。
+            blob,
+            cek_b64,
         };
-
-        let info = self
-            .upload_file_bytes(
-                &token.upload_url,
-                &token.token,
-                &filename,
-                &mime_type,
-                blob,
-                cek_b64,
-            )
-            .await?;
-        Ok((info, token.token))
+        Self::plan_attachment_upload(&mut io, &sha256).await
     }
 
     async fn upload_callback(
@@ -24228,6 +24276,149 @@ mod already_managed_source_tests {
                 !State::source_is_already_managed(path, root),
                 "{path} 不该被当成接手后的成品"
             );
+        }
+    }
+}
+
+/// 秒传没命中时的完整回退次序。
+#[cfg(test)]
+mod attachment_upload_plan_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorder {
+        /// 每次 prepare 收到的摘要（`None` = 这次不参与秒传）。
+        prepares: Vec<Option<String>>,
+        claims: usize,
+        /// 每次 upload 时那张 token。
+        uploads: Vec<String>,
+        already_exists: bool,
+        claim_result: Option<Error>,
+    }
+
+    fn token(name: &str, already_exists: bool) -> FileRequestUploadTokenResponse {
+        FileRequestUploadTokenResponse {
+            token: name.to_string(),
+            upload_url: format!("http://cdn/upload/{name}"),
+            already_exists,
+            file_id: String::new(),
+            expires_at: None,
+            max_size: None,
+        }
+    }
+
+    fn uploaded() -> UploadedFileInfo {
+        UploadedFileInfo {
+            file_id: "4242".to_string(),
+            storage_source_id: 0,
+            file_url: "http://cdn/4242.bin".to_string(),
+            thumbnail_url: None,
+            file_size: 7,
+            original_size: None,
+            width: None,
+            height: None,
+            mime_type: "image/png".to_string(),
+        }
+    }
+
+    impl AttachmentUploadIo for Recorder {
+        async fn prepare(
+            &mut self,
+            digest: Option<&str>,
+        ) -> Result<FileRequestUploadTokenResponse> {
+            self.prepares.push(digest.map(str::to_string));
+            // 只有带摘要那次才可能命中——不带摘要的那次必须是普通上传 token。
+            let hit = self.already_exists && digest.is_some();
+            Ok(token(&format!("token-{}", self.prepares.len()), hit))
+        }
+
+        async fn claim(&mut self, _token: &str, _digest: &str) -> Result<UploadedFileInfo> {
+            self.claims += 1;
+            match self.claim_result.take() {
+                Some(e) => Err(e),
+                None => Ok(uploaded()),
+            }
+        }
+
+        async fn upload(
+            &mut self,
+            token: &FileRequestUploadTokenResponse,
+        ) -> Result<UploadedFileInfo> {
+            self.uploads.push(token.token.clone());
+            Ok(uploaded())
+        }
+    }
+
+    const SHA: &str = "d1e8a70b5ccab1dc2f56bbf7e99f064a660c08e361a35751b9c483c88943d082";
+
+    /// 预检未命中：一次 prepare（带摘要）+ 一次上传，不 claim。
+    #[tokio::test]
+    async fn a_miss_uploads_once() {
+        let mut io = Recorder::default();
+        State::plan_attachment_upload(&mut io, SHA).await.expect("send");
+        assert_eq!(io.prepares, vec![Some(SHA.to_string())]);
+        assert_eq!(io.claims, 0);
+        assert_eq!(io.uploads, vec!["token-1".to_string()]);
+    }
+
+    /// 命中且 claim 成功：一次 prepare + 一次 claim，**一个字节都不传**。
+    #[tokio::test]
+    async fn a_hit_claims_and_uploads_nothing() {
+        let mut io = Recorder {
+            already_exists: true,
+            ..Default::default()
+        };
+        State::plan_attachment_upload(&mut io, SHA).await.expect("send");
+        assert_eq!(io.prepares, vec![Some(SHA.to_string())]);
+        assert_eq!(io.claims, 1);
+        assert!(io.uploads.is_empty(), "🔴 秒传命中还传字节就白传了");
+    }
+
+    /// 🔴 命中但 claim 拿不到：必须再要一张**不带摘要**的 token 并上传。
+    ///
+    /// 第二次仍带摘要的话，服务端还会说「已经有了」，又绕回 claim——转成死循环。
+    /// 完全不回退的话，这条附件就再也发不出去。
+    #[tokio::test]
+    async fn a_missed_claim_re_prepares_without_the_digest_and_uploads() {
+        let mut io = Recorder {
+            already_exists: true,
+            claim_result: Some(Error::Server {
+                code: ErrorCode::ResourceNotFound as u32,
+                message: "服务端没有这份内容，请正常上传".to_string(),
+            }),
+            ..Default::default()
+        };
+        State::plan_attachment_upload(&mut io, SHA).await.expect("send falls back");
+
+        assert_eq!(
+            io.prepares,
+            vec![Some(SHA.to_string()), None],
+            "🔴 第一次带摘要给秒传机会，第二次必须不带——带了就绕回 claim"
+        );
+        assert_eq!(io.claims, 1, "只 claim 一次，失败就不再试");
+        assert_eq!(
+            io.uploads,
+            vec!["token-2".to_string()],
+            "🔴 上传要用第二张 token；用第一张的话它已经被 claim 消费过了"
+        );
+    }
+
+    /// 其它失败不吞成一次上传：不该白传字节，也不该把真问题盖掉。
+    #[tokio::test]
+    async fn other_claim_failures_propagate() {
+        for code in [ErrorCode::PermissionDenied, ErrorCode::ServiceUnavailable] {
+            let mut io = Recorder {
+                already_exists: true,
+                claim_result: Some(Error::Server {
+                    code: code as u32,
+                    message: String::new(),
+                }),
+                ..Default::default()
+            };
+            let out = State::plan_attachment_upload(&mut io, SHA).await;
+            assert!(out.is_err(), "{code:?} 该原样抛出");
+            assert!(io.uploads.is_empty(), "{code:?} 不该触发上传");
+            assert_eq!(io.prepares.len(), 1, "{code:?} 不该再要一张 token");
         }
     }
 }
