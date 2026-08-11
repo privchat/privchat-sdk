@@ -10642,30 +10642,6 @@ impl State {
                 .is_some()
             {
                 // Backward compatibility: attachment callers may still pass raw metadata json.
-                let file_type = content_json
-                    .get("file_type")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        content_json
-                            .get("mime_type")
-                            .and_then(|v| v.as_str())
-                            .and_then(|mime| {
-                                if mime.starts_with("image/") {
-                                    Some("image")
-                                } else if mime.starts_with("video/") {
-                                    Some("video")
-                                } else {
-                                    None
-                                }
-                            })
-                    })
-                    .unwrap_or("file");
-                // 🔴 正文只放用户写的说明文字；没写就是空串。
-                //
-                // 「[图片]」这类占位文案是**展示层**按消息类型和语言现取的，不能进 wire：
-                // 一进 wire 就有两个后果——它跟着消息跑到别的语言的客户端上，而且
-                // 「没写说明」和「说明恰好是 [图片]」再也分不开。
-                let _ = file_type;
                 envelope.content = Self::attachment_caption(&message.extra).unwrap_or_default();
                 envelope.metadata = Some(content_json);
             }
@@ -19817,7 +19793,7 @@ mod tests {
         panic!("sdk actor did not load seeded bootstrap state");
     }
 
-    async fn new_seeded_state(name: &str) -> (State, PathBuf) {
+    pub(crate) async fn new_seeded_state(name: &str) -> (State, PathBuf) {
         let dir = unique_test_dir(name);
         let storage = StorageHandle::start_at(dir.clone()).expect("start storage at test dir");
         let login = LoginResult {
@@ -24751,6 +24727,82 @@ mod seal_once_tests {
         State::drop_sealed_cache(&cache);
         assert!(!cache.exists(), "🔴 密文副本不能永久留在磁盘上");
         assert!(!cache.with_extension("sealed.json").exists());
+    }
+}
+
+/// 附件消息发出去的 wire 正文里到底有什么。
+///
+/// 🔴 这一层必须解码 wire 来看：占位文案是否混进正文，只有在编码之后才看得见。
+#[cfg(test)]
+mod attachment_wire_caption_tests {
+    use super::*;
+
+    fn attachment_row(extra: &str) -> StoredMessage {
+        StoredMessage {
+            message_id: 1,
+            server_message_id: None,
+            local_message_id: Some(7),
+            channel_id: 10,
+            channel_type: 1,
+            from_uid: 7,
+            message_type: privchat_protocol::message::ContentMessageType::Image as i32,
+            content: String::new(),
+            status: 0,
+            created_at: 0,
+            updated_at: 0,
+            extra: extra.to_string(),
+            revoked: false,
+            revoked_by: None,
+            mime_type: Some("image/jpeg".to_string()),
+            media_downloaded: true,
+            thumb_status: 1,
+            delivered: false,
+            pts: None,
+        }
+    }
+
+    /// 发送后 wire envelope 里的正文。
+    async fn wire_content(extra: &str) -> String {
+        let (state, _dir) = crate::tests::new_seeded_state("attachment-wire-caption").await;
+        let attachment = serde_json::json!({
+            "file_type": "image",
+            "file_id": 42,
+            "filename": "payload.jpg",
+            "mime_type": "image/jpeg",
+            "file_url": "http://cdn/42.jpg",
+        })
+        .to_string();
+        let req = state
+            .build_send_message_request_with_content(&attachment_row(extra), 7, attachment)
+            .expect("build request");
+        let envelope: privchat_protocol::protocol::MessagePayloadEnvelope =
+            privchat_protocol::decode_message(&req.payload).expect("decode wire payload");
+        envelope.content
+    }
+
+    /// 没写说明文字：正文是空串。占位文案由展示层按类型和语言现取，不进 wire。
+    #[tokio::test]
+    async fn without_a_caption_the_body_is_empty() {
+        assert_eq!(wire_content(r#"{"file_name":"a.jpg"}"#).await, "");
+    }
+
+    /// 写了就原样带走。
+    #[tokio::test]
+    async fn a_caption_is_carried_verbatim() {
+        assert_eq!(
+            wire_content(r#"{"file_name":"a.jpg","caption":"周末爬山"}"#).await,
+            "周末爬山"
+        );
+    }
+
+    /// 🔴 说明文字**恰好**是占位文案的样子，也必须原样带走：
+    /// 一旦发送端自己会生成「[图片]」，这两种情况就永远分不开了。
+    #[tokio::test]
+    async fn a_caption_that_looks_like_a_placeholder_survives() {
+        assert_eq!(
+            wire_content(r#"{"file_name":"a.jpg","caption":"[图片]"}"#).await,
+            "[图片]"
+        );
     }
 }
 
