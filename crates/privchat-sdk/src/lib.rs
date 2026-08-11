@@ -853,18 +853,32 @@ struct LiveAttachmentUploadIo<'a> {
     filename: String,
     mime_type: String,
     file_type: String,
-    blob: Vec<u8>,
-    cek_b64: String,
+    plaintext: Vec<u8>,
+    /// 封装结果缓存到哪儿：同一条 outbox 任务重试时读回来，不重新加密。
+    sealed_cache: &'a std::path::Path,
 }
 
 impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
-    async fn prepare(&mut self, digest: Option<&str>) -> Result<FileRequestUploadTokenResponse> {
+    async fn seal(&mut self) -> Result<SealedPayload> {
+        let (blob, cek_b64, sha256) = State::seal_once(self.sealed_cache, &self.plaintext)?;
+        Ok(SealedPayload {
+            blob,
+            cek_b64,
+            sha256,
+        })
+    }
+
+    async fn prepare(
+        &mut self,
+        digest: Option<&str>,
+        size: usize,
+    ) -> Result<FileRequestUploadTokenResponse> {
         self.state
             .request_upload_token(
                 self.user_id,
                 self.filename.clone(),
                 // 报的是**封装后**的字节数，与摘要同一口径。
-                self.blob.len() as i64,
+                size as i64,
                 self.mime_type.clone(),
                 self.file_type.clone(),
                 digest,
@@ -879,6 +893,7 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
     async fn upload(
         &mut self,
         token: &FileRequestUploadTokenResponse,
+        payload: &SealedPayload,
     ) -> Result<UploadedFileInfo> {
         self.state
             .upload_file_bytes(
@@ -886,8 +901,8 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                 &token.token,
                 &self.filename,
                 &self.mime_type,
-                self.blob.clone(),
-                self.cek_b64.clone(),
+                payload.blob.clone(),
+                payload.cek_b64.clone(),
             )
             .await
     }
@@ -898,13 +913,29 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
 /// 存在的理由只有一个：让 `plan_attachment_upload` 的次序可被测试驱动。
 /// 生产实现直接转调真实的 RPC/HTTP。
 trait AttachmentUploadIo {
+    /// 封装（压缩后加密）。**整条链路只许调一次**——每次封装用新的随机 CEK/nonce，
+    /// 再封一次就是另一串字节：摘要对不上，秒传必落空，服务端还多存一份。
+    async fn seal(&mut self) -> Result<SealedPayload>;
     /// 申请上传 token。`digest` 为 `None` 表示这次不参与秒传，就是要传字节。
-    async fn prepare(&mut self, digest: Option<&str>) -> Result<FileRequestUploadTokenResponse>;
+    async fn prepare(&mut self, digest: Option<&str>, size: usize)
+        -> Result<FileRequestUploadTokenResponse>;
     /// 秒传取用：换一个属于自己的 file_id，不传正文。
     async fn claim(&mut self, token: &str, digest: &str) -> Result<UploadedFileInfo>;
-    /// 传字节。
-    async fn upload(&mut self, token: &FileRequestUploadTokenResponse)
-        -> Result<UploadedFileInfo>;
+    /// 传字节：传的必须是 [`AttachmentUploadIo::seal`] 那一次的产物。
+    async fn upload(
+        &mut self,
+        token: &FileRequestUploadTokenResponse,
+        payload: &SealedPayload,
+    ) -> Result<UploadedFileInfo>;
+}
+
+/// 一次封装的产物：要上传的密文、解它的 CEK、以及秒传按的摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedPayload {
+    blob: Vec<u8>,
+    cek_b64: String,
+    /// 密文（不是明文）的 SHA-256：服务端按最终上传字节判重。
+    sha256: String,
 }
 
 /// 封装缓存的伴生元数据：密文本身在旁边那个文件里。
@@ -11311,10 +11342,13 @@ impl State {
     /// 这里不碰网络，也不碰文件。
     async fn plan_attachment_upload<Io: AttachmentUploadIo>(
         io: &mut Io,
-        sha256: &str,
     ) -> Result<(UploadedFileInfo, String)> {
+        // 🔴 只封装这一次。后面无论走哪条分支，用的都是它。
+        let payload = io.seal().await?;
+        let sha256 = payload.sha256.as_str();
+
         // 第一次带摘要，给服务端说「这串字节我已经有了」的机会。
-        let token = io.prepare(Some(sha256)).await?;
+        let token = io.prepare(Some(sha256), payload.blob.len()).await?;
 
         if token.already_exists {
             match io.claim(&token.token, sha256).await {
@@ -11326,15 +11360,15 @@ impl State {
                     eprintln!("[SDK.actor] claim missed, falling back to a normal upload: {e}");
                     // 🔴 第二次**不带**摘要。带着的话服务端还会说「已经有了」，
                     // 又绕回 claim —— 转成死循环。
-                    let token = io.prepare(None).await?;
-                    let info = io.upload(&token).await?;
+                    let token = io.prepare(None, payload.blob.len()).await?;
+                    let info = io.upload(&token, &payload).await?;
                     return Ok((info, token.token));
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        let info = io.upload(&token).await?;
+        let info = io.upload(&token, &payload).await?;
         Ok((info, token.token))
     }
 
@@ -11561,19 +11595,16 @@ impl State {
         // 封装结果缓存到哪儿。同一条 outbox 任务重试时读回它，绝不重新封装。
         sealed_cache: &std::path::Path,
     ) -> Result<(UploadedFileInfo, String)> {
-        let (blob, cek_b64, sha256) = Self::seal_once(sealed_cache, &plaintext)?;
         let mut io = LiveAttachmentUploadIo {
             state: self,
             user_id,
             filename,
             mime_type,
             file_type,
-            // 🔴 同一个 blob 供两次上传共用（预检未命中 / claim 没成都用它）。
-            // 重新封装会产出另一串字节，白让服务端多存一份。
-            blob,
-            cek_b64,
+            plaintext,
+            sealed_cache,
         };
-        Self::plan_attachment_upload(&mut io, &sha256).await
+        Self::plan_attachment_upload(&mut io).await
     }
 
     async fn upload_callback(
@@ -24287,11 +24318,13 @@ mod attachment_upload_plan_tests {
 
     #[derive(Default)]
     struct Recorder {
-        /// 每次 prepare 收到的摘要（`None` = 这次不参与秒传）。
-        prepares: Vec<Option<String>>,
+        /// 每次封装的产物。**长度就是封装次数**——重新封装会在这里留下第二条。
+        seals: Vec<SealedPayload>,
+        /// 每次 prepare 收到的 (摘要, 字节数)。`None` = 这次不参与秒传。
+        prepares: Vec<(Option<String>, usize)>,
         claims: usize,
-        /// 每次 upload 时那张 token。
-        uploads: Vec<String>,
+        /// 每次 upload 的 (token, 上传的 blob, 上传的 CEK)。
+        uploads: Vec<(String, Vec<u8>, String)>,
         already_exists: bool,
         claim_result: Option<Error>,
     }
@@ -24322,11 +24355,25 @@ mod attachment_upload_plan_tests {
     }
 
     impl AttachmentUploadIo for Recorder {
+        /// 每次封装都产出**不同**的密文和 CEK——真实加密就是这样（随机 CEK/nonce）。
+        /// 于是「上传的是第一次封装那串字节」成了可断言的事实，而不是读代码得出的结论。
+        async fn seal(&mut self) -> Result<SealedPayload> {
+            let n = self.seals.len() + 1;
+            let payload = SealedPayload {
+                blob: vec![n as u8; 8],
+                cek_b64: format!("cek-{n}"),
+                sha256: format!("{n:064x}"),
+            };
+            self.seals.push(payload.clone());
+            Ok(payload)
+        }
+
         async fn prepare(
             &mut self,
             digest: Option<&str>,
+            size: usize,
         ) -> Result<FileRequestUploadTokenResponse> {
-            self.prepares.push(digest.map(str::to_string));
+            self.prepares.push((digest.map(str::to_string), size));
             // 只有带摘要那次才可能命中——不带摘要的那次必须是普通上传 token。
             let hit = self.already_exists && digest.is_some();
             Ok(token(&format!("token-{}", self.prepares.len()), hit))
@@ -24343,22 +24390,32 @@ mod attachment_upload_plan_tests {
         async fn upload(
             &mut self,
             token: &FileRequestUploadTokenResponse,
+            payload: &SealedPayload,
         ) -> Result<UploadedFileInfo> {
-            self.uploads.push(token.token.clone());
+            self.uploads.push((
+                token.token.clone(),
+                payload.blob.clone(),
+                payload.cek_b64.clone(),
+            ));
             Ok(uploaded())
         }
     }
 
-    const SHA: &str = "d1e8a70b5ccab1dc2f56bbf7e99f064a660c08e361a35751b9c483c88943d082";
+    /// 第一次封装的摘要：假实现按调用次数生成，这里写死好让断言看得见。
+    const FIRST_SEAL_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
     /// 预检未命中：一次 prepare（带摘要）+ 一次上传，不 claim。
     #[tokio::test]
     async fn a_miss_uploads_once() {
         let mut io = Recorder::default();
-        State::plan_attachment_upload(&mut io, SHA).await.expect("send");
-        assert_eq!(io.prepares, vec![Some(SHA.to_string())]);
+        State::plan_attachment_upload(&mut io).await.expect("send");
+
+        assert_eq!(io.seals.len(), 1);
+        assert_eq!(io.prepares, vec![(Some(FIRST_SEAL_SHA.to_string()), 8)]);
         assert_eq!(io.claims, 0);
-        assert_eq!(io.uploads, vec!["token-1".to_string()]);
+        assert_eq!(io.uploads.len(), 1);
+        assert_eq!(io.uploads[0].0, "token-1");
+        assert_eq!(io.uploads[0].1, io.seals[0].blob, "传的必须是封装出来的那串字节");
     }
 
     /// 命中且 claim 成功：一次 prepare + 一次 claim，**一个字节都不传**。
@@ -24368,18 +24425,21 @@ mod attachment_upload_plan_tests {
             already_exists: true,
             ..Default::default()
         };
-        State::plan_attachment_upload(&mut io, SHA).await.expect("send");
-        assert_eq!(io.prepares, vec![Some(SHA.to_string())]);
+        State::plan_attachment_upload(&mut io).await.expect("send");
+
+        assert_eq!(io.seals.len(), 1);
+        assert_eq!(io.prepares, vec![(Some(FIRST_SEAL_SHA.to_string()), 8)]);
         assert_eq!(io.claims, 1);
         assert!(io.uploads.is_empty(), "🔴 秒传命中还传字节就白传了");
     }
 
-    /// 🔴 命中但 claim 拿不到：必须再要一张**不带摘要**的 token 并上传。
+    /// 🔴 命中但 claim 拿不到：再要一张**不带摘要**的 token，上传**第一次封装那串字节**。
     ///
     /// 第二次仍带摘要的话，服务端还会说「已经有了」，又绕回 claim——转成死循环。
+    /// 重新封装的话密文就变了：秒传白做，服务端多存一份，本地缓存也对不上。
     /// 完全不回退的话，这条附件就再也发不出去。
     #[tokio::test]
-    async fn a_missed_claim_re_prepares_without_the_digest_and_uploads() {
+    async fn a_missed_claim_re_prepares_without_the_digest_and_uploads_the_same_bytes() {
         let mut io = Recorder {
             already_exists: true,
             claim_result: Some(Error::Server {
@@ -24388,18 +24448,25 @@ mod attachment_upload_plan_tests {
             }),
             ..Default::default()
         };
-        State::plan_attachment_upload(&mut io, SHA).await.expect("send falls back");
+        State::plan_attachment_upload(&mut io)
+            .await
+            .expect("send falls back");
 
+        assert_eq!(io.seals.len(), 1, "🔴 回退不许重新封装：那会换出另一串密文");
         assert_eq!(
             io.prepares,
-            vec![Some(SHA.to_string()), None],
+            vec![(Some(FIRST_SEAL_SHA.to_string()), 8), (None, 8)],
             "🔴 第一次带摘要给秒传机会，第二次必须不带——带了就绕回 claim"
         );
         assert_eq!(io.claims, 1, "只 claim 一次，失败就不再试");
         assert_eq!(
             io.uploads,
-            vec!["token-2".to_string()],
-            "🔴 上传要用第二张 token；用第一张的话它已经被 claim 消费过了"
+            vec![(
+                "token-2".to_string(),
+                io.seals[0].blob.clone(),
+                io.seals[0].cek_b64.clone(),
+            )],
+            "🔴 用第二张 token 传第一次封装的字节和 CEK；第一张已被 claim 消费过"
         );
     }
 
@@ -24415,7 +24482,7 @@ mod attachment_upload_plan_tests {
                 }),
                 ..Default::default()
             };
-            let out = State::plan_attachment_upload(&mut io, SHA).await;
+            let out = State::plan_attachment_upload(&mut io).await;
             assert!(out.is_err(), "{code:?} 该原样抛出");
             assert!(io.uploads.is_empty(), "{code:?} 不该触发上传");
             assert_eq!(io.prepares.len(), 1, "{code:?} 不该再要一张 token");
