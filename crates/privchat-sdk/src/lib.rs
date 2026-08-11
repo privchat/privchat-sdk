@@ -10660,10 +10660,13 @@ impl State {
                             })
                     })
                     .unwrap_or("file");
-                // 带说明文字的附件，正文就是那句话；没有才退回 `[图片]` 这类占位文案。
-                envelope.content = Self::attachment_caption(&message.extra).unwrap_or_else(|| {
-                    Self::attachment_placeholder_text(message.message_type, file_type).to_string()
-                });
+                // 🔴 正文只放用户写的说明文字；没写就是空串。
+                //
+                // 「[图片]」这类占位文案是**展示层**按消息类型和语言现取的，不能进 wire：
+                // 一进 wire 就有两个后果——它跟着消息跑到别的语言的客户端上，而且
+                // 「没写说明」和「说明恰好是 [图片]」再也分不开。
+                let _ = file_type;
+                envelope.content = Self::attachment_caption(&message.extra).unwrap_or_default();
                 envelope.metadata = Some(content_json);
             }
         }
@@ -11056,24 +11059,6 @@ impl State {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-    }
-
-    fn attachment_placeholder_text(message_type: i32, file_type: &str) -> &'static str {
-        use privchat_protocol::message::ContentMessageType;
-        if message_type == ContentMessageType::Voice as i32 {
-            return "[语音]";
-        }
-        if message_type == ContentMessageType::Image as i32 {
-            return "[图片]";
-        }
-        if message_type == ContentMessageType::Video as i32 {
-            return "[视频]";
-        }
-        match file_type {
-            "image" => "[图片]",
-            "video" => "[视频]",
-            _ => "[文件]",
-        }
     }
 
     fn default_mime_for_message_type(message_type: i32) -> &'static str {
@@ -11469,13 +11454,6 @@ impl State {
         blob: Vec<u8>,
         cek_b64: String,
     ) -> Result<UploadedFileInfo> {
-        // 缩略图走同一个上传接口，靠规范文件名区分（media_store::payload_filename）。
-        let counter = if filename.starts_with("thumb") {
-            &self.attachment_transfers.thumbnail_uploads
-        } else {
-            &self.attachment_transfers.body_uploads
-        };
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let part = reqwest::multipart::Part::bytes(blob)
             .file_name(filename.to_string())
             .mime_str(mime_type)
@@ -11503,7 +11481,16 @@ impl State {
             .json::<serde_json::Value>()
             .await
             .map_err(|e| Error::Serialization(format!("decode upload response: {e}")))?;
-        Self::parse_uploaded_file_info(&envelope, mime_type)
+        let info = Self::parse_uploaded_file_info(&envelope, mime_type)?;
+        // 传成了才计：失败的那次会重试，算进去等于把同一份内容数很多遍。
+        // 缩略图走同一个接口，靠规范文件名区分（见 media_store::payload_filename）。
+        let counter = if filename.starts_with("thumb") {
+            &self.attachment_transfers.thumbnail_uploads
+        } else {
+            &self.attachment_transfers.body_uploads
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(info)
     }
 
     /// 把上传 / 秒传取用的响应解析成同一个结构。
@@ -11579,16 +11566,18 @@ impl State {
 
     /// 秒传命中：拿 token 换**自己的** file_id，一个字节都不传。
     async fn claim_existing_file(&mut self, token: &str, sha256: &str) -> Result<UploadedFileInfo> {
-        self.attachment_transfers
-            .claims
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let value: serde_json::Value = self
             .rpc_call_json(
                 "file/claim_existing".to_string(),
                 serde_json::json!({ "token": token, "sha256": sha256 }),
             )
             .await?;
-        Self::parse_uploaded_file_info(&value, "application/octet-stream")
+        let info = Self::parse_uploaded_file_info(&value, "application/octet-stream")?;
+        // 成功才计：失败的 claim 会退回整传，算进去会让「省了多少带宽」虚高。
+        self.attachment_transfers
+            .claims
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(info)
     }
 
     /// 发一份附件：**封装一次** → 预检 → 命中就换 id，未命中才传那同一个 blob。
@@ -12617,11 +12606,11 @@ impl State {
 /// 附件正文传输计数（诊断用；也是「秒传到底有没有省下带宽」的唯一可信判据）。
 #[derive(Debug, Default)]
 pub struct AttachmentTransferCounters {
-    /// 秒传取用次数：换到自己的 file_id，正文零字节。
+    /// 秒传取用**成功**次数：换到自己的 file_id，正文零字节。
     pub claims: AtomicU64,
-    /// 真正把**主文件**字节传上去的次数。
+    /// **主文件**字节传上去并被服务端接收的次数。
     pub body_uploads: AtomicU64,
-    /// 真正把**缩略图**字节传上去的次数。缩略图是本地重新生成的派生物，
+    /// **缩略图**字节传上去并被服务端接收的次数。缩略图是本地重新生成的派生物，
     /// 每次生成都是新字节，所以它不会命中秒传——这是已知代价，单独计数免得
     /// 被算进「主文件没省下带宽」。
     pub thumbnail_uploads: AtomicU64,
@@ -21805,28 +21794,6 @@ mod tests {
         assert!(!State::should_apply_entity_version(Some(5), 4));
     }
 
-    #[test]
-    fn attachment_placeholder_text_is_protocol_aligned() {
-        use privchat_protocol::message::ContentMessageType;
-        let voice = ContentMessageType::Voice as i32;
-        let image = ContentMessageType::Image as i32;
-        let video = ContentMessageType::Video as i32;
-        let file = ContentMessageType::File as i32;
-
-        // 第一分层：message_type 独立类型直接决定文案，file_type 无法覆盖。
-        assert_eq!(State::attachment_placeholder_text(voice, "file"), "[语音]");
-        assert_eq!(State::attachment_placeholder_text(image, ""), "[图片]");
-        assert_eq!(State::attachment_placeholder_text(video, ""), "[视频]");
-
-        // 第二分层：File 消息才按 file_type 细分。
-        assert_eq!(State::attachment_placeholder_text(file, "image"), "[图片]");
-        assert_eq!(State::attachment_placeholder_text(file, "video"), "[视频]");
-        assert_eq!(State::attachment_placeholder_text(file, "file"), "[文件]");
-        assert_eq!(
-            State::attachment_placeholder_text(file, "unknown"),
-            "[文件]"
-        );
-    }
 
     // 旧测试 conversation_preview_is_rendered_in_sdk_layer 已删除——
     // SDK 不再渲染会话预览（架构归正：preview 是 UI 层职责，参见 SYSTEM_MESSAGE_SPEC）。

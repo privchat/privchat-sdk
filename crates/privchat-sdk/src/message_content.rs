@@ -144,9 +144,11 @@ pub fn project_stored_message(message: &StoredMessage) -> MessageContentProjecti
         body.text = caption;
         body.entities = scan_entities(&body.text, &body.mentioned_user_ids);
     } else if is_attachment_placeholder(message.message_type, &body.text) {
-        // 🔴 `[图片]` 不是用户写的字，是没有说明文字时给会话列表看的占位文案
-        // （TS/Web 也按这个约定发）。当成 caption 的话，重发一次就凭空多出一句
-        // 「[图片]」，再发一次还会叠上去。
+        // 兼容旧数据：占位文案曾经被写进 wire。现在发送端只放用户写的说明文字
+        // （没写就是空串），占位文案由展示层按类型和语言现取。
+        //
+        // 🔴 这条兼容有代价且无法消除：老客户端发的、说明文字**恰好**是「[图片]」
+        // 的那条消息，在这里会被当成占位文案清掉。新发的消息不受影响。
         body.text.clear();
         body.entities.clear();
     } else if looks_like_json(&body.text) {
