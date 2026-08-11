@@ -17,6 +17,7 @@
 
 use crate::account_manager::MultiAccountManager;
 use crate::phases::TestPhases;
+use crate::boxed_err;
 use crate::types::{PhaseResult, TestSummary};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -24,13 +25,42 @@ type BoxResult<T> = Result<T, BoxError>;
 
 pub struct TestCoordinator {
     results: Vec<PhaseResult>,
+    /// `PRIVCHAT_PHASES` 拆出来的选择器；`None` = 全跑。
+    selectors: Option<Vec<String>>,
+    /// 哪些选择器真的命中过 phase。没命中的一律当作写错名字。
+    used_selectors: std::collections::HashSet<String>,
 }
 
 impl TestCoordinator {
     pub fn new() -> Self {
+        let selectors = std::env::var("PRIVCHAT_PHASES")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<String>| !v.is_empty());
         Self {
             results: Vec::new(),
+            selectors,
+            used_selectors: std::collections::HashSet::new(),
         }
+    }
+
+    /// 选择器命中 phase 名的判据：全名，或 `phase45` 这种到下划线为止的短名。
+    ///
+    /// 🔴 前缀必须在下划线处结束：否则 `phase4` 会连 `phase45_*` 一起选上，
+    /// 想跑一条却跑了两条，而且不会有人发现。
+    pub fn selector_matches(selector: &str, phase_name: &str) -> bool {
+        if selector == phase_name {
+            return true;
+        }
+        phase_name
+            .strip_prefix(selector)
+            .is_some_and(|rest| rest.starts_with('_'))
     }
 
     pub async fn run_all(&mut self, manager: &mut MultiAccountManager) -> BoxResult<()> {
@@ -214,23 +244,55 @@ impl TestCoordinator {
             self.run_phase("phase43_outbox_survives_restart", TestPhases::phase43_outbox_survives_restart(manager).await)
                 .await;
         }
-        Ok(())
+        self.finish_selection()
     }
 
     /// `name` 是**调用点**传进来的 phase 名。
     ///
     /// 之前失败路径把它记成 "unknown"：一个不说明自己是什么的失败，等于没报——
     /// 排查时只能靠猜是 43 个 phase 里的哪一个。
-    /// 跑哪些 phase。`PRIVCHAT_PHASES` 是逗号分隔的名字，缺省全跑。
+    /// 跑哪些 phase。`PRIVCHAT_PHASES` 是逗号分隔的名字（全名或 `phase45` 短名），
+    /// 缺省全跑。
     ///
     /// 稳定性门禁要连跑几十次单个 phase：整套跑一次两分钟，没有这个开关就做不到。
-    fn enabled(&self, name: &str) -> bool {
-        match std::env::var("PRIVCHAT_PHASES") {
-            Ok(list) if !list.trim().is_empty() => {
-                list.split(',').any(|want| want.trim() == name)
+    ///
+    /// 🔴 名字写错必须是失败，不能是「跳过所有 phase 然后报全绿」——那是最坏的
+    /// 一种假绿：命令看着跑完了，其实一条都没跑。校验见 [`Self::finish_selection`]。
+    fn enabled(&mut self, name: &str) -> bool {
+        let Some(selectors) = self.selectors.clone() else {
+            return true;
+        };
+        let mut hit = false;
+        for selector in selectors {
+            if Self::selector_matches(&selector, name) {
+                self.used_selectors.insert(selector);
+                hit = true;
             }
-            _ => true,
         }
+        hit
+    }
+
+    /// 收工前校验选择结果：写错的名字、以及「一条都没跑」都要报错退出。
+    fn finish_selection(&self) -> BoxResult<()> {
+        if let Some(selectors) = self.selectors.as_ref() {
+            let unknown: Vec<&str> = selectors
+                .iter()
+                .filter(|s| !self.used_selectors.contains(*s))
+                .map(String::as_str)
+                .collect();
+            if !unknown.is_empty() {
+                return Err(boxed_err(format!(
+                    "PRIVCHAT_PHASES matched no phase: {}",
+                    unknown.join(", ")
+                )));
+            }
+        }
+        if self.results.is_empty() {
+            return Err(boxed_err(
+                "no phase ran; a run that executes nothing is not a pass".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     async fn run_phase(&mut self, name: &str, result: BoxResult<PhaseResult>) {
@@ -273,5 +335,44 @@ impl TestCoordinator {
             duration,
             results: self.results.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::TestCoordinator;
+
+    const PHASE45: &str = "phase45_resend_received_attachment";
+
+    #[test]
+    fn a_full_name_selects_its_phase() {
+        assert!(TestCoordinator::selector_matches(PHASE45, PHASE45));
+    }
+
+    /// 短名要能用：文档里写的就是 `PRIVCHAT_PHASES=phase45`。
+    #[test]
+    fn a_short_name_selects_its_phase() {
+        assert!(TestCoordinator::selector_matches("phase45", PHASE45));
+    }
+
+    /// 🔴 前缀必须停在下划线：`phase4` 不能顺带选中 `phase45_*`，
+    /// 否则以为只跑一条、其实跑了两条。
+    #[test]
+    fn a_shorter_prefix_does_not_leak_into_the_next_phase() {
+        assert!(!TestCoordinator::selector_matches("phase4", PHASE45));
+        assert!(!TestCoordinator::selector_matches(
+            "phase4",
+            "phase42_outbox_attachment_e2e"
+        ));
+        assert!(TestCoordinator::selector_matches(
+            "phase42",
+            "phase42_outbox_attachment_e2e"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_name_selects_nothing() {
+        assert!(!TestCoordinator::selector_matches("phase99", PHASE45));
+        assert!(!TestCoordinator::selector_matches("resend", PHASE45));
     }
 }
