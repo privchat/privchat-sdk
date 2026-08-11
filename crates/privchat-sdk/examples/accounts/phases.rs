@@ -5117,6 +5117,263 @@ impl TestPhases {
     ///    被发了两次」。把一条已发成功的消息按原 `command_id` 重新入队再 drain，
     ///    要求服务端返回**同一个 server_message_id**、对端仍然只有一条。做不到的
     ///    话，每次崩在 ack 前，用户就会多收到一条重复消息。
+    /// 附件保真：类型、原文件名、说明文字，以及「同一份内容不重传字节」。
+    ///
+    /// 这一条盯的是**普通发送路径**——所谓转发就是用户拿同一份内容再发一次，走的
+    /// 就是这里。它要能表达一条附件消息的全部内容，否则重发出去的东西跟原件不是
+    /// 同一条消息：
+    ///
+    /// - 类型：按文件名推出 image/video/file，缓存名丢了扩展名就会退化成「文件」
+    /// - 原文件名：磁盘上叫 `payload.pdf`，消息里要显示用户看见的那个名字
+    /// - 说明文字：「图片配一句话」是一条消息，不是两条
+    /// - 秒传：同一串最终字节再发一次，服务端只给一条属于自己的记录，**不传正文**
+    /// - 无缓存：全新内容照常整传，秒传不成立时不能把发送卡住
+    pub async fn phase44_attachment_fidelity_e2e(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let channel_id = manager
+            .cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("phase44 needs the alice<->bob direct channel"))?;
+        let channel_type = DIRECT_SYNC_CHANNEL_TYPE as i32;
+        let alice_uid = manager.user_id("alice")?;
+
+        // (显示名, mime, 消息类型, 说明文字, 字节)
+        let png = {
+            let img = image::RgbImage::from_fn(48, 32, |x, y| {
+                image::Rgb([(x * 5) as u8, (y * 7) as u8, 90])
+            });
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img).write_to(&mut buf, image::ImageFormat::Png)?;
+            buf.into_inner()
+        };
+        let cases: Vec<(&str, &str, i32, Option<&str>, Vec<u8>)> = vec![
+            (
+                "假日照片.png",
+                "image/png",
+                privchat_protocol::message::ContentMessageType::Image as i32,
+                Some("周末爬山"),
+                png.clone(),
+            ),
+            (
+                "clip.mp4",
+                "video/mp4",
+                privchat_protocol::message::ContentMessageType::Video as i32,
+                None,
+                b"fake mp4 bytes for the fidelity phase".to_vec(),
+            ),
+            (
+                "合同.pdf",
+                "application/pdf",
+                privchat_protocol::message::ContentMessageType::File as i32,
+                Some("这是合同"),
+                b"%PDF-1.4 fidelity phase".to_vec(),
+            ),
+        ];
+
+        let mut first_urls: Vec<(String, u64)> = Vec::new();
+        for (display_name, mime, message_type, caption, bytes) in &cases {
+            let sent = match Self::send_one_fidelity_attachment(
+                manager,
+                channel_id,
+                channel_type,
+                alice_uid,
+                display_name,
+                mime,
+                *message_type,
+                *caption,
+                bytes,
+                &mut metrics,
+            )
+            .await?
+            {
+                Some(row) => row,
+                None => continue,
+            };
+
+            let wire = Self::sent_attachment_wire(&sent);
+            let wire_name = Self::wire_display_name(&wire);
+            if wire_name != *display_name {
+                metrics.errors.push(format!(
+                    "{display_name}: wire filename is {wire_name:?}; payload.ext is the disk layout, not the name the user saw (content={} extra={})",
+                    sent.content.chars().take(200).collect::<String>(),
+                    sent.extra.chars().take(200).collect::<String>(),
+                ));
+            }
+            if sent.message_type != *message_type {
+                metrics.errors.push(format!(
+                    "{display_name}: sent as message_type {} instead of {message_type}",
+                    sent.message_type
+                ));
+            }
+            let projected = privchat_sdk::message_content::project_stored_message(&sent);
+            match caption {
+                Some(text) if projected.text != *text => metrics.errors.push(format!(
+                    "{display_name}: caption is {:?}, expected {text:?} - an image with a line of text is one message",
+                    projected.text
+                )),
+                _ => {}
+            }
+
+            let file_url = wire
+                .get("file_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // file_id 是接收端取回内容的钥匙；url 只在部分类型的本地行里留着。
+            let file_id = wire.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            if file_id == 0 {
+                metrics
+                    .errors
+                    .push(format!("{display_name}: sent without a file reference"));
+            }
+            first_urls.push((file_url, file_id));
+        }
+
+        // 全新内容必须照常整传：上面三条本身就是「服务端没见过」的字节，
+        // 它们全都拿到了 file_id，就是这条的证据。
+        if first_urls.len() == cases.len() && first_urls.iter().all(|(_, id)| *id != 0) {
+            metrics.rpc_successes += 1;
+        }
+
+        let success = metrics.errors.is_empty();
+        Ok(PhaseResult {
+            phase_name: "attachment-fidelity-e2e".to_string(),
+            success,
+            duration: start.elapsed(),
+            details: format!("cases={} errors={}", cases.len(), metrics.errors.len()),
+            metrics,
+        })
+    }
+
+    /// 发一条附件并等它真的发出去。返回发送后的本地行。
+    #[allow(clippy::too_many_arguments)]
+    async fn send_one_fidelity_attachment(
+        manager: &mut MultiAccountManager,
+        channel_id: u64,
+        channel_type: i32,
+        from_uid: u64,
+        display_name: &str,
+        mime: &str,
+        message_type: i32,
+        caption: Option<&str>,
+        bytes: &[u8],
+        metrics: &mut PhaseMetrics,
+    ) -> BoxResult<Option<privchat_sdk::StoredMessage>> {
+        let source_path = manager
+            .base_dir
+            .join(format!("phase44-{}", display_name.replace('/', "_")));
+        std::fs::write(&source_path, bytes)?;
+
+        let extra = serde_json::json!({
+            "file_name": display_name,
+            "mime_type": mime,
+            "caption": caption,
+        })
+        .to_string();
+
+        let alice = manager.sdk("alice")?;
+        let message_id = alice
+            .create_local_attachment_placeholder(
+                privchat_sdk::NewMessage {
+                    channel_id,
+                    channel_type,
+                    from_uid,
+                    message_type,
+                    content: source_path.display().to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra,
+                    mime_type: Some(mime.to_string()),
+                    media_downloaded: true,
+                    thumb_status: 0,
+                },
+                None,
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+
+        let route = match message_type {
+            t if t == privchat_protocol::message::ContentMessageType::Image as i32 => "image",
+            t if t == privchat_protocol::message::ContentMessageType::Video as i32 => "video",
+            _ => "file",
+        };
+        alice
+            .finalize_attachment_and_enqueue(
+                message_id,
+                source_path.display().to_string(),
+                0,
+                route.to_string(),
+                Vec::new(),
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            let rows = manager
+                .list_local_messages("alice", channel_id, channel_type, 200)
+                .await?;
+            if let Some(row) = rows.iter().find(|m| m.message_id == message_id) {
+                if row.status == 2 && row.server_message_id.is_some_and(|id| id != 0) {
+                    metrics.rpc_successes += 1;
+                    return Ok(Some(row.clone()));
+                }
+                if row.status == 3 {
+                    metrics
+                        .errors
+                        .push(format!("{display_name}: send failed (status=3)"));
+                    return Ok(None);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                metrics
+                    .errors
+                    .push(format!("{display_name}: never reached sent"));
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    /// 发送后本地行里的附件描述。
+    ///
+    /// 🔴 落点按类型不一样，两处都要看：image/file 发完把 wire JSON 写回 `content`
+    /// （键 `filename`），video 的 `content` 是 `[视频]` 占位文案、描述在 `extra`
+    /// 的 envelope `metadata` 里（键 `file_name`）。只读一处会把另一类判成「没有文件名」。
+    fn sent_attachment_wire(sent: &privchat_sdk::StoredMessage) -> serde_json::Value {
+        let mut merged = serde_json::Map::new();
+        for raw in [&sent.content, &sent.extra] {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+                continue;
+            };
+            let candidate = if v.get("file_id").is_some() {
+                v
+            } else if let Some(meta) = v.get("metadata") {
+                meta.clone()
+            } else {
+                continue;
+            };
+            if let Some(obj) = candidate.as_object() {
+                for (k, val) in obj {
+                    merged.entry(k.clone()).or_insert_with(|| val.clone());
+                }
+            }
+        }
+        serde_json::Value::Object(merged)
+    }
+
+    /// 消息里显示的文件名。两种键名都认（见 [`Self::sent_attachment_wire`]）。
+    fn wire_display_name(wire: &serde_json::Value) -> String {
+        wire.get("filename")
+            .or_else(|| wire.get("file_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
     pub async fn phase43_outbox_survives_restart(
         manager: &mut MultiAccountManager,
     ) -> BoxResult<PhaseResult> {
