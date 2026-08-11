@@ -9078,30 +9078,45 @@ impl PrivchatClient {
             });
         };
 
-        let response = reqwest::Client::new()
-            .get(&download_url)
-            .send()
+        // 🔴 这段 HTTP 必须跑在 SDK 自己的运行时上。
+        //
+        // FFI 的 async 函数由**宿主**轮询（Kotlin 协程 / Swift），那个上下文里没有
+        // Tokio reactor，直接 `reqwest ... .await` 在运行期就是
+        // 「there is no reactor running, must be called from the context of a Tokio 1.x runtime」——
+        // 从 App 下载附件（比如转发一份还没下载过的图片）必然失败。
+        // 等 JoinHandle 不需要 reactor，所以交给 handle 跑是安全的。
+        let handle = self.inner.runtime_handle();
+        let url = download_url.clone();
+        handle
+            .spawn(async move {
+                let response = reqwest::Client::new().get(&url).send().await.map_err(|e| {
+                    PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::NetworkError as u32,
+                        detail: format!("download attachment request failed: {e}"),
+                    }
+                })?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::NetworkError as u32,
+                        detail: format!("download attachment failed: status={status} body={body}"),
+                    });
+                }
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::NetworkError as u32,
+                        detail: format!("read attachment bytes failed: {e}"),
+                    })?;
+                Ok(bytes.to_vec())
+            })
             .await
             .map_err(|e| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::NetworkError as u32,
-                detail: format!("download attachment request failed: {e}"),
-            })?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::NetworkError as u32,
-                detail: format!("download attachment failed: status={status} body={body}"),
-            });
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::NetworkError as u32,
-                detail: format!("read attachment bytes failed: {e}"),
-            })?;
-        Ok(bytes.to_vec())
+                code: privchat_protocol::ErrorCode::InternalError as u32,
+                detail: format!("download attachment task failed: {e}"),
+            })?
     }
 
     pub fn to_client_endpoint(&self) -> Option<String> {

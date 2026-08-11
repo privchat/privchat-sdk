@@ -16491,6 +16491,15 @@ impl PrivchatSdk {
         &self._runtime_provider
     }
 
+    /// SDK 自己那个 Tokio 运行时的句柄。
+    ///
+    /// 🔴 FFI 的 async 函数是被**宿主**（Kotlin 协程 / Swift）轮询的，那个上下文里
+    /// 没有 Tokio reactor：直接在里面 `reqwest ... .await` 会在运行期报
+    /// 「there is no reactor running」。要做 I/O 的地方把 future 交给这个句柄跑。
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self._runtime_provider.handle().clone()
+    }
+
     pub fn last_event_sequence_id(&self) -> u64 {
         self.event_seq.load(Ordering::Acquire)
     }
