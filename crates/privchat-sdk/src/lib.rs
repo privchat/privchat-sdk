@@ -11238,6 +11238,22 @@ impl State {
         hex::encode(hasher.finalize())
     }
 
+    /// claim 失败是不是「服务端拿不到那份内容」这一种——只有它该退回整传。
+    ///
+    /// 服务端把「没有这份内容」和「有但你无权」说成同一句话（否则这个接口就是
+    /// 文件存在性探测器），所以两者都落在这里，退回整传对两者都是对的：真无权的
+    /// 人传自己的字节，本来就该被允许。
+    ///
+    /// 其余错误各有含义，不能一并退回：Validation 是参数不对（传一遍还是错），
+    /// Forbidden 是这次操作本身不被允许，ServiceUnavailable 是瞬时竞争、该重试。
+    fn claim_miss_should_reupload(e: &Error) -> bool {
+        matches!(
+            e,
+            Error::Server { code, .. }
+                if *code == ErrorCode::ResourceNotFound as u32
+        )
+    }
+
     /// 一条 outbox 任务只封装**一次**，结果落盘；重试读回同一份。
     ///
     /// 🔴 不这样做的话，秒传对「重试」这个最常见的重复来源完全无效：加密用随机
@@ -11453,16 +11469,51 @@ impl State {
                 // 🔴 报的是**封装后**的字节数，与摘要同一口径。
                 blob.len() as i64,
                 mime_type.clone(),
-                file_type,
+                file_type.clone(),
                 Some(&sha256),
             )
             .await?;
 
         if token.already_exists {
             // 服务端已经有这串字节：一个字节都不传，换一个属于自己的 file_id。
-            let info = self.claim_existing_file(&token.token, &sha256).await?;
-            return Ok((info, token.token));
+            match self.claim_existing_file(&token.token, &sha256).await {
+                Ok(info) => return Ok((info, token.token)),
+                // 🔴 秒传没成——**照常上传**，不是发送失败。
+                //
+                // 预检说「有」，claim 却拿不到，是正常会发生的事：那份内容对应的
+                // 记录里没有一条是这个人现在读得到的，或者候选在这中间失效了。
+                // 服务端把它和「根本没有这份内容」说成同一句话（否则接口会变成
+                // 文件存在性探测器），所以客户端只能凭这个信号退回整传。
+                //
+                // 只有这一种错误退回。Validation / Forbidden / ServiceUnavailable
+                // 各有各的含义：参数不对、真的无权、瞬时竞争该重试——把它们一并
+                // 当成「传一遍」会把真问题盖掉，也会白传一遍字节。
+                Err(e) if Self::claim_miss_should_reupload(&e) => {
+                    eprintln!(
+                        "[SDK.actor] claim missed, falling back to a normal upload: {e}"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
+
+        // 走到这里有两条来路：预检未命中，或者命中了但 claim 没拿到。
+        // 两种都用**同一个已封装好的 blob** 重新要一张普通 token 再传——重新封装
+        // 会产出另一串字节，白白让服务端多存一份。
+        let token = if token.already_exists {
+            self.request_upload_token(
+                user_id,
+                filename.clone(),
+                blob.len() as i64,
+                mime_type.clone(),
+                file_type,
+                // 不带摘要：这一次就是要传字节，不要再进秒传分支。
+                None,
+            )
+            .await?
+        } else {
+            token
+        };
 
         let info = self
             .upload_file_bytes(
@@ -24178,6 +24229,45 @@ mod already_managed_source_tests {
                 "{path} 不该被当成接手后的成品"
             );
         }
+    }
+}
+
+/// 只有「服务端拿不到那份内容」才退回整传。
+#[cfg(test)]
+mod claim_miss_fallback_tests {
+    use super::*;
+
+    /// 🔴 判错这一边，用户就再也发不出这个附件：预检说有、claim 拿不到，
+    /// 而客户端把它当终局错误。
+    #[test]
+    fn a_missing_record_falls_back_to_uploading() {
+        assert!(State::claim_miss_should_reupload(&Error::Server {
+            code: ErrorCode::ResourceNotFound as u32,
+            message: "服务端没有这份内容，请正常上传".to_string(),
+        }));
+    }
+
+    /// 判错另一边，就会在参数错/无权/瞬时竞争时白传一遍字节，还把真问题盖掉。
+    #[test]
+    fn other_failures_are_not_swallowed_into_an_upload() {
+        for code in [
+            ErrorCode::InvalidParams,
+            ErrorCode::PermissionDenied,
+            ErrorCode::ServiceUnavailable,
+            ErrorCode::SystemBusy,
+        ] {
+            assert!(
+                !State::claim_miss_should_reupload(&Error::Server {
+                    code: code as u32,
+                    message: String::new(),
+                }),
+                "{code:?} 不该被当成「传一遍就好」"
+            );
+        }
+        // 传输层错误同理：该重试，不是该重传。
+        assert!(!State::claim_miss_should_reupload(&Error::Transport(
+            "connection reset".to_string()
+        )));
     }
 }
 
