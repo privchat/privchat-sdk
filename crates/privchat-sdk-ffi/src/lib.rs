@@ -7534,10 +7534,9 @@ impl PrivchatClient {
         let metadata = privchat_protocol::message::LocalAttachmentMetadata {
             file_name: metadata.file_name,
             mime_type: metadata.mime_type,
-            caption: metadata
-                .caption
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty()),
+            // 🔴 用户正文不修剪：只有空串算「没写」。这边 trim、TS 不 trim 的话，
+            // 同一条消息在两个 SDK 上就是不同的字节。
+            caption: metadata.caption.filter(|v| !v.is_empty()),
             duration: metadata.duration,
             width: metadata.width,
             height: metadata.height,

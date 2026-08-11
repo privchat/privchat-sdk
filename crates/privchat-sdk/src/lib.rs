@@ -11017,22 +11017,17 @@ impl State {
         }
     }
 
-    /// 附件消息的会话预览文案。
-    ///
-    /// 分层：
-    /// 1. 第一层看 `message_type`（Voice / Image / Video 各自独立类型）——
-    ///    协议级类型是真理，一旦匹配就返回固定文案，不受 file_type 影响。
-    /// 2. 第二层（File 消息）才按存储层 `file_type`（"image"/"video"/"file"）细分。
-    ///
-    /// 与「发送入口决定消息类型，MIME 不反推」原则一致：只有 File 消息才允许
-    /// 靠 MIME 推回 `[图片]`/`[视频]` 这种预览文案。
     /// 附件的说明文字，写在本地元数据里（protocol 的 `LocalAttachmentMetadata::caption`）。
+    ///
+    /// `None` = 用户没写；wire 层据此发空正文。
+    ///
+    /// 🔴 **一个字都不改**：不 trim、不折叠空白。用户正文归用户，SDK 擅自修剪
+    /// 会跟不修剪的另一端（TS）在同一条消息上产出不同字节。只有空串算「没写」。
     fn attachment_caption(extra: &str) -> Option<String> {
         serde_json::from_str::<serde_json::Value>(extra)
             .ok()?
             .get("caption")?
             .as_str()
-            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     }
@@ -24762,8 +24757,10 @@ mod attachment_wire_caption_tests {
     }
 
     /// 发送后 wire envelope 里的正文。
-    async fn wire_content(extra: &str) -> String {
-        let (state, _dir) = crate::tests::new_seeded_state("attachment-wire-caption").await;
+    /// `case` 只用来隔离每条用例的 sled 目录：同名目录并发跑会互相抢锁。
+    async fn wire_content(case: &str, extra: &str) -> String {
+        let (state, _dir) =
+            crate::tests::new_seeded_state(&format!("attachment-wire-caption-{case}")).await;
         let attachment = serde_json::json!({
             "file_type": "image",
             "file_id": 42,
@@ -24783,15 +24780,25 @@ mod attachment_wire_caption_tests {
     /// 没写说明文字：正文是空串。占位文案由展示层按类型和语言现取，不进 wire。
     #[tokio::test]
     async fn without_a_caption_the_body_is_empty() {
-        assert_eq!(wire_content(r#"{"file_name":"a.jpg"}"#).await, "");
+        assert_eq!(wire_content("empty", r#"{"file_name":"a.jpg"}"#).await, "");
     }
 
     /// 写了就原样带走。
     #[tokio::test]
     async fn a_caption_is_carried_verbatim() {
         assert_eq!(
-            wire_content(r#"{"file_name":"a.jpg","caption":"周末爬山"}"#).await,
+            wire_content("verbatim", r#"{"file_name":"a.jpg","caption":"周末爬山"}"#).await,
             "周末爬山"
+        );
+    }
+
+    /// 🔴 前后空格是用户写的，wire 上必须一字不差——另一端（TS）不 trim，
+    /// 这边 trim 的话同一条消息在两个 SDK 上就是不同的字节。
+    #[tokio::test]
+    async fn whitespace_reaches_the_wire_untouched() {
+        assert_eq!(
+            wire_content("whitespace", r#"{"file_name":"a.jpg","caption":"  周末爬山  "}"#).await,
+            "  周末爬山  "
         );
     }
 
@@ -24800,7 +24807,7 @@ mod attachment_wire_caption_tests {
     #[tokio::test]
     async fn a_caption_that_looks_like_a_placeholder_survives() {
         assert_eq!(
-            wire_content(r#"{"file_name":"a.jpg","caption":"[图片]"}"#).await,
+            wire_content("placeholder", r#"{"file_name":"a.jpg","caption":"[图片]"}"#).await,
             "[图片]"
         );
     }
@@ -24818,13 +24825,27 @@ mod attachment_caption_tests {
         assert_eq!(State::attachment_caption(extra).as_deref(), Some("周末爬山"));
     }
 
-    /// 没写说明的附件仍然退回占位文案，会话列表才有东西显示。
+    /// 没写就是没写：wire 层据此发空正文，占位文案由展示层现取。
     #[test]
-    fn without_one_the_placeholder_stays() {
+    fn without_one_there_is_nothing_to_send() {
         assert_eq!(State::attachment_caption(r#"{"file_name":"a.jpg"}"#), None);
-        assert_eq!(State::attachment_caption(r#"{"caption":"   "}"#), None);
+        assert_eq!(State::attachment_caption(r#"{"caption":""}"#), None);
         assert_eq!(State::attachment_caption(""), None);
         assert_eq!(State::attachment_caption("not json"), None);
+    }
+
+    /// 🔴 用户正文一个字都不许改：前后空格保留，纯空白也是用户写的东西。
+    /// 这边 trim 那边不 trim，同一条消息在两个 SDK 上就是不同的字节。
+    #[test]
+    fn whitespace_belongs_to_the_user() {
+        assert_eq!(
+            State::attachment_caption(r#"{"caption":"  周末爬山  "}"#).as_deref(),
+            Some("  周末爬山  ")
+        );
+        assert_eq!(
+            State::attachment_caption(r#"{"caption":"   "}"#).as_deref(),
+            Some("   ")
+        );
     }
 }
 
