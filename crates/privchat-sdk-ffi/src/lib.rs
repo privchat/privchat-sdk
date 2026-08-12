@@ -1749,6 +1749,23 @@ pub enum TypingActionType {
     ChoosingSticker,
 }
 
+/// 一份下载到本地的附件：**物理落点**和**它是什么**分开说。
+///
+/// 展示名不能当文件名用（两个人各发一张 `photo.png` 会互相覆盖），
+/// 文件名也不能当展示名用（用户看到的应该是原名，不是 `25865.png`）。
+/// 消息类型只认服务端的 `file_type`——扩展名说不出「这是语音条还是一首歌」。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DownloadedAttachmentView {
+    /// 磁盘上的唯一路径（`{file_id}.{ext}`）。
+    pub local_path: String,
+    /// 界面上显示的文件名（服务端 `original_filename`，已清洗）。缺省为空串。
+    pub display_file_name: String,
+    /// 服务端记录的 MIME。缺省为空串。
+    pub mime_type: String,
+    /// 服务端记录的类型：`image` / `video` / `voice` / `file`。缺省为空串。
+    pub file_type: String,
+}
+
 /// 见 [`PrivchatClient::attachment_transfer_stats`]。
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AttachmentTransferStatsView {
@@ -8811,6 +8828,74 @@ impl PrivchatClient {
             .collect())
     }
 
+    /// 下载一份附件到目录，**由这里决定它在磁盘上叫什么**，并把服务端元数据带回上层。
+    ///
+    /// 调用方不必（也没法）先猜一个文件名：`original_filename` / `mime_type` /
+    /// `file_type` 都在 `file/get_url` 的响应里，只有这一层拿得到。上层曾经先猜后下载，
+    /// 猜不出就用 `.bin`，于是别的客户端发来的图片被当成「文件」重发出去。
+    ///
+    /// [`message_file_name`] / [`message_mime_type`] 是本地那条消息上的值，只作兜底。
+    pub async fn download_attachment_into_dir(
+        &self,
+        source_path: String,
+        target_dir: String,
+        message_file_name: Option<String>,
+        message_mime_type: Option<String>,
+    ) -> Result<DownloadedAttachmentView, PrivchatFfiError> {
+        let (data, sealed, meta) = self
+            .resolve_attachment_bytes_with_meta(&source_path)
+            .await?;
+        let server_name = meta.as_ref().map(|m| m.original_filename.as_str()).unwrap_or("");
+        let server_mime = meta.as_ref().map(|m| m.mime_type.as_str()).unwrap_or("");
+        let file_type = meta.as_ref().map(|m| m.file_type.clone()).unwrap_or_default();
+
+        let file_name = privchat_sdk::media_store::resolve_downloaded_file_name(
+            source_path.trim(),
+            server_name,
+            server_mime,
+            message_file_name.as_deref(),
+            message_mime_type.as_deref(),
+        );
+        let display = privchat_sdk::media_store::display_file_name(
+            server_name,
+            message_file_name.as_deref(),
+        )
+        .unwrap_or_default();
+
+        let dir = std::path::Path::new(&target_dir);
+        std::fs::create_dir_all(dir).map_err(|e| PrivchatFfiError::SdkError {
+            code: privchat_protocol::ErrorCode::InternalError as u32,
+            detail: format!("create target dir failed: {e}"),
+        })?;
+        let target = dir.join(&file_name);
+        let tmp = target.with_file_name(format!("{file_name}.part"));
+        std::fs::write(&tmp, &data)
+            .and_then(|_| std::fs::rename(&tmp, &target))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                PrivchatFfiError::SdkError {
+                    code: privchat_protocol::ErrorCode::InternalError as u32,
+                    detail: format!("write target attachment failed: {e}"),
+                }
+            })?;
+
+        if let Some((blob, cek)) = sealed {
+            privchat_sdk::media_download::write_sealed_cache(
+                dir,
+                &format!("{file_name}.sealed"),
+                &blob,
+                &cek,
+            );
+        }
+
+        Ok(DownloadedAttachmentView {
+            local_path: target.to_string_lossy().to_string(),
+            display_file_name: display,
+            mime_type: server_mime.to_string(),
+            file_type,
+        })
+    }
+
     pub async fn download_attachment_to_path(
         &self,
         source_path: String,
@@ -9487,6 +9572,23 @@ impl PrivchatClient {
         &self,
         source_path: &str,
     ) -> Result<(Vec<u8>, Option<(Vec<u8>, String)>), PrivchatFfiError> {
+        self.resolve_attachment_bytes_with_meta(source_path)
+            .await
+            .map(|(bytes, sealed, _)| (bytes, sealed))
+    }
+
+    /// 同上，但把 `file/get_url` 拿到的**服务端元数据**一并带出来。
+    ///
+    /// 命名必须在这里决定：只有这一层拿得到 `original_filename` / `mime_type` /
+    /// `file_type`。放到上层就成了「调用方先猜一个名字，再来下载」——猜不出就是 `.bin`，
+    /// 于是别的客户端发来的图片被当成文件重发出去。
+    async fn resolve_attachment_bytes_with_meta(
+        &self,
+        source_path: &str,
+    ) -> Result<
+        (Vec<u8>, Option<(Vec<u8>, String)>, Option<FileGetUrlResponse>),
+        PrivchatFfiError,
+    > {
         let source = source_path.trim();
         if source.is_empty() {
             return Err(PrivchatFfiError::SdkError {
@@ -9501,13 +9603,14 @@ impl PrivchatClient {
                 code: privchat_protocol::ErrorCode::InternalError as u32,
                 detail: format!("read local attachment failed: {e}"),
             })?;
-            return Ok((bytes, None));
+            return Ok((bytes, None, None));
         }
 
         // 加密附件（enc_v=1）在服务端存的是密文，CEK 只在 `file/get_url` 的响应里。
         // 调用方直接给 URL 时没有这条信息，只能按明文处理。
         let mut encryption_version = 0;
         let mut cek: Option<String> = None;
+        let mut meta: Option<FileGetUrlResponse> = None;
         let download_url = if source.starts_with("http://") || source.starts_with("https://") {
             source.to_string()
         } else if let Ok(file_id) = source.parse::<u64>() {
@@ -9519,7 +9622,9 @@ impl PrivchatClient {
                 rpc_call_typed(&self.inner, routes::file::GET_URL, &req).await?;
             encryption_version = resp.encryption_version;
             cek = resp.cek.clone();
-            resp.file_url
+            let url = resp.file_url.clone();
+            meta = Some(resp);
+            url
         } else {
             return Err(PrivchatFfiError::SdkError {
                 code: privchat_protocol::ErrorCode::InvalidParams as u32,
@@ -9580,6 +9685,6 @@ impl PrivchatClient {
             detail: format!("decrypt attachment failed: {e}"),
         })?;
         let sealed = cek.filter(|_| encryption_version == 1).map(|c| (blob, c));
-        Ok((plain, sealed))
+        Ok((plain, sealed, meta))
     }
 }
