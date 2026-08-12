@@ -11703,6 +11703,16 @@ impl State {
     ///
     /// 缓存过期或从来没有（老消息、下载时没留）就退回本条消息自己的目录，照常封装
     /// 上传——功能不受影响，只是这次省不掉。
+    /// 封装缓存只有**两个文件都在**才算数：`seal_once` 拿 metadata 当提交标记，
+    /// 缺一个就当没有——缺了还用，就会拿半份缓存去上传。
+    fn committed_sealed_cache(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+        if path.exists() && path.with_extension("sealed.json").exists() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
     fn sealed_cache_for_send(
         content: &str,
         user_root: &std::path::Path,
@@ -11710,19 +11720,36 @@ impl State {
         cache_name: &str,
     ) -> std::path::PathBuf {
         let own = files_dir.join(cache_name);
+        let raw = content.strip_prefix("file://").unwrap_or(content);
+
+        // 🔴 收到的附件带着**原始密文**的旁挂缓存（下载时留下的 `{文件名}.sealed`）。
+        // 认它，重发才可能秒传：重新封装会用新的随机 CEK/nonce，密文一变摘要就变，
+        // 服务端认不出这是同一份内容，只能整传。
+        //
+        // 下载落点不一定在托管目录（App 转发一条还没下载过的附件时落在 cache/），
+        // 所以判据是「旁边有没有这份缓存」，不是「路径在不在托管树里」。
+        //
+        // 🔴 只有主文件能认它：旁挂缓存装的是**这个文件**的密文，缩略图是另一份内容。
+        // 缩略图先于主文件上传，若也认这条路径，会拿缩略图的密文覆盖掉主文件的缓存，
+        // 秒传反而永远打不中。
+        if cache_name == "body.sealed" {
+            let sidecar = std::path::Path::new(raw).file_name().and_then(|name| {
+                let p = std::path::Path::new(raw)
+                    .with_file_name(format!("{}.sealed", name.to_string_lossy()));
+                Self::committed_sealed_cache(p)
+            });
+            if let Some(sidecar) = sidecar {
+                return sidecar;
+            }
+        }
+
         let Some(source) = Self::managed_source_path(content, user_root) else {
             return own;
         };
         let Some(dir) = source.parent() else {
             return own;
         };
-        let inherited = dir.join(cache_name);
-        // 两个文件都在才算数：`seal_once` 把 metadata 当提交标记，缺一个就当没有。
-        if inherited.exists() && inherited.with_extension("sealed.json").exists() {
-            inherited
-        } else {
-            own
-        }
+        Self::committed_sealed_cache(dir.join(cache_name)).unwrap_or(own)
     }
 
     /// 这份文件是不是**接手后的成品**（收到的附件、被转发的原件）。
@@ -24327,6 +24354,40 @@ mod already_managed_source_tests {
                 "body.sealed",
             ),
             own_dir.join("body.sealed"),
+        );
+    }
+
+    /// 旁挂密文（`{文件名}.sealed`）只属于主文件。
+    ///
+    /// 缩略图先于主文件上传。它要是也认这条路径，`seal_once` 会发现摘要对不上、
+    /// 把缩略图的密文写回去，主文件的原始密文就没了——秒传从此永远不命中，而且
+    /// 不报错，只是每次转发都白传一遍。
+    #[test]
+    fn the_sidecar_ciphertext_belongs_to_the_body_only() {
+        let root = std::env::temp_dir().join(format!(
+            "privchat-sidecar-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_micros()
+        ));
+        let cache_dir = root.join("cache");
+        let own_dir = root.join("files").join("202608").join("9");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        std::fs::create_dir_all(&own_dir).expect("own dir");
+
+        let source = cache_dir.join("holiday.png");
+        std::fs::write(source.with_file_name("holiday.png.sealed"), b"blob").expect("blob");
+        std::fs::write(source.with_file_name("holiday.png.sealed.json"), b"{}").expect("meta");
+        let content = source.display().to_string();
+
+        assert_eq!(
+            State::sealed_cache_for_send(&content, &root, &own_dir, "body.sealed"),
+            cache_dir.join("holiday.png.sealed"),
+            "主文件要认下载时留下的原始密文，否则秒传不可能命中"
+        );
+        assert_eq!(
+            State::sealed_cache_for_send(&content, &root, &own_dir, "thumb.sealed"),
+            own_dir.join("thumb.sealed"),
+            "缩略图是另一份内容，不能占用主文件的密文缓存"
         );
     }
 

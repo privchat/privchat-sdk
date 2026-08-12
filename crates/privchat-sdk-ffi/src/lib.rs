@@ -1749,6 +1749,14 @@ pub enum TypingActionType {
     ChoosingSticker,
 }
 
+/// 见 [`PrivchatClient::attachment_transfer_stats`]。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AttachmentTransferStatsView {
+    pub claims: u64,
+    pub body_uploads: u64,
+    pub thumbnail_uploads: u64,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct NewMessage {
     pub channel_id: u64,
@@ -8808,17 +8816,39 @@ impl PrivchatClient {
         source_path: String,
         target_path: String,
     ) -> Result<String, PrivchatFfiError> {
-        let data = self.resolve_attachment_bytes(&source_path).await?;
-        if let Some(parent) = std::path::Path::new(&target_path).parent() {
+        let (data, sealed) = self.resolve_attachment_bytes(&source_path).await?;
+        let target = std::path::Path::new(&target_path);
+        if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| PrivchatFfiError::SdkError {
                 code: privchat_protocol::ErrorCode::InternalError as u32,
                 detail: format!("create target dir failed: {e}"),
             })?;
         }
-        std::fs::write(&target_path, data).map_err(|e| PrivchatFfiError::SdkError {
-            code: privchat_protocol::ErrorCode::InternalError as u32,
-            detail: format!("write target attachment failed: {e}"),
-        })?;
+        // 🔴 先写 `.part` 再原子改名：直接写最终路径的话，中途崩一次就留下一个
+        // 截断文件，之后会被当成完好的附件读出来重新发出去。
+        let tmp = target.with_extension("part");
+        std::fs::write(&tmp, &data)
+            .and_then(|_| std::fs::rename(&tmp, target))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                PrivchatFfiError::SdkError {
+                    code: privchat_protocol::ErrorCode::InternalError as u32,
+                    detail: format!("write target attachment failed: {e}"),
+                }
+            })?;
+
+        // 把原始密文留在文件旁边：这份内容再发一次时原样上传，服务端按摘要认出
+        // 「已经有了」，正文一个字节都不用传。
+        if let (Some((blob, cek)), Some(dir), Some(name)) =
+            (sealed, target.parent(), target.file_name())
+        {
+            privchat_sdk::media_download::write_sealed_cache(
+                dir,
+                &format!("{}.sealed", name.to_string_lossy()),
+                &blob,
+                &cek,
+            );
+        }
         Ok(target_path)
     }
 
@@ -8834,6 +8864,19 @@ impl PrivchatClient {
 
     /// 获取附件下载目标目录 (Canonical 路径)
     /// 参数必须传入 message 表的主键和创建时间，禁止使用业务脏字段
+    /// 附件正文的传输计数（诊断用）。
+    ///
+    /// 「秒传省了带宽」只能在这里证明：服务端也按内容哈希复用物理路径，所以
+    /// 「两条记录指向同一个 file_url」并不代表客户端没上传。
+    pub fn attachment_transfer_stats(&self) -> AttachmentTransferStatsView {
+        let s = self.inner.attachment_transfer_stats();
+        AttachmentTransferStatsView {
+            claims: s.claims,
+            body_uploads: s.body_uploads,
+            thumbnail_uploads: s.thumbnail_uploads,
+        }
+    }
+
     pub fn get_attachment_target_dir(
         &self,
         uid: u64,
@@ -9041,101 +9084,6 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
-    async fn resolve_attachment_bytes(
-        &self,
-        source_path: &str,
-    ) -> Result<Vec<u8>, PrivchatFfiError> {
-        let source = source_path.trim();
-        if source.is_empty() {
-            return Err(PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InvalidParams as u32,
-                detail: "attachment source is empty".to_string(),
-            });
-        }
-
-        let path = std::path::Path::new(source);
-        if path.exists() {
-            return std::fs::read(path).map_err(|e| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InternalError as u32,
-                detail: format!("read local attachment failed: {e}"),
-            });
-        }
-
-        // 加密附件（enc_v=1）在服务端存的是密文，CEK 只在 `file/get_url` 的响应里。
-        // 拿不到 CEK 的那条路（调用方直接给 URL）只能原样返回。
-        let mut cek: Option<String> = None;
-        let download_url = if source.starts_with("http://") || source.starts_with("https://") {
-            source.to_string()
-        } else if let Ok(file_id) = source.parse::<u64>() {
-            let req = FileGetUrlRequest {
-                file_id,
-                user_id: 0,
-            };
-            let resp: FileGetUrlResponse =
-                rpc_call_typed(&self.inner, routes::file::GET_URL, &req).await?;
-            if resp.encryption_version == 1 {
-                cek = resp.cek.clone();
-            }
-            resp.file_url
-        } else {
-            return Err(PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InvalidParams as u32,
-                detail: format!("invalid attachment source: {source}"),
-            });
-        };
-
-        // 🔴 这段 HTTP 必须跑在 SDK 自己的运行时上。
-        //
-        // FFI 的 async 函数由**宿主**轮询（Kotlin 协程 / Swift），那个上下文里没有
-        // Tokio reactor，直接 `reqwest ... .await` 在运行期就是
-        // 「there is no reactor running, must be called from the context of a Tokio 1.x runtime」——
-        // 从 App 下载附件（比如转发一份还没下载过的图片）必然失败。
-        // 等 JoinHandle 不需要 reactor，所以交给 handle 跑是安全的。
-        let handle = self.inner.runtime_handle();
-        let url = download_url.clone();
-        let blob = handle
-            .spawn(async move {
-                let response = reqwest::Client::new().get(&url).send().await.map_err(|e| {
-                    PrivchatFfiError::SdkError {
-                        code: privchat_protocol::ErrorCode::NetworkError as u32,
-                        detail: format!("download attachment request failed: {e}"),
-                    }
-                })?;
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(PrivchatFfiError::SdkError {
-                        code: privchat_protocol::ErrorCode::NetworkError as u32,
-                        detail: format!("download attachment failed: status={status} body={body}"),
-                    });
-                }
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| PrivchatFfiError::SdkError {
-                        code: privchat_protocol::ErrorCode::NetworkError as u32,
-                        detail: format!("read attachment bytes failed: {e}"),
-                    })?;
-                Ok(bytes.to_vec())
-            })
-            .await
-            .map_err(|e| PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InternalError as u32,
-                detail: format!("download attachment task failed: {e}"),
-            })??;
-
-        // 🔴 落盘的必须是明文。返回密文的话，调用方拿到的是一串解不开的字节：
-        // 界面渲染不出来，转发时更糟——它会被当成图片再发出去，收方收到一张坏图。
-        let Some(cek) = cek else {
-            return Ok(blob);
-        };
-        privchat_sdk::attachment_crypto::decrypt_attachment(&blob, &cek).map_err(|e| {
-            PrivchatFfiError::SdkError {
-                code: privchat_protocol::ErrorCode::InternalError as u32,
-                detail: format!("decrypt attachment failed: {e}"),
-            }
-        })
-    }
 
     pub fn to_client_endpoint(&self) -> Option<String> {
         self.config().endpoints.first().map(|v| {
@@ -9516,4 +9464,114 @@ extern "C" fn ffi_privchat_sdk_ffi_rust_future_complete_pointer(
     // SAFETY: output pointer is owned by caller.
     unsafe { set_call_status_ok(out_status) };
     std::ptr::null_mut()
+}
+
+/// FFI 内部辅助：**不进** uniffi 接口。
+///
+/// 放在单独的 impl 块里是因为上面那个 `#[uniffi::export] impl` 会尝试导出块内的每个
+/// 方法，而元组返回值不在 uniffi 的类型系统里。
+impl PrivchatClient {
+    /// 取回附件明文，同时带上**原始密文和 CEK**。
+    ///
+    /// 密文不是调试信息：把它留在本地，这份内容再发一次时就能原样上传，服务端按
+    /// 摘要认出「已经有了」——重新加密会换一串随机 CEK/nonce，摘要一变就只能整传。
+    async fn resolve_attachment_bytes(
+        &self,
+        source_path: &str,
+    ) -> Result<(Vec<u8>, Option<(Vec<u8>, String)>), PrivchatFfiError> {
+        let source = source_path.trim();
+        if source.is_empty() {
+            return Err(PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InvalidParams as u32,
+                detail: "attachment source is empty".to_string(),
+            });
+        }
+
+        let path = std::path::Path::new(source);
+        if path.exists() {
+            let bytes = std::fs::read(path).map_err(|e| PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InternalError as u32,
+                detail: format!("read local attachment failed: {e}"),
+            })?;
+            return Ok((bytes, None));
+        }
+
+        // 加密附件（enc_v=1）在服务端存的是密文，CEK 只在 `file/get_url` 的响应里。
+        // 调用方直接给 URL 时没有这条信息，只能按明文处理。
+        let mut encryption_version = 0;
+        let mut cek: Option<String> = None;
+        let download_url = if source.starts_with("http://") || source.starts_with("https://") {
+            source.to_string()
+        } else if let Ok(file_id) = source.parse::<u64>() {
+            let req = FileGetUrlRequest {
+                file_id,
+                user_id: 0,
+            };
+            let resp: FileGetUrlResponse =
+                rpc_call_typed(&self.inner, routes::file::GET_URL, &req).await?;
+            encryption_version = resp.encryption_version;
+            cek = resp.cek.clone();
+            resp.file_url
+        } else {
+            return Err(PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InvalidParams as u32,
+                detail: format!("invalid attachment source: {source}"),
+            });
+        };
+
+        // 🔴 这段 HTTP 必须跑在 SDK 自己的运行时上。
+        //
+        // FFI 的 async 函数由**宿主**轮询（Kotlin 协程 / Swift），那个上下文里没有
+        // Tokio reactor，直接 `reqwest ... .await` 在运行期就是
+        // 「there is no reactor running, must be called from the context of a Tokio 1.x runtime」——
+        // 从 App 下载附件（比如转发一份还没下载过的图片）必然失败。
+        // 等 JoinHandle 不需要 reactor，所以交给 handle 跑是安全的。
+        let handle = self.inner.runtime_handle();
+        let url = download_url.clone();
+        let blob = handle
+            .spawn(async move {
+                let response = reqwest::Client::new().get(&url).send().await.map_err(|e| {
+                    PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::NetworkError as u32,
+                        detail: format!("download attachment request failed: {e}"),
+                    }
+                })?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::NetworkError as u32,
+                        detail: format!("download attachment failed: status={status} body={body}"),
+                    });
+                }
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::NetworkError as u32,
+                        detail: format!("read attachment bytes failed: {e}"),
+                    })?;
+                Ok(bytes.to_vec())
+            })
+            .await
+            .map_err(|e| PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InternalError as u32,
+                detail: format!("download attachment task failed: {e}"),
+            })??;
+
+        // 🔴 落盘的必须是明文，而且**解不开就要报错**：v1 缺 CEK、或者遇到不认识的
+        // 加密版本时把密文当明文返回，产出的就是一张坏图/一个坏文件——错误被藏起来，
+        // 只在用户眼前显形。严格版判据见 attachment_crypto。
+        let plain = privchat_sdk::attachment_crypto::decrypt_downloaded_attachment_bytes(
+            encryption_version,
+            cek.as_deref(),
+            &blob,
+        )
+        .map_err(|e| PrivchatFfiError::SdkError {
+            code: privchat_protocol::ErrorCode::InternalError as u32,
+            detail: format!("decrypt attachment failed: {e}"),
+        })?;
+        let sealed = cek.filter(|_| encryption_version == 1).map(|c| (blob, c));
+        Ok((plain, sealed))
+    }
 }

@@ -807,7 +807,13 @@ fn sealed_cache_name(final_path: &std::path::Path) -> &'static str {
 /// 摘要并解密验证 CEK，所以这里写坏了不会被误用，只会退回照常封装。
 ///
 /// best-effort：写失败不影响下载本身，只是这次转发省不掉上传。
-fn write_sealed_cache(dir: &std::path::Path, cache_name: &str, blob: &[u8], cek: &str) {
+/// 把密文和它的 CEK 留在文件旁边，供"同一份内容再发一次"时原样上传。
+pub fn write_sealed_cache(
+    dir: &std::path::Path,
+    cache_name: &str,
+    blob: &[u8],
+    cek: &str,
+) {
     use sha2::Digest as _;
     let cache = dir.join(cache_name);
     let meta_path = cache.with_extension("sealed.json");
