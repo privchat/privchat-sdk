@@ -208,17 +208,24 @@ fn find_primary_file(dir: &Path) -> Option<PathBuf> {
                 if name == META_FILENAME {
                     return false;
                 }
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 // 🔴 密文缓存和半成品不是附件本体。
                 //
                 // 挑「最大的那个」会把它们选中：封装后的密文比明文大，下到一半的
                 // `.part` 也可能是。选错的后果不是报错——界面拿密文当图片渲染出一个坏块，
                 // 转发时把密文当原图发出去（发送直接失败）。
-                if p.extension()
-                    .map_or(false, |ext| ext == "sealed" || ext == "part")
-                {
+                //
+                // 按**这两样东西确切的样子**排除，不是封杀扩展名：用户发一个真叫
+                // `xx.sealed` / `xx.part` 的文件完全合法，落盘就是 `payload.sealed` /
+                // `payload.part`，封杀扩展名会让这类附件在本地变成「不存在」。
+                if name == "body.sealed" {
                     return false;
                 }
-                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                // 临时后缀是**追加**上去的（`payload.png.part`、`payload.png.decrypted.part`），
+                // 去掉 `.part` 后仍带扩展名；用户自己那份去掉后只剩 `payload`。
+                if p.extension().map_or(false, |ext| ext == "part") && stem.contains('.') {
+                    return false;
+                }
                 // Exclude thumbnails: thumb.*, {id}_thumb.*, {id}_thumb_v{n}.*
                 if stem == "thumb" || stem.ends_with("_thumb") {
                     return false;
@@ -285,5 +292,26 @@ mod primary_file_tests {
             Some(dir.join("payload.png")),
             "附件本体是明文成品，不是密文缓存也不是半成品"
         );
+    }
+
+    /// 🔴 用户发一个真叫 `合同.sealed` / `补丁.part` 的文件是合法的。
+    ///
+    /// 落盘名是 `payload.sealed` / `payload.part`。按扩展名一刀切排除的话，这类附件
+    /// 在本地就成了「不存在」——本地路径解析不出来，界面点开是空的，转发也发不出去。
+    #[test]
+    fn a_file_the_user_really_named_sealed_is_still_an_attachment() {
+        for name in ["payload.sealed", "payload.part"] {
+            let dir = scratch("legit");
+            fs::write(dir.join(name), vec![7u8; 512]).expect("payload");
+            // 它自己的密文缓存照样叫 body.sealed，两者必须能分开。
+            fs::write(dir.join("body.sealed"), vec![0u8; 4096]).expect("sealed blob");
+            fs::write(dir.join("body.sealed.json"), b"{}").expect("sealed meta");
+
+            assert_eq!(
+                find_primary_file(&dir),
+                Some(dir.join(name)),
+                "{name} 是用户发的那份文件，不能当成内部缓存排掉"
+            );
+        }
     }
 }
