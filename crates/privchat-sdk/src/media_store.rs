@@ -211,19 +211,24 @@ fn find_primary_file(dir: &Path) -> Option<PathBuf> {
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 // 🔴 密文缓存和半成品不是附件本体。
                 //
-                // 挑「最大的那个」会把它们选中：封装后的密文比明文大，下到一半的
-                // `.part` 也可能是。选错的后果不是报错——界面拿密文当图片渲染出一个坏块，
-                // 转发时把密文当原图发出去（发送直接失败）。
+                // 挑「最大的那个」会把它们选中：封装后的密文比明文大，写到一半的
+                // `.part` / `.tmp` 也可能是。选错的后果不是报错——界面拿密文当图片
+                // 渲染出一个坏块，转发时把密文当原图发出去（发送直接失败）。
                 //
-                // 按**这两样东西确切的样子**排除，不是封杀扩展名：用户发一个真叫
+                // 按**这些文件确切的样子**排除，不是封杀扩展名：用户发一个真叫
                 // `xx.sealed` / `xx.part` 的文件完全合法，落盘就是 `payload.sealed` /
                 // `payload.part`，封杀扩展名会让这类附件在本地变成「不存在」。
-                if name == "body.sealed" {
+                //
+                // 密文缓存的名字是固定的（`body.sealed`），写入中途还会出现同名 `.tmp`
+                // （见 `media_download::write_sealed_cache` / `State::seal_once`）。
+                if name == "body.sealed" || name == "body.sealed.tmp" {
                     return false;
                 }
-                // 临时后缀是**追加**上去的（`payload.png.part`、`payload.png.decrypted.part`），
-                // 去掉 `.part` 后仍带扩展名；用户自己那份去掉后只剩 `payload`。
-                if p.extension().map_or(false, |ext| ext == "part") && stem.contains('.') {
+                // 临时后缀是**追加**上去的（`payload.png.part`、`payload.png.decrypted.part`、
+                // `合同.pdf.sealed.tmp`），去掉之后仍带扩展名；用户自己那份去掉后只剩 `payload`。
+                if p.extension().map_or(false, |ext| ext == "part" || ext == "tmp")
+                    && stem.contains('.')
+                {
                     return false;
                 }
                 // Exclude thumbnails: thumb.*, {id}_thumb.*, {id}_thumb_v{n}.*
@@ -243,6 +248,19 @@ fn find_primary_file(dir: &Path) -> Option<PathBuf> {
         if candidates.is_empty() {
             return None;
         }
+
+        // 🔴 认得出规范名就别去猜。附件本体自 §7.5 v2 起一律叫 `payload.{ext}`，
+        // 「挑最大的那个」只是给老目录留的兜底——让它先跑，就等于让目录里任何一个
+        // 更大的内部文件都有机会冒充正文。
+        let canonical: Vec<PathBuf> = candidates
+            .iter()
+            .filter(|p| p.file_stem().and_then(|s| s.to_str()) == Some(PAYLOAD_BASENAME))
+            .cloned()
+            .collect();
+        if !canonical.is_empty() {
+            candidates = canonical;
+        }
+
         if candidates.len() == 1 {
             return Some(candidates.remove(0));
         }
@@ -285,6 +303,10 @@ mod primary_file_tests {
         fs::write(dir.join("body.sealed"), vec![0u8; 4096]).expect("sealed blob");
         fs::write(dir.join("body.sealed.json"), b"{}").expect("sealed meta");
         fs::write(dir.join("payload.png.part"), vec![0u8; 8192]).expect("half-downloaded");
+        // 写缓存写到一半：崩在这里就会留下它，而它同样比明文大。
+        fs::write(dir.join("body.sealed.tmp"), vec![0u8; 16384]).expect("sealed tmp");
+        fs::write(dir.join("thumb.sealed"), vec![2u8; 2048]).expect("thumb sealed");
+        fs::write(dir.join("thumb.sealed.tmp"), vec![2u8; 2048]).expect("thumb sealed tmp");
         fs::write(dir.join("thumb.webp"), vec![1u8; 64]).expect("thumb");
 
         assert_eq!(
@@ -313,5 +335,16 @@ mod primary_file_tests {
                 "{name} 是用户发的那份文件，不能当成内部缓存排掉"
             );
         }
+    }
+
+    /// 老目录（`payload.{ext}` 之前那套命名）才靠「挑最大的」兜底；只要规范名在，
+    /// 就用它。否则目录里任何一个更大的内部文件都有机会冒充正文。
+    #[test]
+    fn the_canonical_payload_wins_over_any_larger_neighbour() {
+        let dir = scratch("canonical");
+        fs::write(dir.join("payload.png"), vec![7u8; 128]).expect("payload");
+        fs::write(dir.join("legacy-huge.bin"), vec![9u8; 65536]).expect("legacy leftover");
+
+        assert_eq!(find_primary_file(&dir), Some(dir.join("payload.png")));
     }
 }
