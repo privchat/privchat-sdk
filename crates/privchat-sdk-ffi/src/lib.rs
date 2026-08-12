@@ -8945,6 +8945,26 @@ impl PrivchatClient {
         Ok(target_path)
     }
 
+    /// 下载到缓存目录，名字由服务端元数据决定。
+    ///
+    /// 与 [`download_attachment_to_cache`] 的差别只有一条：调用方**不再需要先猜名字**。
+    /// 旧接口留着是为了兼容既有调用点。
+    pub async fn download_attachment_into_cache(
+        &self,
+        source_path: String,
+        message_file_name: Option<String>,
+        message_mime_type: Option<String>,
+    ) -> Result<DownloadedAttachmentView, PrivchatFfiError> {
+        let base = self.assets_dir().await?;
+        self.download_attachment_into_dir(
+            source_path,
+            format!("{base}/cache"),
+            message_file_name,
+            message_mime_type,
+        )
+        .await
+    }
+
     pub async fn download_attachment_to_cache(
         &self,
         source_path: String,
