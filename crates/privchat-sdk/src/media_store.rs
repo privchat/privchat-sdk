@@ -190,6 +190,83 @@ pub fn payload_filename_with_fallback(mime: &str, original_filename: Option<&str
     format!("{}.bin", PAYLOAD_BASENAME)
 }
 
+/// 下载一份附件时，它在磁盘上叫什么。
+///
+/// 🔴 **物理名不是展示名**。磁盘名用 `file_id + 扩展名`：两个人各发一张
+/// `photo.png`，用展示名当文件名就会互相覆盖，第二条消息打开是第一张图。
+/// 展示名另走 [`display_file_name`]。
+///
+/// 扩展名的权威来源是**服务端 MIME**（`file/get_url` 的 `mime_type`），
+/// 原文件名只是 MIME 认不出时的兜底：`a.jpg` 配 `image/png` 时，字节是 PNG，
+/// 按 `.jpg` 存会让本地解码和后续类型推断都跟着错。
+///
+/// 🔴 **不能用 `file_type` 推扩展名**：它只说得出「这是图片」，而图片可能是
+/// jpg/webp/gif。`file_type` 只决定消息类型。
+pub fn resolve_downloaded_file_name(
+    file_id: &str,
+    server_filename: &str,
+    server_mime: &str,
+    message_filename: Option<&str>,
+    message_mime: Option<&str>,
+) -> String {
+    let base: String = file_id
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    let base = if base.is_empty() { "attachment".to_string() } else { base };
+
+    let ext = ext_from_known_mime(server_mime)
+        .or_else(|| safe_extension_of(server_filename))
+        .or_else(|| message_mime.and_then(ext_from_known_mime))
+        .or_else(|| message_filename.and_then(safe_extension_of))
+        .unwrap_or_else(|| "bin".to_string());
+
+    format!("{base}.{ext}")
+}
+
+/// 这条消息在界面上显示的文件名。
+///
+/// 与物理名相反，这里**保留用户看到的那个名字**（服务端 `original_filename`），
+/// 只做安全清洗：取最后一段路径、去掉控制字符。名字来自别人的消息，
+/// 直接往路径里拼是路径穿越，直接往界面上放是伪造后缀的钓鱼。
+///
+/// 服务端没有名字时退回本地消息的名字，再没有就返回 None——由上层决定显示什么，
+/// 而不是在这里编一个假名字。
+pub fn display_file_name(server_filename: &str, message_filename: Option<&str>) -> Option<String> {
+    [server_filename, message_filename.unwrap_or("")]
+        .into_iter()
+        .filter_map(|raw| {
+            let base = raw.rsplit(['/', '\\']).next()?.trim();
+            let cleaned: String = base
+                .chars()
+                .filter(|c| !c.is_control() && *c != '\u{202e}')
+                .take(120)
+                .collect();
+            let cleaned = cleaned.trim().trim_matches('.').to_string();
+            (!cleaned.is_empty()).then_some(cleaned)
+        })
+        .next()
+}
+
+/// 文件名里那截扩展名，**清洗过**才返回。
+///
+/// 名字来自别人的消息，不可信：只取最后一段路径（挡 `../`），扩展名只认
+/// 小写字母数字且不超过 8 位。
+fn safe_extension_of(name: &str) -> Option<String> {
+    let base = name.rsplit(['/', '\\']).next()?.trim();
+    let ext = base.rsplit_once('.')?.1.to_ascii_lowercase();
+    (!ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()))
+        .then_some(ext)
+}
+
+/// 认得出的 MIME 才给扩展名。认不出时返回 None，让调用方继续往下退。
+fn ext_from_known_mime(mime: &str) -> Option<String> {
+    let ext = ext_from_mime(mime);
+    (ext != "bin").then(|| ext.to_string())
+}
+
 /// Helper: Find the "primary" file in a directory.
 /// Strategy: Ignore thumb/meta/JSON. If one file, return it. If multiple, return the largest one.
 fn find_primary_file(dir: &Path) -> Option<PathBuf> {
@@ -346,5 +423,130 @@ mod primary_file_tests {
         fs::write(dir.join("legacy-huge.bin"), vec![9u8; 65536]).expect("legacy leftover");
 
         assert_eq!(find_primary_file(&dir), Some(dir.join("payload.png")));
+    }
+}
+
+
+#[cfg(test)]
+mod downloaded_file_name_tests {
+    use super::*;
+
+    /// 🔴 本地那条消息可能既没有文件名也没有 MIME（别的客户端发的）。
+    /// 只看本地就退回 `.bin`，转发出去的 PNG 就变成了「文件」消息——
+    /// 类型、缩略图、预览全丢。服务端一直知道它是什么。
+    #[test]
+    fn the_server_metadata_decides_when_the_message_says_nothing() {
+        assert_eq!(
+            resolve_downloaded_file_name("25865", "dedup-test2.png", "image/png", None, None),
+            "25865.png"
+        );
+    }
+
+
+    /// 🔴 物理名必须带 `file_id`：两个人各发一张 `photo.png`，
+    /// 用展示名当磁盘名就会互相覆盖——第二条消息点开是第一张图。
+    #[test]
+    fn two_files_with_the_same_display_name_do_not_collide() {
+        let a = resolve_downloaded_file_name("101", "photo.png", "image/png", None, None);
+        let b = resolve_downloaded_file_name("102", "photo.png", "image/png", None, None);
+        assert_eq!((a.as_str(), b.as_str()), ("101.png", "102.png"));
+        assert_ne!(a, b);
+    }
+
+    /// 🔴 原文件名与 MIME 冲突时，字节说了算：`a.jpg` + `image/png` 的内容是 PNG。
+    /// 存成 `.jpg` 会让本地解码器按 JPEG 去读，也会让后续按扩展名推断的地方全错；
+    /// 但**展示名仍是用户看到的那个**，不能被物理名改写。
+    #[test]
+    fn the_bytes_decide_the_extension_but_not_the_label() {
+        assert_eq!(
+            resolve_downloaded_file_name("103", "a.jpg", "image/png", None, None),
+            "103.png"
+        );
+        assert_eq!(display_file_name("a.jpg", None).as_deref(), Some("a.jpg"));
+    }
+
+    /// 展示名同样不可信：只取最后一段路径，控制字符和 RTL 覆盖符去掉
+    /// （`report<RLO>gpj.exe` 这种在界面上看起来是 .jpg）。
+    #[test]
+    fn the_display_name_is_cleaned_but_kept_human() {
+        assert_eq!(
+            display_file_name("../../etc/年度报告.pdf", None).as_deref(),
+            Some("年度报告.pdf")
+        );
+        assert_eq!(
+            display_file_name("report\u{202e}gpj.exe", None).as_deref(),
+            Some("reportgpj.exe")
+        );
+        assert_eq!(display_file_name("", Some("local.png")).as_deref(), Some("local.png"));
+        assert_eq!(display_file_name("", None), None);
+    }
+
+    /// 🔴 `file_type=image` 说不出是 jpg 还是 png。这里只认 MIME，
+    /// 认错就是把 JPEG 存成 `.png`：本地预览、再次发送的类型推断全跟着错。
+    #[test]
+    fn an_image_is_not_automatically_a_png() {
+        assert_eq!(
+            resolve_downloaded_file_name("7", "", "image/jpeg", None, None),
+            "7.jpg"
+        );
+        assert_eq!(
+            resolve_downloaded_file_name("8", "", "image/webp", None, None),
+            "8.webp"
+        );
+        assert_eq!(
+            resolve_downloaded_file_name("9", "", "video/mp4", None, None),
+            "9.mp4"
+        );
+    }
+
+    /// 服务端没有可用名字时才轮到本地消息，最后才是 bin。
+    #[test]
+    fn the_message_is_only_a_fallback() {
+        assert_eq!(
+            resolve_downloaded_file_name("10", "", "", None, Some("image/heic")),
+            "10.heic"
+        );
+        // 服务端 MIME 认不出时，才轮到原文件名的扩展名。
+        assert_eq!(
+            resolve_downloaded_file_name("10b", "report.HEIC", "application/octet-stream", None, None),
+            "10b.heic"
+        );
+        assert_eq!(
+            resolve_downloaded_file_name("11", "", "", None, Some("audio/mp4")),
+            "11.m4a"
+        );
+        assert_eq!(resolve_downloaded_file_name("12", "", "", None, None), "12.bin");
+    }
+
+    /// 🔴 文件名来自别人的消息。拼进缓存路径之前必须清洗，
+    /// 否则 `../` 或分隔符能把文件写到缓存目录之外。
+    #[test]
+    fn a_hostile_name_cannot_escape_the_cache_directory() {
+        for hostile in [
+            "../../../../etc/passwd",
+            "..\\..\\windows\\system32\\evil.exe",
+            "payload.png/../../x",
+            "no-extension",
+            "trailing.",
+        ] {
+            let name = resolve_downloaded_file_name("13", hostile, "", None, None);
+            assert!(!name.contains('/') && !name.contains('\\'), "{hostile} -> {name}");
+            assert!(!name.contains(".."), "{hostile} -> {name}");
+        }
+        // 合法扩展名照常保留（上面那条 exe 是合法字符，但目录部分必须被丢掉）。
+        assert_eq!(
+            resolve_downloaded_file_name("13", "../../etc/report.pdf", "", None, None),
+            "13.pdf"
+        );
+    }
+
+    /// file_id 也进路径，同样要清洗。
+    #[test]
+    fn the_file_id_is_sanitised_too() {
+        assert_eq!(
+            resolve_downloaded_file_name("../7", "x.png", "", None, None),
+            "7.png"
+        );
+        assert_eq!(resolve_downloaded_file_name("", "x.png", "", None, None), "attachment.png");
     }
 }
