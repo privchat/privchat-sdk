@@ -9061,6 +9061,9 @@ impl PrivchatClient {
             });
         }
 
+        // 加密附件（enc_v=1）在服务端存的是密文，CEK 只在 `file/get_url` 的响应里。
+        // 拿不到 CEK 的那条路（调用方直接给 URL）只能原样返回。
+        let mut cek: Option<String> = None;
         let download_url = if source.starts_with("http://") || source.starts_with("https://") {
             source.to_string()
         } else if let Ok(file_id) = source.parse::<u64>() {
@@ -9070,6 +9073,9 @@ impl PrivchatClient {
             };
             let resp: FileGetUrlResponse =
                 rpc_call_typed(&self.inner, routes::file::GET_URL, &req).await?;
+            if resp.encryption_version == 1 {
+                cek = resp.cek.clone();
+            }
             resp.file_url
         } else {
             return Err(PrivchatFfiError::SdkError {
@@ -9087,7 +9093,7 @@ impl PrivchatClient {
         // 等 JoinHandle 不需要 reactor，所以交给 handle 跑是安全的。
         let handle = self.inner.runtime_handle();
         let url = download_url.clone();
-        handle
+        let blob = handle
             .spawn(async move {
                 let response = reqwest::Client::new().get(&url).send().await.map_err(|e| {
                     PrivchatFfiError::SdkError {
@@ -9116,7 +9122,19 @@ impl PrivchatClient {
             .map_err(|e| PrivchatFfiError::SdkError {
                 code: privchat_protocol::ErrorCode::InternalError as u32,
                 detail: format!("download attachment task failed: {e}"),
-            })?
+            })??;
+
+        // 🔴 落盘的必须是明文。返回密文的话，调用方拿到的是一串解不开的字节：
+        // 界面渲染不出来，转发时更糟——它会被当成图片再发出去，收方收到一张坏图。
+        let Some(cek) = cek else {
+            return Ok(blob);
+        };
+        privchat_sdk::attachment_crypto::decrypt_attachment(&blob, &cek).map_err(|e| {
+            PrivchatFfiError::SdkError {
+                code: privchat_protocol::ErrorCode::InternalError as u32,
+                detail: format!("decrypt attachment failed: {e}"),
+            }
+        })
     }
 
     pub fn to_client_endpoint(&self) -> Option<String> {

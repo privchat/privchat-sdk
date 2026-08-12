@@ -33,14 +33,9 @@ async fn main() -> BoxResult<()> {
     // returns 502 for loopback admin calls; curl bypasses it, hence the mismatch.
     // Never proxy localhost smoke traffic — default a loopback no_proxy unless
     // the caller already set one.
-    if std::env::var_os("NO_PROXY").is_none() && std::env::var_os("no_proxy").is_none() {
-        // 🔴 内网段也要绕过代理：真机调试时服务端会广播局域网地址（config.toml 的
-        // `[file]` base urls），上传就走 192.168.x.x —— 只豁免 loopback 的话，
-        // 那几条附件用例会被本机代理拦下，看起来像产品坏了。
-        let bypass = "127.0.0.1,localhost,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12";
-        std::env::set_var("NO_PROXY", bypass);
-        std::env::set_var("no_proxy", bypass);
-    }
+    // 🔴 合并进**已有**的值，而不是「两个都没设才写」：只要环境里已经有一个
+    // `NO_PROXY=localhost`，缺失的网段就永远补不上，附件上传照样走代理。
+    ensure_proxy_bypass();
 
     println!("\nPrivChat SDK Multi-Account Example (accounts)");
     println!("================================================");
@@ -79,6 +74,41 @@ async fn main() -> BoxResult<()> {
     }
 
     Ok(())
+}
+
+/// 让本机 HTTP 代理放过 loopback 和内网。
+///
+/// 两件事都会踩到：admin/metrics 走 127.0.0.1，而真机调试时服务端广播的上传地址是
+/// 局域网 IP（config.toml `[file]` base urls）。被代理拦下的表现是 502 / 连不上，
+/// 看起来像产品坏了——curl 却是好的，因为 curl 不读这两个变量。
+fn ensure_proxy_bypass() {
+    const NEEDED: [&str; 6] = [
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "192.168.0.0/16",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+    ];
+    let existing = std::env::var("NO_PROXY")
+        .ok()
+        .or_else(|| std::env::var("no_proxy").ok())
+        .unwrap_or_default();
+    let mut entries: Vec<String> = existing
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for want in NEEDED {
+        if !entries.iter().any(|e| e == want) {
+            entries.push(want.to_string());
+        }
+    }
+    let merged = entries.join(",");
+    // 大小写两个都写：不同 HTTP 客户端读的不是同一个。
+    std::env::set_var("NO_PROXY", &merged);
+    std::env::set_var("no_proxy", &merged);
 }
 
 fn boxed_err(msg: impl Into<String>) -> BoxError {
