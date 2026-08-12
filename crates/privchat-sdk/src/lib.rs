@@ -7445,7 +7445,14 @@ impl State {
         storage
             .outbox_ack_sent(msg.message_id, server_message_id, message_seq)
             .await?;
-        Self::drop_attachment_sealed_caches_at(storage, msg).await;
+        // 🔴 发送成功**不**清密文缓存。
+        //
+        // 「转发要秒传」不区分这条消息是谁发的：用户把自己刚发的图再发一次，同样不该
+        // 重传。ack 后立刻删掉，等于只有「收到并下载过的附件」能秒传，自己发的永远
+        // 整传——那是实现细节漏成了产品行为。
+        //
+        // 留着不会无限占磁盘：`prune_sealed_caches` 每次登录按 SEALED_CACHE_RETENTION
+        // 回收；终态拒绝的那条路径仍然立刻清（那条消息不会再发）。
         Ok(())
     }
 
@@ -7543,7 +7550,7 @@ impl State {
                             );
                             break;
                         }
-                        self.drop_attachment_sealed_caches(&msg).await;
+                        // 同上：对账认定已发送，也留着密文缓存供再次发送时秒传。
                         self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                             kind: "file".to_string(),
                             action: "dequeue_reconciled".to_string(),
@@ -24266,8 +24273,12 @@ mod ack_before_cache_release_tests {
             )
             .expect("count outbox");
         assert_eq!(queued, 0, "确认提交之后命令出队");
-        assert!(!cache.exists(), "确认提交之后缓存要清掉");
-        assert!(!cache.with_extension("sealed.json").exists());
+        // 🔴 确认之后缓存**留着**：用户把自己刚发的这张图再发一次时要靠它秒传。
+        // 过期回收交给 `prune_sealed_caches`（SEALED_CACHE_RETENTION）。
+        assert!(
+            cache.exists() && cache.with_extension("sealed.json").exists(),
+            "发送成功后清掉密文，等于自己发过的附件永远秒传不了"
+        );
     }
 }
 
