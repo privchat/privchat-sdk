@@ -8826,7 +8826,15 @@ impl PrivchatClient {
         }
         // 🔴 先写 `.part` 再原子改名：直接写最终路径的话，中途崩一次就留下一个
         // 截断文件，之后会被当成完好的附件读出来重新发出去。
-        let tmp = target.with_extension("part");
+        // 后缀是**追加**不是替换：`with_extension("part")` 会把 holiday.png 和
+        // holiday.mp4 都变成 holiday.part，两个下载撞在同一个临时文件上。
+        let tmp = target.with_file_name(format!(
+            "{}.part",
+            target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
         std::fs::write(&tmp, &data)
             .and_then(|_| std::fs::rename(&tmp, target))
             .map_err(|e| {

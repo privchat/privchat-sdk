@@ -208,6 +208,16 @@ fn find_primary_file(dir: &Path) -> Option<PathBuf> {
                 if name == META_FILENAME {
                     return false;
                 }
+                // 🔴 密文缓存和半成品不是附件本体。
+                //
+                // 挑「最大的那个」会把它们选中：封装后的密文比明文大，下到一半的
+                // `.part` 也可能是。选错的后果不是报错——界面拿密文当图片渲染出一个坏块，
+                // 转发时把密文当原图发出去（发送直接失败）。
+                if p.extension()
+                    .map_or(false, |ext| ext == "sealed" || ext == "part")
+                {
+                    return false;
+                }
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 // Exclude thumbnails: thumb.*, {id}_thumb.*, {id}_thumb_v{n}.*
                 if stem == "thumb" || stem.ends_with("_thumb") {
@@ -235,5 +245,45 @@ fn find_primary_file(dir: &Path) -> Option<PathBuf> {
         candidates.pop()
     } else {
         None
+    }
+}
+
+
+#[cfg(test)]
+mod primary_file_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-primary-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// 🔴 密文缓存比明文大，而这里挑的是「最大的那个」。
+    ///
+    /// 选中密文不会报错：界面把它当图片渲染成一个坏块，转发时把它当原图发出去
+    /// （发送直接失败）。半成品 `.part` 同理——下到一半的字节被当成完好的附件。
+    #[test]
+    fn the_ciphertext_cache_is_not_the_attachment() {
+        let dir = scratch("sealed");
+        fs::write(dir.join("payload.png"), vec![7u8; 512]).expect("payload");
+        // 封装后更大：明文 + nonce + tag。
+        fs::write(dir.join("body.sealed"), vec![0u8; 4096]).expect("sealed blob");
+        fs::write(dir.join("body.sealed.json"), b"{}").expect("sealed meta");
+        fs::write(dir.join("payload.png.part"), vec![0u8; 8192]).expect("half-downloaded");
+        fs::write(dir.join("thumb.webp"), vec![1u8; 64]).expect("thumb");
+
+        assert_eq!(
+            find_primary_file(&dir),
+            Some(dir.join("payload.png")),
+            "附件本体是明文成品，不是密文缓存也不是半成品"
+        );
     }
 }
