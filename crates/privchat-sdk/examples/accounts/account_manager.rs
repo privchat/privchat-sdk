@@ -1196,6 +1196,8 @@ impl MultiAccountManager {
                 .unwrap_or_else(|| "unknown-file-id".to_string()),
             expires_at: None,
             max_size: None,
+            // 这个假实现只走整包路径，不下发分片方案。
+            upload_plan: None,
         })
     }
 

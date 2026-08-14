@@ -863,6 +863,10 @@ struct LiveAttachmentUploadIo<'a> {
     mime_type: String,
     file_type: String,
     local_message_id: String,
+    /// 会话记录放在密文缓存旁边（`<sealed>.upload-session.json`）。
+    sealed_cache: &'a std::path::Path,
+    /// 服务器身份：切环境之后旧会话必须作废。
+    server_identity: String,
 }
 
 impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
@@ -871,7 +875,55 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
         digest: Option<&str>,
         size: usize,
     ) -> Result<FileRequestUploadTokenResponse> {
-        self.state
+        // 🔴 **先看看上次那张 token 还能不能用。**
+        //
+        // 每次重试都重新 prepare 的话，服务端每次都会签一个新的 `upload_id`，
+        // 也就是一个**全新的空会话**——于是「传到 90% 断网、回来接着传」永远不成立，
+        // 断点续传只在一次调用内部有效。token 有效期 24 小时正是为这件事留的。
+        if let Some(digest) = digest {
+            if let Some(rec) = crate::resumable_upload::UploadSessionRecord::load(self.sealed_cache)
+            {
+                let now = chrono::Utc::now().timestamp();
+                match rec.reusable_for(
+                    now,
+                    self.user_id,
+                    &self.server_identity,
+                    digest,
+                    size as u64,
+                ) {
+                    crate::resumable_upload::ReuseVerdict::Reusable => {
+                        eprintln!(
+                            "[SDK.upload] 复用上次的上传会话（token 未过期、密文未变），接着传"
+                        );
+                        return Ok(FileRequestUploadTokenResponse {
+                            token: rec.token,
+                            upload_url: rec.upload_url,
+                            already_exists: false,
+                            file_id: String::new(),
+                            expires_at: Some(rec.expires_at),
+                            max_size: None,
+                            upload_plan: Some(
+                                privchat_protocol::rpc::file::UploadPlanDto {
+                                    base_unit: rec.plan.base_unit,
+                                    initial_request_size: rec.plan.initial_request_size,
+                                    max_request_size: rec.plan.max_request_size,
+                                    session_threshold: rec.plan.session_threshold,
+                                    max_parallel_parts: rec.plan.max_parallel_parts,
+                                },
+                            ),
+                        });
+                    }
+                    verdict => {
+                        // 不能复用的每一种都记下来：否则「怎么又从头传了」查不出原因。
+                        eprintln!("[SDK.upload] 旧上传会话作废（{verdict:?}），重新申请");
+                        crate::resumable_upload::UploadSessionRecord::discard(self.sealed_cache);
+                    }
+                }
+            }
+        }
+
+        let response = self
+            .state
             .request_upload_token(
                 self.user_id,
                 self.filename.clone(),
@@ -881,7 +933,36 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                 self.file_type.clone(),
                 digest,
             )
-            .await
+            .await?;
+
+        // 🔴 **在发出第一片之前**把会话落盘（临时文件 + rename）。
+        //
+        // 反过来的话，第一片传完就崩溃，那次上传就成了服务端上一个没人认领的会话；
+        // 下次重来又是新的，永远续不上。
+        if let (Some(digest), Some(plan)) = (digest, response.upload_plan.as_ref()) {
+            let rec = crate::resumable_upload::UploadSessionRecord {
+                token: response.token.clone(),
+                expires_at: response.expires_at.unwrap_or(0),
+                upload_url: response.upload_url.clone(),
+                plan: crate::resumable_upload::UploadPlanRecord {
+                    base_unit: plan.base_unit,
+                    initial_request_size: plan.initial_request_size,
+                    max_request_size: plan.max_request_size,
+                    session_threshold: plan.session_threshold,
+                    max_parallel_parts: plan.max_parallel_parts,
+                },
+                sealed_sha256: digest.to_string(),
+                sealed_size: size as u64,
+                user_id: self.user_id,
+                local_message_id: self.local_message_id.clone(),
+                server_identity: self.server_identity.clone(),
+            };
+            if let Err(e) = rec.store(self.sealed_cache) {
+                // 落盘失败不该让这次发送失败：最坏结果只是下次从头传。
+                eprintln!("[SDK.upload] 上传会话落盘失败（下次将从头传）: {e}");
+            }
+        }
+        Ok(response)
     }
 
     async fn claim(&mut self, token: &str, digest: &str) -> Result<UploadedFileInfo> {
@@ -913,6 +994,26 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                 &self.local_message_id,
             )
             .await
+    }
+}
+
+/// 查询上传进度的结果。
+///
+/// 「服务端说还没有任何区间」与「我们问不出来」是两件事，不能是同一个值。
+pub(crate) enum UploadStatusOutcome {
+    /// 服务端给出的已确认区间（可能为空 = 确实一片都没传）。
+    Ranges(Vec<(u64, u64)>),
+    /// 会话不存在/已清理：续传状态作废，得重新 prepare。
+    SessionGone,
+}
+
+impl UploadStatusOutcome {
+    /// 取区间；会话没了就明确报错，交由上层决定重新 prepare。
+    pub(crate) fn into_ranges(self) -> Result<Vec<(u64, u64)>> {
+        match self {
+            Self::Ranges(r) => Ok(r),
+            Self::SessionGone => Err(Error::UploadSessionGone),
+        }
     }
 }
 
@@ -2344,6 +2445,15 @@ pub struct LocalAccountSummary {
 pub enum Error {
     #[error("transport error: {0}")]
     Transport(String),
+    /// 上传会话没了（服务端已清理/从未存在/token 换了）。
+    ///
+    /// 🔴 与「网络失败」分开：这个不该重试同一个会话，而该**丢掉续传状态、重新
+    /// prepare**。混在一起的话，客户端会拿着一张作废的 token 一直重试。
+    #[error("upload session is gone; a new upload token is required")]
+    UploadSessionGone,
+    /// 登录态失效：交给登录恢复，重试多少次都还是 401。
+    #[error("authentication expired")]
+    AuthExpired,
     #[error("serialization error: {0}")]
     Serialization(String),
     #[error("storage error: {0}")]
@@ -2479,6 +2589,10 @@ impl Error {
             // 原样重发是安全的。漏掉它的代价是发送超时被当成永久失败：outbox 条目
             // 被 reject 并删除，用户的消息就此消失。
             Error::NotConnected | Error::Transport(_) | Error::RequestUnanswered { .. } => true,
+            // 🔴 会话没了**要**重试：重试时会丢掉续传状态重新 prepare，那正是它的自愈路径。
+            Error::UploadSessionGone => true,
+            // 登录态失效不该由发送重试解决——交给登录恢复，否则就是拿旧凭证撞墙。
+            Error::AuthExpired => false,
             Error::Server { code, .. } => is_retryable_server_code(*code),
             _ => false,
         }
@@ -2487,6 +2601,9 @@ impl Error {
     pub fn sdk_code(&self) -> u32 {
         match self {
             Error::Transport(_) => error_codes::TRANSPORT_FAILURE,
+            // 会话没了要重新 prepare，对宿主而言是一次可自愈的传输问题。
+            Error::UploadSessionGone => error_codes::TRANSPORT_FAILURE,
+            Error::AuthExpired => error_codes::AUTH_FAILURE,
             // 没拿到应答，对宿主而言与传输失败同一类。
             Error::RequestUnanswered { .. } => error_codes::TRANSPORT_FAILURE,
             Error::Serialization(_) => error_codes::SERIALIZATION_FAILURE,
@@ -2506,6 +2623,8 @@ impl Error {
     pub fn protocol_code(&self) -> u32 {
         match self {
             Error::Transport(_) => ErrorCode::NetworkError as u32,
+            Error::UploadSessionGone => ErrorCode::NetworkError as u32,
+            Error::AuthExpired => ErrorCode::InvalidToken as u32,
             Error::RequestUnanswered { .. } => ErrorCode::NetworkError as u32,
             Error::Serialization(_) => ErrorCode::DecodingError as u32,
             Error::Storage(_) => ErrorCode::DatabaseError as u32,
@@ -3953,9 +4072,11 @@ impl State {
     fn classify_resume_error(err: &Error) -> ResumeFailureClass {
         match err {
             Error::Transport(_)
+            | Error::UploadSessionGone
             | Error::RequestUnanswered { .. }
             | Error::NotConnected
             | Error::ActorClosed => ResumeFailureClass::RetryableTemporaryError,
+            Error::AuthExpired => ResumeFailureClass::FullRebuildRequired,
             Error::Serialization(_) => ResumeFailureClass::FatalProtocolError,
             // 本地行缺幂等身份：重试或重连都救不回来，只能重建本地状态。
             Error::Storage(_) | Error::MissingLocalMessageId { .. } => {
@@ -4345,6 +4466,18 @@ impl State {
         } else if let Some(tx) = &self.event_tx {
             let _ = tx.send(event);
         }
+    }
+
+    /// 当前服务器身份：用于判断磁盘上的上传会话还属不属于这个环境。
+    fn server_identity_for_uploads(&self) -> String {
+        // 端点列表就是「这台客户端在跟哪个环境说话」。切本地/生产之后它必然不同，
+        // 旧的上传会话也就跟着作废——那正是我们要的。
+        self.config
+            .endpoints
+            .iter()
+            .map(|e| format!("{}:{}", e.host, e.port))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     /// 登录态：分片端点要双凭证。
@@ -11506,11 +11639,12 @@ impl State {
         }
     }
 
-    /// 分片上传：查缺口 → 逐片传（自适应大小 + 每片最多重试 2 次）→ complete。
+    /// 分片上传：查缺口 → 逐片传 → complete。
     ///
     /// 🔴 **每一轮都以服务端的已确认区间为准**。本地记账只是乐观估计，一旦对不上
     /// （重试、上次崩溃、换了设备），必须听服务端的——否则要么漏传一段永远完不成，
     /// 要么重复传一段白费流量。
+    #[allow(clippy::too_many_arguments)]
     async fn upload_in_chunks(
         &self,
         upload_url: &str,
@@ -11521,9 +11655,7 @@ impl State {
         plan: crate::resumable_upload::UploadPlan,
         local_message_id: &str,
     ) -> Result<UploadedFileInfo> {
-        use crate::resumable_upload::{
-            verdict_for_code, ChunkTimer, ChunkVerdict, ResumableUpload, CHUNK_RETRIES,
-        };
+        use crate::resumable_upload::{ChunkTimer, ChunkVerdict, ResumableUpload, CHUNK_RETRIES};
 
         let base = Self::upload_base(upload_url);
         let client = reqwest::Client::new();
@@ -11532,9 +11664,17 @@ impl State {
         // 先问一次：可能是续传（上次断在半路），也可能一片都还没传。
         let confirmed = self
             .fetch_upload_status(&client, &base, upload_token)
-            .await
-            .unwrap_or_default();
+            .await?
+            .into_ranges()?;
         let mut up = ResumableUpload::new(total, plan, &confirmed);
+
+        // 🔴 **失败预算是「自上次有进展以来」的，不是每片各算一份。**
+        //
+        // 早先这个计数声明在内层循环里，每片重来都归零：于是既永远到不了上限
+        // （outbox 收不到失败，消息永远停在「发送中」），又可能在降到网格下限之后
+        // 无限地重试同一片。真正要限的是**没有进展**——只要服务端确认了新字节，
+        // 预算就该重新给满。
+        let mut failures_since_progress = 0u32;
 
         while let Some(chunk) = up.next_chunk() {
             let start = chunk.offset as usize;
@@ -11542,47 +11682,56 @@ impl State {
             let bytes = &blob[start..end];
             let digest = crate::resumable_upload::chunk_digest(bytes);
 
-            let mut attempt = 0;
-            loop {
-                let timer = ChunkTimer::start();
-                let verdict = self
-                    .put_chunk(&client, &base, upload_token, chunk.offset, bytes, &digest)
-                    .await;
-                match verdict {
-                    ChunkVerdict::Ok => {
-                        up.on_chunk_ok(chunk, timer.elapsed());
-                        self.emit_upload_progress(local_message_id, up.progress());
-                        break;
-                    }
-                    ChunkVerdict::RetryChunk if attempt < CHUNK_RETRIES => {
-                        attempt += 1;
-                        up.on_chunk_failed();
-                        tokio::time::sleep(crate::resumable_upload::retry_delay(attempt)).await;
-                        // 🔴 减半之后**重新取**这一片：大小变了，区间也就变了。
-                        // 沿用旧区间的话，减半这件事等于没做。
-                        break;
-                    }
-                    // 区间视图对不上：以服务端为准重算，然后继续。
-                    ChunkVerdict::Resync => {
-                        let confirmed = self
-                            .fetch_upload_status(&client, &base, upload_token)
-                            .await
-                            .unwrap_or_default();
-                        up.resync(&confirmed);
-                        self.emit_upload_progress(local_message_id, up.progress());
-                        break;
-                    }
-                    ChunkVerdict::StartOver => {
-                        return Err(Error::Transport(
-                            "上传会话已失效，需要重新申请 token".to_string(),
-                        ));
-                    }
-                    ChunkVerdict::RetryChunk | ChunkVerdict::Fatal => {
+            let timer = ChunkTimer::start();
+            match self
+                .put_chunk(&client, &base, upload_token, chunk.offset, bytes, &digest)
+                .await
+            {
+                ChunkVerdict::Ok => {
+                    up.on_chunk_ok(chunk, timer.elapsed());
+                    self.emit_upload_progress(local_message_id, up.progress());
+                    // 有进展 → 预算重新给满。
+                    failures_since_progress = 0;
+                }
+                ChunkVerdict::RetryChunk => {
+                    failures_since_progress += 1;
+                    if failures_since_progress > CHUNK_RETRIES {
+                        // 交回 outbox：它有自己的退避与最终失败语义，比在这里死等好。
                         return Err(Error::Transport(format!(
-                            "分片上传失败（offset={}）",
+                            "分片上传连续 {failures_since_progress} 次没有进展（offset={}）",
                             chunk.offset
                         )));
                     }
+                    up.on_chunk_failed();
+                    tokio::time::sleep(crate::resumable_upload::retry_delay(
+                        failures_since_progress,
+                    ))
+                    .await;
+                    // 减半之后**重新取**这一片：大小变了，区间也就变了。
+                }
+                // 区间视图对不上：以服务端为准重算。这也算一次没有进展。
+                ChunkVerdict::Resync => {
+                    failures_since_progress += 1;
+                    if failures_since_progress > CHUNK_RETRIES {
+                        return Err(Error::Transport(
+                            "反复与服务端区间对不齐，交回重试".to_string(),
+                        ));
+                    }
+                    let confirmed = self
+                        .fetch_upload_status(&client, &base, upload_token)
+                        .await?
+                        .into_ranges()?;
+                    up.resync(&confirmed);
+                    self.emit_upload_progress(local_message_id, up.progress());
+                }
+                ChunkVerdict::StartOver => {
+                    return Err(Error::UploadSessionGone);
+                }
+                ChunkVerdict::Fatal => {
+                    return Err(Error::Transport(format!(
+                        "分片上传被服务端终局拒绝（offset={}）",
+                        chunk.offset
+                    )));
                 }
             }
         }
@@ -11599,26 +11748,68 @@ impl State {
             .to_string()
     }
 
-    /// 查已确认区间。查不到就当作「一片都没传」——从头传总是安全的。
+    /// 查已确认区间。
+    ///
+    /// 🔴 **返回类型化结果，不是 `Option`。** 早先这里 `unwrap_or_default()`，于是
+    /// 登录态失效、token 过期、会话已清、服务端 5xx、响应损坏——全被抹成「一片都没传」，
+    /// 客户端会兴高采烈地从 offset 0 重传，然后撞冲突、再查 status、再拿到空区间，
+    /// 转圈。每一种失败要走的路都不一样，就不能混成同一个值。
     async fn fetch_upload_status(
         &self,
         client: &reqwest::Client,
         base: &str,
         token: &str,
-    ) -> Option<Vec<(u64, u64)>> {
-        let resp = self
+    ) -> Result<UploadStatusOutcome> {
+        let resp = match self
             .authorized(client.get(format!("{base}/status")), token)
             .await
             .send()
             .await
-            .ok()?;
-        let json = resp.json::<serde_json::Value>().await.ok()?;
-        let arr = json["data"]["confirmed_ranges"].as_array()?;
-        Some(
-            arr.iter()
-                .filter_map(|r| Some((r["offset"].as_u64()?, r["len"].as_u64()?)))
-                .collect(),
-        )
+        {
+            Ok(r) => r,
+            // 网络层失败：值得重试，但不是「没传过」。
+            Err(e) => return Err(Error::Transport(format!("查询上传进度失败: {e}"))),
+        };
+        let status = resp.status();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Serialization(format!("上传进度响应无法解析: {e}")))?;
+        let code = json["code"].as_u64().unwrap_or(u64::MAX) as u32;
+
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            // 交给登录恢复，不要在这里重试——重试多少次都还是 401。
+            return Err(Error::AuthExpired);
+        }
+        // 会话没了/已完成：上层要丢掉续传状态重新 prepare。
+        if code == 20613 {
+            return Ok(UploadStatusOutcome::SessionGone);
+        }
+        if status.is_server_error() {
+            return Err(Error::Transport(format!("上传进度查询服务端错误: {status}")));
+        }
+        if code != 0 {
+            return Err(Error::Transport(format!(
+                "上传进度查询失败: code={code} {}",
+                json["message"].as_str().unwrap_or("")
+            )));
+        }
+
+        let Some(arr) = json["data"]["confirmed_ranges"].as_array() else {
+            return Err(Error::Serialization(
+                "上传进度响应缺少 confirmed_ranges".to_string(),
+            ));
+        };
+        let mut ranges = Vec::with_capacity(arr.len());
+        for r in arr {
+            let (Some(offset), Some(len)) = (r["offset"].as_u64(), r["len"].as_u64()) else {
+                return Err(Error::Serialization(
+                    "上传进度响应里的区间格式不对".to_string(),
+                ));
+            };
+            ranges.push((offset, len));
+        }
+        Ok(UploadStatusOutcome::Ranges(ranges))
     }
 
     async fn put_chunk(
@@ -11851,6 +12042,7 @@ impl State {
             cek_b64,
             sha256,
         };
+        let server_identity = self.server_identity_for_uploads();
         let mut io = LiveAttachmentUploadIo {
             state: self,
             user_id,
@@ -11858,6 +12050,10 @@ impl State {
             mime_type,
             file_type,
             local_message_id: local_message_id.to_string(),
+            sealed_cache,
+            // 服务器身份用「这次上传要打到哪个 base」——切环境（本地/生产）之后
+            // 旧会话在新服务器上根本不存在，必须作废重来。
+            server_identity,
         };
         Self::plan_attachment_upload(&mut io, &payload).await
     }

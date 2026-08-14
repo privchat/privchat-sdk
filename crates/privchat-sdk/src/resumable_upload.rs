@@ -554,3 +554,233 @@ mod tests {
         assert_eq!(p.percent(), 99);
     }
 }
+
+// ---------------------------------------------------------------- 会话 sidecar
+
+/// 一次上传会话的落盘记录。
+///
+/// 🔴 **单独一个文件，不塞进 `body.sealed.json`。** 两者的生命周期不一样：密文缓存
+/// 为了转发秒传可以留一周，而上传会话只有 token 的 24 小时；而且同一份收到的密文
+/// 可能被多条重发任务复用，它们不该不受控地共享同一个上传会话。
+///
+/// 🔴 存的是**整张 token**，不是 `upload_id`。status/chunk/complete 三个端点都要
+/// `X-Upload-Token`，只留 id 等于留了个打不开的门牌号。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UploadSessionRecord {
+    pub token: String,
+    /// Unix 秒。过期就别再试了，直接重新 prepare。
+    pub expires_at: i64,
+    pub upload_url: String,
+    pub plan: UploadPlanRecord,
+    /// 这张 token 是为**哪一份密文**签的。
+    pub sealed_sha256: String,
+    pub sealed_size: u64,
+    /// 谁的会话。换账号之后不能接着用。
+    pub user_id: u64,
+    pub local_message_id: String,
+    /// 服务器身份（切环境后旧会话作废）。
+    pub server_identity: String,
+}
+
+/// `UploadPlan` 的可序列化副本。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct UploadPlanRecord {
+    pub base_unit: u32,
+    pub initial_request_size: u32,
+    pub max_request_size: u32,
+    pub session_threshold: u64,
+    pub max_parallel_parts: u8,
+}
+
+impl From<UploadPlan> for UploadPlanRecord {
+    fn from(p: UploadPlan) -> Self {
+        Self {
+            base_unit: p.base_unit,
+            initial_request_size: p.initial_request_size,
+            max_request_size: p.max_request_size,
+            session_threshold: p.session_threshold,
+            max_parallel_parts: p.max_parallel_parts,
+        }
+    }
+}
+
+impl From<UploadPlanRecord> for UploadPlan {
+    fn from(p: UploadPlanRecord) -> Self {
+        Self {
+            base_unit: p.base_unit,
+            initial_request_size: p.initial_request_size,
+            max_request_size: p.max_request_size,
+            session_threshold: p.session_threshold,
+            max_parallel_parts: p.max_parallel_parts,
+        }
+    }
+}
+
+/// 记录为什么不能复用。返回原因而不是 `bool`，是为了让日志能说清「为什么又从头传了」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseVerdict {
+    Reusable,
+    Expired,
+    DifferentUser,
+    DifferentServer,
+    /// 密文换了（重新封装过）——那张 token 签的是另一份字节。
+    DifferentPayload,
+}
+
+impl UploadSessionRecord {
+    /// 这条记录还能不能拿来续传。
+    ///
+    /// 🔴 四个条件缺一不可。少查一个的后果都是**把字节传到错误的地方**：换了账号还用
+    /// 旧 token、换了环境指向旧服务器、密文重新封装过而 token 签的是旧摘要——
+    /// 最后要么被服务端拒，要么更糟，续到一个不属于这次发送的会话上。
+    pub fn reusable_for(
+        &self,
+        now_secs: i64,
+        user_id: u64,
+        server_identity: &str,
+        sealed_sha256: &str,
+        sealed_size: u64,
+    ) -> ReuseVerdict {
+        if self.expires_at <= now_secs {
+            return ReuseVerdict::Expired;
+        }
+        if self.user_id != user_id {
+            return ReuseVerdict::DifferentUser;
+        }
+        if self.server_identity != server_identity {
+            return ReuseVerdict::DifferentServer;
+        }
+        if !self.sealed_sha256.eq_ignore_ascii_case(sealed_sha256) || self.sealed_size != sealed_size
+        {
+            return ReuseVerdict::DifferentPayload;
+        }
+        ReuseVerdict::Reusable
+    }
+
+    /// 会话记录的路径：`<sealed>.upload-session.json`。
+    pub fn path_for(sealed_cache: &std::path::Path) -> std::path::PathBuf {
+        sealed_cache.with_extension("upload-session.json")
+    }
+
+    /// 读回来；不存在或损坏都当作「没有」——从头传总是安全的那一侧。
+    pub fn load(sealed_cache: &std::path::Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(Self::path_for(sealed_cache)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// 原子写：临时文件 → rename。
+    ///
+    /// 🔴 必须在**发出第一片之前**落盘。反过来的话，第一片传完就崩溃，那次上传
+    /// 就成了服务端上一个没人认领的会话——下次重来又是新的，永远续不上。
+    pub fn store(&self, sealed_cache: &std::path::Path) -> std::io::Result<()> {
+        let path = Self::path_for(sealed_cache);
+        let tmp = path.with_extension("tmp");
+        let body = serde_json::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp, &body)?;
+        std::fs::rename(&tmp, &path)
+    }
+
+    /// 丢掉会话记录，**保留密文**：密文还要用来重新 prepare。
+    pub fn discard(sealed_cache: &std::path::Path) {
+        let _ = std::fs::remove_file(Self::path_for(sealed_cache));
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn rec() -> UploadSessionRecord {
+        UploadSessionRecord {
+            token: "tok".into(),
+            expires_at: 1_000,
+            upload_url: "http://h/api/app/files/upload".into(),
+            plan: UploadPlanRecord {
+                base_unit: 65536,
+                initial_request_size: 65536,
+                max_request_size: 2 << 20,
+                session_threshold: 65536,
+                max_parallel_parts: 1,
+            },
+            sealed_sha256: "aa".repeat(32),
+            sealed_size: 4096,
+            user_id: 7,
+            local_message_id: "m1".into(),
+            server_identity: "local".into(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_matching_record_is_reusable() {
+        assert_eq!(
+            rec().reusable_for(999, 7, "local", &"aa".repeat(32), 4096),
+            ReuseVerdict::Reusable
+        );
+    }
+
+    /// 🔴 过期的 token 再试也是白试——重新 prepare 才是出路。
+    #[test]
+    fn an_expired_record_is_not_reusable() {
+        assert_eq!(
+            rec().reusable_for(1_000, 7, "local", &"aa".repeat(32), 4096),
+            ReuseVerdict::Expired
+        );
+    }
+
+    /// 🔴 换了账号还用旧 token = 把字节传到别人的会话里。
+    #[test]
+    fn another_user_may_not_reuse_it() {
+        assert_eq!(
+            rec().reusable_for(999, 8, "local", &"aa".repeat(32), 4096),
+            ReuseVerdict::DifferentUser
+        );
+    }
+
+    /// 换了服务器环境，旧会话在新服务器上根本不存在。
+    #[test]
+    fn another_server_invalidates_it() {
+        assert_eq!(
+            rec().reusable_for(999, 7, "prod", &"aa".repeat(32), 4096),
+            ReuseVerdict::DifferentServer
+        );
+    }
+
+    /// 🔴 密文重新封装过：token 签的是旧摘要，续上去传的就是拼错的文件。
+    #[test]
+    fn a_resealed_payload_invalidates_it() {
+        assert_eq!(
+            rec().reusable_for(999, 7, "local", &"bb".repeat(32), 4096),
+            ReuseVerdict::DifferentPayload
+        );
+        assert_eq!(
+            rec().reusable_for(999, 7, "local", &"aa".repeat(32), 4097),
+            ReuseVerdict::DifferentPayload
+        );
+    }
+
+    #[test]
+    fn it_survives_a_round_trip_and_lives_beside_the_sealed_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = dir.path().join("body.sealed");
+        std::fs::write(&sealed, b"x").unwrap();
+
+        rec().store(&sealed).unwrap();
+        let back = UploadSessionRecord::load(&sealed).expect("load");
+        assert_eq!(back.token, "tok");
+        assert_eq!(back.sealed_size, 4096);
+
+        // 丢会话不丢密文：密文还要用来重新 prepare。
+        UploadSessionRecord::discard(&sealed);
+        assert!(UploadSessionRecord::load(&sealed).is_none());
+        assert!(sealed.exists(), "密文不能跟着会话一起被删");
+    }
+
+    #[test]
+    fn a_corrupt_record_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = dir.path().join("body.sealed");
+        std::fs::write(UploadSessionRecord::path_for(&sealed), b"{not json").unwrap();
+        assert!(UploadSessionRecord::load(&sealed).is_none());
+    }
+}
