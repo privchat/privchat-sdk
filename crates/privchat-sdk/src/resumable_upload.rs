@@ -625,6 +625,8 @@ pub enum ReuseVerdict {
     DifferentServer,
     /// 密文换了（重新封装过）——那张 token 签的是另一份字节。
     DifferentPayload,
+    /// 这条记录属于另一条消息。
+    DifferentMessage,
 }
 
 impl UploadSessionRecord {
@@ -640,7 +642,13 @@ impl UploadSessionRecord {
         server_identity: &str,
         sealed_sha256: &str,
         sealed_size: u64,
+        local_message_id: &str,
     ) -> ReuseVerdict {
+        // 路径已经按消息隔离了；这里再查一次，是因为「路径对了内容却是别人的」
+        // 属于最难查的一类错误，多一道判断比事后追查便宜。
+        if self.local_message_id != local_message_id {
+            return ReuseVerdict::DifferentMessage;
+        }
         if self.expires_at <= now_secs {
             return ReuseVerdict::Expired;
         }
@@ -657,14 +665,23 @@ impl UploadSessionRecord {
         ReuseVerdict::Reusable
     }
 
-    /// 会话记录的路径：`<sealed>.upload-session.json`。
-    pub fn path_for(sealed_cache: &std::path::Path) -> std::path::PathBuf {
-        sealed_cache.with_extension("upload-session.json")
+    /// 会话记录的路径：**每条出站消息独占**。
+    ///
+    /// 🔴 不能只按密文路径命名。转发收到的附件时，多条新消息复用**同一份源密文**，
+    /// 于是它们会读到同一张 upload token：两条消息并发操作同一个会话（服务端回
+    /// SessionBusy）、进度画到别人的气泡上、一条清理状态把另一条的也清了。
+    /// 密文可以共享，上传会话不行。
+    pub fn path_for(sealed_cache: &std::path::Path, local_message_id: &str) -> std::path::PathBuf {
+        let safe: String = local_message_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        sealed_cache.with_extension(format!("{safe}.upload-session.json"))
     }
 
     /// 读回来；不存在或损坏都当作「没有」——从头传总是安全的那一侧。
-    pub fn load(sealed_cache: &std::path::Path) -> Option<Self> {
-        let raw = std::fs::read_to_string(Self::path_for(sealed_cache)).ok()?;
+    pub fn load(sealed_cache: &std::path::Path, local_message_id: &str) -> Option<Self> {
+        let raw = std::fs::read_to_string(Self::path_for(sealed_cache, local_message_id)).ok()?;
         serde_json::from_str(&raw).ok()
     }
 
@@ -672,18 +689,44 @@ impl UploadSessionRecord {
     ///
     /// 🔴 必须在**发出第一片之前**落盘。反过来的话，第一片传完就崩溃，那次上传
     /// 就成了服务端上一个没人认领的会话——下次重来又是新的，永远续不上。
+    /// 🔴 `rename` 只保证「要么旧的要么新的」，不保证**掉电后还在**。写完不 fsync
+    /// 的话，崩溃恢复时这条记录可能根本不存在——而它存在的唯一理由就是给崩溃用的。
+    /// 顺序：独占创建临时文件 → 写 → fsync 文件 → rename → fsync 父目录。
     pub fn store(&self, sealed_cache: &std::path::Path) -> std::io::Result<()> {
-        let path = Self::path_for(sealed_cache);
-        let tmp = path.with_extension("tmp");
+        use std::io::Write;
+        let path = Self::path_for(sealed_cache, &self.local_message_id);
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
         let body = serde_json::to_vec(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&tmp, &body)?;
-        std::fs::rename(&tmp, &path)
+
+        // 固定 `.tmp` 会让并发写互相截断；名字带 pid+纳秒并用 create_new 独占。
+        let tmp = dir.join(format!(
+            ".upload-session-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(&body)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        // 目录项本身也要落盘，否则 rename 可能在崩溃后消失。
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
 
     /// 丢掉会话记录，**保留密文**：密文还要用来重新 prepare。
-    pub fn discard(sealed_cache: &std::path::Path) {
-        let _ = std::fs::remove_file(Self::path_for(sealed_cache));
+    pub fn discard(sealed_cache: &std::path::Path, local_message_id: &str) {
+        let _ = std::fs::remove_file(Self::path_for(sealed_cache, local_message_id));
     }
 }
 
@@ -714,7 +757,7 @@ mod session_tests {
     #[test]
     fn a_fresh_matching_record_is_reusable() {
         assert_eq!(
-            rec().reusable_for(999, 7, "local", &"aa".repeat(32), 4096),
+            rec().reusable_for(999, 7, "local", &"aa".repeat(32), 4096, "m1"),
             ReuseVerdict::Reusable
         );
     }
@@ -723,7 +766,7 @@ mod session_tests {
     #[test]
     fn an_expired_record_is_not_reusable() {
         assert_eq!(
-            rec().reusable_for(1_000, 7, "local", &"aa".repeat(32), 4096),
+            rec().reusable_for(1_000, 7, "local", &"aa".repeat(32), 4096, "m1"),
             ReuseVerdict::Expired
         );
     }
@@ -732,7 +775,7 @@ mod session_tests {
     #[test]
     fn another_user_may_not_reuse_it() {
         assert_eq!(
-            rec().reusable_for(999, 8, "local", &"aa".repeat(32), 4096),
+            rec().reusable_for(999, 8, "local", &"aa".repeat(32), 4096, "m1"),
             ReuseVerdict::DifferentUser
         );
     }
@@ -741,7 +784,7 @@ mod session_tests {
     #[test]
     fn another_server_invalidates_it() {
         assert_eq!(
-            rec().reusable_for(999, 7, "prod", &"aa".repeat(32), 4096),
+            rec().reusable_for(999, 7, "prod", &"aa".repeat(32), 4096, "m1"),
             ReuseVerdict::DifferentServer
         );
     }
@@ -750,11 +793,11 @@ mod session_tests {
     #[test]
     fn a_resealed_payload_invalidates_it() {
         assert_eq!(
-            rec().reusable_for(999, 7, "local", &"bb".repeat(32), 4096),
+            rec().reusable_for(999, 7, "local", &"bb".repeat(32), 4096, "m1"),
             ReuseVerdict::DifferentPayload
         );
         assert_eq!(
-            rec().reusable_for(999, 7, "local", &"aa".repeat(32), 4097),
+            rec().reusable_for(999, 7, "local", &"aa".repeat(32), 4097, "m1"),
             ReuseVerdict::DifferentPayload
         );
     }
@@ -766,13 +809,13 @@ mod session_tests {
         std::fs::write(&sealed, b"x").unwrap();
 
         rec().store(&sealed).unwrap();
-        let back = UploadSessionRecord::load(&sealed).expect("load");
+        let back = UploadSessionRecord::load(&sealed, "m1").expect("load");
         assert_eq!(back.token, "tok");
         assert_eq!(back.sealed_size, 4096);
 
         // 丢会话不丢密文：密文还要用来重新 prepare。
-        UploadSessionRecord::discard(&sealed);
-        assert!(UploadSessionRecord::load(&sealed).is_none());
+        UploadSessionRecord::discard(&sealed, "m1");
+        assert!(UploadSessionRecord::load(&sealed, "m1").is_none());
         assert!(sealed.exists(), "密文不能跟着会话一起被删");
     }
 
@@ -780,7 +823,52 @@ mod session_tests {
     fn a_corrupt_record_reads_as_absent() {
         let dir = tempfile::tempdir().unwrap();
         let sealed = dir.path().join("body.sealed");
-        std::fs::write(UploadSessionRecord::path_for(&sealed), b"{not json").unwrap();
-        assert!(UploadSessionRecord::load(&sealed).is_none());
+        std::fs::write(UploadSessionRecord::path_for(&sealed, "m1"), b"{not json").unwrap();
+        assert!(UploadSessionRecord::load(&sealed, "m1").is_none());
+    }
+
+    /// 🔴 转发时多条新消息复用**同一份源密文**：会话必须各归各的。
+    ///
+    /// 共用一张 token 的话，两条消息会并发操作同一个服务端会话（回 SessionBusy）、
+    /// 进度画到别人的气泡上、一条发完把另一条的会话也清了。
+    #[test]
+    fn two_messages_sharing_one_sealed_blob_do_not_share_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = dir.path().join("shared.sealed");
+        std::fs::write(&sealed, b"x").unwrap();
+
+        let mut first = rec();
+        first.local_message_id = "msg-a".into();
+        first.token = "tok-a".into();
+        first.store(&sealed).unwrap();
+
+        let mut second = rec();
+        second.local_message_id = "msg-b".into();
+        second.token = "tok-b".into();
+        second.store(&sealed).unwrap();
+
+        assert_ne!(
+            UploadSessionRecord::path_for(&sealed, "msg-a"),
+            UploadSessionRecord::path_for(&sealed, "msg-b"),
+        );
+        assert_eq!(
+            UploadSessionRecord::load(&sealed, "msg-a").unwrap().token,
+            "tok-a",
+            "第二条消息把第一条的 token 覆盖了"
+        );
+
+        // 一条发完清理，不能带走另一条的会话。
+        UploadSessionRecord::discard(&sealed, "msg-a");
+        assert!(UploadSessionRecord::load(&sealed, "msg-a").is_none());
+        assert!(UploadSessionRecord::load(&sealed, "msg-b").is_some());
+    }
+
+    /// 路径隔离之外再加一道：内容属于别人就不认。
+    #[test]
+    fn a_record_belonging_to_another_message_is_rejected() {
+        assert_eq!(
+            rec().reusable_for(999, 7, "local", &"aa".repeat(32), 4096, "m2"),
+            ReuseVerdict::DifferentMessage
+        );
     }
 }

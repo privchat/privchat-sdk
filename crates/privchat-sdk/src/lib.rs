@@ -867,6 +867,13 @@ struct LiveAttachmentUploadIo<'a> {
     sealed_cache: &'a std::path::Path,
     /// 服务器身份：切环境之后旧会话必须作废。
     server_identity: String,
+    /// 🔴 当前密文的身份，**始终存在**。
+    ///
+    /// 不能拿 `prepare(digest)` 参数当身份用：秒传未命中后会以 `None` 再调一次
+    /// prepare（避免重复走秒传判断），那一路同样拿到分片 plan，却因为 digest 为
+    /// None 而不落盘会话——App 被杀之后照样从头传。「要不要问秒传」和「这份密文
+    /// 是谁」是两件事。
+    payload_digest: String,
 }
 
 impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
@@ -880,9 +887,12 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
         // 每次重试都重新 prepare 的话，服务端每次都会签一个新的 `upload_id`，
         // 也就是一个**全新的空会话**——于是「传到 90% 断网、回来接着传」永远不成立，
         // 断点续传只在一次调用内部有效。token 有效期 24 小时正是为这件事留的。
-        if let Some(digest) = digest {
-            if let Some(rec) = crate::resumable_upload::UploadSessionRecord::load(self.sealed_cache)
-            {
+        {
+            let digest = self.payload_digest.as_str();
+            if let Some(rec) = crate::resumable_upload::UploadSessionRecord::load(
+                self.sealed_cache,
+                &self.local_message_id,
+            ) {
                 let now = chrono::Utc::now().timestamp();
                 match rec.reusable_for(
                     now,
@@ -890,6 +900,7 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                     &self.server_identity,
                     digest,
                     size as u64,
+                    &self.local_message_id,
                 ) {
                     crate::resumable_upload::ReuseVerdict::Reusable => {
                         eprintln!(
@@ -916,7 +927,10 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                     verdict => {
                         // 不能复用的每一种都记下来：否则「怎么又从头传了」查不出原因。
                         eprintln!("[SDK.upload] 旧上传会话作废（{verdict:?}），重新申请");
-                        crate::resumable_upload::UploadSessionRecord::discard(self.sealed_cache);
+                        crate::resumable_upload::UploadSessionRecord::discard(
+                            self.sealed_cache,
+                            &self.local_message_id,
+                        );
                     }
                 }
             }
@@ -939,7 +953,8 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
         //
         // 反过来的话，第一片传完就崩溃，那次上传就成了服务端上一个没人认领的会话；
         // 下次重来又是新的，永远续不上。
-        if let (Some(digest), Some(plan)) = (digest, response.upload_plan.as_ref()) {
+        if let Some(plan) = response.upload_plan.as_ref() {
+            let digest = self.payload_digest.as_str();
             let rec = crate::resumable_upload::UploadSessionRecord {
                 token: response.token.clone(),
                 expires_at: response.expires_at.unwrap_or(0),
@@ -963,6 +978,13 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
             }
         }
         Ok(response)
+    }
+
+    fn on_upload_finished(&mut self) {
+        crate::resumable_upload::UploadSessionRecord::discard(
+            self.sealed_cache,
+            &self.local_message_id,
+        );
     }
 
     async fn claim(&mut self, token: &str, digest: &str) -> Result<UploadedFileInfo> {
@@ -1023,6 +1045,13 @@ impl UploadStatusOutcome {
 /// 生产实现直接转调真实的 RPC/HTTP。
 trait AttachmentUploadIo {
     /// 申请上传 token。`digest` 为 `None` 表示这次不参与秒传，就是要传字节。
+    /// 这次上传已经拿到 file_id 了，会话记录可以删了。
+    ///
+    /// 不删的话有两个后果：一张 24 小时有效的 bearer token 会跟着密文缓存留一周；
+    /// 以及下一次发送可能复用一个**已完成**的会话，服务端只会回 SessionCompleted。
+    /// 默认空实现——测试用的假 Io 不需要关心。
+    fn on_upload_finished(&mut self) {}
+
     async fn prepare(&mut self, digest: Option<&str>, size: usize)
         -> Result<FileRequestUploadTokenResponse>;
     /// 秒传取用：换一个属于自己的 file_id，不传正文。
@@ -11498,7 +11527,10 @@ impl State {
 
         if token.already_exists {
             match io.claim(&token.token, sha256).await {
-                Ok(info) => return Ok((info, token.token)),
+                Ok(info) => {
+                    io.on_upload_finished();
+                    return Ok((info, token.token));
+                }
                 // 🔴 秒传没成 → 照常上传，不是发送失败。预检说「有」而 claim 拿不到
                 // 会正常发生：那份内容的记录里没有一条是这个人现在读得到的，或者
                 // 候选在这中间失效了。
@@ -11508,6 +11540,7 @@ impl State {
                     // 又绕回 claim —— 转成死循环。
                     let token = io.prepare(None, payload.blob.len()).await?;
                     let info = io.upload(&token, payload).await?;
+                    io.on_upload_finished();
                     return Ok((info, token.token));
                 }
                 Err(e) => return Err(e),
@@ -11515,6 +11548,7 @@ impl State {
         }
 
         let info = io.upload(&token, payload).await?;
+        io.on_upload_finished();
         Ok((info, token.token))
     }
 
@@ -12054,6 +12088,7 @@ impl State {
             // 服务器身份用「这次上传要打到哪个 base」——切环境（本地/生产）之后
             // 旧会话在新服务器上根本不存在，必须作废重来。
             server_identity,
+            payload_digest: payload.sha256.clone(),
         };
         Self::plan_attachment_upload(&mut io, &payload).await
     }
