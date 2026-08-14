@@ -1521,6 +1521,12 @@ pub enum SdkEvent {
         dropped_duplicates: u64,
     },
     /// 分页同步中「又落库了一页」；宿主用它在首屏进度条的本族区间内往前爬。
+    /// 附件上传进度：UI 的进度条数据源。
+    AttachmentUploadProgress {
+        local_message_id: String,
+        uploaded: u64,
+        total: u64,
+    },
     SyncEntityPageApplied {
         entity_type: String,
         page: u32,
@@ -2566,6 +2572,15 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             applied: applied as u64,
             dropped_duplicates: dropped_duplicates as u64,
         },
+        privchat_sdk::SdkEvent::AttachmentUploadProgress {
+            local_message_id,
+            uploaded,
+            total,
+        } => SdkEvent::AttachmentUploadProgress {
+            local_message_id,
+            uploaded,
+            total,
+        },
         privchat_sdk::SdkEvent::SyncEntityPageApplied { entity_type, page } => {
             SdkEvent::SyncEntityPageApplied { entity_type, page }
         }
@@ -2868,6 +2883,16 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "queued": queued,
             "applied": applied,
             "dropped_duplicates": dropped_duplicates
+        }),
+        SdkEvent::AttachmentUploadProgress {
+            local_message_id,
+            uploaded,
+            total,
+        } => json!({
+            "type": "attachment_upload_progress",
+            "local_message_id": local_message_id,
+            "uploaded": uploaded,
+            "total": total,
         }),
         SdkEvent::SyncEntityPageApplied { entity_type, page } => json!({
             "type": "sync_entity_page_applied",
