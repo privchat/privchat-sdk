@@ -40,6 +40,8 @@ uniffi.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+sha2 = "0.10"
+hex = "0.4"
 # R8.6c diagnostic — `qr_decode_image` example reads a real PNG/JPG/WebP
 # file and feeds its luma plane to qr_decode_luma. Dev-only; not in release.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -47,3 +49,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 [[example]]
 name = "qr_decode_image"
 path = "examples/qr_decode_image.rs"
+
+[[example]]
+name = "chunked_upload_live"
+path = "examples/chunked_upload_live.rs"
