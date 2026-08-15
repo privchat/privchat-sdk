@@ -1812,6 +1812,7 @@ dependencies = [
 name = "privchat-sdk-ffi"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "image",
  "privchat-protocol",
  "privchat-sdk",
@@ -1820,6 +1821,7 @@ dependencies = [
  "rxing",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "uniffi",
