@@ -48,19 +48,24 @@ impl MockServer {
                 log.lock().unwrap().push(req.clone());
 
                 let body = if req.path.starts_with("/api/app/files/status") {
-                    let ranges = if confirmed == 0 {
+                    // RESUMABLE_UPLOAD_SPEC §3.2：received 与 missing 都回。
+                    let received = if confirmed == 0 {
                         "[]".to_string()
                     } else {
-                        format!(r#"[{{"offset":0,"len":{confirmed}}}]"#)
+                        format!(r#"[{{"offset":0,"length":{confirmed}}}]"#)
+                    };
+                    let missing = if confirmed >= total {
+                        "[]".to_string()
+                    } else {
+                        format!(r#"[{{"offset":{confirmed},"length":{}}}]"#, total - confirmed)
                     };
                     format!(
-                        r#"{{"code":0,"message":"OK","data":{{"upload_id":"abc","total_size":{total},"confirmed_ranges":{ranges},"confirmed_bytes":{confirmed},"complete":{}}}}}"#,
-                        confirmed >= total
+                        r#"{{"code":0,"message":"OK","data":{{"received":{received},"missing":{missing},"received_bytes":{confirmed},"total_size":{total},"completed":false}}}}"#
                     )
                 } else if req.path.starts_with("/api/app/files/chunk") {
                     confirmed += req.body.len() as u64;
                     format!(
-                        r#"{{"code":0,"message":"OK","data":{{"outcome":"confirmed","confirmed_bytes":{confirmed},"complete":{}}}}}"#,
+                        r#"{{"code":0,"message":"OK","data":{{"outcome":"written","received_bytes":{confirmed},"total_size":{total},"complete":{}}}}}"#,
                         confirmed >= total
                     )
                 } else {
@@ -186,18 +191,17 @@ async fn a_chunked_upload_speaks_the_documented_protocol() {
     let status: serde_json::Value = client
         .get(format!("{base}/status"))
         .header("X-Upload-Token", "tok")
-        .header("Authorization", "Bearer u:1")
         .send()
         .await
         .expect("status")
         .json()
         .await
         .expect("json");
-    let confirmed: Vec<(u64, u64)> = status["data"]["confirmed_ranges"]
+    let missing: Vec<(u64, u64)> = status["data"]["missing"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| (r["offset"].as_u64().unwrap(), r["len"].as_u64().unwrap()))
+        .map(|r| (r["offset"].as_u64().unwrap(), r["length"].as_u64().unwrap()))
         .collect();
 
     // 2) 用 SDK 的决策逻辑决定发什么。
@@ -208,13 +212,12 @@ async fn a_chunked_upload_speaks_the_documented_protocol() {
         session_threshold: 64 * 1024,
         max_parallel_parts: 1,
     };
-    let mut up = privchat_sdk::resumable_upload::ResumableUpload::new(total as u64, plan, &confirmed);
+    let mut up = privchat_sdk::resumable_upload::ResumableUpload::from_missing(total as u64, plan, &missing);
     while let Some(chunk) = up.next_chunk() {
         let piece = &blob[chunk.offset as usize..(chunk.offset + chunk.len) as usize];
         let resp = client
             .put(format!("{base}/chunk?offset={}", chunk.offset))
             .header("X-Upload-Token", "tok")
-            .header("Authorization", "Bearer u:1")
             .header("X-Chunk-SHA256", sha256_hex(piece))
             .body(piece.to_vec())
             .send()
@@ -229,8 +232,7 @@ async fn a_chunked_upload_speaks_the_documented_protocol() {
     let done: serde_json::Value = client
         .post(format!("{base}/complete"))
         .header("X-Upload-Token", "tok")
-        .header("Authorization", "Bearer u:1")
-        .json(&serde_json::json!({ "cek": "k" }))
+        .json(&serde_json::json!({ "cek": "k", "encryption_version": 1 }))
         .send()
         .await
         .expect("complete")
@@ -256,8 +258,8 @@ async fn a_chunked_upload_speaks_the_documented_protocol() {
             "每个分片都要带上传 token"
         );
         assert!(
-            r.headers.contains_key("authorization"),
-            "🔴 分片端点要双凭证，少了 Authorization 服务端会 401"
+            !r.headers.contains_key("authorization"),
+            "单凭据（决策 7）：分片端点只认 X-Upload-Token"
         );
         let offset: usize = r
             .path
@@ -336,10 +338,10 @@ async fn resuming_puts_only_the_missing_bytes_on_the_wire() {
         session_threshold: 64 * 1024,
         max_parallel_parts: 1,
     };
-    let mut up = privchat_sdk::resumable_upload::ResumableUpload::new(
+    let mut up = privchat_sdk::resumable_upload::ResumableUpload::from_missing(
         total as u64,
         plan,
-        &[(0, already as u64)],
+        &[(already as u64, (total - already) as u64)],
     );
 
     while let Some(chunk) = up.next_chunk() {
@@ -347,7 +349,6 @@ async fn resuming_puts_only_the_missing_bytes_on_the_wire() {
         client
             .put(format!("{base}/chunk?offset={}", chunk.offset))
             .header("X-Upload-Token", "tok")
-            .header("Authorization", "Bearer u:1")
             .header("X-Chunk-SHA256", sha256_hex(piece))
             .body(piece.to_vec())
             .send()

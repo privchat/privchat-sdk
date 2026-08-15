@@ -80,15 +80,19 @@ impl MockServer {
                     let payload = {
                         let mut s = st.lock().unwrap();
                         if path.starts_with("/api/app/files/status") {
-                            let ranges = if s.confirmed == 0 {
+                            let received = if s.confirmed == 0 {
                                 "[]".to_string()
                             } else {
-                                format!(r#"[{{"offset":0,"len":{}}}]"#, s.confirmed)
+                                format!(r#"[{{"offset":0,"length":{}}}]"#, s.confirmed)
+                            };
+                            let missing = if s.confirmed >= TOTAL as u64 {
+                                "[]".to_string()
+                            } else {
+                                format!(r#"[{{"offset":{},"length":{}}}]"#, s.confirmed, TOTAL as u64 - s.confirmed)
                             };
                             format!(
-                                r#"{{"code":0,"message":"OK","data":{{"upload_id":"abc","total_size":{TOTAL},"confirmed_ranges":{ranges},"confirmed_bytes":{},"complete":{}}}}}"#,
-                                s.confirmed,
-                                s.confirmed >= TOTAL as u64
+                                r#"{{"code":0,"message":"OK","data":{{"received":{received},"missing":{missing},"received_bytes":{},"total_size":{TOTAL},"completed":false}}}}"#,
+                                s.confirmed
                             )
                         } else if path.starts_with("/api/app/files/chunk") {
                             let offset: u64 = path
@@ -105,7 +109,7 @@ impl MockServer {
                             });
                             s.confirmed = s.confirmed.max(offset + body.len() as u64);
                             format!(
-                                r#"{{"code":0,"message":"OK","data":{{"outcome":"confirmed","confirmed_bytes":{},"complete":{}}}}}"#,
+                                r#"{{"code":0,"message":"OK","data":{{"outcome":"written","received_bytes":{},"total_size":{TOTAL},"complete":{}}}}}"#,
                                 s.confirmed,
                                 s.confirmed >= TOTAL as u64
                             )
@@ -242,38 +246,36 @@ async fn child_main(base: String, cache: std::path::PathBuf) {
 
     // 捡回会话的那条命必须先问服务端「你收到哪儿了」——本地记不得，也不该记：
     // 客户端以为写成功、服务端没落盘的那一片，只有服务端说了算。
-    let confirmed: Vec<(u64, u64)> = if resumed {
+    let missing: Vec<(u64, u64)> = if resumed {
         let body: serde_json::Value = client
             .get(format!("{base}/status"))
             .header("X-Upload-Token", "tok")
-            .header("Authorization", "Bearer u:7")
             .send()
             .await
             .expect("status")
             .json()
             .await
             .expect("status json");
-        body["data"]["confirmed_ranges"]
+        body["data"]["missing"]
             .as_array()
             .map(|a| {
                 a.iter()
-                    .map(|r| (r["offset"].as_u64().unwrap(), r["len"].as_u64().unwrap()))
+                    .map(|r| (r["offset"].as_u64().unwrap(), r["length"].as_u64().unwrap()))
                     .collect()
             })
             .unwrap_or_default()
     } else {
-        Vec::new()
+        vec![(0, data.len() as u64)]
     };
-    eprintln!("[child] confirmed={confirmed:?}");
+    eprintln!("[child] missing={missing:?}");
 
-    let mut up = ResumableUpload::new(data.len() as u64, plan, &confirmed);
+    let mut up = ResumableUpload::from_missing(data.len() as u64, plan, &missing);
     while let Some(chunk) = up.next_chunk() {
         let piece = &data[chunk.offset as usize..(chunk.offset + chunk.len) as usize];
         let started = std::time::Instant::now();
         client
             .put(format!("{base}/chunk?offset={}", chunk.offset))
             .header("X-Upload-Token", "tok")
-            .header("Authorization", "Bearer u:7")
             .header("X-Chunk-SHA256", sha256_hex(piece))
             .body(piece.to_vec())
             .send()
@@ -287,7 +289,6 @@ async fn child_main(base: String, cache: std::path::PathBuf) {
     client
         .post(format!("{base}/complete"))
         .header("X-Upload-Token", "tok")
-        .header("Authorization", "Bearer u:7")
         .send()
         .await
         .expect("complete");

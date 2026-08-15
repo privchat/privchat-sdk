@@ -35,7 +35,8 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
-/// 服务端下发的分片方案。
+/// 分片方案。服务端只冻结 `base_unit`（寻址网格）；其余是客户端的传输决策
+/// （RESUMABLE_UPLOAD_SPEC §5：首片 64KiB 探测、单次上限 2MiB、并发 1）。
 #[derive(Debug, Clone, Copy)]
 pub struct UploadPlan {
     pub base_unit: u32,
@@ -43,6 +44,20 @@ pub struct UploadPlan {
     pub max_request_size: u32,
     pub session_threshold: u64,
     pub max_parallel_parts: u8,
+}
+
+impl UploadPlan {
+    /// 从服务端给的网格构造客户端方案。
+    pub fn for_base_unit(base_unit: u32) -> Self {
+        let base_unit = base_unit.max(1);
+        Self {
+            base_unit,
+            initial_request_size: base_unit,
+            max_request_size: (2 * 1024 * 1024).max(base_unit),
+            session_threshold: base_unit as u64,
+            max_parallel_parts: 1,
+        }
+    }
 }
 
 /// 上传进度：`uploaded / total`。
@@ -246,6 +261,32 @@ impl ResumableUpload {
             gaps: gaps_from_confirmed(confirmed, total),
             confirmed: confirmed.iter().map(|(_, len)| len).sum(),
         }
+    }
+
+    /// 直接用服务端给的缺失区间构造（spec §3.2：客户端不自己求补集）。
+    pub fn from_missing(total: u64, plan: UploadPlan, missing: &[(u64, u64)]) -> Self {
+        let mut gaps: Vec<Gap> = missing
+            .iter()
+            .map(|(offset, len)| Gap {
+                offset: *offset,
+                len: *len,
+            })
+            .collect();
+        gaps.sort_by_key(|g| g.offset);
+        let missing_total: u64 = gaps.iter().map(|g| g.len).sum();
+        Self {
+            total,
+            sizer: ChunkSizer::new(plan),
+            gaps,
+            confirmed: total.saturating_sub(missing_total),
+        }
+    }
+
+    /// 以服务端的 `missing` 为准重算缺口。
+    pub fn resync_missing(&mut self, missing: &[(u64, u64)]) {
+        let fresh = Self::from_missing(self.total, self.sizer.plan, missing);
+        self.gaps = fresh.gaps;
+        self.confirmed = fresh.confirmed;
     }
 
     pub fn progress(&self) -> UploadProgress {
