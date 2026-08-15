@@ -12357,15 +12357,39 @@ impl State {
             let managed_thumb = Self::managed_source_path(&message.content, &user_root)
                 .and_then(|source| source.parent().map(|dir| dir.join(media_store::THUMB_FILENAME)))
                 .filter(|path| path.exists());
-            let (w, h, size) = if let Some(source_thumb) = managed_thumb {
-                std::fs::copy(&source_thumb, &canonical_thumb)
-                    .map_err(|e| Error::Storage(format!("copy managed image thumbnail failed: {e}")))?;
-                let img = Self::decode_image_oriented(&canonical_thumb)
-                    .map_err(|e| Error::Storage(format!("decode managed image thumbnail failed: {e}")))?;
-                let size = std::fs::metadata(&canonical_thumb)
-                    .map_err(|e| Error::Storage(format!("stat managed image thumbnail failed: {e}")))?
-                    .len();
-                (img.width(), img.height(), size)
+            // 🔴 **同一个路径不能拷给自己**。
+            //
+            // 重试同一条消息时，`managed_source_path` 解析出来的就是这条消息自己的
+            // 目录，于是 source 与 canonical 是同一个文件——`fs::copy` 会先把目标
+            // 截断，结果 `thumb.webp` 变成 0 字节。第一次发送留下的有效缩略图就这样
+            // 被自己的重试毁掉，而且毁得很隐蔽：meta.json 还记着上一次的真实大小，
+            // 磁盘上却是空文件，之后解码失败、正文密文根本来不及生成。
+            //
+            // 复用之前还要验一遍能不能解码：上一次可能正好死在写缩略图的中途。
+            // 复用不了就当作没有，走下面的重新生成——那条路本来就允许「没有缩略图」。
+            let reused = managed_thumb.and_then(|source_thumb| {
+                if source_thumb != canonical_thumb {
+                    if let Err(e) = std::fs::copy(&source_thumb, &canonical_thumb) {
+                        eprintln!("[SDK.media] 复制托管缩略图失败，改为重新生成: {e}");
+                        return None;
+                    }
+                }
+                let size = std::fs::metadata(&canonical_thumb).ok()?.len();
+                if size == 0 {
+                    eprintln!("[SDK.media] 现有缩略图是空文件，重新生成");
+                    return None;
+                }
+                match Self::decode_image_oriented(&canonical_thumb) {
+                    Ok(img) => Some((img.width(), img.height(), size)),
+                    Err(e) => {
+                        eprintln!("[SDK.media] 现有缩略图解不开，重新生成: {e}");
+                        None
+                    }
+                }
+            });
+
+            let (w, h, size) = if let Some(dims) = reused {
+                dims
             } else {
                 // 托管来源但没有现成缩略图时**照样生成**，不报错。
                 //
