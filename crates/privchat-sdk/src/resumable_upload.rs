@@ -214,23 +214,35 @@ pub enum ChunkVerdict {
     Fatal,
 }
 
-/// 服务端错误码 → 客户端动作。码值见 protocol `ErrorCode` 20610-20617。
-pub fn verdict_for_code(code: u32) -> ChunkVerdict {
+/// 一次分片 PUT 响应 → 客户端动作。**Rust 与 TS 必须逐字一致**（RESUMABLE_UPLOAD_SPEC）。
+///
+/// - `code`：响应信封里的业务码；响应体无法解析成 JSON 时为 `None`。
+/// - `is_server_error`：HTTP 状态是否 5xx。
+///
+/// 已知业务码给定论；其余（未知码 / 20616 未对齐 / 20617 模式冲突 / 无法解析）按
+/// HTTP 状态兜底：**5xx 视为瞬时错误可重试，其余终局失败**。
+///
+/// 🔴 少了 5xx 这一路，一次数据库抖动返回的「带未知码的 500」会被直接判死、放弃
+/// 整份上传——这正是本函数替代旧 `verdict_for_code(只看码)` 的原因。
+pub fn chunk_verdict(code: Option<u32>, is_server_error: bool) -> ChunkVerdict {
     match code {
-        0 => ChunkVerdict::Ok,
-        // 这一片本身有问题，重传这一片就好。
-        20611 => ChunkVerdict::RetryChunk,
-        // 会话被别的请求占着，等一下再来。
-        20612 => ChunkVerdict::RetryChunk,
-        // 区间对不上，拉 status 对齐。
-        20610 => ChunkVerdict::Resync,
-        // 会话没了 / 模式冲突 / 没有分片方案：这条路走不通了。
-        20613 => ChunkVerdict::StartOver,
-        20614 => ChunkVerdict::Ok, // 已完成：拿 file_id 就是了
-        20615 => ChunkVerdict::Resync,
-        20616 | 20617 => ChunkVerdict::Fatal,
-        _ => ChunkVerdict::Fatal,
+        Some(0) | Some(20614) => ChunkVerdict::Ok, // 20614=已完成，拿 file_id 即可
+        Some(20611) | Some(20612) => ChunkVerdict::RetryChunk, // 摘要不符 / 会话忙
+        Some(20610) | Some(20615) => ChunkVerdict::Resync,     // 区间对不上 / 缺区间
+        Some(20613) => ChunkVerdict::StartOver,                // 会话没了
+        _ => {
+            if is_server_error {
+                ChunkVerdict::RetryChunk
+            } else {
+                ChunkVerdict::Fatal
+            }
+        }
     }
+}
+
+/// 只按业务码判（不看 HTTP 状态）——保留给纯码单测；生产路径用 [`chunk_verdict`]。
+pub fn verdict_for_code(code: u32) -> ChunkVerdict {
+    chunk_verdict(Some(code), false)
 }
 
 /// 单片最多重试次数（首发之外）。
@@ -572,6 +584,24 @@ mod tests {
             "没有分片方案时重试多少次都一样"
         );
         assert_eq!(verdict_for_code(20617), ChunkVerdict::Fatal);
+    }
+
+    #[test]
+    fn chunk_verdict_falls_back_on_http_status_for_unknown_bodies() {
+        use ChunkVerdict::*;
+        // 已知码：HTTP 状态无关，永远给定论。
+        assert_eq!(chunk_verdict(Some(0), true), Ok);
+        assert_eq!(chunk_verdict(Some(20611), true), RetryChunk);
+        assert_eq!(chunk_verdict(Some(20613), true), StartOver);
+        // 🔴 未知码 + 5xx = 瞬时错误，重试；未知码 + 非 5xx = 终局。
+        assert_eq!(chunk_verdict(Some(99999), true), RetryChunk);
+        assert_eq!(chunk_verdict(Some(99999), false), Fatal);
+        // 20616/20617 是 400 类校验错，非 5xx → 终局；万一带 5xx 也按瞬时重试（与 TS 一致）。
+        assert_eq!(chunk_verdict(Some(20617), false), Fatal);
+        assert_eq!(chunk_verdict(Some(20617), true), RetryChunk);
+        // 无法解析响应体：同样按 HTTP 状态兜底。
+        assert_eq!(chunk_verdict(None, true), RetryChunk);
+        assert_eq!(chunk_verdict(None, false), Fatal);
     }
 
     /// 退避是涨的——网络刚断的时候连打三枪没有意义。

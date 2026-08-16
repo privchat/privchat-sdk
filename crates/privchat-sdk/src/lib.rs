@@ -11968,7 +11968,7 @@ impl State {
         bytes: Vec<u8>,
         digest: &str,
     ) -> crate::resumable_upload::ChunkVerdict {
-        use crate::resumable_upload::{verdict_for_code, ChunkVerdict};
+        use crate::resumable_upload::{chunk_verdict, ChunkVerdict};
         let resp = self
             .with_upload_token(client.put(format!("{base}/chunk?offset={offset}")), token)
             .header("X-Chunk-SHA256", digest)
@@ -11976,12 +11976,19 @@ impl State {
             .send()
             .await;
         let Ok(resp) = resp else {
+            // 连不上/超时：这一片值得再试，别把网络抖动当成协议失败。
             return ChunkVerdict::RetryChunk;
         };
-        match resp.json::<serde_json::Value>().await {
-            Ok(json) => verdict_for_code(json["code"].as_u64().unwrap_or(1) as u32),
-            Err(_) => ChunkVerdict::RetryChunk,
-        }
+        // 🔴 先取 HTTP 状态再消费 body：未知码/解析失败时靠它区分「瞬时 5xx 可重试」
+        // 与「客户端 4xx 终局」，与 TS SDK 逐字一致。
+        let is_server_error = resp.status().is_server_error();
+        let code = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|j| j["code"].as_u64())
+            .map(|c| c as u32);
+        chunk_verdict(code, is_server_error)
     }
 
     async fn complete_upload(
