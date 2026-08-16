@@ -4,7 +4,7 @@ PrivChat 即时通讯平台的核心 Rust SDK，为 iOS、Android、macOS、Linu
 
 ## 定位
 
-privchat-sdk 是整个 PrivChat 客户端体系的**唯一核心引擎**。上层的 Kotlin Multiplatform（privchat-sdk-kotlin）、Swift（privchat-sdk-swift）、Android（privchat-sdk-android）等平台 SDK 均通过 UniFFI 绑定调用本项目，不直接实现业务逻辑。
+privchat-sdk 是整个 PrivChat 客户端体系的**唯一核心引擎**。上层的 Kotlin Multiplatform（privchat-sdk-kotlin）与 Swift（privchat-sdk-swift）平台 SDK 均通过 UniFFI 绑定调用本项目，不直接实现业务逻辑。
 
 ## 职责
 
@@ -238,7 +238,6 @@ SDK 使用 `SdkError` 枚举统一错误类型，FFI 层包装为 `PrivchatFfiEr
 |----------|------|
 | [privchat-sdk-kotlin](https://github.com/privchat/privchat-sdk-kotlin) | Kotlin Multiplatform（Android + iOS + Desktop） |
 | [privchat-sdk-swift](https://github.com/privchat/privchat-sdk-swift) | Swift 原生（iOS / macOS） |
-| [privchat-sdk-android](https://github.com/privchat/privchat-sdk-android) | Android 原生 |
 
 ## 相关文档
 

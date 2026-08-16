@@ -6,7 +6,7 @@ Core Rust SDK for the PrivChat messaging platform, providing unified low-level c
 
 ## Overview
 
-privchat-sdk is the **single core engine** of the entire PrivChat client ecosystem. Platform SDKs such as Kotlin Multiplatform (privchat-sdk-kotlin), Swift (privchat-sdk-swift), and Android (privchat-sdk-android) all call into this project via UniFFI bindings and do not implement business logic directly.
+privchat-sdk is the **single core engine** of the entire PrivChat client ecosystem. Platform SDKs — Kotlin Multiplatform (privchat-sdk-kotlin) and Swift (privchat-sdk-swift) — call into this project via UniFFI bindings and do not implement business logic directly.
 
 ## Responsibilities
 
@@ -240,7 +240,6 @@ This project is not intended for direct use by application developers. Instead, 
 |--------------|-------------|
 | [privchat-sdk-kotlin](https://github.com/privchat/privchat-sdk-kotlin) | Kotlin Multiplatform (Android + iOS + Desktop) |
 | [privchat-sdk-swift](https://github.com/privchat/privchat-sdk-swift) | Native Swift (iOS / macOS) |
-| [privchat-sdk-android](https://github.com/privchat/privchat-sdk-android) | Native Android |
 
 ## Documentation
 
