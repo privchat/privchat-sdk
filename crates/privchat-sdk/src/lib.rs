@@ -12017,7 +12017,10 @@ impl State {
             .await
             .map_err(|e| Error::Serialization(format!("decode complete response: {e}")))?;
         let code = envelope["code"].as_u64().unwrap_or(0) as u32;
-        if code == 20613 {
+        // 🔴 20613（会话没了）与 20618（完成后校验失败，仅 S3 直传）客户端动作相同：
+        // 废弃会话从零重新申请（RESUMABLE §8）。漏掉 20618 它会被包成普通 Transport
+        // 错误，编排层进不了重新申请分支，真实 S3 complete 失败后永远无法自愈。
+        if crate::resumable_upload::complete_code_means_restart(code) {
             return Err(Error::UploadSessionGone);
         }
         if !status.is_success() {
@@ -25393,6 +25396,25 @@ mod chunked_upload_plan_tests {
         assert_eq!(io.claims, 1);
         assert_eq!(token, "claim-1");
         assert!(io.finished >= 2, "会话没了要先丢掉本地记录");
+    }
+
+    /// 🔴 complete 的 20618 同样落在这条分支（complete_upload 把 20618 映射成
+    /// UploadSessionGone）：重新申请后没命中，就在新会话上把字节完整传完，
+    /// 绝不把重启错误当成终局失败抛出去。
+    #[tokio::test]
+    async fn a_restart_after_complete_failure_re_uploads_on_a_fresh_session() {
+        let mut io = Recorder {
+            hits: vec![false, false],
+            first_upload_error: Some(Error::UploadSessionGone),
+            ..Default::default()
+        };
+        let (_, token) = State::plan_attachment_upload(&mut io, &sealed()).await.unwrap();
+        // 两次 prepare 都不带 force：这不是 claim miss，没有理由跳过预检。
+        assert_eq!(io.prepares, vec![(SHA.to_string(), 8, false), (SHA.to_string(), 8, false)]);
+        assert_eq!(io.uploads, vec![session(0).upload_token, session(1).upload_token]);
+        assert_eq!(io.claims, 0);
+        assert_eq!(token, session(1).upload_token, "回调用新会话的 token");
+        assert!(io.finished >= 2, "旧会话记录要先丢掉再重来");
     }
 
     #[tokio::test]

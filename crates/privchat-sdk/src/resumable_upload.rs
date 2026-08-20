@@ -249,6 +249,16 @@ pub fn verdict_for_code(code: u32) -> ChunkVerdict {
     chunk_verdict(Some(code), false)
 }
 
+/// complete 响应的业务码是否意味着「会话作废、废弃它从零重新申请」。
+///
+/// 🔴 20618 **只在 complete 路径产生**（完成后校验失败，仅 S3 直传，RESUMABLE §8），
+/// chunk 循环里永远碰不到；它的客户端动作与 20613 完全相同——废弃 token 与会话、
+/// 重新 prepare。抽成纯函数是因为编排层的重新申请分支必须被测试驱动：漏掉这条
+/// 映射，20618 会被包成普通 Transport 错误，真实 S3 complete 失败后永远无法自愈。
+pub fn complete_code_means_restart(code: u32) -> bool {
+    matches!(code, 20613 | 20618)
+}
+
 /// 单片最多重试次数（首发之外）。
 pub const CHUNK_RETRIES: u32 = 2;
 
@@ -611,6 +621,19 @@ mod tests {
         // 无法解析响应体：同样按 HTTP 状态兜底。
         assert_eq!(chunk_verdict(None, true), RetryChunk);
         assert_eq!(chunk_verdict(None, false), Fatal);
+    }
+
+    /// 🔴 complete 路径的重启映射（RESUMABLE §8）：20613 与 20618 都是「废弃会话、
+    /// 从零重新申请」；其余码都不是。
+    #[test]
+    fn complete_restart_codes_are_exactly_20613_and_20618() {
+        assert!(complete_code_means_restart(20613), "会话没了要重来");
+        assert!(complete_code_means_restart(20618), "完成后校验失败要从零重来");
+        assert!(!complete_code_means_restart(0));
+        assert!(!complete_code_means_restart(20611));
+        assert!(!complete_code_means_restart(20615));
+        assert!(!complete_code_means_restart(20616));
+        assert!(!complete_code_means_restart(99999));
     }
 
     /// 退避是涨的——网络刚断的时候连打三枪没有意义。
