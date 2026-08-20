@@ -11563,6 +11563,9 @@ impl State {
             filename: Some(filename),
             transform_version: 0,
             force_upload,
+            // 能力协商（RESUMABLE_UPLOAD_SPEC §8.2）：S3 客户端分支落地前先不声明，
+            // 行为与旧客户端逐字节一致；届时改为声明两种 transport。
+            supported_upload_transports: None,
         };
         self.rpc_call_typed(routes::file::REQUEST_CHUNKED_UPLOAD_TOKEN, &payload)
             .await
