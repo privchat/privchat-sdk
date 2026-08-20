@@ -210,6 +210,9 @@ pub enum ChunkVerdict {
     Resync,
     /// 会话没了：只能重新申请 token 从头传。
     StartOver,
+    /// 完成后校验失败（20618，仅 S3 直传）：废弃 token 与会话、从零重新申请，
+    /// 禁止沿原会话重传片（RESUMABLE_UPLOAD_SPEC §8）。
+    RestartUpload,
     /// 终局失败，重试没有意义。
     Fatal,
 }
@@ -230,6 +233,7 @@ pub fn chunk_verdict(code: Option<u32>, is_server_error: bool) -> ChunkVerdict {
         Some(20611) | Some(20612) => ChunkVerdict::RetryChunk, // 摘要不符 / 会话忙
         Some(20610) | Some(20615) => ChunkVerdict::Resync,     // 区间对不上 / 缺区间
         Some(20613) => ChunkVerdict::StartOver,                // 会话没了
+        Some(20618) => ChunkVerdict::RestartUpload,            // 完成后校验失败，从零重来
         _ => {
             if is_server_error {
                 ChunkVerdict::RetryChunk
@@ -584,6 +588,11 @@ mod tests {
             "没有分片方案时重试多少次都一样"
         );
         assert_eq!(verdict_for_code(20617), ChunkVerdict::Fatal);
+        assert_eq!(
+            verdict_for_code(20618),
+            ChunkVerdict::RestartUpload,
+            "完成后校验失败：废弃会话从零重来，禁止沿原会话重传片"
+        );
     }
 
     #[test]

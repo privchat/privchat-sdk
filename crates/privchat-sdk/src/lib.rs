@@ -11893,6 +11893,9 @@ impl State {
                     self.emit_upload_progress(local_message_id, up.progress());
                 }
                 ChunkVerdict::StartOver => return Err(Error::UploadSessionGone),
+                // 20618 只在 complete 路径产生，chunk 路径不会碰到；语义同为
+                // 「废弃会话、从零重新申请」，并入 StartOver 同一出口（RESUMABLE §8）。
+                ChunkVerdict::RestartUpload => return Err(Error::UploadSessionGone),
                 ChunkVerdict::Fatal => {
                     return Err(Error::Transport(format!(
                         "分片上传被服务端终局拒绝（offset={}）",
