@@ -880,20 +880,10 @@ mod tests {
         }
     }
 
-    /// Compile the C smoke test against the header to prove the header is
-    /// self-contained and matches C expectations. Skips when no C compiler
-    /// is available (or when cross-compiling, where a host cc is unreliable).
-    #[test]
-    fn c_smoke_compiles_against_header() {
-        if cfg!(not(target_os = "macos")) {
-            eprintln!("skip: header compile check only wired for macOS hosts");
-            return;
-        }
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let src = format!("{manifest}/tests/c_smoke.c");
-        let include = format!("{manifest}/include");
-        // Resolve the macOS SDK root explicitly: some environments put an
-        // iOS-targeted cc first in PATH, which rejects host compiles.
+    /// First usable C compiler with a clean host-compile environment.
+    /// Some environments put an iOS-targeted cc first in PATH (which rejects
+    /// a macOS sysroot) or export an iOS-pointing SDKROOT; strip both.
+    fn host_cc() -> Option<std::process::Command> {
         let sdkroot = std::process::Command::new("xcrun")
             .args(["--sdk", "macosx", "--show-sdk-path"])
             .output()
@@ -902,29 +892,123 @@ mod tests {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         for cc in ["cc", "clang", "gcc"] {
             let mut cmd = std::process::Command::new(cc);
-            cmd.args(["-fsyntax-only", "-Wall", "-Werror", "-I", &include, &src]);
-            if let Some(root) = &sdkroot {
-                cmd.args(["-isysroot", root]);
-            }
-            // Test harnesses may export an iOS-pointing SDKROOT / deployment
-            // target; that makes cc default to the iPhone triple and reject
-            // a macOS sysroot. Force a clean host compile.
-            cmd.env_remove("SDKROOT");
-            cmd.env_remove("IPHONEOS_DEPLOYMENT_TARGET");
-            cmd.env_remove("MACOSX_DEPLOYMENT_TARGET");
-            match cmd.output() {
-                Ok(o) => {
-                    assert!(
-                        o.status.success(),
-                        "{cc} reported header/usage errors:\n{}{}",
-                        String::from_utf8_lossy(&o.stdout),
-                        String::from_utf8_lossy(&o.stderr)
-                    );
-                    return;
+            cmd.arg("--version");
+            if cmd.output().map(|o| o.status.success()).unwrap_or(false) {
+                let mut cmd = std::process::Command::new(cc);
+                if let Some(root) = &sdkroot {
+                    cmd.args(["-isysroot", root]);
                 }
-                Err(_) => continue, // compiler not found; try next
+                cmd.env_remove("SDKROOT");
+                cmd.env_remove("IPHONEOS_DEPLOYMENT_TARGET");
+                cmd.env_remove("MACOSX_DEPLOYMENT_TARGET");
+                return Some(cmd);
             }
         }
-        eprintln!("skip: no C compiler found (cc/clang/gcc)");
+        None
+    }
+
+    fn require_macos() -> bool {
+        if cfg!(not(target_os = "macos")) {
+            eprintln!("skip: C toolchain checks are only wired for macOS hosts");
+            return false;
+        }
+        true
+    }
+
+    /// Compile the C smoke test against the header to prove the header is
+    /// self-contained and matches C expectations.
+    #[test]
+    fn c_smoke_compiles_against_header() {
+        if !require_macos() {
+            return;
+        }
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let src = format!("{manifest}/tests/c_smoke.c");
+        let include = format!("{manifest}/include");
+        let mut cmd = host_cc().expect(
+            "no C compiler found (cc/clang/gcc); install Xcode command line tools",
+        );
+        cmd.args(["-fsyntax-only", "-Wall", "-Werror", "-I", &include, &src]);
+        let o = cmd.output().expect("failed to invoke cc");
+        assert!(
+            o.status.success(),
+            "cc reported header/usage errors:\n{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+
+    /// Directory holding the debug cdylib (cargo test does not build the
+    /// cdylib target itself, so build it on demand).
+    fn cdylib_dir() -> std::path::PathBuf {
+        if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+            return std::path::PathBuf::from(dir).join("debug");
+        }
+        // Workspace layout: crates/privchat-sdk-c-api -> privchat-sdk/target.
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+    }
+
+    /// Real ABI proof: link the C smoke test against the built cdylib and
+    /// run it. This exercises actual symbol names and signatures end to end
+    /// (create -> invalid config -> event poll -> connect failure -> destroy),
+    /// which `-fsyntax-only` against the header cannot.
+    #[test]
+    fn c_smoke_links_and_runs() {
+        if !require_macos() {
+            return;
+        }
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let lib_dir = cdylib_dir();
+        let dylib = lib_dir.join("libprivchat_sdk_c_api.dylib");
+        if !dylib.exists() {
+            let status = std::process::Command::new(env!("CARGO"))
+                .args(["build", "-p", "privchat-sdk-c-api"])
+                .current_dir(manifest)
+                .status()
+                .expect("failed to invoke cargo");
+            assert!(status.success(), "cargo build of the cdylib failed");
+        }
+        assert!(dylib.exists(), "cdylib missing at {}", dylib.display());
+
+        let bin = std::env::temp_dir().join(format!(
+            "privchat-capi-c-smoke-{}",
+            std::process::id()
+        ));
+        let mut cc = host_cc().expect("no C compiler found (cc/clang/gcc)");
+        let rpath = format!("-Wl,-rpath,{}", lib_dir.display());
+        let lib_dir_str = lib_dir.display().to_string();
+        cc.args([
+            "-Wall",
+            "-Werror",
+            "-I",
+            &format!("{manifest}/include"),
+            &format!("{manifest}/tests/c_smoke.c"),
+            "-L",
+            &lib_dir_str,
+            "-lprivchat_sdk_c_api",
+            &rpath,
+            "-o",
+        ]);
+        cc.arg(&bin);
+        let o = cc.output().expect("failed to invoke cc");
+        assert!(
+            o.status.success(),
+            "linking c_smoke against the cdylib failed:\n{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+
+        let o = std::process::Command::new(&bin)
+            .output()
+            .expect("failed to run c_smoke");
+        assert!(
+            o.status.success(),
+            "c_smoke runtime failure (rc={:?}):\n{}{}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let _ = std::fs::remove_file(&bin);
     }
 }

@@ -1,11 +1,12 @@
 // C smoke test for privchat-sdk-c-api.
 //
-// 1. Compiled (syntax-checked) by `cargo test -p privchat-sdk-c-api`
-//    (c_smoke_compiles_against_header) to prove the header is
-//    self-contained and the call sites match the C ABI.
-// 2. Can also be linked against the cdylib for a runtime smoke run:
+// 1. `cargo test -p privchat-sdk-c-api` syntax-checks it against the header
+//    (c_smoke_compiles_against_header) and links + executes it against the
+//    built cdylib (c_smoke_links_and_runs) — real ABI signature proof.
+// 2. Manual runtime run:
 //      cc tests/c_smoke.c -Iinclude \
-//         -L../../target/release -lprivchat_sdk_c_api -o c_smoke
+//         -L../../target/release -lprivchat_sdk_c_api \
+//         -Wl,-rpath,../../target/release -o c_smoke
 //      ./c_smoke
 //    (no server required; the connect attempt is expected to fail fast.)
 #include <stdio.h>
