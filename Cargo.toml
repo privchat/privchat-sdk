@@ -2,6 +2,7 @@
 members = [
   "crates/privchat-sdk",
   "crates/privchat-sdk-ffi",
+  "crates/privchat-sdk-c-api",
 ]
 resolver = "2"
 

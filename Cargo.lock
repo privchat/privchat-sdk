@@ -1809,6 +1809,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "privchat-sdk-c-api"
+version = "0.1.0"
+dependencies = [
+ "privchat-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "privchat-sdk-ffi"
 version = "0.1.0"
 dependencies = [
