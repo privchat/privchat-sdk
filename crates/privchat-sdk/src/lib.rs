@@ -6856,8 +6856,14 @@ impl State {
                     } else {
                         false
                     };
+                    // SYSTEM_MESSAGE_SPEC §6：系统消息不计入未读。服务端（fe54ee0 起）
+                    // 已不给 System 记未读，这里是同一条规则的本地投影——少了它，
+                    // 「你们已成为好友」这类灰条会让角标 +1，真机双端实测过。
+                    let is_system_message =
+                        message_type == ContentMessageType::System.as_u32() as i32;
                     let should_bump_unread = bump_unread_on_incoming
                         && !from_self
+                        && !is_system_message
                         && upserted.inserted_new
                         && is_after_read_cursor;
                     if inbound_logs_enabled() {
