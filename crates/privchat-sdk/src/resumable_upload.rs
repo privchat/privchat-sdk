@@ -267,6 +267,42 @@ pub fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(300 * 2u64.pow(attempt.min(4)))
 }
 
+/// S3 面：把服务端下发的**字节区间**换算成要传的 **part 号**（RESUMABLE §8.1/§8.3）。
+///
+/// 🔴 两面共用同一个 status 协议：服务端把 `ListParts` 换算成区间下发，客户端再换回
+/// 片号。所以这里的输入就是 proxy 面那套 `missing`，不需要第二种进度模型。
+///
+/// part 号从 1 起，第 n 片覆盖 `[(n-1)*part_size, n*part_size)`。区间只要与某片有交集，
+/// 该片就要整片重传——S3 不接受半片，最小可写单位就是一片。
+pub fn parts_from_missing(missing: &[(u64, u64)], part_size: u64, total_parts: u32) -> Vec<u32> {
+    if part_size == 0 {
+        return Vec::new();
+    }
+    let mut want: Vec<u32> = Vec::new();
+    for &(offset, len) in missing {
+        if len == 0 {
+            continue;
+        }
+        let first = offset / part_size + 1;
+        let last = (offset + len - 1) / part_size + 1;
+        for n in first..=last {
+            if n >= 1 && n <= total_parts as u64 {
+                want.push(n as u32);
+            }
+        }
+    }
+    want.sort_unstable();
+    want.dedup();
+    want
+}
+
+/// 第 n 片在源文件中的字节区间（末片按余数截断）。
+pub fn part_range(part_number: u32, part_size: u64, total: u64) -> (u64, u64) {
+    let offset = (part_number as u64 - 1) * part_size;
+    let len = part_size.min(total.saturating_sub(offset));
+    (offset, len)
+}
+
 /// 一次分片上传的状态机——**不做 IO**，因此可以完整单测。
 ///
 /// 🔴 把决策与 IO 分开的理由：弱网行为几乎全是决策（发多大、重试几次、什么时候
@@ -683,6 +719,20 @@ pub struct UploadSessionRecord {
     pub local_message_id: String,
     /// 服务器身份（切环境后旧会话作废）。
     pub server_identity: String,
+    /// 会话的数据面（§8.2）。🔴 必须落盘：重启后要靠它决定字节发给谁；
+    /// 缺省（旧记录）= 内置面，与该记录写下时的行为一致。
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// 仅 S3 面：固定分片大小。缺了就算不出片号，恢复时判为不可复用。
+    #[serde(default)]
+    pub part_size: Option<u64>,
+    /// 仅 S3 面：总片数。
+    #[serde(default)]
+    pub total_parts: Option<u32>,
+}
+
+fn default_transport() -> String {
+    "proxy_offset_v1".to_string()
 }
 
 /// `UploadPlan` 的可序列化副本。
@@ -833,6 +883,49 @@ impl UploadSessionRecord {
     }
 }
 
+
+#[cfg(test)]
+mod s3_part_mapping_tests {
+    use super::*;
+
+    /// §8.1/§8.3：status 的字节区间 → 要重传的片号。
+    #[test]
+    fn missing_ranges_map_to_whole_parts() {
+        let part = 8u64 << 20;
+        let total_parts = 3u32;
+
+        // 完整一片。
+        assert_eq!(parts_from_missing(&[(0, part)], part, total_parts), vec![1]);
+        // 🔴 只缺一个字节也要整片重传：S3 的最小可写单位是一片。
+        assert_eq!(parts_from_missing(&[(part, 1)], part, total_parts), vec![2]);
+        // 跨片区间 → 覆盖到的片全要。
+        assert_eq!(
+            parts_from_missing(&[(part - 1, 2)], part, total_parts),
+            vec![1, 2]
+        );
+        // 多段合并去重且有序。
+        assert_eq!(
+            parts_from_missing(&[(2 * part, 10), (0, 5), (1, 5)], part, total_parts),
+            vec![1, 3]
+        );
+        // 空区间不产片；越界片号被丢弃（服务端不该给，给了也不炸）。
+        assert_eq!(parts_from_missing(&[(0, 0)], part, total_parts), Vec::<u32>::new());
+        assert_eq!(parts_from_missing(&[(99 * part, part)], part, total_parts), Vec::<u32>::new());
+    }
+
+    /// 末片按余数截断，不能按整片长度去读盘（会越界或多传）。
+    #[test]
+    fn last_part_is_truncated_to_the_remainder() {
+        let part = 8u64 << 20;
+        let total = part * 2 + 123;
+        assert_eq!(part_range(1, part, total), (0, part));
+        assert_eq!(part_range(2, part, total), (part, part));
+        assert_eq!(part_range(3, part, total), (2 * part, 123));
+        // 单片会话：整个文件就是第 1 片（小文件在 S3 面的常态）。
+        assert_eq!(part_range(1, part, 900), (0, 900));
+    }
+}
+
 #[cfg(test)]
 mod session_tests {
     use super::*;
@@ -849,6 +942,9 @@ mod session_tests {
                 session_threshold: 65536,
                 max_parallel_parts: 1,
             },
+            transport: default_transport(),
+            part_size: None,
+            total_parts: None,
             sealed_sha256: "aa".repeat(32),
             sealed_size: 4096,
             user_id: 7,

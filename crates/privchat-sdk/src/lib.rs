@@ -890,8 +890,8 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
             .await
     }
 
-    fn chunked_threshold(&self) -> Option<usize> {
-        Some(CHUNKED_UPLOAD_THRESHOLD)
+    fn uses_chunked_orchestration(&self) -> bool {
+        true
     }
 
     async fn prepare_chunked(
@@ -928,6 +928,9 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                             upload_url: rec.upload_url,
                             base_unit: rec.plan.base_unit,
                             expires_at: rec.expires_at,
+                            transport: rec.transport,
+                            part_size: rec.part_size,
+                            total_parts: rec.total_parts,
                         }));
                     }
                     verdict => {
@@ -975,7 +978,24 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
             })?,
             base_unit: response.base_unit.filter(|b| *b > 0).unwrap_or(64 * 1024),
             expires_at: response.expires_at.unwrap_or(0),
+            // 不下发 = 旧服务端 = 内置面。
+            transport: response
+                .transport
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| TRANSPORT_PROXY_OFFSET_V1.to_string()),
+            part_size: response.part_size.filter(|v| *v > 0),
+            total_parts: response.total_parts.filter(|v| *v > 0),
         };
+        // 🔴 S3 面缺几何 = 会话不可用：宁可当场报错，也不要拿 None 去算片号，
+        // 那会退化成「传了一堆对不上的片」，直到 complete 才炸。
+        if session.transport == TRANSPORT_S3_MULTIPART_V1
+            && (session.part_size.is_none() || session.total_parts.is_none())
+        {
+            return Err(Error::Serialization(
+                "decode file/request_chunked_upload_token: s3_multipart_v1 缺 part_size/total_parts"
+                    .to_string(),
+            ));
+        }
 
         // 🔴 **在发出第一片之前**把会话落盘（临时文件 + rename）。
         // 反过来的话，第一片传完就崩溃，那次上传就成了服务端上一个没人认领的会话。
@@ -989,6 +1009,9 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
             user_id: self.user_id,
             local_message_id: self.local_message_id.clone(),
             server_identity: self.server_identity.clone(),
+            transport: session.transport.clone(),
+            part_size: session.part_size,
+            total_parts: session.total_parts,
         };
         if let Err(e) = rec.store(self.sealed_cache) {
             eprintln!("[SDK.upload] 上传会话落盘失败（下次将从头传）: {e}");
@@ -1042,10 +1065,6 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
     }
 }
 
-/// 超过这个大小走分片（RESUMABLE_UPLOAD_SPEC §2.4）。
-///
-/// 阈值是客户端常量，不进协议：它只影响「这次拆不拆」，拆错了也只是效率问题。
-const CHUNKED_UPLOAD_THRESHOLD: usize = 1024 * 1024;
 
 /// 一个分片会话：申请 token 拿到的、四个端点要用的全部。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1055,7 +1074,19 @@ pub(crate) struct ChunkedSession {
     pub upload_url: String,
     pub base_unit: u32,
     pub expires_at: i64,
+    /// 本次会话的数据面（RESUMABLE §8.2）：服务端按配置选定并下发，客户端不参与选择。
+    /// 旧服务端不下发该字段 → 视为内置面（与旧客户端行为逐字节一致）。
+    pub transport: String,
+    /// 仅 `s3_multipart_v1`：服务端下发的固定分片大小。
+    pub part_size: Option<u64>,
+    /// 仅 `s3_multipart_v1`：总分片数。
+    pub total_parts: Option<u32>,
 }
+
+/// 内置面：分片字节走文件服务的 `PUT /files/chunk?offset=`（RESUMABLE §8.1）。
+pub(crate) const TRANSPORT_PROXY_OFFSET_V1: &str = "proxy_offset_v1";
+/// S3 面：分片字节经 `POST /files/part-url` 签出的预签名 URL 直传对象存储。
+pub(crate) const TRANSPORT_S3_MULTIPART_V1: &str = "s3_multipart_v1";
 
 /// `file/request_chunked_upload_token` 的两种结局。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1064,6 +1095,18 @@ pub(crate) enum ChunkedPrepared {
     Claim { claim_token: String },
     /// 建了会话：去传字节。
     Session(ChunkedSession),
+}
+
+/// S3 面单片的结局：签发 + 直传合成一个动作后的判定。
+#[derive(Debug)]
+pub(crate) enum PartOutcome {
+    Ok,
+    /// 可重试：网络抖动、URL 过期、瞬时 5xx。
+    Retry,
+    /// 会话没了/已关闭：重新申请同模式 token 从零传。
+    SessionGone,
+    /// 终局失败：几何对不上、响应格式不对等，重试没有意义。
+    Fatal(String),
 }
 
 /// 查询上传进度的结果。
@@ -1105,9 +1148,11 @@ trait AttachmentUploadIo {
         payload: &SealedPayload,
     ) -> Result<UploadedFileInfo>;
 
-    /// 超过多大走分片；`None` = 不分片（测试假 Io 的默认）。
-    fn chunked_threshold(&self) -> Option<usize> {
-        None
+    /// 是否走分片编排。生产恒 `true`（RESUMABLE §2.4 第三十轮：任何大小都走分片，
+    /// 数据面由服务端下发，客户端不拿文件大小选面）；测试假 Io 默认 `false`，
+    /// 保留对整包次序的覆盖。
+    fn uses_chunked_orchestration(&self) -> bool {
+        false
     }
     /// 申请分片 token（`file/request_chunked_upload_token`）。
     async fn prepare_chunked(
@@ -11569,9 +11614,12 @@ impl State {
             filename: Some(filename),
             transform_version: 0,
             force_upload,
-            // 能力协商（RESUMABLE_UPLOAD_SPEC §8.2）：S3 客户端分支落地前先不声明，
-            // 行为与旧客户端逐字节一致；届时改为声明两种 transport。
-            supported_upload_transports: None,
+            // 能力协商（RESUMABLE_UPLOAD_SPEC §8.2）：两种数据面都实现了，都声明。
+            // 服务端按自己的配置单选一种并在响应里下发，客户端不挑、也没有回退。
+            supported_upload_transports: Some(vec![
+                TRANSPORT_PROXY_OFFSET_V1.to_string(),
+                TRANSPORT_S3_MULTIPART_V1.to_string(),
+            ]),
         };
         self.rpc_call_typed(routes::file::REQUEST_CHUNKED_UPLOAD_TOKEN, &payload)
             .await
@@ -11614,11 +11662,15 @@ impl State {
     ) -> Result<(UploadedFileInfo, String)> {
         let sha256 = payload.sha256.as_str();
 
-        // 大文件走分片（RESUMABLE_UPLOAD_SPEC）：独立 RPC、独立端点，与整包互不影响。
-        if let Some(threshold) = io.chunked_threshold() {
-            if payload.blob.len() > threshold {
-                return Self::plan_chunked_upload(io, payload).await;
-            }
+        // 🔴 任何大小都走分片编排（RESUMABLE §2.4 第三十轮修订）。
+        //
+        // 旧版按 `file_size` 阈值在「整包 token」和「分片 token」之间二选一。那等于
+        // 让文件大小去选数据面：服务端配了 S3 直传时，整包端点属于内置面、根本没有
+        // 对应物，于是小文件从内置面上传成功、大文件被 S3 面拒绝（Weey 实测）。
+        // 现在客户端只有一条编排，数据面由服务端在 token 响应里下发。
+        // 小文件在两面都表现为「只有一片的分片上传」。
+        if io.uses_chunked_orchestration() {
+            return Self::plan_chunked_upload(io, payload).await;
         }
 
         // 第一次带摘要，给服务端说「这串字节我已经有了」的机会。
@@ -11815,6 +11867,14 @@ impl State {
     ) -> Result<UploadedFileInfo> {
         use crate::resumable_upload::{ChunkTimer, ChunkVerdict, ResumableUpload, CHUNK_RETRIES};
 
+        // §8.2：数据面由服务端在 token 里定好，这里只按它分流。两条分支共用秒传、
+        // status、complete、abort 与全部落盘/进度逻辑，差别只有「分片字节发给谁」。
+        if session.transport == TRANSPORT_S3_MULTIPART_V1 {
+            return self
+                .upload_in_parts(session, mime_type, sealed_cache, blob, cek_b64, local_message_id)
+                .await;
+        }
+
         let base = session.upload_url.trim_end_matches('/').to_string();
         let token = session.upload_token.as_str();
         let client = reqwest::Client::new();
@@ -11919,6 +11979,197 @@ impl State {
     }
 
     /// 查进度：服务端**同时**回已收与缺失，客户端直接用 `missing`。
+    /// S3 面的分片上传（RESUMABLE §8.3/§8.5）。
+    ///
+    /// 与内置面**同一套编排**：先 status 看缺哪些、只补缺的、最后共用 complete。
+    /// 唯一的差别在这一步——字节不发给文件服务，而是 `POST /files/part-url` 换一张
+    /// 预签名 URL 后直传对象存储。片号与字节区间的换算在 `resumable_upload` 里，
+    /// 是纯函数、可单测。
+    ///
+    /// 🔴 S3 的最小可写单位是**整片**：区间只要缺一个字节，那一片就得整片重传。
+    /// 不存在 proxy 面那种「补一小段」的续传，这是 S3 Multipart 的约束，不是取舍。
+    async fn upload_in_parts(
+        &self,
+        session: &ChunkedSession,
+        mime_type: &str,
+        sealed_cache: &std::path::Path,
+        blob: &[u8],
+        cek_b64: String,
+        local_message_id: &str,
+    ) -> Result<UploadedFileInfo> {
+        use crate::resumable_upload::{
+            part_range, parts_from_missing, retry_delay, UploadProgress, CHUNK_RETRIES,
+        };
+
+        let base = session.upload_url.trim_end_matches('/').to_string();
+        let token = session.upload_token.as_str();
+        let client = reqwest::Client::new();
+        let total = blob.len() as u64;
+        // 会话建成时已校验过这两个字段，这里再兜一次底，绝不用默认值瞎算片号。
+        let part_size = session.part_size.ok_or_else(|| {
+            Error::Storage("s3_multipart_v1 会话缺 part_size".to_string())
+        })?;
+        let total_parts = session.total_parts.ok_or_else(|| {
+            Error::Storage("s3_multipart_v1 会话缺 total_parts".to_string())
+        })?;
+
+        let status = self.fetch_upload_status(&client, &base, token).await?;
+        let (missing, completed) = match status {
+            UploadStatusOutcome::Status { missing, completed, .. } => (missing, completed),
+            UploadStatusOutcome::SessionGone => return Err(Error::UploadSessionGone),
+        };
+        if completed {
+            // complete 成功但回执丢了：直接再要一次结果（§3.3.1，与 proxy 面同口径）。
+            return self.complete_upload(&client, &base, token, mime_type, cek_b64).await;
+        }
+
+        let mut todo = parts_from_missing(&missing, part_size, total_parts);
+        let file = std::fs::File::open(sealed_cache).ok();
+        let read_piece = |offset: u64, len: u64| -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; len as usize];
+            if let Some(f) = file.as_ref() {
+                use std::os::unix::fs::FileExt;
+                if f.read_exact_at(&mut buf, offset).is_ok() {
+                    return Ok(buf);
+                }
+            }
+            let start = offset as usize;
+            let end = start + len as usize;
+            if end > blob.len() {
+                return Err(Error::Storage(
+                    "sealed blob shorter than the session total".to_string(),
+                ));
+            }
+            Ok(blob[start..end].to_vec())
+        };
+
+        // 进度按「已传字节 / 总字节」算，与 proxy 面同一口径：UI 不需要知道数据面。
+        let done_bytes = |remaining: &[u32]| -> u64 {
+            let left: u64 = remaining
+                .iter()
+                .map(|n| part_range(*n, part_size, total).1)
+                .sum();
+            total.saturating_sub(left)
+        };
+        self.emit_upload_progress(
+            local_message_id,
+            UploadProgress { uploaded: done_bytes(&todo), total },
+        );
+
+        // 🔴 失败预算与 proxy 面一致：算「自上次有进展以来」，不是每片各算一份。
+        let mut failures_since_progress = 0u32;
+        while let Some(&part_number) = todo.first() {
+            let (offset, len) = part_range(part_number, part_size, total);
+            let bytes = read_piece(offset, len)?;
+            let digest = crate::resumable_upload::chunk_digest(&bytes);
+
+            match self
+                .put_part_direct(&client, &base, token, part_number, bytes, &digest)
+                .await
+            {
+                PartOutcome::Ok => {
+                    todo.remove(0);
+                    failures_since_progress = 0;
+                    self.emit_upload_progress(
+                        local_message_id,
+                        UploadProgress { uploaded: done_bytes(&todo), total },
+                    );
+                }
+                PartOutcome::Retry => {
+                    failures_since_progress += 1;
+                    if failures_since_progress > CHUNK_RETRIES {
+                        return Err(Error::Transport(format!(
+                            "S3 分片上传连续 {failures_since_progress} 次没有进展（part={part_number}）"
+                        )));
+                    }
+                    tokio::time::sleep(retry_delay(failures_since_progress)).await;
+                }
+                // 会话没了/已关闭：续传状态作废，交回上层重新申请**同模式** token
+                // （§8 判据 18：绝不改申请 proxy）。
+                PartOutcome::SessionGone => return Err(Error::UploadSessionGone),
+                PartOutcome::Fatal(msg) => return Err(Error::Transport(msg)),
+            }
+        }
+
+        self.complete_upload(&client, &base, token, mime_type, cek_b64).await
+    }
+
+    /// 签一张预签名 URL 并把这一片直传对象存储。
+    ///
+    /// 两次网络往返合成一个动作：签发失败与直传失败对调用方是同一件事——这一片没成。
+    /// 🔴 `required_headers` 必须原样回传：checksum/加密头都签进了签名，少一个就 403。
+    async fn put_part_direct(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        token: &str,
+        part_number: u32,
+        bytes: Vec<u8>,
+        digest_hex: &str,
+    ) -> PartOutcome {
+        use crate::resumable_upload::verdict_for_code;
+        use crate::resumable_upload::ChunkVerdict;
+
+        let body = serde_json::json!({
+            "parts": [{
+                "part_number": part_number,
+                "content_length": bytes.len() as u64,
+                "checksum_sha256_hex": digest_hex,
+            }]
+        });
+        let resp = self
+            .with_upload_token(client.post(format!("{base}/part-url")), token)
+            .json(&body)
+            .send()
+            .await;
+        let Ok(resp) = resp else {
+            return PartOutcome::Retry;
+        };
+        let is_server_error = resp.status().is_server_error();
+        let json = match resp.json::<serde_json::Value>().await {
+            Ok(j) => j,
+            Err(_) if is_server_error => return PartOutcome::Retry,
+            Err(e) => return PartOutcome::Fatal(format!("part-url 响应无法解析: {e}")),
+        };
+        let code = json["code"].as_u64().unwrap_or(0) as u32;
+        if code != 0 {
+            return match verdict_for_code(code) {
+                ChunkVerdict::RetryChunk | ChunkVerdict::Resync => PartOutcome::Retry,
+                ChunkVerdict::StartOver | ChunkVerdict::RestartUpload => PartOutcome::SessionGone,
+                ChunkVerdict::Ok => PartOutcome::Ok,
+                ChunkVerdict::Fatal => PartOutcome::Fatal(format!(
+                    "part-url 签发失败: code={code} {}",
+                    json["message"].as_str().unwrap_or("")
+                )),
+            };
+        }
+        let Some(signed) = json["data"]["parts"].as_array().and_then(|a| a.first()) else {
+            return PartOutcome::Fatal("part-url 响应缺少 parts".to_string());
+        };
+        let Some(url) = signed["url"].as_str() else {
+            return PartOutcome::Fatal("part-url 响应缺少 url".to_string());
+        };
+
+        let mut put = client.put(url).body(bytes);
+        if let Some(headers) = signed["required_headers"].as_object() {
+            for (k, v) in headers {
+                if let Some(v) = v.as_str() {
+                    put = put.header(k.as_str(), v);
+                }
+            }
+        }
+        match put.send().await {
+            // 直传是裸 S3：没有 code 信封，只有 HTTP 状态。
+            Ok(r) if r.status().is_success() => PartOutcome::Ok,
+            // 403 多半是 URL 过期：重签一次即可，不是终局。
+            Ok(r) if r.status().as_u16() == 403 || r.status().is_server_error() => {
+                PartOutcome::Retry
+            }
+            Ok(r) => PartOutcome::Fatal(format!("直传 S3 失败: HTTP {}", r.status())),
+            Err(_) => PartOutcome::Retry,
+        }
+    }
+
     async fn fetch_upload_status(
         &self,
         client: &reqwest::Client,
@@ -25284,6 +25535,9 @@ mod chunked_upload_plan_tests {
             upload_url: "http://cdn/api/app/files".to_string(),
             base_unit: 65536,
             expires_at: 0,
+            transport: TRANSPORT_PROXY_OFFSET_V1.to_string(),
+            part_size: None,
+            total_parts: None,
         }
     }
 
@@ -25318,8 +25572,8 @@ mod chunked_upload_plan_tests {
         async fn upload(&mut self, _t: &FileRequestUploadTokenResponse, _p: &SealedPayload) -> Result<UploadedFileInfo> {
             panic!("大文件不该走整包 upload");
         }
-        fn chunked_threshold(&self) -> Option<usize> {
-            Some(4)
+        fn uses_chunked_orchestration(&self) -> bool {
+            true
         }
         async fn prepare_chunked(&mut self, digest: &str, size: usize, force: bool) -> Result<ChunkedPrepared> {
             let n = self.prepares.len();
