@@ -1201,11 +1201,23 @@ impl LocalStore {
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         conn.execute(
+            // 🔴 pts 在建行时就填「本会话当前的 pts 水位」（SDK_ENTITY_MODEL_SPEC §2.6.2）。
+            //
+            // 未确认的消息本来没有 pts。留 0 的话它在 pts 排序里永远是最小值，会窜到
+            // 会话顶端；旧版为了躲这一点把「未确认」整组压到列表末尾，于是**早上发失败
+            // 的消息会排在晚上收到的消息后面**——位置由「确认与否」决定，而不是由它发生
+            // 的时刻决定。
+            //
+            // 填成建行那一刻的水位，它就锚在「当时已有的最后一条」之后：早上失败的留在
+            // 早上，刚发出的因为水位最高自然落在末尾。两种表现都不用特判，也不依赖时钟
+            // （时钟倒退/乱序到达的防护仍由 pts 主序提供，见 display-order fixture）。
             "INSERT INTO message (
                 server_message_id, channel_id, channel_type, from_uid, type, content,
                 status, created_at, updated_at, searchable_word, local_message_id, setting, extra,
-                mime_type, media_downloaded, thumb_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                mime_type, media_downloaded, thumb_status, pts
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                       COALESCE((SELECT MAX(pts) FROM message
+                                  WHERE channel_id = ?2 AND channel_type = ?3), 0))",
             params![
                 Option::<i64>::None,
                 input.channel_id as i64,
@@ -1254,11 +1266,23 @@ impl LocalStore {
             .transaction()
             .map_err(|e| Error::Storage(format!("create+enqueue begin tx: {e}")))?;
         tx.execute(
+            // 🔴 pts 在建行时就填「本会话当前的 pts 水位」（SDK_ENTITY_MODEL_SPEC §2.6.2）。
+            //
+            // 未确认的消息本来没有 pts。留 0 的话它在 pts 排序里永远是最小值，会窜到
+            // 会话顶端；旧版为了躲这一点把「未确认」整组压到列表末尾，于是**早上发失败
+            // 的消息会排在晚上收到的消息后面**——位置由「确认与否」决定，而不是由它发生
+            // 的时刻决定。
+            //
+            // 填成建行那一刻的水位，它就锚在「当时已有的最后一条」之后：早上失败的留在
+            // 早上，刚发出的因为水位最高自然落在末尾。两种表现都不用特判，也不依赖时钟
+            // （时钟倒退/乱序到达的防护仍由 pts 主序提供，见 display-order fixture）。
             "INSERT INTO message (
                 server_message_id, channel_id, channel_type, from_uid, type, content,
                 status, created_at, updated_at, searchable_word, local_message_id, setting, extra,
-                mime_type, media_downloaded, thumb_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                mime_type, media_downloaded, thumb_status, pts
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                       COALESCE((SELECT MAX(pts) FROM message
+                                  WHERE channel_id = ?2 AND channel_type = ?3), 0))",
             params![
                 Option::<i64>::None,
                 input.channel_id as i64,
@@ -1962,9 +1986,9 @@ impl LocalStore {
                  LEFT JOIN message_extra me ON me.message_id = m.id
                  WHERE m.channel_id = ?1 AND m.channel_type = ?2
                  ORDER BY
+                     COALESCE(m.pts, 0) DESC,
                      CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END DESC,
-                     m.pts DESC,
-                     m.server_message_id DESC,
+                     COALESCE(m.server_message_id, 0) DESC,
                      m.id DESC
                  LIMIT ?3 OFFSET ?4",
             )
@@ -1998,12 +2022,13 @@ impl LocalStore {
         after_limit: usize,
     ) -> Result<Vec<StoredMessage>> {
         let conn = self.conn_for_user(uid)?;
-        // anchor 的排序键（显示排序元组：pending 组, pts, server_message_id, id）
+        // anchor 的排序键（显示排序元组：pts, pending 组, server_message_id, id）
         let anchor_key: Option<(i64, i64, i64, i64)> = conn
             .query_row(
                 "SELECT
+                    COALESCE(pts, 0),
                     CASE WHEN COALESCE(server_message_id, 0) <= 0 THEN 1 ELSE 0 END,
-                    COALESCE(pts, 0), COALESCE(server_message_id, 0), id
+                    COALESCE(server_message_id, 0), id
                  FROM message
                  WHERE channel_id = ?1 AND channel_type = ?2 AND server_message_id = ?3
                  LIMIT 1",
@@ -2030,8 +2055,9 @@ impl LocalStore {
                     m.mime_type, m.media_downloaded, m.thumb_status,
                     COALESCE(me.delivered, 0),
                     m.pts,
-                    CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END AS k1,
-                    COALESCE(m.pts, 0) AS k2, COALESCE(m.server_message_id, 0) AS k3, m.id AS k4
+                    COALESCE(m.pts, 0) AS k1,
+                    CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END AS k2,
+                    COALESCE(m.server_message_id, 0) AS k3, m.id AS k4
              FROM message m
              LEFT JOIN message_extra me ON me.message_id = m.id
              WHERE m.channel_id = ?1 AND m.channel_type = ?2 AND ?3 >= 0";
@@ -2429,9 +2455,9 @@ impl LocalStore {
                  -- 预览行选择必须与 list_messages 显示排序同构（spec §2.5）：
                  -- pending 最新端；已确认按 pts；到达序会在乱序补投时选中旧消息。
                  ORDER BY
+                     COALESCE(m.pts, 0) DESC,
                      CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END DESC,
-                     m.pts DESC,
-                     m.server_message_id DESC,
+                     COALESCE(m.server_message_id, 0) DESC,
                      m.id DESC
                  LIMIT 1
              )
@@ -2609,9 +2635,9 @@ impl LocalStore {
                        AND m.channel_type = c.channel_type
                      -- 同 get_channel_by_id：预览行选择与显示排序同构（spec §2.5）
                      ORDER BY
+                         COALESCE(m.pts, 0) DESC,
                          CASE WHEN COALESCE(m.server_message_id, 0) <= 0 THEN 1 ELSE 0 END DESC,
-                         m.pts DESC,
-                         m.server_message_id DESC,
+                         COALESCE(m.server_message_id, 0) DESC,
                          m.id DESC
                      LIMIT 1
                  )
@@ -6424,6 +6450,78 @@ mod tests {
                 .expect("peek at due")
                 .len(),
             1
+        );
+    }
+
+    /// 发送失败的消息留在它当时的位置（微信/Telegram 口径）。
+    ///
+    /// 回归的是线上现象：早上发失败的一条视频排在了晚上收到的图片之后。旧版把
+    /// 「未确认」整组压到列表末尾，位置由确认与否决定而不是由发生时刻决定。
+    /// 现在本地消息建行时就锚住当时的 pts 水位。
+    #[test]
+    fn a_failed_message_keeps_the_position_it_was_sent_at() {
+        let store = test_store();
+        let uid = "10003-order";
+        let (cid, ctype) = (100u64, 1i32);
+
+        let remote = |smid: u64, pts: i64, ts: i64, body: &str| UpsertRemoteMessageInput {
+            server_message_id: smid,
+            local_message_id: 0,
+            channel_id: cid,
+            channel_type: ctype,
+            timestamp: ts,
+            from_uid: 200,
+            message_type: 1,
+            content: body.to_string(),
+            status: 2,
+            searchable_word: String::new(),
+            setting: 0,
+            pts,
+            order_seq: pts,
+            extra: "{}".to_string(),
+            timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
+            mime_type: None,
+            revoked: false,
+        };
+
+        // 早上的一条已确认消息。
+        store
+            .upsert_remote_message_with_result(uid, &remote(900001, 5, 1_700_000_000_000, "早上的消息"))
+            .expect("morning");
+
+        // 紧接着发一条，失败了：拿不到 server_message_id，但锚住了当时的水位 pts=5。
+        store
+            .create_local_message(
+                uid,
+                &NewMessage {
+                    channel_id: cid,
+                    channel_type: ctype,
+                    from_uid: 200,
+                    message_type: 1,
+                    content: "失败的视频".to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: "{}".to_string(),
+                    mime_type: None,
+                    media_downloaded: false,
+                    thumb_status: 0,
+                },
+                123_456,
+            )
+            .expect("failed local message");
+
+        // 晚上又收到一条，pts 更大。
+        store
+            .upsert_remote_message_with_result(uid, &remote(900002, 9, 1_700_000_600_000, "晚上的图片"))
+            .expect("evening");
+
+        let page = store.list_messages(uid, cid, ctype, 10, 0).expect("list");
+        let order: Vec<&str> = page.iter().map(|m| m.content.as_str()).collect();
+        // list_messages 回 DESC（最新在前）
+        assert_eq!(
+            order,
+            vec!["晚上的图片", "失败的视频", "早上的消息"],
+            "失败的消息必须留在它发送时的位置，而不是被顶到会话末尾"
         );
     }
 
