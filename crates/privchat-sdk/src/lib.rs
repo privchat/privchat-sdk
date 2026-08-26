@@ -2018,20 +2018,40 @@ pub(crate) fn is_attachment_message_type(message_type: i32) -> bool {
     )
 }
 
-/// 从已存消息的 content 取回可重传的本地文件路径。首发失败的附件其 content 仍是本地
-/// 路径（可能带 `file://` 前缀）；已上传成功的消息 content 是 caption，不是路径，这时
-/// 返回 None，调用方按「源文件缺失」处理。
-pub(crate) fn attachment_local_path(content: &str) -> Option<String> {
+/// 取回一条附件消息可重传的本地文件。已上传成功的消息 content 是 caption，不是路径，
+/// 这时返回 None，调用方按「源文件缺失」处理。
+///
+/// 🔴 **content 里的绝对路径不是权威来源。** 托管附件的位置由 `message_id` +
+/// `created_at` 推导（`{user_root}/files/{yyyymm}/{message_id}/`，Spec §7.5）；
+/// content 里那条绝对路径只覆盖「用户刚选完、SDK 还没接手」这一小段。iOS 的数据
+/// 容器 UUID 在重装/迁移后会变，固化进 content 的路径当场失效，而托管文件原地没动。
+/// 认死那条路径，用户看到的是「视频没了、重试也没用」，其实一个字节都没少。
+///
+/// 次序：content 指的文件还在就用它（那是用户选的原件，最贴近其意图），否则按 spec
+/// 推导本条消息自己的目录，再不行就把失效路径重挂到当前 root。
+pub(crate) fn attachment_local_path(
+    content: &str,
+    user_root: &std::path::Path,
+    message_id: u64,
+    created_at_ms: i64,
+) -> Option<String> {
     let raw = content.strip_prefix("file://").unwrap_or(content);
+    let from_content = std::path::Path::new(raw);
+    if !raw.is_empty() && from_content.is_absolute() && from_content.is_file() {
+        return Some(raw.to_string());
+    }
+
+    let derived = media_store::get_message_dir(user_root, message_id as i64, created_at_ms);
+    if let Some(file) = media_store::find_primary_file(&derived) {
+        return Some(file.display().to_string());
+    }
+
     if raw.is_empty() {
         return None;
     }
-    let path = std::path::Path::new(raw);
-    if path.is_absolute() && path.is_file() {
-        Some(raw.to_string())
-    } else {
-        None
-    }
+    media_store::reanchor_managed_path(from_content, user_root)
+        .filter(|p| p.is_file())
+        .map(|p| p.display().to_string())
 }
 
 fn outbound_queue_ready(
@@ -12651,10 +12671,17 @@ impl State {
     ///
     /// 判据用路径而不是另存一份标记：这个区分本身就是真的，不需要再维护一份可能
     /// 与事实不符的元数据。
+    ///
+    /// 路径可能带着**已经失效的沙盒前缀**（iOS 容器 UUID 重装/迁移后会变），这时
+    /// 重挂到当前 root 再判——文件还在托管树里，坏的只是 content 里那串前缀。
+    /// 重挂后要求文件真的存在：挂不实的路径不能算「接手后的成品」。
     fn managed_source_path(content: &str, user_root: &std::path::Path) -> Option<std::path::PathBuf> {
         let path = content.strip_prefix("file://").unwrap_or(content);
         let path = std::path::Path::new(path);
-        path.starts_with(user_root.join("files")).then(|| path.to_path_buf())
+        if path.starts_with(user_root.join("files")) {
+            return Some(path.to_path_buf());
+        }
+        media_store::reanchor_managed_path(path, user_root).filter(|p| p.exists())
     }
 
     fn source_is_already_managed(content: &str, user_root: &std::path::Path) -> bool {
@@ -12667,19 +12694,33 @@ impl State {
         local_message_id: u64,
         payload: Vec<u8>,
     ) -> Result<SendMessageResponse> {
-        // 命令里不带文件字节。附件由 SDK 托管在本地，`message.content` 就是它的
-        // 路径——把几十上百 MB 复制进 SQLite 只是同一份数据存两遍，还要跟着事务
-        // 一起写。空 payload 因此是**正常情况**：从托管路径读。
+        let storage_paths = self.storage.get_storage_paths().await?;
+        let user_root = PathBuf::from(&storage_paths.user_root);
+
+        // 命令里不带文件字节。附件由 SDK 托管在本地——把几十上百 MB 复制进 SQLite
+        // 只是同一份数据存两遍，还要跟着事务一起写。空 payload 因此是**正常情况**：
+        // 从托管路径读。
+        //
+        // 位置走 `attachment_local_path`，不直接信 content 里那串绝对路径：容器
+        // UUID 变过之后它就是坏的，而文件按 spec 推导得出来。
         //
         // 旧 sled 队列里的项内嵌了字节，搬过来后仍然带着，按原样发。
         let payload = if payload.is_empty() {
-            let path = message
-                .content
-                .strip_prefix("file://")
-                .unwrap_or(&message.content);
+            let path = attachment_local_path(
+                &message.content,
+                &user_root,
+                message.message_id,
+                message.created_at,
+            )
+            .ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "attachment source missing for message {}",
+                    message.message_id
+                ))
+            })?;
             // 异步读：单 actor 跑着收消息、同步和事件发布，几十上百 MB 的
             // 附件用同步读会把这些一起卡住。
-            tokio::fs::read(path).await.map_err(|e| {
+            tokio::fs::read(&path).await.map_err(|e| {
                 Error::InvalidState(format!("attachment source unreadable at {path}: {e}"))
             })?
         } else {
@@ -12712,8 +12753,6 @@ impl State {
         let file_type =
             Self::guess_file_type(message.message_type, &filename, &mime_type).to_string();
 
-        let storage_paths = self.storage.get_storage_paths().await?;
-        let user_root = PathBuf::from(&storage_paths.user_root);
         let files_dir =
             media_store::get_message_dir(&user_root, message.message_id as i64, message.created_at);
         std::fs::create_dir_all(&files_dir)
@@ -18399,8 +18438,14 @@ impl PrivchatSdk {
             .ok_or_else(|| Error::InvalidState(format!("message not found: {message_id}")))?;
 
         if is_attachment_message_type(msg.message_type) {
-            let path = attachment_local_path(&msg.content)
-                .ok_or(Error::AttachmentSourceMissing { message_id })?;
+            let user_root = PathBuf::from(self.user_storage_paths().await?.user_root);
+            let path = attachment_local_path(
+                &msg.content,
+                &user_root,
+                msg.message_id,
+                msg.created_at,
+            )
+            .ok_or(Error::AttachmentSourceMissing { message_id })?;
             // 只证明源文件此刻可读，**不把字节读进来**：drain 会在真正发送时
             // 从这条托管路径读盘（payload 为空即走该分支）。把几十上百 MB 复制
             // 进 outbox 的 BLOB 列，等于同一份数据存两遍，还要跟着事务一起写。
@@ -25190,6 +25235,103 @@ mod ack_before_cache_release_tests {
             cache.exists() && cache.with_extension("sealed.json").exists(),
             "发送成功后清掉密文，等于自己发过的附件永远秒传不了"
         );
+    }
+}
+
+/// 附件本体的位置由 spec 推导，不由 content 里那串绝对路径决定。
+#[cfg(test)]
+mod attachment_local_path_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-alp-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_micros()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// 2026-08 现场：`message.id=24` 的 content 指向容器 `854ED157`，库已经搬到
+    /// `47AD7B80`，而 `files/202608/24/payload.mov` 就在新容器里躺着。
+    ///
+    /// 🔴 认死 content 那条路径 = 重试永远报「源文件缺失」，用户看到「视频没了」，
+    /// 其实一个字节都没少。
+    #[test]
+    fn a_stale_container_path_still_resolves_to_the_managed_file() {
+        let root = scratch("stale");
+        let user_root = root.join("new-container/users/100000003");
+        let dir = user_root.join("files/202608/24");
+        std::fs::create_dir_all(&dir).expect("managed dir");
+        std::fs::write(dir.join("payload.mov"), vec![7u8; 128]).expect("payload");
+
+        let stale = "file:///old-container/users/100000003/files/202608/24/payload.mov";
+        assert_eq!(
+            attachment_local_path(stale, &user_root, 24, 1_787_625_582_581),
+            Some(dir.join("payload.mov").display().to_string()),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// content 路径还有效时用它：那是用户选的原件，最贴近其意图。
+    #[test]
+    fn a_live_content_path_wins() {
+        let root = scratch("live");
+        let user_root = root.join("users/100000003");
+        std::fs::create_dir_all(&user_root).expect("user root");
+        let picked = root.join("from-camera-roll.mov");
+        std::fs::write(&picked, vec![1u8; 64]).expect("picked");
+
+        assert_eq!(
+            attachment_local_path(
+                &format!("file://{}", picked.display()),
+                &user_root,
+                24,
+                1_787_625_582_581
+            ),
+            Some(picked.display().to_string()),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// content 是 caption（已上传成功）且托管目录里什么都没有 → 确实没有可重传的源。
+    #[test]
+    fn a_caption_with_no_managed_file_is_a_missing_source() {
+        let root = scratch("caption");
+        let user_root = root.join("users/100000003");
+        std::fs::create_dir_all(&user_root).expect("user root");
+
+        assert_eq!(
+            attachment_local_path("[视频]", &user_root, 24, 1_787_625_582_581),
+            None
+        );
+        assert_eq!(
+            attachment_local_path("", &user_root, 24, 1_787_625_582_581),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 已上传成功的消息 content 是 caption，但本条消息的托管目录里还留着原件——
+    /// 那就是可重传的源，按 spec 推导得出来。
+    #[test]
+    fn a_caption_still_finds_the_file_by_id_and_time() {
+        let root = scratch("derive");
+        let user_root = root.join("users/100000003");
+        let dir = user_root.join("files/202608/24");
+        std::fs::create_dir_all(&dir).expect("managed dir");
+        std::fs::write(dir.join("payload.mov"), vec![3u8; 256]).expect("payload");
+
+        assert_eq!(
+            attachment_local_path("[视频]", &user_root, 24, 1_787_625_582_581),
+            Some(dir.join("payload.mov").display().to_string()),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

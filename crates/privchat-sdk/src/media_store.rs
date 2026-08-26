@@ -33,6 +33,30 @@ pub fn get_canonical_message_dir(
     get_message_dir(&user_root, message_id, created_at_ms)
 }
 
+/// 把一条带**旧沙盒前缀**的托管路径重挂到当前 `user_root`。
+///
+/// iOS 的 App 数据容器 UUID 在重装/迁移之后会变。落库时固化下来的绝对路径随之
+/// 失效，而文件本身一直在 `{user_root}/files/{yyyymm}/{message_id}/`（Spec §7.5）
+/// 原地没动——路径坏了，附件没坏。
+///
+/// 判据是 `users/{uid}/files/…` 这一段，且 `uid` 必须与 `user_root` 的末段相同：
+/// 别人账号目录下的同形路径不能被挪到自己名下。匹配取**最后一处**，因为容器路径
+/// 本身也可能含有 `users` 段。
+pub fn reanchor_managed_path(path: &Path, user_root: &Path) -> Option<PathBuf> {
+    if path.starts_with(user_root) {
+        return Some(path.to_path_buf());
+    }
+    let uid = user_root.file_name()?;
+    let comps: Vec<_> = path.components().collect();
+    let hit = (0..comps.len().saturating_sub(2)).rfind(|&i| {
+        comps[i].as_os_str() == "users"
+            && comps[i + 1].as_os_str() == uid
+            && comps[i + 2].as_os_str() == "files"
+    })?;
+    let tail: PathBuf = comps[hit + 2..].iter().collect();
+    Some(user_root.join(tail))
+}
+
 /// Ensure the attachment directory exists and return its path.
 /// Used when downloading/saving new attachments.
 pub fn ensure_attachment_dir(
@@ -269,7 +293,7 @@ fn ext_from_known_mime(mime: &str) -> Option<String> {
 
 /// Helper: Find the "primary" file in a directory.
 /// Strategy: Ignore thumb/meta/JSON. If one file, return it. If multiple, return the largest one.
-fn find_primary_file(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_primary_file(dir: &Path) -> Option<PathBuf> {
     if let Ok(entries) = fs::read_dir(dir) {
         let mut candidates: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
@@ -350,6 +374,67 @@ fn find_primary_file(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+
+#[cfg(test)]
+mod reanchor_tests {
+    use super::*;
+
+    /// 🔴 iOS 容器 UUID 变了之后，固化在 content 里的绝对路径全体失效。
+    ///
+    /// 现场就是这样：`message.id=24` 的 content 指向容器 `854ED157`，而库已经搬到
+    /// `47AD7B80`；`files/202608/24/payload.mov` 1.6MB 好端端躺在新容器里。
+    /// 认死那条绝对路径 = 用户看到「视频没了」，其实一个字节都没少。
+    #[test]
+    fn a_stale_container_prefix_is_remapped_onto_the_current_root() {
+        let user_root = Path::new("/C/Application/47AD7B80/Documents/privchat_data/users/100000003");
+        let stale = Path::new(
+            "/C/Application/854ED157/Documents/privchat_data/users/100000003/files/202608/24/payload.mov",
+        );
+        assert_eq!(
+            reanchor_managed_path(stale, user_root),
+            Some(user_root.join("files/202608/24/payload.mov")),
+        );
+    }
+
+    /// 已经在当前 root 底下的路径原样返回。
+    #[test]
+    fn a_current_path_is_returned_unchanged() {
+        let user_root = Path::new("/data/users/100001");
+        let p = user_root.join("files/202608/42/payload.mp4");
+        assert_eq!(reanchor_managed_path(&p, user_root), Some(p.clone()));
+    }
+
+    /// 🔴 uid 必须对得上。别人账号目录下的同形路径挪到自己名下，等于把 A 的附件
+    /// 当成 B 的发出去。
+    #[test]
+    fn another_users_directory_is_never_adopted() {
+        let user_root = Path::new("/data/users/100001");
+        for path in [
+            "/old/users/100002/files/202608/42/payload.mp4",
+            "/private/var/mobile/Media/DCIM/100APPLE/IMG_0001.MOV",
+            "/tmp/whatever.mp4",
+        ] {
+            assert_eq!(
+                reanchor_managed_path(Path::new(path), user_root),
+                None,
+                "{path} 不该被重挂到当前账号"
+            );
+        }
+    }
+
+    /// 容器路径里自己也可能出现 `users` 段，取最后一处才不会挂错。
+    #[test]
+    fn the_last_users_segment_wins() {
+        let user_root = Path::new("/Users/dev/sim/Documents/privchat_data/users/100000003");
+        let stale = Path::new(
+            "/Users/dev/old/Documents/privchat_data/users/100000003/files/202608/24/payload.mov",
+        );
+        assert_eq!(
+            reanchor_managed_path(stale, user_root),
+            Some(user_root.join("files/202608/24/payload.mov")),
+        );
+    }
+}
 
 #[cfg(test)]
 mod primary_file_tests {
