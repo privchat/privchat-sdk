@@ -6525,6 +6525,98 @@ mod tests {
         );
     }
 
+    /// 回填迁移：修复前写进库的未确认消息也要归位。
+    ///
+    /// 建行时锚定 pts 只对新行生效。存量行 pts=0，在 pts 主序下会窜到会话顶端——
+    /// 比修复前压在末尾更糟。这里模拟一条存量行（pts 手动清 0），跑一遍回填 SQL，
+    /// 断言它落回「同会话中比它早的最后一条已确认消息」之后。
+    #[test]
+    fn the_backfill_puts_legacy_pending_rows_back_in_place() {
+        let store = test_store();
+        let uid = "10003-backfill";
+        let (cid, ctype) = (100u64, 1i32);
+
+        let remote = |smid: u64, pts: i64, ts: i64, body: &str| UpsertRemoteMessageInput {
+            server_message_id: smid,
+            local_message_id: 0,
+            channel_id: cid,
+            channel_type: ctype,
+            timestamp: ts,
+            from_uid: 200,
+            message_type: 1,
+            content: body.to_string(),
+            status: 2,
+            searchable_word: String::new(),
+            setting: 0,
+            pts,
+            order_seq: pts,
+            extra: "{}".to_string(),
+            timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
+            mime_type: None,
+            revoked: false,
+        };
+
+        store
+            .upsert_remote_message_with_result(uid, &remote(900001, 5, 1_700_000_000_000, "早上的消息"))
+            .expect("morning");
+        let legacy = store
+            .create_local_message(
+                uid,
+                &NewMessage {
+                    channel_id: cid,
+                    channel_type: ctype,
+                    from_uid: 200,
+                    message_type: 1,
+                    content: "存量失败消息".to_string(),
+                    searchable_word: String::new(),
+                    setting: 0,
+                    extra: "{}".to_string(),
+                    mime_type: None,
+                    media_downloaded: false,
+                    thumb_status: 0,
+                },
+                123_456,
+            )
+            .expect("legacy local row");
+        store
+            .upsert_remote_message_with_result(uid, &remote(900002, 9, 1_700_000_600_000, "晚上的图片"))
+            .expect("evening");
+
+        let conn = store.conn_for_user(uid).expect("conn");
+        // 退回修复前的样子：存量行没有 pts。created_at 也压到早上与晚上之间——
+        // create_local_message 用的是当下时钟，不压的话这条行本来就是最新的，
+        // 回填锚到晚上那条反而是对的，测不到要测的东西。
+        conn.execute(
+            "UPDATE message SET pts = 0, created_at = ?2 WHERE id = ?1",
+            params![legacy as i64, 1_700_000_300_000i64],
+        )
+        .expect("clear pts");
+
+        // 迁移里的那条回填（与 V20260826090000 逐字一致）。
+        conn.execute(
+            "UPDATE message
+                SET pts = COALESCE(
+                    (SELECT MAX(m2.pts) FROM message m2
+                      WHERE m2.channel_id = message.channel_id
+                        AND m2.channel_type = message.channel_type
+                        AND COALESCE(m2.server_message_id, 0) > 0
+                        AND m2.created_at <= message.created_at),
+                    0)
+              WHERE COALESCE(server_message_id, 0) <= 0
+                AND COALESCE(pts, 0) = 0",
+            [],
+        )
+        .expect("backfill");
+
+        let page = store.list_messages(uid, cid, ctype, 10, 0).expect("list");
+        let order: Vec<&str> = page.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["晚上的图片", "存量失败消息", "早上的消息"],
+            "回填后存量失败消息应落在早上那条之后、晚上那条之前"
+        );
+    }
+
     #[test]
     fn mark_message_sent_merges_duplicate_server_row_into_local_row() {
         let store = test_store();
