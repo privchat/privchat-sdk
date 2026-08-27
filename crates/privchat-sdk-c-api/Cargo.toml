@@ -7,6 +7,10 @@ authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Stable C ABI bindings for the PrivChat SDK (C / C++ / Godot consumers)"
+# examples/capi_full is a STANDALONE cargo workspace that links the built
+# cdylib like a real C/C++ host (see its build.rs); it must not be compiled
+# as an in-crate example target.
+autoexamples = false
 
 [lib]
 crate-type = ["staticlib", "cdylib", "lib"]

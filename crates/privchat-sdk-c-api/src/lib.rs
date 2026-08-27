@@ -57,7 +57,9 @@ fn clear_last_error() {
 }
 
 /// Last error message on this thread; NULL when the last call succeeded.
-/// Pointer stays valid until the next failing c-api call on the same thread.
+/// The pointer is invalidated by the NEXT c-api call on the same thread —
+/// successful calls clear (free) the stored message too. Callers must copy
+/// the string before making any further c-api call. Do not free it.
 #[no_mangle]
 pub extern "C" fn privchat_capi_last_error() -> *const c_char {
     LAST_ERROR.with(|cell| {
@@ -613,8 +615,11 @@ pub unsafe extern "C" fn privchat_capi_transfer(
     };
     let body_bytes = body.into_bytes();
     let sdk = client.sdk.clone();
-    match block_on_timeout(client, timeout_ms, async move {
-        sdk.transfer(channel_id, route, body_bytes, timeout_ms).await
+    // Resolve the 0-means-default rule ONCE so the inner SDK timeout matches
+    // the outer bridge timeout instead of receiving a literal 0.
+    let effective_ms = resolve_timeout(timeout_ms).as_millis() as u64;
+    match block_on_timeout(client, effective_ms, async move {
+        sdk.transfer(channel_id, route, body_bytes, effective_ms).await
     }) {
         Ok(reply) => {
             let data_value = match std::str::from_utf8(&reply.data) {
@@ -661,6 +666,236 @@ pub unsafe extern "C" fn privchat_capi_rpc_call(
         Err((_, msg)) => {
             set_last_error(msg);
             ptr::null_mut()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversation history / channel list / read state
+//
+// Local-first mirrors of the UniFFI surface (MESSAGE_HISTORY spec
+// SDK-HISTORY-5/7): local SQLite is the render source of truth; the SDK
+// decides when to hydrate from the server and persists the gap watermark.
+// ---------------------------------------------------------------------------
+
+/// Open a conversation (mirrors FFI `open_conversation`, SDK-HISTORY-7):
+/// local rows are the render truth; when local is empty the SDK hydrates one
+/// LATEST window. Empty conversations return an empty list (no placeholder).
+/// Returns JSON `{"messages":[StoredMessage,...],"has_more_before":bool,
+/// "fetched_from_server":bool}`, NULL on failure.
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_open_conversation(
+    handle: *const PrivchatCapiClient,
+    channel_id: u64,
+    channel_type: i32,
+    limit: u32,
+    timeout_ms: u64,
+) -> *mut c_char {
+    let client = guard_client!(handle, ptr::null_mut());
+    let sdk = client.sdk.clone();
+    match block_on_timeout(client, timeout_ms, async move {
+        sdk.open_conversation(channel_id, channel_type, limit).await
+    }) {
+        Ok(page) => into_c_string(
+            serde_json::json!({
+                "messages": page.messages,
+                "has_more_before": page.has_more_before,
+                "fetched_from_server": page.fetched_from_server,
+            })
+            .to_string(),
+        ),
+        Err((_, msg)) => {
+            set_last_error(msg);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Scroll-up paging (mirrors FFI `load_older_history`, SDK-HISTORY-5):
+/// local-first, the server only fills gaps; the gap watermark is persisted by
+/// the SDK, so `has_more_before=false` means "top reached" across sessions.
+/// Returns JSON `{"messages":[StoredMessage,...],"has_more_before":bool}`.
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_load_older_history(
+    handle: *const PrivchatCapiClient,
+    channel_id: u64,
+    channel_type: i32,
+    before_server_message_id: u64,
+    limit: u32,
+    timeout_ms: u64,
+) -> *mut c_char {
+    let client = guard_client!(handle, ptr::null_mut());
+    let sdk = client.sdk.clone();
+    match block_on_timeout(client, timeout_ms, async move {
+        sdk.load_older_history(channel_id, channel_type, before_server_message_id, limit)
+            .await
+    }) {
+        Ok(page) => into_c_string(
+            serde_json::json!({
+                "messages": page.messages,
+                "has_more_before": page.has_more_before,
+            })
+            .to_string(),
+        ),
+        Err((_, msg)) => {
+            set_last_error(msg);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Pure local page read (mirrors FFI `list_messages`); no network.
+/// Returns JSON `[StoredMessage,...]`, NULL on failure.
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_list_messages(
+    handle: *const PrivchatCapiClient,
+    channel_id: u64,
+    channel_type: i32,
+    limit: u64,
+    offset: u64,
+    timeout_ms: u64,
+) -> *mut c_char {
+    let client = guard_client!(handle, ptr::null_mut());
+    let sdk = client.sdk.clone();
+    match block_on_timeout(client, timeout_ms, async move {
+        sdk.list_messages(channel_id, channel_type, limit as usize, offset as usize)
+            .await
+    }) {
+        Ok(messages) => json_to_c_string(&messages),
+        Err((_, msg)) => {
+            set_last_error(msg);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Local conversation list (mirrors FFI `list_channels`; note the FFI's
+/// `get_channel_list_entries(page, page_size)` alias forwards its args as
+/// (limit, offset) — this ABI uses the honest core names). Each entry is a
+/// `StoredChannel` carrying `unread_count`/`top`/`mute`/`last_msg_timestamp`/
+/// `last_msg_content`, i.e. everything a sorted badge list needs.
+/// Returns JSON `[StoredChannel,...]`, NULL on failure.
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_list_channels(
+    handle: *const PrivchatCapiClient,
+    limit: u64,
+    offset: u64,
+    timeout_ms: u64,
+) -> *mut c_char {
+    let client = guard_client!(handle, ptr::null_mut());
+    let sdk = client.sdk.clone();
+    match block_on_timeout(client, timeout_ms, async move {
+        sdk.list_channels(limit as usize, offset as usize).await
+    }) {
+        Ok(channels) => json_to_c_string(&channels),
+        Err((_, msg)) => {
+            set_last_error(msg);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Advance the read cursor (mirrors FFI `mark_read_to_pts`): RPC
+/// `message/status/read_pts` then project the server-confirmed cursor into
+/// the local store (projection failure is non-fatal, same as the FFI).
+/// `out_last_read_pts` receives the server-accepted pts.
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_mark_read_to_pts(
+    handle: *const PrivchatCapiClient,
+    channel_id: u64,
+    read_pts: u64,
+    timeout_ms: u64,
+    out_last_read_pts: *mut u64,
+) -> i32 {
+    let client = guard_client!(handle, PRIVCHAT_CAPI_ERR_INVALID_ARG);
+    let sdk = client.sdk.clone();
+    match block_on_timeout(client, timeout_ms, async move {
+        let body = serde_json::json!({
+            "channel_id": channel_id,
+            "read_pts": read_pts,
+        })
+        .to_string();
+        let resp = sdk
+            .rpc_call("message/status/read_pts".to_string(), body)
+            .await?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| privchat_sdk::Error::Serialization(format!("read_pts resp: {e}")))?;
+        let last_read_pts = v["last_read_pts"].as_u64().ok_or_else(|| {
+            privchat_sdk::Error::Serialization(format!("read_pts resp missing last_read_pts: {resp}"))
+        })?;
+        // Same fallback as the FFI's resolve_channel_type: unknown -> direct.
+        let channel_type = match sdk.get_channel_by_id(channel_id).await {
+            Ok(Some(ch)) => ch.channel_type,
+            _ => 1,
+        };
+        let _ = sdk
+            .project_channel_read_cursor(channel_id, channel_type, last_read_pts)
+            .await;
+        Ok(last_read_pts)
+    }) {
+        Ok(last_read_pts) => {
+            if !out_last_read_pts.is_null() {
+                *out_last_read_pts = last_read_pts;
+            }
+            PRIVCHAT_CAPI_OK
+        }
+        Err((code, msg)) => {
+            set_last_error(msg);
+            code
+        }
+    }
+}
+
+/// Per-channel unread count (mirrors FFI `get_channel_unread_count`; local).
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_get_channel_unread_count(
+    handle: *const PrivchatCapiClient,
+    channel_id: u64,
+    channel_type: i32,
+    timeout_ms: u64,
+    out_count: *mut i32,
+) -> i32 {
+    let client = guard_client!(handle, PRIVCHAT_CAPI_ERR_INVALID_ARG);
+    let sdk = client.sdk.clone();
+    match block_on_timeout(client, timeout_ms, async move {
+        sdk.get_channel_unread_count(channel_id, channel_type).await
+    }) {
+        Ok(count) => {
+            if !out_count.is_null() {
+                *out_count = count;
+            }
+            PRIVCHAT_CAPI_OK
+        }
+        Err((code, msg)) => {
+            set_last_error(msg);
+            code
+        }
+    }
+}
+
+/// Global unread badge (mirrors FFI `get_total_unread_count`; local).
+/// `exclude_muted != 0` skips muted channels.
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_get_total_unread_count(
+    handle: *const PrivchatCapiClient,
+    exclude_muted: i32,
+    timeout_ms: u64,
+    out_count: *mut i32,
+) -> i32 {
+    let client = guard_client!(handle, PRIVCHAT_CAPI_ERR_INVALID_ARG);
+    let sdk = client.sdk.clone();
+    match block_on_timeout(client, timeout_ms, async move {
+        sdk.get_total_unread_count(exclude_muted != 0).await
+    }) {
+        Ok(count) => {
+            if !out_count.is_null() {
+                *out_count = count;
+            }
+            PRIVCHAT_CAPI_OK
+        }
+        Err((code, msg)) => {
+            set_last_error(msg);
+            code
         }
     }
 }
@@ -767,6 +1002,19 @@ mod tests {
             );
             assert!(last_error_string().contains("null client handle"));
 
+            assert_eq!(
+                privchat_capi_mark_read_to_pts(null, 1, 1, 10, ptr::null_mut()),
+                PRIVCHAT_CAPI_ERR_INVALID_ARG
+            );
+            assert_eq!(
+                privchat_capi_get_channel_unread_count(null, 1, 1, 10, ptr::null_mut()),
+                PRIVCHAT_CAPI_ERR_INVALID_ARG
+            );
+            assert_eq!(
+                privchat_capi_get_total_unread_count(null, 0, 10, ptr::null_mut()),
+                PRIVCHAT_CAPI_ERR_INVALID_ARG
+            );
+
             // Pointer-returning entry points must yield NULL, not crash.
             assert!(privchat_capi_connection_state(null, 10).is_null());
             assert!(privchat_capi_session_snapshot(null, 10).is_null());
@@ -776,6 +1024,10 @@ mod tests {
             assert!(privchat_capi_get_message_by_id(null, 1, 10).is_null());
             assert!(privchat_capi_transfer(null, 1, route.as_ptr(), route.as_ptr(), 10).is_null());
             assert!(privchat_capi_rpc_call(null, route.as_ptr(), route.as_ptr(), 10).is_null());
+            assert!(privchat_capi_open_conversation(null, 1, 1, 10, 10).is_null());
+            assert!(privchat_capi_load_older_history(null, 1, 1, 0, 10, 10).is_null());
+            assert!(privchat_capi_list_messages(null, 1, 1, 10, 0, 10).is_null());
+            assert!(privchat_capi_list_channels(null, 10, 0, 10).is_null());
         }
     }
 
@@ -871,6 +1123,13 @@ mod tests {
             "privchat_capi_get_message_by_id",
             "privchat_capi_transfer",
             "privchat_capi_rpc_call",
+            "privchat_capi_open_conversation",
+            "privchat_capi_load_older_history",
+            "privchat_capi_list_messages",
+            "privchat_capi_list_channels",
+            "privchat_capi_mark_read_to_pts",
+            "privchat_capi_get_channel_unread_count",
+            "privchat_capi_get_total_unread_count",
         ];
         for name in EXPORTS {
             assert!(

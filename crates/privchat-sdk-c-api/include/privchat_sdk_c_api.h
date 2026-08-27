@@ -27,8 +27,10 @@ typedef struct PrivchatCapiClient PrivchatCapiClient;
 PrivchatCapiClient* privchat_capi_client_create(const char* config_json);
 void privchat_capi_client_destroy(PrivchatCapiClient* client);
 
-// Last error on this thread; NULL when the last call succeeded. Valid until
-// the next failing c-api call on the same thread. Do not free.
+// Last error on this thread; NULL when the last call succeeded. The pointer
+// is invalidated by the NEXT c-api call on the same thread (successful calls
+// clear the stored message too) — copy it before calling anything else.
+// Do not free.
 const char* privchat_capi_last_error(void);
 
 void privchat_capi_free_string(char* s);
@@ -82,6 +84,50 @@ char* privchat_capi_events_since(PrivchatCapiClient* client,
 // JSON StoredMessage, JSON "null" when not found.
 char* privchat_capi_get_message_by_id(PrivchatCapiClient* client, uint64_t message_id,
                                       uint64_t timeout_ms);
+
+// --- conversation history / channel list / read state ----------------------
+// Local-first mirrors of the UniFFI surface: local SQLite is the render
+// source of truth; the SDK decides when to hydrate from the server and
+// persists the history-gap watermark.
+
+// Open a conversation: local rows first; when local is empty the SDK hydrates
+// one LATEST window. Returns JSON
+// {"messages":[StoredMessage,...],"has_more_before":bool,"fetched_from_server":bool}.
+char* privchat_capi_open_conversation(PrivchatCapiClient* client, uint64_t channel_id,
+                                      int32_t channel_type, uint32_t limit,
+                                      uint64_t timeout_ms);
+
+// Scroll-up paging; has_more_before=false means top reached (persisted).
+// Returns JSON {"messages":[StoredMessage,...],"has_more_before":bool}.
+char* privchat_capi_load_older_history(PrivchatCapiClient* client, uint64_t channel_id,
+                                       int32_t channel_type,
+                                       uint64_t before_server_message_id,
+                                       uint32_t limit, uint64_t timeout_ms);
+
+// Pure local page read (no network). Returns JSON [StoredMessage,...].
+char* privchat_capi_list_messages(PrivchatCapiClient* client, uint64_t channel_id,
+                                  int32_t channel_type, uint64_t limit,
+                                  uint64_t offset, uint64_t timeout_ms);
+
+// Local conversation list; entries carry unread_count/top/mute/
+// last_msg_timestamp/last_msg_content for sorted badge lists.
+// Returns JSON [StoredChannel,...].
+char* privchat_capi_list_channels(PrivchatCapiClient* client, uint64_t limit,
+                                  uint64_t offset, uint64_t timeout_ms);
+
+// Advance the read cursor: RPC message/status/read_pts, then project the
+// server-confirmed cursor locally. out_last_read_pts receives the accepted pts.
+int32_t privchat_capi_mark_read_to_pts(PrivchatCapiClient* client, uint64_t channel_id,
+                                       uint64_t read_pts, uint64_t timeout_ms,
+                                       uint64_t* out_last_read_pts);
+
+// Unread counters (local). exclude_muted != 0 skips muted channels.
+int32_t privchat_capi_get_channel_unread_count(PrivchatCapiClient* client,
+                                               uint64_t channel_id, int32_t channel_type,
+                                               uint64_t timeout_ms, int32_t* out_count);
+int32_t privchat_capi_get_total_unread_count(PrivchatCapiClient* client,
+                                             int32_t exclude_muted, uint64_t timeout_ms,
+                                             int32_t* out_count);
 
 // --- transfer / rpc --------------------------------------------------------
 
