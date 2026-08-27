@@ -789,22 +789,6 @@ pub enum ResumeEscalationScope {
     FullRebuild,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MediaProcessOp {
-    Thumbnail,
-    Compress,
-}
-
-pub type VideoProcessHook = Arc<
-    dyn Fn(
-            MediaProcessOp,
-            &std::path::Path,
-            &std::path::Path,
-            &std::path::Path,
-        ) -> std::result::Result<bool, String>
-        + Send
-        + Sync,
->;
 
 /// Plan 2 媒体作业结果。Kotlin/iOS 宿主完成工作后，通过
 /// [`PrivchatSdk::submit_media_job_result`] 回传。`ok=true` 时 `output_path`
@@ -814,6 +798,11 @@ pub struct MediaJobResult {
     pub ok: bool,
     pub output_path: Option<String>,
     pub error: Option<String>,
+    /// 媒体的**显示**宽高（已按旋转摆正）。宿主拿得到就填——它手上有原始 asset，
+    /// 比 Core 从首帧图反推准确（首帧会被缩放，只保得住比例）。缺省则 Core 回退到
+    /// 解首帧（Spec §3.8.3 的取值次序）。
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// 网址预览抓取结果（应用层实现）：URL → 标题 / 描述 / 本地缩略图文件路径。
@@ -2881,10 +2870,6 @@ enum Command {
     InboundDisconnected {
         epoch: u64,
     },
-    SetVideoProcessHook {
-        hook: Option<VideoProcessHook>,
-        resp: oneshot::Sender<Result<()>>,
-    },
     SetLinkPreviewHook {
         hook: Option<LinkPreviewHook>,
         resp: oneshot::Sender<Result<()>>,
@@ -3873,7 +3858,6 @@ struct State {
     last_sync_queued: usize,
     last_sync_dropped_duplicates: usize,
     last_sync_entity_events: Vec<SdkEvent>,
-    video_process_hook: Option<VideoProcessHook>,
     link_preview_hook: Option<LinkPreviewHook>,
     last_tmp_cleanup_day: Option<String>,
     pending_events: Vec<SdkEvent>,
@@ -12693,6 +12677,81 @@ impl State {
     ///
     /// 目录不同也顺带保证了 source_thumb ≠ canonical_thumb：`fs::copy` 不会把缩略图
     /// 拷给它自己（那会先截断目标，重试一次就把上次的有效缩略图清成 0 字节）。
+    /// Plan 2 异步媒体作业：发 `MediaJobRequested` 给宿主，阻塞等它 `submit_media_job_result`。
+    ///
+    /// 🔴 **媒体加工只能走这条路，不能同步回调宿主。** 同步 hook 从 actor 线程发起会死锁
+    /// （2026-08-28 iOS 实测：Rust 打完 "calling Compress hook" 之后宿主一行日志都没有，
+    /// 附件永远停在「发送中」；Android 上是 JNI local ref table 被打崩）。这里线程控制权
+    /// 在宿主侧，没有反向 trampoline。
+    ///
+    /// 超时/失败/宿主没实现都返回 `None`，调用方按「这一步没做成」继续——媒体加工是
+    /// 增强，不该把整条发送拖垮。
+    async fn run_media_job(
+        &self,
+        job_kind: &str,
+        source_path: &std::path::Path,
+        output_path: &std::path::Path,
+        mime_type: &str,
+        message_id: u64,
+        timeout_ms: u64,
+    ) -> Option<MediaJobResult> {
+        self.event_tx.as_ref()?;
+        let job_id = self
+            .snowflake
+            .next_id()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|_| {
+                chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0)
+                    .to_string()
+            });
+        let (job_tx, job_rx) = oneshot::channel::<MediaJobResult>();
+        {
+            let mut locked = self
+                .pending_media_jobs
+                .lock()
+                .expect("pending_media_jobs poisoned");
+            locked.insert(job_id.clone(), job_tx);
+        }
+        let event = SdkEvent::MediaJobRequested {
+            job_id: job_id.clone(),
+            job_kind: job_kind.to_string(),
+            source_path: source_path.display().to_string(),
+            output_path: output_path.display().to_string(),
+            mime_type: mime_type.to_string(),
+            message_id,
+            timeout_ms,
+        };
+        if let (Some(tx), Some(history), Some(seq)) = (
+            self.event_tx.as_ref(),
+            self.event_history.as_ref(),
+            self.event_seq.as_ref(),
+        ) {
+            emit_sequenced_event(tx, history, seq, self.event_history_limit, event);
+        }
+        let wait = tokio::time::timeout(Duration::from_millis(timeout_ms), job_rx).await;
+        // 任何出口都要清表：宿主可能在超时之后才回传。
+        if let Ok(mut locked) = self.pending_media_jobs.lock() {
+            locked.remove(&job_id);
+        }
+        match wait {
+            Ok(Ok(result)) if result.ok => Some(result),
+            Ok(Ok(result)) => {
+                eprintln!(
+                    "[SDK.media] job {job_kind} failed: {}",
+                    result.error.as_deref().unwrap_or("unspecified")
+                );
+                None
+            }
+            Ok(Err(_)) => None,
+            Err(_) => {
+                eprintln!("[SDK.media] job {job_kind} timed out after {timeout_ms}ms");
+                None
+            }
+        }
+    }
+
     fn inherited_managed_dir(
         content: &str,
         user_root: &std::path::Path,
@@ -12900,7 +12959,9 @@ impl State {
             //
             // 压缩目前没有对应的 job_kind，等同不压缩上传——与此前行为一致（宿主的
             // Compress 分支本来就直接返回 false）。
-
+            // 压缩**不在这里做**：宿主在发送前就已经转码（见 app 的 `prepareForSending`
+            // → `VideoTranscoder.transcodeForSending`），交给 SDK 的已经是压好的文件。
+            // 在这里再挂一个 `video_compress` 作业等于压两遍。
             let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
             let thumb_scratch = files_dir.join("thumb.src.jpg");
             let mut hook_used = false;
@@ -12945,118 +13006,68 @@ impl State {
                 ));
             }
             // 缩略图同样只走 Plan 2（见上）。这里不再有同步 hook 分支。
-            // Plan 2: no sync hook registered → issue an async media job to the host
-            // (Kotlin/iOS) and block on a oneshot. `submit_media_job_result` bypasses
-            // the actor command channel because the actor is blocked here.
-            if !hook_used && self.event_tx.is_some() {
+            if !hook_used {
                 const VIDEO_THUMBNAIL_TIMEOUT_MS: u64 = 8_000;
-                let job_id = self
-                    .snowflake
-                    .next_id()
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|_| {
-                        chrono::Utc::now()
-                            .timestamp_nanos_opt()
-                            .unwrap_or(0)
-                            .to_string()
-                    });
-                let (job_tx, job_rx) = oneshot::channel::<MediaJobResult>();
+                if let Some(result) = self
+                    .run_media_job(
+                        "video_thumbnail",
+                        &body_path,
+                        &thumb_scratch,
+                        &mime_type,
+                        message.message_id,
+                        VIDEO_THUMBNAIL_TIMEOUT_MS,
+                    )
+                    .await
                 {
-                    let mut locked = self
-                        .pending_media_jobs
-                        .lock()
-                        .expect("pending_media_jobs poisoned");
-                    locked.insert(job_id.clone(), job_tx);
-                }
-                let event = SdkEvent::MediaJobRequested {
-                    job_id: job_id.clone(),
-                    job_kind: "video_thumbnail".to_string(),
-                    source_path: body_path.display().to_string(),
-                    output_path: thumb_scratch.display().to_string(),
-                    mime_type: mime_type.clone(),
-                    message_id: message.message_id,
-                    timeout_ms: VIDEO_THUMBNAIL_TIMEOUT_MS,
-                };
-                if let (Some(tx), Some(history), Some(seq)) = (
-                    self.event_tx.as_ref(),
-                    self.event_history.as_ref(),
-                    self.event_seq.as_ref(),
-                ) {
-                    emit_sequenced_event(tx, history, seq, self.event_history_limit, event);
-                }
-                let wait =
-                    tokio::time::timeout(Duration::from_millis(VIDEO_THUMBNAIL_TIMEOUT_MS), job_rx)
-                        .await;
-                // Clear the entry on any exit path — host may submit after timeout.
-                if let Ok(mut locked) = self.pending_media_jobs.lock() {
-                    locked.remove(&job_id);
-                }
-                match wait {
-                    Ok(Ok(result)) if result.ok => {
-                        let out = result
-                            .output_path
-                            .as_deref()
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|| thumb_scratch.clone());
-                        if out.exists() {
-                            // Spec §3.8.3：视频必须带**摆正后**的显示宽高。
-                            //
-                            // 首帧由宿主带 `appliesPreferredTrackTransform` 生成，方向已经
-                            // 是对的，它的宽高比就是该显示的比例。
-                            //
-                            // 🔴 少了这一步，wire 里 width/height 是 0，接收端算不出宽高比，
-                            // 只能退回默认竖版气泡——横屏视频被塞进竖框。
-                            if let Ok(frame) = Self::decode_image_oriented(&out) {
-                                source_width = Some(frame.width());
-                                source_height = Some(frame.height());
+                    let out = result
+                        .output_path
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| thumb_scratch.clone());
+                    if out.exists() {
+                        match (result.width, result.height) {
+                            (Some(w), Some(h)) if w > 0 && h > 0 => {
+                                source_width = Some(w);
+                                source_height = Some(h);
                             }
-                            match Self::generate_image_thumbnail_sync(
-                                &out,
-                                &canonical_thumb,
-                                320,
-                                85,
-                            ) {
-                                Ok(_) => {
-                                    hook_used = true;
-                                    let _ = self
-                                        .storage
-                                        .update_thumb_status(message.message_id, 1)
-                                        .await;
-                                    thumb_upload = Some((
-                                        canonical_thumb.clone(),
-                                        "image/webp".to_string(),
-                                        media_store::THUMB_FILENAME.to_string(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "[SDK.video] plan2 re-encode thumbnail to webp failed: {e}"
-                                    );
+                            _ => {
+                                if let Ok(frame) = Self::decode_image_oriented(&out) {
+                                    source_width = Some(frame.width());
+                                    source_height = Some(frame.height());
                                 }
                             }
-                        } else {
-                            eprintln!(
-                                "[SDK.video] plan2 host reported ok but {} missing",
-                                out.display()
-                            );
                         }
-                        let _ = std::fs::remove_file(&thumb_scratch);
-                    }
-                    Ok(Ok(result)) => {
+                        match Self::generate_image_thumbnail_sync(
+                            &out,
+                            &canonical_thumb,
+                            320,
+                            85,
+                        ) {
+                            Ok(_) => {
+                                hook_used = true;
+                                let _ = self
+                                    .storage
+                                    .update_thumb_status(message.message_id, 1)
+                                    .await;
+                                thumb_upload = Some((
+                                    canonical_thumb.clone(),
+                                    "image/webp".to_string(),
+                                    media_store::THUMB_FILENAME.to_string(),
+                                ));
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[SDK.video] plan2 re-encode thumbnail to webp failed: {e}"
+                                );
+                            }
+                        }
+                    } else {
                         eprintln!(
-                            "[SDK.video] plan2 host failed job {job_id}: {}",
-                            result.error.unwrap_or_else(|| "unknown".to_string())
+                            "[SDK.video] plan2 host reported ok but {} missing",
+                            out.display()
                         );
                     }
-                    Ok(Err(_)) => {
-                        eprintln!("[SDK.video] plan2 job {job_id} sender dropped");
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "[SDK.video] plan2 job {job_id} timed out after {}ms",
-                            VIDEO_THUMBNAIL_TIMEOUT_MS
-                        );
-                    }
+                    let _ = std::fs::remove_file(&thumb_scratch);
                 }
             }
             if !hook_used {
@@ -13779,7 +13790,6 @@ impl PrivchatSdk {
                 last_sync_queued: 0,
                 last_sync_dropped_duplicates: 0,
                 last_sync_entity_events: Vec::new(),
-                video_process_hook: None,
                 link_preview_hook: None,
                 last_tmp_cleanup_day: None,
                 pending_events: Vec::new(),
@@ -14643,10 +14653,6 @@ impl PrivchatSdk {
                                 SdkEvent::ConnectionStateChanged { from, to },
                             );
                         }
-                    }
-                    Command::SetVideoProcessHook { hook, resp } => {
-                        state.video_process_hook = hook;
-                        let _ = resp.send(Ok(()));
                     }
                     Command::SetLinkPreviewHook { hook, resp } => {
                         state.link_preview_hook = hook;
@@ -17615,18 +17621,6 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-    pub async fn set_video_process_hook(&self, hook: Option<VideoProcessHook>) -> Result<()> {
-        self.ensure_running()?;
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(Command::SetVideoProcessHook {
-                hook,
-                resp: resp_tx,
-            })
-            .await
-            .map_err(|_| self.actor_channel_error())?;
-        resp_rx.await.map_err(|_| self.actor_channel_error())?
-    }
 
     /// Plan 2 媒体作业回传。宿主（Kotlin/iOS）收到 `SdkEvent::MediaJobRequested`
     /// 处理完成后调用此接口。直接操作共享 `pending_media_jobs` 表、不经 actor
@@ -20846,7 +20840,6 @@ mod tests {
             last_sync_queued: 0,
             last_sync_dropped_duplicates: 0,
             last_sync_entity_events: Vec::new(),
-            video_process_hook: None,
             link_preview_hook: None,
             last_tmp_cleanup_day: None,
             pending_events: Vec::new(),

@@ -183,8 +183,7 @@ use privchat_sdk::{
     ConnectionState as SdkConnectionState, ContactCardMessageInput as SdkContactCardMessageInput,
     Error as SdkError, LinkMessageInput as SdkLinkMessageInput,
     LocalAccountSummary as SdkLocalAccountSummary, LocationMessageInput as SdkLocationMessageInput,
-    LoginResult as SdkLoginResult, MediaProcessOp as SdkMediaProcessOp,
-    MentionInput as SdkMentionInput, NetworkHint as SdkNetworkHint, NewMessage as SdkNewMessage,
+    LoginResult as SdkLoginResult,     MentionInput as SdkMentionInput, NetworkHint as SdkNetworkHint, NewMessage as SdkNewMessage,
     PresenceStatus as SdkPresenceStatus, PrivchatConfig as SdkConfig, PrivchatSdk as InnerSdk,
     QueueMessage as SdkQueueMessage, SequencedSdkEvent as SdkSequencedSdkEvent,
     ServerEndpoint as SdkServerEndpoint, SessionSnapshot as SdkSessionSnapshot,
@@ -204,7 +203,7 @@ use privchat_sdk::{
     UpsertGroupMemberInput as SdkUpsertGroupMemberInput,
     UpsertMessageReactionInput as SdkUpsertMessageReactionInput,
     UpsertReminderInput as SdkUpsertReminderInput, UpsertUserInput as SdkUpsertUserInput,
-    UserStoragePaths as SdkUserStoragePaths, VideoProcessHook as SdkVideoProcessHook,
+    UserStoragePaths as SdkUserStoragePaths, 
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -343,23 +342,6 @@ pub struct AvatarCacheResult {
 pub struct SeenByEntry {
     pub user_id: u64,
     pub read_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum MediaProcessOp {
-    Thumbnail,
-    Compress,
-}
-
-#[uniffi::export(callback_interface)]
-pub trait VideoProcessHook: Send + Sync {
-    fn process(
-        &self,
-        op: MediaProcessOp,
-        source_path: String,
-        meta_path: String,
-        output_path: String,
-    ) -> Result<bool, PrivchatFfiError>;
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1632,6 +1614,10 @@ pub struct MediaJobResult {
     pub ok: bool,
     pub output_path: Option<String>,
     pub error: Option<String>,
+    /// 媒体的**显示**宽高（已按旋转摆正）。宿主拿得到就填，Core 优先用它；
+    /// 缺省则 Core 回退到解首帧（Spec §3.8.3）。
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -9167,44 +9153,6 @@ impl PrivchatClient {
         None
     }
 
-    pub async fn set_video_process_hook(
-        &self,
-        hook: Option<Box<dyn VideoProcessHook>>,
-    ) -> Result<(), PrivchatFfiError> {
-        let hook_registered = hook.is_some();
-        let sdk_hook: Option<SdkVideoProcessHook> = hook.map(|h| {
-            let h: Arc<dyn VideoProcessHook> = Arc::from(h);
-            Arc::new(
-                move |op: SdkMediaProcessOp,
-                      source_path: &std::path::Path,
-                      meta_path: &std::path::Path,
-                      output_path: &std::path::Path| {
-                    let op_ffi = match op {
-                        SdkMediaProcessOp::Thumbnail => MediaProcessOp::Thumbnail,
-                        SdkMediaProcessOp::Compress => MediaProcessOp::Compress,
-                    };
-                    h.process(
-                        op_ffi,
-                        source_path.to_string_lossy().to_string(),
-                        meta_path.to_string_lossy().to_string(),
-                        output_path.to_string_lossy().to_string(),
-                    )
-                    .map_err(|e| format!("{e}"))
-                },
-            ) as SdkVideoProcessHook
-        });
-        self.inner
-            .set_video_process_hook(sdk_hook)
-            .await
-            .map_err(PrivchatFfiError::from)?;
-        self.video_process_hook_registered
-            .store(hook_registered, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub async fn remove_video_process_hook(&self) -> Result<(), PrivchatFfiError> {
-        self.set_video_process_hook(None).await
-    }
 
     /// Plan 2：宿主处理完 `SdkEvent::MediaJobRequested` 后回传结果。
     pub fn submit_media_job_result(
@@ -9216,6 +9164,8 @@ impl PrivchatClient {
             ok: result.ok,
             output_path: result.output_path,
             error: result.error,
+            width: result.width,
+            height: result.height,
         };
         self.inner
             .submit_media_job_result(job_id, inner)
