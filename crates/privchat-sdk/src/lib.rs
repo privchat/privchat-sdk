@@ -12684,8 +12684,23 @@ impl State {
         media_store::reanchor_managed_path(path, user_root).filter(|p| p.exists())
     }
 
-    fn source_is_already_managed(content: &str, user_root: &std::path::Path) -> bool {
-        Self::managed_source_path(content, user_root).is_some()
+    /// 「接手后的成品」的目录——只有来自**别的消息**才算（Spec §3.8.2）。
+    ///
+    /// 🔴 判据不能是「路径在不在托管树里」。宿主的 `materialize` 在 finalize **之前**
+    /// 就把源文件拷进了本条消息自己的 canonical 目录，所以 content 永远指向托管树内，
+    /// 那个判据恒为真。视频缩略图就是这么没的：恒真 → 走「已接手，不再生成」分支 →
+    /// 后面的 hook 调用和异步兜底两条全跳过 → `thumb_status` 永远是 3。
+    ///
+    /// 目录不同也顺带保证了 source_thumb ≠ canonical_thumb：`fs::copy` 不会把缩略图
+    /// 拷给它自己（那会先截断目标，重试一次就把上次的有效缩略图清成 0 字节）。
+    fn inherited_managed_dir(
+        content: &str,
+        user_root: &std::path::Path,
+        own_dir: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        Self::managed_source_path(content, user_root)
+            .and_then(|source| source.parent().map(|dir| dir.to_path_buf()))
+            .filter(|dir| dir != own_dir)
     }
 
     async fn process_outbound_file(
@@ -12765,6 +12780,9 @@ impl State {
         let mut upload_payload = payload;
         let mut upload_filename = filename.clone();
         let mut body_size = upload_payload.len() as u64;
+
+        let inherited_source_dir =
+            Self::inherited_managed_dir(&message.content, &user_root, &files_dir);
 
         let mut source_width = None;
         let mut source_height = None;
@@ -12863,33 +12881,33 @@ impl State {
             //
             // 判据是路径而不是另存一份标记：用户刚从相册选的文件在托管目录外，
             // 收到并落盘的在里面，这个区分本身就是真的。
-            let source_is_managed = Self::source_is_already_managed(&message.content, &user_root);
+            // 判据见 `inherited_managed_dir`（Spec §3.8.2）。
+            let source_is_managed = inherited_source_dir.is_some();
             if source_is_managed {
                 eprintln!(
                     "[SDK.actor] process_outbound_file: source already managed, skipping re-compress"
                 );
             }
-            if let Some(hook) = self.video_process_hook.as_ref().filter(|_| !source_is_managed) {
-                // Hook writes compressed output in place to `payload.{ext}`.
-                // On failure the implementation must leave the file untouched.
-                let compressed_ok =
-                    hook(MediaProcessOp::Compress, &body_path, &meta_path, &body_path)
-                        .map_err(|e| Error::Storage(format!("video compress hook failed: {e}")))?;
-                if compressed_ok {
-                    upload_payload = std::fs::read(&body_path).map_err(|e| {
-                        Error::Storage(format!("read compressed video failed: {e}"))
-                    })?;
-                    body_size = upload_payload.len() as u64;
-                    upload_filename = filename.clone();
-                }
-            }
+            // 🔴 **不在这里调同步 hook。**
+            //
+            // `video_process_hook` 是 Rust → 宿主的同步回调，从 actor 线程发起会**死锁**：
+            // 2026-08-28 实测 iOS 上打到 `calling Compress hook` 之后宿主侧一行日志都不再
+            // 出现，附件永远停在「发送中」。Android 上表现为 JNI local ref table 被打崩。
+            //
+            // 媒体加工统一走下面的 Plan 2 异步作业：Rust 发 `MediaJobRequested`，宿主在
+            // 自己的线程上做完再调 `submit_media_job_result` 回传。线程控制权在宿主侧，
+            // 没有反向 trampoline。
+            //
+            // 压缩目前没有对应的 job_kind，等同不压缩上传——与此前行为一致（宿主的
+            // Compress 分支本来就直接返回 false）。
 
             let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
             let thumb_scratch = files_dir.join("thumb.src.jpg");
             let mut hook_used = false;
             if source_is_managed {
-                if let Some(source_thumb) = Self::managed_source_path(&message.content, &user_root)
-                    .and_then(|source| source.parent().map(|dir| dir.join(media_store::THUMB_FILENAME)))
+                if let Some(source_thumb) = inherited_source_dir
+                    .as_ref()
+                    .map(|dir| dir.join(media_store::THUMB_FILENAME))
                     .filter(|path| path.exists())
                 {
                     std::fs::copy(&source_thumb, &canonical_thumb)
@@ -12926,43 +12944,7 @@ impl State {
                     media_store::THUMB_FILENAME.to_string(),
                 ));
             }
-            if !hook_used {
-                if let Some(hook) = self.video_process_hook.as_ref() {
-                    // Hook outputs JPEG; Rust re-encodes to canonical WebP (Spec §FILE_STORAGE).
-                    let ok = hook(
-                        MediaProcessOp::Thumbnail,
-                        &body_path,
-                        &meta_path,
-                        &thumb_scratch,
-                    )
-                    .map_err(|e| Error::Storage(format!("video thumbnail hook failed: {e}")))?;
-                    if ok && thumb_scratch.exists() {
-                        match Self::generate_image_thumbnail_sync(
-                            &thumb_scratch,
-                            &canonical_thumb,
-                            320,
-                            85,
-                        ) {
-                            Ok(_) => {
-                                hook_used = true;
-                                let _ = self
-                                    .storage
-                                    .update_thumb_status(message.message_id, 1)
-                                    .await;
-                                thumb_upload = Some((
-                                    canonical_thumb.clone(),
-                                    "image/webp".to_string(),
-                                    media_store::THUMB_FILENAME.to_string(),
-                                ));
-                            }
-                            Err(e) => {
-                                eprintln!("[SDK.video] re-encode thumbnail to webp failed: {e}");
-                            }
-                        }
-                        let _ = std::fs::remove_file(&thumb_scratch);
-                    }
-                }
-            }
+            // 缩略图同样只走 Plan 2（见上）。这里不再有同步 hook 分支。
             // Plan 2: no sync hook registered → issue an async media job to the host
             // (Kotlin/iOS) and block on a oneshot. `submit_media_job_result` bypasses
             // the actor command channel because the actor is blocked here.
@@ -13017,6 +12999,17 @@ impl State {
                             .map(std::path::PathBuf::from)
                             .unwrap_or_else(|| thumb_scratch.clone());
                         if out.exists() {
+                            // Spec §3.8.3：视频必须带**摆正后**的显示宽高。
+                            //
+                            // 首帧由宿主带 `appliesPreferredTrackTransform` 生成，方向已经
+                            // 是对的，它的宽高比就是该显示的比例。
+                            //
+                            // 🔴 少了这一步，wire 里 width/height 是 0，接收端算不出宽高比，
+                            // 只能退回默认竖版气泡——横屏视频被塞进竖框。
+                            if let Ok(frame) = Self::decode_image_oriented(&out) {
+                                source_width = Some(frame.width());
+                                source_height = Some(frame.height());
+                            }
                             match Self::generate_image_thumbnail_sync(
                                 &out,
                                 &canonical_thumb,
@@ -25340,19 +25333,54 @@ mod attachment_local_path_tests {
 mod already_managed_source_tests {
     use super::*;
 
+    /// 转发/重发一份收到的附件：源在**别的消息**的目录下，算接手后的成品。
     #[test]
-    fn a_received_attachment_counts_as_managed() {
+    fn another_messages_directory_counts_as_inherited() {
         let root = std::path::Path::new("/data/users/100001");
-        // 收到并落盘的附件就在这个位置（media_store::get_message_dir）。
-        assert!(State::source_is_already_managed(
-            "/data/users/100001/files/202608/42/payload.mp4",
-            root
-        ));
+        let own = root.join("files/202608/43");
+        let source_dir = root.join("files/202608/42");
+
+        assert_eq!(
+            State::inherited_managed_dir(
+                "/data/users/100001/files/202608/42/payload.mp4",
+                root,
+                &own,
+            ),
+            Some(source_dir.clone()),
+        );
         // file:// 前缀是同一份东西。
-        assert!(State::source_is_already_managed(
-            "file:///data/users/100001/files/202608/42/payload.mp4",
-            root
-        ));
+        assert_eq!(
+            State::inherited_managed_dir(
+                "file:///data/users/100001/files/202608/42/payload.mp4",
+                root,
+                &own,
+            ),
+            Some(source_dir),
+        );
+    }
+
+    /// 🔴 **本条消息自己的目录不算「接手后的成品」**（Spec §3.8.2）。
+    ///
+    /// 宿主的 `materialize` 在 finalize 之前就把用户新选的文件拷进了本条消息自己的
+    /// canonical 目录，所以 content 永远落在托管树内。按「在不在托管树里」判就恒为真，
+    /// 于是每条新发的视频都被当成成品：缩略图 hook 从不执行，`thumb_status` 永远是 3，
+    /// 接收端只能画默认占位；宽高也一并没有。
+    ///
+    /// 这条测试钉死那个恒真。
+    #[test]
+    fn a_freshly_materialized_file_is_not_inherited() {
+        let root = std::path::Path::new("/data/users/100001");
+        let own = root.join("files/202608/42");
+
+        assert_eq!(
+            State::inherited_managed_dir(
+                "/data/users/100001/files/202608/42/payload.mp4",
+                root,
+                &own,
+            ),
+            None,
+            "materialize 拷进自己目录的文件不是接手后的成品",
+        );
     }
 
     /// 🔴 用户刚选的文件必须照常压缩——判错这一边，所有新发的视频都不压了。
@@ -25456,15 +25484,17 @@ mod already_managed_source_tests {
     }
 
     #[test]
-    fn a_freshly_picked_file_is_not_managed() {
+    fn a_path_outside_this_account_is_not_inherited() {
         let root = std::path::Path::new("/data/users/100001");
+        let own = root.join("files/202608/43");
         for path in [
             "/private/var/mobile/Media/DCIM/100APPLE/IMG_0001.MOV",
             "/tmp/whatever.mp4",
-            "/data/users/100002/files/202608/42/payload.mp4", // 别人的目录
+            "/data/users/100002/files/202608/42/payload.mp4", // 别人的账号目录
         ] {
-            assert!(
-                !State::source_is_already_managed(path, root),
+            assert_eq!(
+                State::inherited_managed_dir(path, root, &own),
+                None,
                 "{path} 不该被当成接手后的成品"
             );
         }
