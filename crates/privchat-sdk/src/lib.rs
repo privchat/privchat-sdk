@@ -2018,6 +2018,23 @@ pub(crate) fn is_attachment_message_type(message_type: i32) -> bool {
 ///
 /// 次序：content 指的文件还在就用它（那是用户选的原件，最贴近其意图），否则按 spec
 /// 推导本条消息自己的目录，再不行就把失效路径重挂到当前 root。
+/// 把「本次上传」的进度折算成「这条附件整体」的进度。
+///
+/// `span = (已完成字节, 总字节)`。缩略图和正文是两次独立上传，各自 `0→total`；不折算
+/// 的话同一条消息上的进度条会走满一次再从头来一遍，用户读不出还剩多少。
+///
+/// 总量按明文估、实际传的是密文（每段多 nonce+tag），所以要**钳到上限**——否则末尾会
+/// 报出 101%。
+fn fold_upload_progress(span: Option<(u64, u64)>, uploaded: u64, total: u64) -> (u64, u64) {
+    match span {
+        Some((done_before, grand_total)) => (
+            done_before.saturating_add(uploaded).min(grand_total),
+            grand_total,
+        ),
+        None => (uploaded, total),
+    }
+}
+
 pub(crate) fn attachment_local_path(
     content: &str,
     user_root: &std::path::Path,
@@ -3900,6 +3917,15 @@ struct State {
     /// Plan 2 共享作业表：Rust 发起 `MediaJobRequested` 时插入 oneshot sender，
     /// 宿主通过 `PrivchatSdk::submit_media_job_result` 直接（不经 actor cmd）
     /// 取出并触发。
+    /// 一条附件的**整体**上传跨度：`(已完成字节, 总字节)`。
+    ///
+    /// 🔴 缩略图和正文是两次独立上传。各报各的 `0→total` 时，同一条消息上的进度条会
+    /// 走满一次再从头来一遍——用户看到的是「传完了又倒回去」，无从判断到底还剩多少。
+    /// 设了这个跨度之后，两段折算进同一个百分比。
+    ///
+    /// 只在 `process_outbound_file` 内设置/清除；drain 是串行的，同一时刻只有一条附件
+    /// 在这条路径上。
+    upload_progress_span: Option<(u64, u64)>,
     pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>>,
     /// 投影 repair 队列（MESSAGE_PROJECTION_SPEC §2.4）。
     ///
@@ -4596,10 +4622,12 @@ impl State {
         local_message_id: &str,
         p: crate::resumable_upload::UploadProgress,
     ) {
+        let (uploaded, total) =
+            fold_upload_progress(self.upload_progress_span, p.uploaded, p.total);
         let event = SdkEvent::AttachmentUploadProgress {
             local_message_id: local_message_id.to_string(),
-            uploaded: p.uploaded,
-            total: p.total,
+            uploaded,
+            total,
         };
         if let (Some(tx), Some(history), Some(seq)) =
             (&self.event_tx, &self.event_history, &self.event_seq)
@@ -12768,6 +12796,8 @@ impl State {
         local_message_id: u64,
         payload: Vec<u8>,
     ) -> Result<SendMessageResponse> {
+        // 上一条附件若在上传中途失败，跨度会留在那儿；先清掉，别让它套到这一条身上。
+        self.upload_progress_span = None;
         let storage_paths = self.storage.get_storage_paths().await?;
         let user_root = PathBuf::from(&storage_paths.user_root);
 
@@ -13143,6 +13173,19 @@ impl State {
             message.message_id, file_type, mime_type, body_size, thumb_upload.is_some()
         );
 
+        // 缩略图 + 正文合成**一条**进度。见 `upload_progress_span`：两次上传各报各的
+        // 0→100 会让进度条走满一次再倒回去。
+        //
+        // 按明文长度估总量：实际传的是封装后的密文（每段多 nonce+tag 二十几字节），
+        // 这点差额在百分比上看不出来，`emit_upload_progress` 里做了上限钳制。
+        let thumb_plain_len = thumb_upload
+            .as_ref()
+            .and_then(|(path, _, _)| std::fs::metadata(path).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let upload_grand_total = thumb_plain_len.saturating_add(upload_payload.len() as u64);
+        self.upload_progress_span = Some((0, upload_grand_total));
+
         let uploaded_thumbnail = if let Some((thumb_path, thumb_mime, thumb_name)) = thumb_upload {
             let thumb_size = std::fs::metadata(&thumb_path)
                 .map(|m| m.len() as i64)
@@ -13176,6 +13219,8 @@ impl State {
             None
         };
 
+        // 缩略图那一段已经传完，正文从它的末尾接着走。
+        self.upload_progress_span = Some((thumb_plain_len, upload_grand_total));
         eprintln!(
             "[SDK.actor] process_outbound_file: requesting upload token for main file size={}",
             upload_payload.len()
@@ -13199,6 +13244,7 @@ impl State {
         eprintln!("[SDK.actor] process_outbound_file: upload callback");
         self.upload_callback(message.from_uid, &main_token, &uploaded)
             .await?;
+        self.upload_progress_span = None;
 
         let uploaded_file_id = uploaded.file_id.parse::<u64>().map_err(|_| {
             Error::Serialization(format!(
@@ -13814,6 +13860,7 @@ impl PrivchatSdk {
                 event_seq: Some(actor_event_seq.clone()),
                 event_history_limit: event_history_limit,
                 pending_media_jobs: actor_pending_media_jobs,
+                upload_progress_span: None,
                 repair_queue: VecDeque::new(),
                 repair_seen: HashSet::new(),
                 repair_backoff: HashMap::new(),
@@ -20800,6 +20847,7 @@ mod tests {
         let mut config = PrivchatConfig::default();
         config.data_dir = dir.display().to_string();
         let state = State {
+            upload_progress_span: None,
             attachment_transfers: Arc::new(crate::AttachmentTransferCounters::default()),
             config,
             transport: None,
@@ -25221,6 +25269,45 @@ mod ack_before_cache_release_tests {
             cache.exists() && cache.with_extension("sealed.json").exists(),
             "发送成功后清掉密文，等于自己发过的附件永远秒传不了"
         );
+    }
+}
+
+/// 缩略图 + 正文合成一条进度。
+#[cfg(test)]
+mod upload_progress_fold_tests {
+    use super::*;
+
+    /// 🔴 不折算的话，同一条消息上进度条会走满一次再从头来。
+    ///
+    /// 缩略图 20KB、正文 80KB：缩略图传完时应该是 20/100（20%），而不是 20/20（100%）。
+    #[test]
+    fn the_thumbnail_is_only_the_first_slice_of_one_bar() {
+        let span = Some((0u64, 100u64));
+        assert_eq!(fold_upload_progress(span, 0, 20), (0, 100));
+        assert_eq!(fold_upload_progress(span, 10, 20), (10, 100));
+        assert_eq!(fold_upload_progress(span, 20, 20), (20, 100), "缩略图传完 = 20%，不是 100%");
+    }
+
+    /// 正文从缩略图的末尾接着走，不从 0 重来。
+    #[test]
+    fn the_body_resumes_where_the_thumbnail_ended() {
+        let span = Some((20u64, 100u64));
+        assert_eq!(fold_upload_progress(span, 0, 80), (20, 100), "正文起点是 20% 不是 0%");
+        assert_eq!(fold_upload_progress(span, 40, 80), (60, 100));
+        assert_eq!(fold_upload_progress(span, 80, 80), (100, 100));
+    }
+
+    /// 🔴 总量按明文估，实传密文（每段多 nonce+tag）——不钳上限就会报出 >100%。
+    #[test]
+    fn ciphertext_overhead_never_pushes_it_past_full() {
+        let span = Some((20u64, 100u64));
+        assert_eq!(fold_upload_progress(span, 108, 108), (100, 100));
+    }
+
+    /// 没有跨度时（单文件上传）原样透传。
+    #[test]
+    fn without_a_span_the_single_upload_reports_itself() {
+        assert_eq!(fold_upload_progress(None, 30, 80), (30, 80));
     }
 }
 
