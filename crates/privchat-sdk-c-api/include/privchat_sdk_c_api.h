@@ -136,6 +136,25 @@ int32_t privchat_capi_get_total_unread_count(PrivchatCapiClient* client,
 char* privchat_capi_transfer(PrivchatCapiClient* client, uint64_t channel_id,
                              const char* route, const char* body, uint64_t timeout_ms);
 // Returns the server JSON body as a string.
+/* Owned byte buffer; release with privchat_capi_free_buffer.
+ * Binary-safe: embedded NUL bytes are preserved (FlatBuffers/Protobuf). */
+typedef struct PrivchatCapiBuffer {
+    uint8_t* data;
+    size_t len;
+} PrivchatCapiBuffer;
+
+/* Free a buffer produced by this library. NULL is a no-op. */
+void privchat_capi_free_buffer(PrivchatCapiBuffer* buffer);
+
+/* Binary-safe Channel Transfer. out_code receives the envelope code (0 = ok);
+ * out_reply receives the raw reply payload (release with free_buffer).
+ * Returns PRIVCHAT_CAPI_OK when the round trip completed. */
+int32_t privchat_capi_transfer_bytes(const PrivchatCapiClient* client,
+                                     uint64_t channel_id, const char* route,
+                                     const uint8_t* body, size_t body_len,
+                                     uint64_t timeout_ms, int32_t* out_code,
+                                     PrivchatCapiBuffer* out_reply);
+
 char* privchat_capi_rpc_call(PrivchatCapiClient* client, const char* route,
                              const char* body_json, uint64_t timeout_ms);
 

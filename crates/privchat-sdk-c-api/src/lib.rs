@@ -70,6 +70,47 @@ pub extern "C" fn privchat_capi_last_error() -> *const c_char {
     })
 }
 
+/// Owned byte buffer handed to the caller. Release with
+/// [`privchat_capi_free_buffer`]; `data` is NULL and `len` 0 when empty.
+/// Binary-safe: unlike the string entry points, embedded NULs are preserved,
+/// which is what FlatBuffers/Protobuf payloads require.
+#[repr(C)]
+pub struct PrivchatCapiBuffer {
+    pub data: *mut u8,
+    pub len: usize,
+}
+
+impl PrivchatCapiBuffer {
+    fn empty() -> Self {
+        Self { data: ptr::null_mut(), len: 0 }
+    }
+
+    fn from_vec(mut v: Vec<u8>) -> Self {
+        if v.is_empty() {
+            return Self::empty();
+        }
+        v.shrink_to_fit();
+        let len = v.len();
+        let data = v.as_mut_ptr();
+        std::mem::forget(v);
+        Self { data, len }
+    }
+}
+
+/// Free a buffer produced by this crate. NULL or already-empty is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_free_buffer(buffer: *mut PrivchatCapiBuffer) {
+    if buffer.is_null() {
+        return;
+    }
+    let b = &mut *buffer;
+    if !b.data.is_null() && b.len > 0 {
+        drop(Vec::from_raw_parts(b.data, b.len, b.len));
+    }
+    b.data = ptr::null_mut();
+    b.len = 0;
+}
+
 /// Free a string previously returned by this crate. NULL is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn privchat_capi_free_string(s: *mut c_char) {
@@ -642,6 +683,71 @@ pub unsafe extern "C" fn privchat_capi_transfer(
     }
 }
 
+/// Binary-safe Channel Transfer. `body`/`body_len` carry arbitrary bytes
+/// (FlatBuffers, Protobuf, ...); the reply payload is returned verbatim in
+/// `out_reply`. `out_code` receives the transfer envelope code (0 = success);
+/// the envelope message goes to the thread-local last error when non-zero.
+///
+/// Returns PRIVCHAT_CAPI_OK when the round trip completed — check `*out_code`
+/// for the business result. Caller must release `out_reply` via
+/// [`privchat_capi_free_buffer`].
+#[no_mangle]
+pub unsafe extern "C" fn privchat_capi_transfer_bytes(
+    handle: *const PrivchatCapiClient,
+    channel_id: u64,
+    route: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    timeout_ms: u64,
+    out_code: *mut i32,
+    out_reply: *mut PrivchatCapiBuffer,
+) -> i32 {
+    let client = guard_client!(handle, PRIVCHAT_CAPI_ERR_INVALID_ARG);
+    if !out_reply.is_null() {
+        *out_reply = PrivchatCapiBuffer::empty();
+    }
+    let route = match read_c_str(route) {
+        Some(r) => r,
+        None => {
+            set_last_error("route is null or invalid utf-8".to_string());
+            return PRIVCHAT_CAPI_ERR_INVALID_ARG;
+        }
+    };
+    // A zero-length body is legal (some routes take no payload); only a NULL
+    // pointer with a non-zero length is a caller bug.
+    let body_bytes: Vec<u8> = if body_len == 0 {
+        Vec::new()
+    } else if body.is_null() {
+        set_last_error("body is null but body_len > 0".to_string());
+        return PRIVCHAT_CAPI_ERR_INVALID_ARG;
+    } else {
+        std::slice::from_raw_parts(body, body_len).to_vec()
+    };
+
+    let sdk = client.sdk.clone();
+    let effective_ms = resolve_timeout(timeout_ms).as_millis() as u64;
+    match block_on_timeout(client, timeout_ms, async move {
+        sdk.transfer(channel_id, route, body_bytes, effective_ms).await
+    }) {
+        Ok(reply) => {
+            if !out_code.is_null() {
+                *out_code = reply.code;
+            }
+            if reply.code != 0 {
+                set_last_error(reply.message.clone());
+            }
+            if !out_reply.is_null() {
+                *out_reply = PrivchatCapiBuffer::from_vec(reply.data);
+            }
+            PRIVCHAT_CAPI_OK
+        }
+        Err((code, msg)) => {
+            set_last_error(msg);
+            code
+        }
+    }
+}
+
 /// Global RPC call; returns the server JSON body as a string, NULL on failure.
 #[no_mangle]
 pub unsafe extern "C" fn privchat_capi_rpc_call(
@@ -1094,6 +1200,49 @@ mod tests {
 
     /// Every exported function must be declared in the hand-maintained
     /// header; a missing declaration breaks C/C++ consumers silently.
+    /// 二进制安全:含内嵌 NUL 与非 UTF-8 字节的 body 必须原样传递,
+    /// 不得像字符串接口那样被截断/拒绝。
+    #[test]
+    fn transfer_bytes_rejects_bad_args_and_keeps_binary() {
+        let cfg = test_config_json();
+        unsafe {
+            let h = privchat_capi_client_create(cfg.as_ptr());
+            assert!(!h.is_null(), "create failed: {}", last_error_string());
+            let route = cstr("game/battle/act");
+            let mut code: i32 = -1;
+            let mut out = PrivchatCapiBuffer::empty();
+
+            // NULL body + 非零长度 = 调用方 bug
+            assert_eq!(
+                privchat_capi_transfer_bytes(h, 1, route.as_ptr(), ptr::null(), 4, 10,
+                        &mut code, &mut out),
+                PRIVCHAT_CAPI_ERR_INVALID_ARG
+            );
+            // NULL route
+            assert_eq!(
+                privchat_capi_transfer_bytes(h, 1, ptr::null(), ptr::null(), 0, 10,
+                        &mut code, &mut out),
+                PRIVCHAT_CAPI_ERR_INVALID_ARG
+            );
+            // 含 NUL 与 0xFF 的二进制 body:离线必然超时/失败,但不得因为
+            // 内容不是 UTF-8 就在参数校验阶段被拒(那才是字符串接口的毛病)。
+            let binary: [u8; 6] = [0x00, 0xFF, 0x41, 0x00, 0xFE, 0x42];
+            let rc = privchat_capi_transfer_bytes(h, 1, route.as_ptr(),
+                    binary.as_ptr(), binary.len(), 200, &mut code, &mut out);
+            assert_ne!(rc, PRIVCHAT_CAPI_ERR_INVALID_ARG,
+                    "binary body must not be rejected as an invalid argument");
+
+            privchat_capi_free_buffer(&mut out);
+            privchat_capi_free_buffer(&mut out);   // 二次释放必须是 no-op
+            privchat_capi_client_destroy(h);
+        }
+    }
+
+    #[test]
+    fn free_buffer_null_is_noop() {
+        unsafe { privchat_capi_free_buffer(ptr::null_mut()) };
+    }
+
     #[test]
     fn header_declares_every_export() {
         let header = std::fs::read_to_string(concat!(
@@ -1122,6 +1271,8 @@ mod tests {
             "privchat_capi_events_since",
             "privchat_capi_get_message_by_id",
             "privchat_capi_transfer",
+            "privchat_capi_transfer_bytes",
+            "privchat_capi_free_buffer",
             "privchat_capi_rpc_call",
             "privchat_capi_open_conversation",
             "privchat_capi_load_older_history",
