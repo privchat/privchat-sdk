@@ -27,9 +27,9 @@
 //!      `(channel_id) → service_id` with `dispatch_transfer_enabled = 1`.
 //!
 //! Without the above the demo will return:
-//!   - 20901 ChannelNotBound — binding row missing / disabled
-//!   - 20902 TransferServiceNotFound — route prefix doesn't match a service
-//!   - 20903 ServiceDisabled — service.status = 0
+//!   - 21501 ChannelNotBound — binding row missing / disabled
+//!   - 21502 TransferServiceNotFound — route prefix doesn't match a service
+//!   - 21503 ServiceDisabled — service.status = 0
 //! These are all valid responses and prove the wire/dispatch path works.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -167,17 +167,17 @@ async fn main() -> BoxResult<()> {
     println!();
     match reply.code {
         0 => println!("✓ OK — wire + relay + dispatch + handler all green."),
-        20900 => println!("× ChannelNotSubscribed — subscribe the channel first."),
-        20901 => println!(
+        21500 => println!("× ChannelNotSubscribed — subscribe the channel first."),
+        21501 => println!(
             "× ChannelNotBound — no privchat_business_channel row for channel {} (or dispatch_transfer_enabled=0).",
             channel_id
         ),
-        20902 => println!(
+        21502 => println!(
             "× TransferServiceNotFound — route prefix '{}' doesn't match any registered service.",
             route.split('/').next().unwrap_or("")
         ),
-        20903 => println!("× TransferServiceDisabled — service.status = 0."),
-        20904 => println!("× TransferCallbackFailed — external callback URL unreachable."),
+        21503 => println!("× TransferServiceDisabled — service.status = 0."),
+        21504 => println!("× TransferCallbackFailed — external callback URL unreachable."),
         c if c >= 20000 => println!("× business code {} — handler returned this; not a framework error.", c),
         c => println!("× code {} — see ERROR_CODE_SPEC for segment ownership.", c),
     }
