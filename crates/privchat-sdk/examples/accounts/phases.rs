@@ -4112,7 +4112,7 @@ impl TestPhases {
         }
 
         // 5. 等 ServerEvent fire-and-forget 落 binding。server emit + app 写表
-        //    全异步；首发后第一个 bot/menu/get 偶尔 race 拿到 20901 ChannelNotBound，
+        //    全异步；首发后第一个 bot/menu/get 偶尔 race 拿到 21501 ChannelNotBound，
         //    所以容忍最多 5 次 × 200ms 重试。
         let alice_sdk = manager.sdk("alice")?;
         let mut transfer_reply = None;
