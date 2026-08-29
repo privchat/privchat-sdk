@@ -87,6 +87,7 @@ async fn provision_credentials(host: &str, base: &PathBuf) -> BoxResult<(u64, St
         endpoints: vec![endpoint(TransportProtocol::Tcp, host)],
         connection_timeout_secs: 30,
         data_dir: dir.to_string_lossy().to_string(),
+        spki_pins: vec![],
     });
     sdk.connect().await?;
     let suffix = unique_suffix();
@@ -115,6 +116,7 @@ async fn one_round(
         endpoints: vec![endpoint(protocol, host)],
         connection_timeout_secs: 30,
         data_dir: dir.to_string_lossy().to_string(),
+        spki_pins: vec![],
     });
 
     let t0 = Instant::now();

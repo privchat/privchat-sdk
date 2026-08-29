@@ -148,6 +148,15 @@ pub struct PrivchatConfig {
     pub endpoints: Vec<ServerEndpoint>,
     pub connection_timeout_secs: u64,
     pub data_dir: String,
+    /// 允许的服务端 SPKI pin（base64 SHA-256），QUIC 与 TLS/TCP 共用。
+    ///
+    /// 🔴 正式构建缺 pin 直接拒绝连接。裸 IP + 自签证书部署下链校验必然失败，
+    /// pinning 是唯一能提供服务端身份的手段；没有它，攻击者冒充网关即可接管
+    /// 后续所有认证与（将来的）E2EE 公钥交换。
+    /// 支持多个是为了密钥轮换：先发同时接受 current+next 的客户端，
+    /// 再切服务端密钥，旧 pin 下一版删除。
+    #[serde(default)]
+    pub spki_pins: Vec<String>,
 }
 
 static QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING: AtomicBool = AtomicBool::new(false);
@@ -186,6 +195,7 @@ impl Default for PrivchatConfig {
             }],
             connection_timeout_secs: 10,
             data_dir: String::new(),
+            spki_pins: Vec::new(),
         }
     }
 }
@@ -213,7 +223,18 @@ impl PrivchatConfig {
             endpoints,
             connection_timeout_secs,
             data_dir: String::new(),
+            spki_pins: Vec::new(),
         }
+    }
+
+    /// 设置允许的服务端 SPKI pin（QUIC 与 TLS/TCP 共用）。
+    pub fn with_spki_pins<I, S>(mut self, pins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.spki_pins = pins.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -247,17 +268,17 @@ fn env_flag_enabled(key: &str) -> bool {
 ///
 /// 部署形态是裸 IP + 自签证书（域名未备案，CA 证书拿不到），按系统根校验的结果
 /// 只有一种：`UnknownIssuer` → 握手失败 → 静默回落 TCP——QUIC 等于从来没跑过。
-/// 我们要的是 QUIC 的弱网传输优势（0-RTT、多路复用、丢包恢复、连接迁移），
-/// 不是把机密性押在传输层 PKI 上；QUIC 协议强制 TLS 1.3，握手与链路加密仍在，
-/// 只是不做证书链校验（等效自签互通）。
+/// 传输层是否允许在**没有 SPKI pin** 的情况下建立连接。
 ///
-/// 将来上证书 pinning（profile 带 SPKI）时，设 `PRIVCHAT_QUIC_STRICT_TLS=1` 切回
-/// 严格校验；旧的测试豁免 env/setter 仍兼容（语义变为冗余的显式开启）。
-fn quic_accept_self_signed_for_testing_enabled() -> bool {
-    if env_flag_enabled("PRIVCHAT_QUIC_STRICT_TLS") {
-        return QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.load(Ordering::Acquire);
-    }
-    true
+/// 默认 `false`：缺 pin 直接拒绝连接。此前这里默认返回 `true`（无条件跳过
+/// 证书校验），意味着任何能应答的对端都会被当作我们的网关——那把认证 token、
+/// RPC、以及将来 E2EE 的公钥交换全部交给了中间人。
+///
+/// 只有显式设置 `PRIVCHAT_ALLOW_INSECURE_TRANSPORT=1` 的本地开发构建才放行，
+/// 且每次都会打印警告。
+fn insecure_transport_allowed() -> bool {
+    env_flag_enabled("PRIVCHAT_ALLOW_INSECURE_TRANSPORT")
+        || QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.load(Ordering::Acquire)
 }
 
 /// 一次性大声警告：QUIC 证书校验被跳过。**仅限本地开发 / 压测**，生产绝不可触发
@@ -266,9 +287,9 @@ fn warn_quic_insecure_verification_disabled_once() {
     static WARN_ONCE: std::sync::Once = std::sync::Once::new();
     WARN_ONCE.call_once(|| {
         eprintln!(
-            "[SDK.quic] certificate verification: OFF by product default (bare-IP + \
-self-signed deployment; QUIC used for weak-network transport, not PKI). \
-Set PRIVCHAT_QUIC_STRICT_TLS=1 to enforce verification."
+            "[SDK.transport] SERVER IDENTITY VERIFICATION IS OFF. No SPKI pin is \
+configured and PRIVCHAT_ALLOW_INSECURE_TRANSPORT is set. Any peer that answers \
+is accepted as the gateway. Local development only — never ship this."
         );
     });
 }
@@ -8280,15 +8301,29 @@ impl State {
         }
         let timeout = self.timeout();
         let target = Self::resolve_target(&ep.host, ep.port).await?;
+        // 🔴 服务端身份：QUIC 与 TLS/TCP 共用同一组 SPKI pin。
+        // 缺 pin 时直接拒绝连接，除非本地开发显式开了
+        // PRIVCHAT_ALLOW_INSECURE_TRANSPORT——否则任何能应答的对端都会被
+        // 当成我们的网关。
+        let pins = self.config.spki_pins.clone();
+        if pins.is_empty() && !insecure_transport_allowed() {
+            return Err(Error::Transport(
+                "no SPKI pin configured for this gateway; refusing to connect \
+without server identity verification".to_string(),
+            ));
+        }
+
         let mut client = match ep.protocol {
             TransportProtocol::Quic => {
                 let mut cfg = QuicClientConfig::new(&target)
                     .map_err(|e| Error::Transport(format!("quic config: {e}")))?
                     .connect_timeout(timeout)
                     .server_name(ep.host.clone());
-                if quic_accept_self_signed_for_testing_enabled() {
+                if pins.is_empty() {
                     warn_quic_insecure_verification_disabled_once();
                     cfg = cfg.danger_skip_verification();
+                } else {
+                    cfg = cfg.spki_pins(pins.clone());
                 }
                 TransportClientBuilder::new()
                     .protocol(cfg)
@@ -8297,9 +8332,17 @@ impl State {
                     .map_err(|e| Error::Transport(format!("quic build: {e}")))?
             }
             TransportProtocol::Tcp => {
-                let cfg = TcpClientConfig::new(&target)
+                // PrivChat 语义下 tcp:// 是 "PrivChat over TLS/TCP"：连上立即握手，
+                // 不做 STARTTLS，握手失败直接断开。否则攻击者丢弃 UDP 迫使回落
+                // TCP 后，就绕过了 QUIC 侧的 pinning。
+                let mut cfg = TcpClientConfig::new(&target)
                     .map_err(|e| Error::Transport(format!("tcp config: {e}")))?
                     .connect_timeout(timeout);
+                if pins.is_empty() {
+                    warn_quic_insecure_verification_disabled_once();
+                } else {
+                    cfg = cfg.spki_pins(pins.clone()).server_name(ep.host.clone());
+                }
                 TransportClientBuilder::new()
                     .protocol(cfg)
                     .build()
@@ -26550,5 +26593,44 @@ mod attachment_wire_equivalence_tests {
         assert_eq!(content["height"], serde_json::json!(1080));
         assert_eq!(content["thumbnail_width"], serde_json::json!(320));
         assert_eq!(content["thumbnail_height"], serde_json::json!(180));
+    }
+}
+
+#[cfg(test)]
+mod transport_pinning_tests {
+    use super::*;
+
+    /// 缺 pin 时必须拒绝连接；放行只能是显式动作。
+    ///
+    /// 此前默认无条件跳过证书校验，任何能应答的对端都会被当作我们的网关——
+    /// 认证 token、RPC、将来的 E2EE 公钥交换全部暴露。
+    ///
+    /// 两个断言写在同一个测试里：开关是进程级全局量，拆成两个测试会在并行
+    /// 执行时互相踩。
+    #[test]
+    fn insecure_transport_requires_an_explicit_opt_in() {
+        set_quic_accept_self_signed_for_testing(false);
+        assert!(!insecure_transport_allowed(), "缺 pin 时默认必须拒绝连接");
+
+        set_quic_accept_self_signed_for_testing(true);
+        assert!(insecure_transport_allowed(), "显式开启后应放行");
+
+        set_quic_accept_self_signed_for_testing(false);
+        assert!(!insecure_transport_allowed(), "关闭后必须恢复拒绝");
+    }
+
+    #[test]
+    fn pins_round_trip_through_the_config_builder() {
+        let cfg = PrivchatConfig::from_server_urls(["quic://10.0.0.1:9001"], 10)
+            .with_spki_pins(["pin-a".to_string(), "pin-b".to_string()]);
+        assert_eq!(cfg.spki_pins, vec!["pin-a", "pin-b"]);
+        assert_eq!(cfg.endpoints.len(), 1);
+    }
+
+    /// 默认配置不带 pin —— 这样任何忘记配 pin 的调用方都会在连接时失败，
+    /// 而不是静默地跑在无认证的连接上。
+    #[test]
+    fn default_config_carries_no_pins() {
+        assert!(PrivchatConfig::default().spki_pins.is_empty());
     }
 }

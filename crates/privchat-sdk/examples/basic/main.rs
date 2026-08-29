@@ -64,6 +64,7 @@ async fn main() -> BoxResult<()> {
         ],
         connection_timeout_secs: 30,
         data_dir: path_to_string(&data_dir),
+        spki_pins: vec![],
     });
 
     println!("1) connect");

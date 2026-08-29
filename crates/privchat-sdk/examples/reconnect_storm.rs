@@ -241,6 +241,7 @@ async fn provision_client(
         }],
         connection_timeout_secs: 30,
         data_dir: data_dir.to_string_lossy().to_string(),
+        spki_pins: vec![],
     }));
     sdk.connect().await?;
     let username = format!("storm_{suffix}_{idx}");

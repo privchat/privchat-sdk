@@ -102,6 +102,7 @@ async fn register(host: &str, port: u16, tag: &str, idx: usize) -> BoxResult<Cli
         }],
         connection_timeout_secs: 30,
         data_dir: format!("/tmp/hydration-{}-{}", now_millis(), tag),
+        spki_pins: vec![],
     });
     sdk.connect().await?;
     let login = sdk

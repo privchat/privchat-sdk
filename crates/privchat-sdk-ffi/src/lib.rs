@@ -1306,6 +1306,9 @@ pub struct PrivchatConfig {
     pub endpoints: Vec<ServerEndpoint>,
     pub connection_timeout_secs: u64,
     pub data_dir: String,
+    /// 允许的服务端 SPKI pin（base64 SHA-256），QUIC 与 TLS/TCP 共用。
+    /// 正式构建缺 pin 直接拒绝连接。
+    pub spki_pins: Vec<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2264,6 +2267,7 @@ fn map_config(c: PrivchatConfig) -> SdkConfig {
             .collect(),
         connection_timeout_secs: c.connection_timeout_secs,
         data_dir: c.data_dir,
+        spki_pins: c.spki_pins,
     }
 }
 
@@ -4026,6 +4030,7 @@ impl PrivchatClient {
                 endpoints: vec![],
                 connection_timeout_secs: 30,
                 data_dir: String::new(),
+                spki_pins: vec![],
             })
     }
 
@@ -9420,6 +9425,7 @@ mod tests {
             }],
             connection_timeout_secs: 1,
             data_dir: String::new(),
+        spki_pins: vec![],
         }
     }
 

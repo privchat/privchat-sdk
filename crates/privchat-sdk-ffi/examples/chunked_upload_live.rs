@@ -50,6 +50,7 @@ async fn main() {
         }],
         connection_timeout_secs: 30,
         data_dir: data_dir.to_string_lossy().to_string(),
+        spki_pins: vec![],
     })
     .expect("client"));
 
