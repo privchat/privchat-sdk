@@ -324,6 +324,16 @@ impl<'a> Drop for ConnGuard<'a> {
     }
 }
 
+/// 进 `searchable_word` 列（本地搜索源）的内容——**只有文本消息**才有资格。
+///
+/// 🔴 系统/媒体消息的 content 是结构化 JSON（模板引用、file_id…）。把它写进
+/// searchable_word，本地搜索就会把协议内部结构当聊天记录端给用户（生产实拍：
+/// 搜 "Test" 命中一条 system.friend_request 的原始 JSON）。服务端索引同规则
+/// （message_repo `AND m.message_type = 0`），两层必须一致。
+fn searchable_word_gate(message_type: i32, searchable_word: &str) -> String {
+    if message_type == 0 { searchable_word.to_string() } else { String::new() }
+}
+
 impl LocalStore {
     fn current_user_file(&self) -> PathBuf {
         self.base_dir().join("current_user")
@@ -1228,7 +1238,7 @@ impl LocalStore {
                 0_i32,
                 now_ms,
                 now_ms,
-                input.searchable_word,
+                searchable_word_gate(input.message_type, &input.searchable_word),
                 local_message_id as i64,
                 input.setting,
                 input.extra,
@@ -1295,7 +1305,7 @@ impl LocalStore {
                 1_i32,
                 now_ms,
                 now_ms,
-                input.searchable_word,
+                searchable_word_gate(input.message_type, &input.searchable_word),
                 local_message_id as i64,
                 input.setting,
                 input.extra,
@@ -1404,7 +1414,7 @@ impl LocalStore {
                     input.content,
                     input.status,
                     now_ms,
-                    input.searchable_word,
+                    searchable_word_gate(input.message_type, &input.searchable_word),
                     input.local_message_id as i64,
                     input.setting,
                     input.extra,
@@ -1498,7 +1508,7 @@ impl LocalStore {
                 input.content,
                 input.status,
                 now_ms,
-                input.searchable_word,
+                searchable_word_gate(input.message_type, &input.searchable_word),
                 input.local_message_id as i64,
                 input.setting,
                 input.order_seq,
@@ -1691,7 +1701,7 @@ impl LocalStore {
                     input.content,
                     input.status,
                     now_ms,
-                    input.searchable_word,
+                    searchable_word_gate(input.message_type, &input.searchable_word),
                     input.local_message_id as i64,
                     input.setting,
                     input.extra,
@@ -1781,7 +1791,7 @@ impl LocalStore {
                 input.content,
                 input.status,
                 now_ms,
-                input.searchable_word,
+                searchable_word_gate(input.message_type, &input.searchable_word),
                 input.local_message_id as i64,
                 input.setting,
                 input.order_seq,
