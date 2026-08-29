@@ -243,10 +243,21 @@ fn env_flag_enabled(key: &str) -> bool {
     )
 }
 
+/// QUIC 证书校验策略（产品拍板 2026-08-30）：**默认不校验**。
+///
+/// 部署形态是裸 IP + 自签证书（域名未备案，CA 证书拿不到），按系统根校验的结果
+/// 只有一种：`UnknownIssuer` → 握手失败 → 静默回落 TCP——QUIC 等于从来没跑过。
+/// 我们要的是 QUIC 的弱网传输优势（0-RTT、多路复用、丢包恢复、连接迁移），
+/// 不是把机密性押在传输层 PKI 上；QUIC 协议强制 TLS 1.3，握手与链路加密仍在，
+/// 只是不做证书链校验（等效自签互通）。
+///
+/// 将来上证书 pinning（profile 带 SPKI）时，设 `PRIVCHAT_QUIC_STRICT_TLS=1` 切回
+/// 严格校验；旧的测试豁免 env/setter 仍兼容（语义变为冗余的显式开启）。
 fn quic_accept_self_signed_for_testing_enabled() -> bool {
-    QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.load(Ordering::Acquire)
-        || env_flag_enabled("PRIVCHAT_QUIC_ACCEPT_SELF_SIGNED")
-        || env_flag_enabled("PRIVCHAT_QUIC_INSECURE_SKIP_VERIFY")
+    if env_flag_enabled("PRIVCHAT_QUIC_STRICT_TLS") {
+        return QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.load(Ordering::Acquire);
+    }
+    true
 }
 
 /// 一次性大声警告：QUIC 证书校验被跳过。**仅限本地开发 / 压测**，生产绝不可触发
@@ -255,13 +266,9 @@ fn warn_quic_insecure_verification_disabled_once() {
     static WARN_ONCE: std::sync::Once = std::sync::Once::new();
     WARN_ONCE.call_once(|| {
         eprintln!(
-            "⚠️  [SECURITY] QUIC certificate verification is DISABLED via testing flag \
-             (set_quic_accept_self_signed_for_testing / PRIVCHAT_QUIC_ACCEPT_SELF_SIGNED / \
-             PRIVCHAT_QUIC_INSECURE_SKIP_VERIFY). LOCAL DEV / LOAD TEST ONLY — MUST NEVER be set \
-             in production (accepts any server cert; MITM risk)."
-        );
-        tracing::warn!(
-            "QUIC certificate verification DISABLED (testing-only self-signed accept); never enable in production"
+            "[SDK.quic] certificate verification: OFF by product default (bare-IP + \
+self-signed deployment; QUIC used for weak-network transport, not PKI). \
+Set PRIVCHAT_QUIC_STRICT_TLS=1 to enforce verification."
         );
     });
 }
