@@ -281,6 +281,26 @@ fn insecure_transport_allowed() -> bool {
         || QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.load(Ordering::Acquire)
 }
 
+fn validate_transport_pins(
+    protocol: &TransportProtocol,
+    pins: &[String],
+    allow_insecure_quic: bool,
+) -> Result<()> {
+    match protocol {
+        TransportProtocol::Quic if pins.is_empty() && !allow_insecure_quic => Err(
+            Error::Transport(
+                "no SPKI pin configured for this QUIC gateway; refusing to connect without server identity verification"
+                    .to_string(),
+            ),
+        ),
+        TransportProtocol::Tcp if pins.is_empty() => Err(Error::Transport(
+            "no SPKI pin configured for this TCP gateway; PrivChat tcp:// is TLS-only and will not fall back to plaintext"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// 一次性大声警告：QUIC 证书校验被跳过。**仅限本地开发 / 压测**，生产绝不可触发
 /// （接受任意服务端证书 = MITM 风险）。在关闭校验的**唯一**入口打印，便于审计。
 fn warn_quic_insecure_verification_disabled_once() {
@@ -8301,17 +8321,8 @@ impl State {
         }
         let timeout = self.timeout();
         let target = Self::resolve_target(&ep.host, ep.port).await?;
-        // 🔴 服务端身份：QUIC 与 TLS/TCP 共用同一组 SPKI pin。
-        // 缺 pin 时直接拒绝连接，除非本地开发显式开了
-        // PRIVCHAT_ALLOW_INSECURE_TRANSPORT——否则任何能应答的对端都会被
-        // 当成我们的网关。
         let pins = self.config.spki_pins.clone();
-        if pins.is_empty() && !insecure_transport_allowed() {
-            return Err(Error::Transport(
-                "no SPKI pin configured for this gateway; refusing to connect \
-without server identity verification".to_string(),
-            ));
-        }
+        validate_transport_pins(&ep.protocol, &pins, insecure_transport_allowed())?;
 
         let mut client = match ep.protocol {
             TransportProtocol::Quic => {
@@ -8332,17 +8343,12 @@ without server identity verification".to_string(),
                     .map_err(|e| Error::Transport(format!("quic build: {e}")))?
             }
             TransportProtocol::Tcp => {
-                // PrivChat 语义下 tcp:// 是 "PrivChat over TLS/TCP"：连上立即握手，
-                // 不做 STARTTLS，握手失败直接断开。否则攻击者丢弃 UDP 迫使回落
-                // TCP 后，就绕过了 QUIC 侧的 pinning。
-                let mut cfg = TcpClientConfig::new(&target)
+                // PrivChat tcp:// starts TLS immediately and never falls back to plaintext.
+                let cfg = TcpClientConfig::new(&target)
                     .map_err(|e| Error::Transport(format!("tcp config: {e}")))?
-                    .connect_timeout(timeout);
-                if pins.is_empty() {
-                    warn_quic_insecure_verification_disabled_once();
-                } else {
-                    cfg = cfg.spki_pins(pins.clone()).server_name(ep.host.clone());
-                }
+                    .connect_timeout(timeout)
+                    .spki_pins(pins.clone())
+                    .server_name(ep.host.clone());
                 TransportClientBuilder::new()
                     .protocol(cfg)
                     .build()
@@ -26632,5 +26638,27 @@ mod transport_pinning_tests {
     #[test]
     fn default_config_carries_no_pins() {
         assert!(PrivchatConfig::default().spki_pins.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod transport_pin_scope_tests {
+    use super::*;
+
+    #[test]
+    fn websocket_endpoints_do_not_require_pins() {
+        assert!(validate_transport_pins(&TransportProtocol::WebSocket, &[], false).is_ok());
+    }
+
+    #[test]
+    fn tcp_has_no_insecure_escape_hatch() {
+        assert!(validate_transport_pins(&TransportProtocol::Tcp, &[], false).is_err());
+        assert!(validate_transport_pins(&TransportProtocol::Tcp, &[], true).is_err());
+        assert!(validate_transport_pins(
+            &TransportProtocol::Tcp,
+            &["pin".to_string()],
+            false
+        )
+        .is_ok());
     }
 }
