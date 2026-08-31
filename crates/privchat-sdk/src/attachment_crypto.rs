@@ -67,6 +67,79 @@ pub fn decrypt_attachment(blob: &[u8], cek_b64: &str) -> Result<Vec<u8>, String>
         .map_err(|_| "attachment decrypt/auth failed".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// v2：全站统一密钥
+// ---------------------------------------------------------------------------
+
+/// v2 blob 头：`magic(2B) || version(1B) || key_id(1B)`，其后是 `nonce || ct || tag`。
+///
+/// 头自描述，解密不依赖任何服务端字段——密钥轮换后老对象照样解得开。
+const V2_MAGIC: [u8; 2] = *b"PC";
+const V2_VERSION: u8 = 2;
+const V2_HEADER_LEN: usize = 4;
+pub const MIN_V2_BLOB_LEN: usize = V2_HEADER_LEN + NONCE_LEN + TAG_LEN;
+
+/// 用全站密钥加密。
+///
+/// 威胁模型是**对象存储服务商**：不少厂商会拿用户上传的图片视频去训练。所以明文和
+/// 密钥都不能出现在服务端或 S3，加解密只在客户端做。用户之间不靠这把密钥隔离——
+/// 那由鉴权（`resolve_attachment_access`）和不可枚举的内容寻址路径负责。
+///
+/// 🔴 **nonce 必须逐次随机，绝不能固定或按内容派生。** 现在全站共用一把密钥，
+/// AES-GCM 在同一密钥下重用 nonce 会直接崩：泄露两条明文的异或，并且可以伪造。
+/// per-file 密钥时代这个错误还有密钥隔离兜底，现在没有了。想按内容去重必须换
+/// AES-GCM-SIV，而 WebCrypto 不支持 SIV——见 ATTACHMENT_ENCRYPTION_SPEC。
+pub fn encrypt_attachment_v2(plaintext: &[u8], key: &[u8], key_id: u8) -> Result<Vec<u8>, String> {
+    if key.len() != CEK_LEN {
+        return Err(format!("site key must be {CEK_LEN} bytes, got {}", key.len()));
+    }
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let ct_with_tag = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|_| "attachment encrypt failed".to_string())?;
+
+    let mut blob = Vec::with_capacity(MIN_V2_BLOB_LEN + plaintext.len());
+    blob.extend_from_slice(&V2_MAGIC);
+    blob.push(V2_VERSION);
+    blob.push(key_id);
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ct_with_tag);
+    Ok(blob)
+}
+
+/// 读出 v2 blob 声明的 key_id，用于挑选密钥（轮换期会同时存在两代对象）。
+pub fn v2_key_id(blob: &[u8]) -> Option<u8> {
+    if blob.len() >= MIN_V2_BLOB_LEN && blob[0..2] == V2_MAGIC && blob[2] == V2_VERSION {
+        Some(blob[3])
+    } else {
+        None
+    }
+}
+
+/// 用全站密钥解密 v2 blob。
+pub fn decrypt_attachment_v2(blob: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
+    if blob.len() < MIN_V2_BLOB_LEN {
+        return Err(format!(
+            "attachment blob too short: {} < {MIN_V2_BLOB_LEN}",
+            blob.len()
+        ));
+    }
+    if blob[0..2] != V2_MAGIC || blob[2] != V2_VERSION {
+        return Err("not a v2 attachment blob".to_string());
+    }
+    if key.len() != CEK_LEN {
+        return Err(format!("site key must be {CEK_LEN} bytes, got {}", key.len()));
+    }
+    let (nonce_bytes, ct_with_tag) = blob[V2_HEADER_LEN..].split_at(NONCE_LEN);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(Nonce::from_slice(nonce_bytes), ct_with_tag)
+        .map_err(|_| "attachment decrypt/auth failed".to_string())
+}
+
 /// 下载完成后按加密信息把 blob 还原成明文（run_download / thumbnail 下载统一调用）。
 ///
 /// - `version=0`（或上层视为缺失时传 0）→ legacy 明文，原样返回。
@@ -86,6 +159,28 @@ pub fn decrypt_downloaded_attachment_bytes(
             decrypt_attachment(blob, cek)
         }
         v => Err(format!("unsupported encryption_version: {v}")),
+    }
+}
+
+/// v2 版本的还原入口：密钥由调用方按 blob 里的 key_id 选出。
+///
+/// `version=0` 仍是 legacy 明文；`version=1` 走 per-file CEK（历史对象）；
+/// `version=2` 用全站密钥。**任何一条都不许在失败时回落成明文**——那会把密文
+/// 当图片写进缓存，UI 显示坏图，同时把真实错误藏起来。
+pub fn decrypt_downloaded_attachment_bytes_v2(
+    encryption_version: i32,
+    cek: Option<&str>,
+    site_key: Option<&[u8]>,
+    blob: &[u8],
+) -> Result<Vec<u8>, String> {
+    match encryption_version {
+        2 => {
+            let key = site_key.ok_or_else(|| {
+                "encryption_version=2 but no site key available".to_string()
+            })?;
+            decrypt_attachment_v2(blob, key)
+        }
+        other => decrypt_downloaded_attachment_bytes(other, cek, blob),
     }
 }
 // 单测见 tests/attachment_crypto_test.rs（集成测试，绕开 lib 内不相关的 test fixture）。
