@@ -63,6 +63,9 @@ async fn main() {
         ],
         connection_timeout_secs: 15,
         data_dir,
+        // 本地示例连的是明文本地栈，没有可 pin 的证书。
+        // 生产必须给 pin，否则 tcp:// 会直接拒绝连接。
+        spki_pins: vec![],
     };
 
     eprintln!("[basic] create");

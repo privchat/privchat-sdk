@@ -481,6 +481,24 @@ pub struct TransferReply {
     pub data: Vec<u8>,
 }
 
+impl TransferReply {
+    /// 线上 `TransferResponse` → 客户端 `TransferReply`。
+    ///
+    /// `code` 是**原样搬运**的整数：核心 SDK 不认识 `21655`、`30004` 这类
+    /// 业务码的语义，也不该认识 —— 认识就意味着每加一个业务模块都要改核心。
+    /// 抽成独立函数是为了让这一跳可被单测覆盖(见
+    /// `business_code_passthrough_tests`),而不是埋在 async 方法里。
+    pub fn from_wire(resp: TransferResponse) -> Self {
+        Self {
+            request_id: resp.request_id,
+            channel_id: resp.channel_id,
+            code: resp.code,
+            message: resp.message,
+            data: resp.data.unwrap_or_default(),
+        }
+    }
+}
+
 /// 会话状态快照：精确阶段 + 它属于哪个账号的哪一次会话。
 ///
 /// 三个字段必须一起读：宿主拿到阶段后再去问「当前是谁」是不安全的，两次读之间
@@ -10929,13 +10947,7 @@ impl State {
             .await?;
         let resp: TransferResponse = decode_message(&raw)
             .map_err(|e| Error::Serialization(format!("decode transfer_channel resp: {e}")))?;
-        Ok(TransferReply {
-            request_id: resp.request_id,
-            channel_id: resp.channel_id,
-            code: resp.code,
-            message: resp.message,
-            data: resp.data.unwrap_or_default(),
-        })
+        Ok(TransferReply::from_wire(resp))
     }
 
     /// 取消订阅频道事件
@@ -11965,7 +11977,8 @@ impl State {
 
         let base = session.upload_url.trim_end_matches('/').to_string();
         let token = session.upload_token.as_str();
-        let client = reqwest::Client::new();
+        // 代理分片全部打我们自己的服务器，走 pin。
+        let client = file_plane_http::control_client(&base, &self.config.spki_pins)?;
         let total = blob.len() as u64;
         let plan = crate::resumable_upload::UploadPlan::for_base_unit(session.base_unit);
 
@@ -12091,7 +12104,11 @@ impl State {
 
         let base = session.upload_url.trim_end_matches('/').to_string();
         let token = session.upload_token.as_str();
-        let client = reqwest::Client::new();
+        // 控制面（part-url / status / complete / abort）走 pin；
+        // 对象存储（COS 预签名 PUT）走系统 CA。两者绝不能共用同一个 client。
+        let control = file_plane_http::control_client(&base, &self.config.spki_pins)?;
+        let object_store = file_plane_http::object_store_client();
+        let client = control.clone();
         let total = blob.len() as u64;
         // 会话建成时已校验过这两个字段，这里再兜一次底，绝不用默认值瞎算片号。
         let part_size = session.part_size.ok_or_else(|| {
@@ -12152,7 +12169,7 @@ impl State {
             let digest = crate::resumable_upload::chunk_digest(&bytes);
 
             match self
-                .put_part_direct(&client, &base, token, part_number, bytes, &digest)
+                .put_part_direct(&control, &object_store, &base, token, part_number, bytes, &digest)
                 .await
             {
                 PartOutcome::Ok => {
@@ -12188,7 +12205,8 @@ impl State {
     /// 🔴 `required_headers` 必须原样回传：checksum/加密头都签进了签名，少一个就 403。
     async fn put_part_direct(
         &self,
-        client: &reqwest::Client,
+        control: &reqwest::Client,
+        object_store: &reqwest::Client,
         base: &str,
         token: &str,
         part_number: u32,
@@ -12206,7 +12224,7 @@ impl State {
             }]
         });
         let resp = self
-            .with_upload_token(client.post(format!("{base}/part-url")), token)
+            .with_upload_token(control.post(format!("{base}/part-url")), token)
             .json(&body)
             .send()
             .await;
@@ -12237,8 +12255,12 @@ impl State {
         let Some(url) = signed["url"].as_str() else {
             return PartOutcome::Fatal("part-url 响应缺少 url".to_string());
         };
+        if let Err(error) = file_plane_http::validate_object_store_url(url) {
+            return PartOutcome::Fatal(error.to_string());
+        }
 
-        let mut put = client.put(url).body(bytes);
+        // 🔴 预签名 URL 指向 COS，走系统根证书；拿我们的 pin 去比对必然失败。
+        let mut put = object_store.put(url).body(bytes);
         if let Some(headers) = signed["required_headers"].as_object() {
             for (k, v) in headers {
                 if let Some(v) = v.as_str() {
@@ -12405,7 +12427,8 @@ impl State {
             .part("file", part)
             .text("encryption_version", "1")
             .text("cek", cek_b64);
-        let response = reqwest::Client::new()
+        // 整文件上传打的也是我们自己的服务器（不是对象存储），走控制面 pin。
+        let response = file_plane_http::control_client(upload_url, &self.config.spki_pins)?
             .post(upload_url)
             .header("X-Upload-Token", upload_token)
             .multipart(form)
@@ -13661,6 +13684,98 @@ impl State {
             })
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod business_code_passthrough_tests {
+    use super::*;
+
+    /// 业务错误码不得被 resume 分类器改写成同步恢复信号。
+    ///
+    /// 注意这**只**覆盖分类器这一处,不等于"端到端原样透传";
+    /// 逐跳搬运由下面 `transfer_reply_preserves_business_code` 覆盖。
+    ///
+    /// 21501 起属 application 与各业务模块(21500 `ChannelNotSubscribed`
+    /// 是核心码,由 privchat-server 投递路由产生,见 segments.toml)。
+    /// 若把 215xx/216xx 当成 20900 那类恢复码,一次普通的投递失败会触发
+    /// 整库重建 —— 这正是 20900 被双重定义时的真实风险。
+    #[test]
+    fn business_codes_do_not_trigger_resume_reclassification() {
+        for msg in [
+            "dispatch failed code=21502",
+            "scene error code=21600",
+            "battle error code=21401",
+            "shop error code=21655",
+            "code=30002 room closed",
+        ] {
+            // default 传 FatalProtocolError:未识别时应原样返回它,
+            // 而不是被改写成任何 *ResyncRequired。
+            let got = State::classify_resume_message(
+                msg, ResumeFailureClass::FatalProtocolError);
+            assert!(
+                matches!(got, ResumeFailureClass::FatalProtocolError),
+                "{msg} 被误判为 {got:?};业务码不该触发重分类");
+        }
+    }
+
+    /// 反面:三个同步恢复码仍必须被各自正确识别。
+    ///
+    /// 20901 曾被漏测 —— 它与 20900/20902 分属不同恢复范围
+    /// (实体级 vs 频道级 vs 全量重建),漏一个就等于漏掉一整档降级路径。
+    #[test]
+    fn sync_recovery_codes_still_classified() {
+        for (msg, want) in [
+            ("code=20900", ResumeFailureClass::ChannelResyncRequired),
+            ("code=20901", ResumeFailureClass::EntityResyncRequired),
+            ("code=20902", ResumeFailureClass::FullRebuildRequired),
+        ] {
+            let got = State::classify_resume_message(
+                msg, ResumeFailureClass::FatalProtocolError);
+            assert_eq!(
+                std::mem::discriminant(&got),
+                std::mem::discriminant(&want),
+                "{msg} 应分类为 {want:?},实际 {got:?}");
+        }
+    }
+
+    /// 分层透传第一跳:线上 `TransferResponse.code` → `TransferReply.code`。
+    ///
+    /// 走真实的 encode/decode,而不是直接构造结构体 —— 编解码本身也是
+    /// 这一跳的一部分,`code` 的符号与位宽在这里出错同样会毁掉透传。
+    #[test]
+    fn transfer_reply_preserves_business_code() {
+        for code in [0i32, 21401, 21502, 21600, 21655, 30004, 65535] {
+            let wire = TransferResponse {
+                request_id: "rid-1".to_string(),
+                channel_id: 42,
+                code,
+                message: format!("biz {code}"),
+                data: Some(vec![1, 2, 3]),
+            };
+            let bytes = encode_message(&wire).expect("encode TransferResponse");
+            let decoded: TransferResponse =
+                decode_message(&bytes).expect("decode TransferResponse");
+            let reply = TransferReply::from_wire(decoded);
+            assert_eq!(reply.code, code, "code 在 wire → TransferReply 这一跳被改写");
+            assert_eq!(reply.message, format!("biz {code}"));
+            assert_eq!(reply.data, vec![1, 2, 3]);
+        }
+    }
+
+    /// 未识别的业务码经 `sync_rpc_rejection` 后,数值必须仍出现在错误文本里。
+    ///
+    /// 宿主只能从这段文本里读回原始码;一旦被吞掉,线上就再也查不出
+    /// 服务端到底拒绝了什么。
+    #[test]
+    fn unknown_codes_survive_in_rejection_message() {
+        for code in [21502i32, 21600, 21655, 30004] {
+            let err = State::sync_rpc_rejection("op", code, "boom".to_string());
+            let text = err.to_string();
+            assert!(
+                text.contains(&format!("code={code}")),
+                "码 {code} 未出现在拒绝文本中: {text}");
+        }
     }
 }
 
@@ -26661,4 +26776,151 @@ mod transport_pin_scope_tests {
         )
         .is_ok());
     }
+}
+
+/// 文件平面的两个 HTTP 客户端。
+///
+/// 🔴 必须分开，不能共用：
+/// - **控制面**（`part-url` / `status` / `complete` / `abort` / proxy `chunk`）打的是我们
+///   自己的服务器，裸 IP + 自签证书，身份只能由 SPKI pin 保证。
+/// - **对象存储**（COS 预签名 URL 的 PUT / GET）打的是腾讯云，用的是公网 CA 证书。
+///
+/// 把它们合成一个 pinned client，COS 的预签名 URL 会被我们的 pin 拒掉；合成一个
+/// system-CA client，我们自己的自签证书又过不了校验。2026-08-31 就是只改了服务端、
+/// 没分这两个客户端，把生产的文件上传打断过一次。
+pub mod file_plane_http {
+    use crate::{Error, Result};
+
+    /// 控制面客户端：对我们自己的服务器做 SPKI pinning。
+    ///
+    /// `https` 的控制面缺 pin 直接报错——不 fail-open。`http` 的控制面只在本地开发
+    /// 出现（没有 TLS 可言），此时 pin 无意义，按明文放行。
+    pub fn control_client(control_url: &str, pins: &[String]) -> Result<reqwest::Client> {
+        if !control_url.starts_with("https://") {
+            if !is_local_control_url(control_url) {
+                return Err(Error::Storage(format!(
+                    "refusing plaintext file control plane on a non-local host: {control_url}"
+                )));
+            }
+            return Ok(reqwest::Client::new());
+        }
+
+        if pins.is_empty() {
+            return Err(Error::Storage(
+                "no SPKI pin configured for the file control plane; refusing to upload \
+without server identity verification"
+                    .to_string(),
+            ));
+        }
+
+        let verifier = msgtrans::PinnedSpkiVerification::new(pins.to_vec())
+            .map_err(|e| Error::Storage(format!("invalid SPKI pins: {e}")))?;
+        let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Storage(format!("TLS versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth();
+
+        reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .build()
+            .map_err(|e| Error::Storage(format!("build pinned http client: {e}")))
+    }
+
+    /// 对象存储客户端：走系统根证书，**不** pin。
+    /// COS 的证书是公网 CA 签的，拿我们的 pin 去比对必然失败。
+    pub fn object_store_client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    /// Presigned credentials must never cross a public plaintext connection.
+    pub fn validate_object_store_url(url: &str) -> Result<()> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| Error::Storage(format!("invalid object-store URL: {e}")))?;
+        if parsed.scheme() == "https" {
+            return Ok(());
+        }
+        if parsed.scheme() == "http" && is_local_host(&parsed) {
+            return Ok(());
+        }
+        Err(Error::Storage(format!(
+            "refusing plaintext object-store URL on a non-local host: {}",
+            parsed.origin().ascii_serialization()
+        )))
+    }
+
+    fn is_local_control_url(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if parsed.scheme() != "http" {
+            return false;
+        }
+        is_local_host(&parsed)
+    }
+
+    fn is_local_host(parsed: &reqwest::Url) -> bool {
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_unspecified(),
+            Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local() || ip.is_unspecified(),
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn https_control_plane_without_a_pin_is_refused() {
+            let err = control_client("https://106.55.63.153:9083/api/app", &[]).unwrap_err();
+            assert!(format!("{err}").contains("no SPKI pin"), "{err}");
+        }
+
+        #[test]
+        fn https_control_plane_with_a_pin_builds() {
+            assert!(control_client(
+                "https://106.55.63.153:9083/api/app",
+                &["SKMkpK5wwUD8sXug1pEktuTrlEntEqwP70qDLfnlTT0=".to_string()],
+            )
+            .is_ok());
+        }
+
+        /// 本地开发没有 TLS 可言，明文放行；但公网明文必须拒绝，
+        /// 否则一次配置回退就把 upload token 重新暴露出去。
+        #[test]
+        fn plaintext_is_local_only() {
+            assert!(control_client("http://127.0.0.1:9083/api/app", &[]).is_ok());
+            assert!(control_client("http://[::1]:9083/api/app", &[]).is_ok());
+            assert!(control_client("http://192.168.1.9:9083/api/app", &[]).is_ok());
+            assert!(control_client("http://172.16.1.9:9083/api/app", &[]).is_ok());
+            let err = control_client("http://106.55.63.153:9083/api/app", &[]).unwrap_err();
+            assert!(format!("{err}").contains("plaintext"), "{err}");
+        }
+
+        #[test]
+        fn empty_pin_list_is_rejected_not_ignored() {
+            assert!(control_client("https://example.com/x", &[]).is_err());
+            assert!(control_client("https://example.com/x", &["  ".to_string()]).is_err());
+        }
+
+        #[test]
+        fn object_store_requires_https_outside_local_development() {
+            assert!(validate_object_store_url("https://bucket.cos.example/part?signature=x").is_ok());
+            assert!(validate_object_store_url("http://127.0.0.1:9000/part?signature=x").is_ok());
+            let err = validate_object_store_url("http://bucket.example/part?signature=x")
+                .unwrap_err();
+            assert!(format!("{err}").contains("plaintext object-store"), "{err}");
+        }
+    }
+
 }

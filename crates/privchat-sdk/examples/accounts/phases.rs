@@ -5588,11 +5588,8 @@ started={started} expected={payload_filename} dir={:?} contents=[{listing}] extr
     /// 重发一份收到的**视频**：不再压一遍。
     ///
     /// 「转发不二次处理」在图片上看不出来，视频上是肉眼可见的画质损失：压一次
-    /// 就掉一档，转几手就糊了。判据用**计数 hook**（`set_video_process_hook` 是产品
-    /// 接口，这里只是数它被调了几次，不改行为）：
-    ///
-    /// - alice 从托管目录**外**发（用户刚选的文件）→ 压缩被调用一次，这是应该的
-    /// - bob 拿收到的托管文件重发 → 压缩**一次都不许调**，主文件也不重传
+    /// 就掉一档，转几手就糊了。宿主在把文件交给 SDK 前完成转码；这里验证 SDK
+    /// 重发托管文件时不修改正文，也不重新上传正文。
     ///
     /// 素材是真视频（`fixtures/tiny.mp4`，H.264 160x120 1 秒），不是假字节：
     /// 假字节连不进真实媒体路径，测了也说明不了问题。
@@ -5610,23 +5607,6 @@ started={started} expected={payload_filename} dir={:?} contents=[{listing}] extr
 
         let video = include_bytes!("fixtures/tiny.mp4").to_vec();
 
-        // 两端都装上计数 hook：报告「没压」（返回 false）并原样留下文件，
-        // 这样计数反映的是**调用与否**，不掺进真实转码的行为差异。
-        let alice_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let bob_compress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let bob_thumbnail = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        manager
-            .sdk("alice")?
-            .set_video_process_hook(Some(Self::counting_hook(alice_calls.clone(), None)))
-            .await?;
-        manager
-            .sdk("bob")?
-            .set_video_process_hook(Some(Self::counting_hook(
-                bob_compress.clone(),
-                Some(bob_thumbnail.clone()),
-            )))
-            .await?;
-
         let video_type = privchat_protocol::message::ContentMessageType::Video as i32;
         let Some(alice_sent) = Self::send_one_fidelity_attachment(
             manager, "alice", ab, channel_type, alice_uid, "假期.mp4", "video/mp4",
@@ -5641,15 +5621,6 @@ started={started} expected={payload_filename} dir={:?} contents=[{listing}] extr
                 metrics,
             ));
         };
-        let first_compress = alice_calls.load(std::sync::atomic::Ordering::Relaxed);
-        if first_compress == 0 {
-            // 首发必须走压缩，否则下面「重发没压」什么都证明不了——两边都是 0。
-            metrics.errors.push(
-                "🔴 the first send of a freshly picked video must go through compression; \
-the hook was never called, so this phase would prove nothing".to_string(),
-            );
-        }
-
         let alice_server_id = alice_sent.server_message_id.unwrap_or(0);
         let bob_root = manager.base_dir.join("bob");
         let Some(bob_row) = Self::wait_for_downloaded_attachment(
@@ -5676,8 +5647,6 @@ the hook was never called, so this phase would prove nothing".to_string(),
         }
         let before_bytes = std::fs::read(&bob_local)?;
         let before = manager.sdk("bob")?.attachment_transfer_stats();
-        bob_compress.store(0, std::sync::atomic::Ordering::Relaxed);
-
         let Some(bob_sent) = Self::send_one_fidelity_attachment(
             manager, "bob", ab, channel_type, bob_uid, "假期.mp4", "video/mp4",
             video_type, Some("海边"), &[], Some(bob_local.as_path()), &mut metrics,
@@ -5692,13 +5661,6 @@ the hook was never called, so this phase would prove nothing".to_string(),
             ));
         };
 
-        let compress_calls = bob_compress.load(std::sync::atomic::Ordering::Relaxed);
-        if compress_calls != 0 {
-            metrics.errors.push(format!(
-                "🔴 resending a received video must not compress it again ({compress_calls} calls) — \
-every pass costs quality and changes the bytes, which also kills the dedup"
-            ));
-        }
         let after_bytes = std::fs::read(&bob_local)?;
         if after_bytes != before_bytes {
             metrics.errors.push(format!(
@@ -5737,34 +5699,12 @@ every pass costs quality and changes the bytes, which also kills the dedup"
             success,
             duration: start.elapsed(),
             details: format!(
-                "first_send_compress_calls={first_compress} resend_compress_calls={compress_calls} \
-resend_body_uploads={} resend_claims={} bytes_unchanged={}",
+                "resend_body_uploads={} resend_claims={} bytes_unchanged={}",
                 after.body_uploads - before.body_uploads,
                 after.claims - before.claims,
                 after_bytes == before_bytes
             ),
             metrics,
-        })
-    }
-
-    /// 只数调用次数的 video hook：报告「没有处理」并原样留下文件。
-    fn counting_hook(
-        compress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        thumbnail: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    ) -> privchat_sdk::VideoProcessHook {
-        std::sync::Arc::new(move |op, _input, _meta, _output| {
-            match op {
-                privchat_sdk::MediaProcessOp::Compress => {
-                    compress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                privchat_sdk::MediaProcessOp::Thumbnail => {
-                    if let Some(t) = thumbnail.as_ref() {
-                        t.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
-            // false = 没处理，文件原样。计数反映调用与否，不掺真实转码的行为差异。
-            Ok(false)
         })
     }
 

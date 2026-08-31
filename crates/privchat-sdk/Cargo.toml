@@ -28,12 +28,21 @@ hkdf.workspace = true
 rand.workspace = true
 base64.workspace = true
 snowflake_me = "0.5"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "rustls-tls-manual-roots"] }
+# 文件控制面要挂 SPKI pinning 校验器（与 QUIC / TLS-TCP 同一实现）
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 regex = "1"
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# 确定性 TLS 测试：起一张真证书 + 真握手，不依赖任何环境变量或外部服务
+rcgen = "0.14"
+tokio-rustls = "0.26"
+sha2 = "0.10"
+base64 = "0.22"
+rustls-pemfile = "2.0"
+x509-parser = "0.18"
 # 只用来把测试文件的 mtime 拨回去，验证封装缓存的保留窗口。
 filetime = "0.2"

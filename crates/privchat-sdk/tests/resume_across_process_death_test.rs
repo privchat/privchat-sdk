@@ -237,6 +237,9 @@ async fn child_main(base: String, cache: std::path::PathBuf) {
             user_id: 7,
             local_message_id: "m1".into(),
             server_identity: "mock".into(),
+            transport: "proxy_offset_v1".into(),
+            part_size: None,
+            total_parts: None,
         };
         rec.store(&sealed).expect("store session");
     }

@@ -20,7 +20,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use privchat_sdk::{NewMessage, PrivchatConfig, PrivchatSdk};
+use privchat_sdk::{NewMessage, PrivchatConfig, PrivchatSdk, TransferReply};
 use tokio::runtime::Runtime;
 
 /// Opaque client handle; fields are private to this crate.
@@ -634,6 +634,55 @@ pub unsafe extern "C" fn privchat_capi_get_message_by_id(
 // Transfer / RPC
 // ---------------------------------------------------------------------------
 
+/// Render a [`TransferReply`] as the JSON body `privchat_capi_transfer` returns.
+///
+/// Split out of the FFI entry point so the "does the business code survive this
+/// hop" question can be answered by a unit test instead of a live server: the
+/// FFI signature needs a connected client, this does not. `code` is copied
+/// verbatim — the bridge never interprets business codes.
+fn transfer_reply_json(reply: &TransferReply) -> String {
+    let data_value = match std::str::from_utf8(&reply.data) {
+        Ok(s) => serde_json::Value::String(s.to_string()),
+        Err(_) => serde_json::to_value(&reply.data).unwrap_or(serde_json::Value::Null),
+    };
+    serde_json::json!({
+        "request_id": reply.request_id,
+        "channel_id": reply.channel_id,
+        "code": reply.code,
+        "message": reply.message,
+        "data": data_value,
+    })
+    .to_string()
+}
+
+/// Write a successful round trip's result into the caller's out-params.
+///
+/// Split out for the same reason as [`transfer_reply_json`]: this is the hop
+/// where a business code could be silently reinterpreted, and it must be
+/// testable without a connected client. Both pointers may be NULL.
+///
+/// # Safety
+/// `out_code` and `out_reply`, when non-NULL, must be valid writable pointers.
+/// Takes `reply` **by value**: the payload is moved into the caller's buffer,
+/// not copied. This is the binary battle path (FlatBuffers frames), so an extra
+/// full copy of the body per round trip is not acceptable just to make the
+/// function testable.
+unsafe fn write_transfer_bytes_out(
+    reply: TransferReply,
+    out_code: *mut i32,
+    out_reply: *mut PrivchatCapiBuffer,
+) {
+    if !out_code.is_null() {
+        *out_code = reply.code;
+    }
+    if reply.code != 0 {
+        set_last_error(reply.message);
+    }
+    if !out_reply.is_null() {
+        *out_reply = PrivchatCapiBuffer::from_vec(reply.data);
+    }
+}
+
 /// Channel Transfer round-trip. `body` is passed through as raw bytes
 /// (callers send a JSON string). Returns JSON:
 /// `{"request_id","channel_id","code","message","data"}` where `data` is a
@@ -662,20 +711,7 @@ pub unsafe extern "C" fn privchat_capi_transfer(
     match block_on_timeout(client, effective_ms, async move {
         sdk.transfer(channel_id, route, body_bytes, effective_ms).await
     }) {
-        Ok(reply) => {
-            let data_value = match std::str::from_utf8(&reply.data) {
-                Ok(s) => serde_json::Value::String(s.to_string()),
-                Err(_) => serde_json::to_value(&reply.data).unwrap_or(serde_json::Value::Null),
-            };
-            let json = serde_json::json!({
-                "request_id": reply.request_id,
-                "channel_id": reply.channel_id,
-                "code": reply.code,
-                "message": reply.message,
-                "data": data_value,
-            });
-            into_c_string(json.to_string())
-        }
+        Ok(reply) => into_c_string(transfer_reply_json(&reply)),
         Err((_, msg)) => {
             set_last_error(msg);
             ptr::null_mut()
@@ -730,15 +766,7 @@ pub unsafe extern "C" fn privchat_capi_transfer_bytes(
         sdk.transfer(channel_id, route, body_bytes, effective_ms).await
     }) {
         Ok(reply) => {
-            if !out_code.is_null() {
-                *out_code = reply.code;
-            }
-            if reply.code != 0 {
-                set_last_error(reply.message.clone());
-            }
-            if !out_reply.is_null() {
-                *out_reply = PrivchatCapiBuffer::from_vec(reply.data);
-            }
+            write_transfer_bytes_out(reply, out_code, out_reply);
             PRIVCHAT_CAPI_OK
         }
         Err((code, msg)) => {
@@ -1020,6 +1048,60 @@ mod tests {
 
     fn cstr(s: &str) -> CString {
         CString::new(s).unwrap()
+    }
+
+    fn reply_with_code(code: i32) -> TransferReply {
+        TransferReply {
+            request_id: "rid-1".to_string(),
+            channel_id: 42,
+            code,
+            message: format!("biz {code}"),
+            data: b"{\"ok\":1}".to_vec(),
+        }
+    }
+
+    /// 业务码经 JSON 出口这一跳必须原样到达宿主。
+    ///
+    /// 桥接层不认识 `21655`、`30004` 的语义 —— 认识就意味着每加一个业务
+    /// 模块都要改 C ABI。这里只证明它**没有**顺手解释或截断。
+    #[test]
+    fn transfer_json_preserves_business_code() {
+        for code in [0i32, 21401, 21502, 21600, 21655, 30004, 65535] {
+            let json = transfer_reply_json(&reply_with_code(code));
+            let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+            assert_eq!(v["code"].as_i64(), Some(code as i64), "code 被改写: {json}");
+            assert_eq!(v["message"].as_str(), Some(format!("biz {code}").as_str()));
+            assert_eq!(v["channel_id"].as_u64(), Some(42));
+        }
+    }
+
+    /// 负数码同样要原样透传:`code` 在线上是有符号 i32,
+    /// 中途若被当成无符号搬运,`-1` 会变成 4294967295。
+    #[test]
+    fn transfer_json_preserves_negative_code() {
+        let v: serde_json::Value =
+            serde_json::from_str(&transfer_reply_json(&reply_with_code(-1))).unwrap();
+        assert_eq!(v["code"].as_i64(), Some(-1));
+    }
+
+    /// 二进制出口的同一问题:`out_code` 指针写入的值必须等于回包里的码,
+    /// 且非零时错误文本可从 `last_error` 读回。
+    #[test]
+    fn transfer_bytes_out_code_mirrors_reply() {
+        for code in [0i32, 21600, 21655, 30004] {
+            let mut out_code: i32 = i32::MIN;
+            let mut out_reply = PrivchatCapiBuffer::empty();
+            unsafe {
+                write_transfer_bytes_out(reply_with_code(code), &mut out_code, &mut out_reply);
+            }
+            assert_eq!(out_code, code, "out_code 与回包不一致");
+            if code != 0 {
+                assert!(
+                    last_error_string().contains(&format!("biz {code}")),
+                    "非零码的 message 未进入 last_error");
+            }
+            unsafe { privchat_capi_free_buffer(&mut out_reply) };
+        }
     }
 
     fn last_error_string() -> String {

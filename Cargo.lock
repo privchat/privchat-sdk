@@ -1852,10 +1852,13 @@ dependencies = [
  "msgtrans",
  "privchat-protocol",
  "rand 0.8.5",
+ "rcgen",
  "refinery",
  "regex",
  "reqwest",
  "rusqlite",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2",
@@ -1864,7 +1867,9 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
