@@ -79,6 +79,18 @@ const V2_VERSION: u8 = 2;
 const V2_HEADER_LEN: usize = 4;
 pub const MIN_V2_BLOB_LEN: usize = V2_HEADER_LEN + NONCE_LEN + TAG_LEN;
 
+/// v2 密文比明文固定多这么多字节（头 + nonce + tag）。
+///
+/// 🔴 上传 token 要签下**密文**的字节数，而密钥要等 token 回来才拿得到——
+/// 先有鸡还是先有蛋。因为这个增量是常数，客户端可以在拿到密钥之前就把密文大小
+/// 算准，于是 `prepare` 能先发出去、密钥随 token 回来、再加密上传。
+pub const V2_OVERHEAD: usize = V2_HEADER_LEN + NONCE_LEN + TAG_LEN;
+
+/// 给定明文长度，v2 密文的确切字节数。
+pub fn v2_sealed_len(plaintext_len: usize) -> usize {
+    plaintext_len + V2_OVERHEAD
+}
+
 /// 用全站密钥加密。
 ///
 /// 威胁模型是**对象存储服务商**：不少厂商会拿用户上传的图片视频去训练。所以明文和

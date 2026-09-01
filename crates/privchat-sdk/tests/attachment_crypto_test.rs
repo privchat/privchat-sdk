@@ -193,3 +193,16 @@ fn a_missing_site_key_never_falls_back_to_plaintext() {
     let err = decrypt_downloaded_attachment_bytes_v2(2, None, None, &blob).unwrap_err();
     assert!(err.contains("no site key"), "{err}");
 }
+
+/// 密文长度必须能在**拿到密钥之前**算准：上传 token 要签字节数，而密钥随 token
+/// 才回来。算错的话 token 签的大小和实际上传的对不上，服务端直接拒。
+#[test]
+fn the_sealed_size_is_predictable_without_the_key() {
+    use privchat_sdk::attachment_crypto::v2_sealed_len;
+    let key = site_key(3);
+    for len in [0usize, 1, 15, 1024, 1_852_290] {
+        let plain = vec![0xabu8; len];
+        let blob = encrypt_attachment_v2(&plain, &key, 1).expect("encrypt");
+        assert_eq!(blob.len(), v2_sealed_len(len), "明文 {len} 字节");
+    }
+}
