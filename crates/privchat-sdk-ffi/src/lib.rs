@@ -4486,6 +4486,15 @@ impl PrivchatClient {
         true
     }
 
+    /// 摘掉当前会话但保留它的盘上快照。「添加账号」用这个，不要用
+    /// [`Self::clear_local_state`]——那个会把上一个账号一起登出。
+    pub async fn detach_current_session(&self) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .detach_current_session()
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn clear_local_state(&self) -> Result<(), PrivchatFfiError> {
         self.inner
             .clear_local_state()

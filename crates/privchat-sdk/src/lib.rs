@@ -3169,6 +3169,11 @@ enum Command {
     GetSessionSnapshot {
         resp: oneshot::Sender<Result<Option<SessionSnapshot>>>,
     },
+    /// 摘掉当前会话但**保留**它的盘上快照（「添加账号」用）。
+    /// 与 [`Command::ClearLocalState`] 的唯一区别就是不删快照。
+    DetachCurrentSession {
+        resp: oneshot::Sender<Result<()>>,
+    },
     ClearLocalState {
         resp: oneshot::Sender<Result<()>>,
     },
@@ -10745,6 +10750,55 @@ impl State {
         self.ensure_synced_inner(true, emit).await
     }
 
+    /// 把当前会话从内存里摘下来，**不动盘上的东西**。
+    ///
+    /// 「添加账号」时用：新身份要重新握手，就不能让 `connect` 再拿上一个账号的
+    /// access token 去自动恢复。以前这里走的是 `clear_local_state`，它顺手把那个
+    /// 账号的会话快照也删了——用户只是想多登一个号，结果原来那个号被静默登出，
+    /// 切回去只剩 `no_local_session`，必须重新输密码。access token 过期（10002）
+    /// 是可恢复状态，不是登出理由。
+    ///
+    /// 清掉 active uid 指针是必要的（否则 connect 又会自动恢复），但那只是"当前是谁"，
+    /// 与"这个账号还登着吗"无关；紧接着的登录会写上新的 uid。
+    async fn detach_current_session(&mut self, now_ms: i64) -> Result<()> {
+        self.teardown_session_for_handover(now_ms);
+        if self.current_uid.is_some() {
+            let cleared = self.storage.clear_current_uid().await;
+            self.current_uid = None;
+            self.session_epoch += 1;
+            cleared?;
+        }
+        Ok(())
+    }
+
+    /// 真正的登出：连盘上的会话快照一起清掉。
+    async fn clear_current_session(&mut self, now_ms: i64) -> Result<()> {
+        self.teardown_session_for_handover(now_ms);
+        if let Some(uid) = self.current_uid.clone() {
+            let cleared = self.storage.clear_session(uid).await;
+            let cleared_uid = self.storage.clear_current_uid().await;
+            self.current_uid = None;
+            self.session_epoch += 1;
+            cleared.and(cleared_uid)?;
+        }
+        Ok(())
+    }
+
+    /// detach 与 clear 共用的那半段：停掉会话作用域内的活动，回到 Connected。
+    /// 两条路径必须拆得一模一样，只在"动不动盘"上分叉——分叉点越少越不会走偏。
+    fn teardown_session_for_handover(&mut self, now_ms: i64) {
+        self.download_manager.cancel_all_scoped();
+        self.should_auto_reconnect = false;
+        self.reset_reconnect_backoff();
+        self.bootstrap_completed = false;
+        self.convergence_run = None;
+        self.sync_coordinator.reset(now_ms);
+        self.pending_events.push(SdkEvent::SyncStateChanged {
+            state: self.sync_coordinator.snapshot(),
+        });
+        self.session_state = SessionState::Connected;
+    }
+
     async fn hydrate_system_channel_messages_from_history(&mut self) -> Result<()> {
         let channels = self.storage.list_channels(200, 0).await?;
         for channel in channels {
@@ -15603,29 +15657,30 @@ impl PrivchatSdk {
                         };
                         let _ = resp.send(result);
                     }
-                    Command::ClearLocalState { resp } => {
-                        state.download_manager.cancel_all_scoped();
-                        state.should_auto_reconnect = false;
-                        state.reset_reconnect_backoff();
+                    Command::DetachCurrentSession { resp } => {
                         let from_state = state.session_state.as_connection_state();
-                        state.bootstrap_completed = false;
-                        state.convergence_run = None;
-                        state
-                            .sync_coordinator
-                            .reset(chrono::Utc::now().timestamp_millis());
-                        state.pending_events.push(SdkEvent::SyncStateChanged {
-                            state: state.sync_coordinator.snapshot(),
-                        });
-                        state.session_state = SessionState::Connected;
-                        let result = if let Some(uid) = &state.current_uid {
-                            let clear = state.storage.clear_session(uid.clone()).await;
-                            let clear_uid = state.storage.clear_current_uid().await;
-                            state.current_uid = None;
-                            state.session_epoch += 1;
-                            clear.and(clear_uid)
-                        } else {
-                            Ok(())
-                        };
+                        let result = state
+                            .detach_current_session(chrono::Utc::now().timestamp_millis())
+                            .await;
+                        if result.is_ok() {
+                            emit_sequenced_event(
+                                &actor_event_tx,
+                                &actor_event_history,
+                                &actor_event_seq,
+                                event_history_limit,
+                                SdkEvent::ConnectionStateChanged {
+                                    from: from_state,
+                                    to: state.session_state.as_connection_state(),
+                                },
+                            );
+                        }
+                        let _ = resp.send(result);
+                    }
+                    Command::ClearLocalState { resp } => {
+                        let from_state = state.session_state.as_connection_state();
+                        let result = state
+                            .clear_current_session(chrono::Utc::now().timestamp_millis())
+                            .await;
                         if result.is_ok() {
                             emit_sequenced_event(
                                 &actor_event_tx,
@@ -18458,6 +18513,21 @@ impl PrivchatSdk {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::GetSessionSnapshot { resp: resp_tx })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
+    /// 摘掉当前会话，保留它的盘上快照。
+    ///
+    /// 「添加账号」的正确姿势：新身份要重新握手，不能让 `connect` 再拿上一个账号
+    /// 已过期的 access token 去自动恢复；但那个账号并没有要求退出，它的会话必须
+    /// 留着，否则切回去时只剩 `no_local_session`。
+    pub async fn detach_current_session(&self) -> Result<()> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::DetachCurrentSession { resp: resp_tx })
             .await
             .map_err(|_| self.actor_channel_error())?;
         resp_rx.await.map_err(|_| self.actor_channel_error())?
@@ -24058,6 +24128,37 @@ mod tests {
         assert_eq!(channel.top, 1);
         assert_eq!(channel.mute, 1);
         assert_eq!(channel.version, 52);
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 「添加账号」要先把当前会话让开，才能用新身份重新握手。让开**不等于登出**：
+    /// 旧账号的会话快照必须原样留在盘上，否则切回去时只剩 `no_local_session`，
+    /// 用户被迫重新输密码——而他从头到尾没要求退出那个账号。
+    #[tokio::test(flavor = "current_thread")]
+    async fn detaching_a_session_keeps_the_snapshot_for_switching_back() {
+        let (mut state, dir) = new_seeded_state("detach-keeps-snapshot").await;
+        state.current_uid = Some("10001".to_string());
+
+        state
+            .detach_current_session(1_710_400_000_000)
+            .await
+            .expect("detach");
+
+        assert_eq!(
+            state.current_uid, None,
+            "必须摘掉活跃账号，否则下一次 connect 又拿旧 token 去握手"
+        );
+        let snapshot = state
+            .storage
+            .load_session("10001".to_string())
+            .await
+            .expect("load session");
+        assert!(
+            snapshot.is_some(),
+            "🔴 detach 不能删账号的会话快照：删了就切不回去了"
+        );
 
         state.storage.shutdown();
         let _ = std::fs::remove_dir_all(dir);
