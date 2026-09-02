@@ -13092,9 +13092,9 @@ impl State {
         let meta_path = files_dir.join(media_store::META_FILENAME);
         std::fs::write(&body_path, &payload)
             .map_err(|e| Error::Storage(format!("write body file failed: {e}")))?;
-        let mut upload_payload = payload;
-        let mut upload_filename = filename.clone();
-        let mut body_size = upload_payload.len() as u64;
+        let upload_payload = payload;
+        let upload_filename = filename.clone();
+        let body_size = upload_payload.len() as u64;
 
         let inherited_source_dir =
             Self::inherited_managed_dir(&message.content, &user_root, &files_dir);
@@ -26373,13 +26373,6 @@ mod chunked_upload_plan_tests {
                 return Err(e);
             }
             Ok(uploaded())
-        }
-    }
-
-    fn sealed() -> SealedPayload {
-        SealedPayload {
-            blob: b"sealed!!".to_vec(),
-            sha256: plaintext_sha(),
         }
     }
 
