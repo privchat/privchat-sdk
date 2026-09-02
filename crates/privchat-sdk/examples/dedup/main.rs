@@ -17,19 +17,25 @@
 
 //! 附件秒传的真链路验证：真 SDK、真连接、真服务端、真对象存储。
 //!
-//! 验的是两件事，也只有这两件：
+//! 判重键是**明文摘要**。密文摘要做不了判重：每块都用新的随机 nonce，同一份
+//! 明文封两次就是两串不同的字节，按密文永远不可能命中。所以这里验的是：
 //!
-//! 1. **没上传过的内容 → miss，老流程照走。** 顺带覆盖「不带摘要」的老客户端，
-//!    它们必须还能上传（`already_exists` 缺省当 false）。
-//! 2. **已经在服务端的内容 → hit，换到自己的 `file_id`，正文零字节。**
-//!    两条记录指向同一个物理文件——这就是「转发不重新上传」的全部含义。
-//!
-//! 🔴 这里刻意**不**验「同一张图片封两次会命中」，因为按设计它不会：每次封装用
-//! 新的随机 CEK/nonce，密文不同 ⇒ 摘要不同 ⇒ 两个物理文件。那是正确行为，不是缺陷。
-//! 命中只发生在客户端手里就是服务端已有的那串字节时。
+//! 1. **没上传过的明文 → miss，照常上传密文。**
+//! 1b. **不申报明文摘要 → 最终落库被拒**：没有冻结的身份就没有东西可复核，
+//!    verify-before-publish 在这里必须 fail-closed。
+//! 2. **同一份明文再探测 → hit**，换到自己的 `file_id`，正文零字节，两条记录
+//!    指向同一个物理文件。
+//! 3. **重新封装同一份明文 → 仍然 hit**。这一条是判重键从密文换成明文的全部
+//!    意义所在；写反了就等于回到旧模型。
+//! 4. **换一个毫不相干的用户 → 仍然 hit**，且探测不泄露别人的 `file_id`。
+//!    跨用户秒传是这套设计要的结果，不是副作用。
+//! 5. 不同明文 → 不同物理文件。
 //!
 //! 跑法（需要本机 server 起着）：
 //! ```bash
+//! export PRIVCHAT_SPKI_PINS=$(openssl x509 -in ../privchat-server/certs/server.crt \
+//!   -pubkey -noout | openssl pkey -pubin -outform der \
+//!   | openssl dgst -sha256 -binary | base64)
 //! cargo run -p privchat-sdk --example dedup
 //! ```
 
@@ -55,18 +61,7 @@ async fn main() -> BoxResult<()> {
         std::env::temp_dir().join(format!("privchat-dedup-{}-{}", ts, std::process::id()));
     std::fs::create_dir_all(&data_dir)?;
 
-    let sdk = PrivchatSdk::new(PrivchatConfig {
-        endpoints: vec![ServerEndpoint {
-            protocol: TransportProtocol::Tcp,
-            host,
-            port: tcp_port,
-            path: None,
-            use_tls: false,
-        }],
-        connection_timeout_secs: 30,
-        data_dir: data_dir.to_string_lossy().to_string(),
-        spki_pins: vec![],
-    });
+    let sdk = PrivchatSdk::new(sdk_config(&host, tcp_port, &data_dir));
 
     println!("1) connect + register + authenticate");
     sdk.connect().await?;
@@ -88,7 +83,7 @@ async fn main() -> BoxResult<()> {
         Some(false),
         "🔴 服务端从没见过这串字节，预检必须是 miss"
     );
-    let file_a = upload_blob(&token_a, &blob_a).await?;
+    let file_a = upload_blob(&token_a, &seal_with_token(&token_a, &blob_a)?).await?;
     let (id_a, url_a) = (file_id(&file_a)?, file_url(&file_a)?);
     println!("   file_id={} url={}", id_a, url_a);
 
@@ -130,7 +125,7 @@ async fn main() -> BoxResult<()> {
     );
 
     // ---------------------------------------------------------------- 场景 4
-    println!("\n6) 不带摘要的老客户端 → 照常上传，不受影响");
+    println!("\n6) 不申报明文摘要 → 判重不命中，且最终不许落库（fail-closed）");
     let blob_b = random_blob(ts.wrapping_add(7919));
     let token_b = request_token(&sdk, blob_b.len(), None).await?;
     assert_ne!(
@@ -138,20 +133,89 @@ async fn main() -> BoxResult<()> {
         Some(true),
         "🔴 没申报摘要就没法判重，不许假装命中"
     );
-    let file_b = upload_blob(&token_b, &blob_b).await?;
+    // 🔴 没有冻结的明文身份就没有东西可复核，服务端必须拒绝，而不是"先存下来再说"。
+    // 目前这道拒绝落在**完成**那一步（HTTP 400「token 未冻结明文摘要」），
+    // 也就是客户端会先白传一遍正文；放到 prepare 就拒会更省事，但安全性是一样的。
+    let refused = upload_blob(&token_b, &seal_with_token(&token_b, &blob_b)?).await;
+    let err = refused
+        .err()
+        .ok_or("🔴 没有冻结明文身份的上传竟然成功了：verify-before-publish 被绕过")?
+        .to_string();
+    assert!(
+        err.contains("未冻结明文摘要"),
+        "🔴 期望因为缺少冻结的明文身份被拒，实际={err}"
+    );
+    println!("   已按预期拒绝：{err}");
+
+    // 不同明文 → 不同物理文件（这次带上摘要，走正常路径）。
+    let digest_b = sha256_hex(&blob_b);
+    let token_b2 = request_token(&sdk, blob_b.len(), Some(&digest_b)).await?;
+    let file_b = upload_blob(&token_b2, &seal_with_token(&token_b2, &blob_b)?).await?;
     let url_b = file_url(&file_b)?;
     assert_ne!(url_b, url_a, "🔴 不同内容必须是不同的物理文件");
     println!("   file_id={} url={}", file_id(&file_b)?, url_b);
 
     // ---------------------------------------------------------------- 场景 5
-    println!("\n7) 重新封装同一份明文 → 密文变了，必须 miss（预期行为，不是缺陷）");
-    let resealed = random_blob(ts.wrapping_add(31337)); // 等价于换了随机 CEK/nonce
-    let token_c = request_token(&sdk, resealed.len(), Some(&sha256_hex(&resealed))).await?;
+    println!("\n7) 重新封装同一份明文 → 密文是另一串字节，但必须**仍然命中**");
+    let resealed = seal_with_token(&token_a, &blob_a)?;
+    let first_sealed = seal_with_token(&token_a, &blob_a)?;
+    assert_ne!(
+        resealed, first_sealed,
+        "🔴 每块都用新 nonce，同一份明文封两次不该得到同一串字节；\
+         真相等说明 nonce 复用了，那是可以直接解密的严重缺陷"
+    );
+    let token_c = request_token(&sdk, blob_a.len(), Some(&digest_a)).await?;
     assert_eq!(
         token_c["already_exists"].as_bool(),
-        Some(false),
-        "🔴 字节不同就是另一个文件，不许命中"
+        Some(true),
+        "🔴 判重键是明文摘要。这里 miss 就说明又退回按密文判重了——\
+         那样同一份内容永远命中不了"
     );
+
+    // ---------------------------------------------------------------- 场景 6
+    println!("\n8) 换一个毫不相干的用户 → 仍然命中，且不泄露别人的 file_id");
+    let other_dir = std::env::temp_dir().join(format!(
+        "privchat-dedup-other-{}-{}",
+        ts,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&other_dir)?;
+    let other = PrivchatSdk::new(sdk_config(&host, tcp_port, &other_dir));
+    other.connect().await?;
+    let other_name = format!("dedup_other_{}", ts);
+    let other_login = other
+        .register(other_name, "password123".to_string(), uuid_like())
+        .await?;
+    other
+        .authenticate(
+            other_login.user_id,
+            other_login.token.clone(),
+            other_login.device_id.clone(),
+        )
+        .await?;
+    let token_x = request_token(&other, blob_a.len(), Some(&digest_a)).await?;
+    assert_eq!(
+        token_x["already_exists"].as_bool(),
+        Some(true),
+        "🔴 跨用户秒传是这套设计要的结果：判重键是内容，不是谁传的"
+    );
+    assert!(
+        token_x["file_id"].as_str().unwrap_or_default().is_empty(),
+        "🔴 探测只回答「在不在」，不许把别人的 file_id 递出去；实际={}",
+        token_x["file_id"]
+    );
+    let claimed_x = claim_existing(&other, &token_x, &digest_a).await?;
+    assert_eq!(
+        file_url(&claimed_x)?,
+        url_a,
+        "🔴 另一个用户取用的必须是同一个物理文件"
+    );
+    assert_ne!(
+        file_id(&claimed_x)?,
+        id_a,
+        "🔴 但要有自己的一条记录，不是把源记录递回来"
+    );
+    other.disconnect().await?;
 
     sdk.disconnect().await?;
     println!("\n✅ 秒传真链路全部通过");
@@ -159,6 +223,34 @@ async fn main() -> BoxResult<()> {
 }
 
 // ---------------------------------------------------------------------------
+
+/// 两个客户端连同一台服务端，但各自独立的本地目录——跨用户秒传要的是两个
+/// 毫不相干的账号，共用 data_dir 会让本地缓存把结果搅浑。
+fn sdk_config(host: &str, tcp_port: u16, data_dir: &std::path::Path) -> PrivchatConfig {
+    // tcp:// 是 TLS-only 且缺 pin 直接拒连（裸 IP + 自签部署下没有别的身份来源），
+    // 所以 pin 必须显式给：
+    //   PRIVCHAT_SPKI_PINS=$(openssl x509 -in certs/server.crt -pubkey -noout \
+    //     | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)
+    let spki_pins: Vec<String> = std::env::var("PRIVCHAT_SPKI_PINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    PrivchatConfig {
+        endpoints: vec![ServerEndpoint {
+            protocol: TransportProtocol::Tcp,
+            host: host.to_string(),
+            port: tcp_port,
+            path: None,
+            use_tls: true,
+        }],
+        connection_timeout_secs: 30,
+        data_dir: data_dir.to_string_lossy().to_string(),
+        spki_pins,
+    }
+}
 
 async fn claim_existing(sdk: &PrivchatSdk, token: &Value, sha256: &str) -> BoxResult<Value> {
     let body = json!({
@@ -181,23 +273,63 @@ async fn get_url(sdk: &PrivchatSdk, file_id: u64) -> BoxResult<Value> {
     )?)
 }
 
-async fn request_token(sdk: &PrivchatSdk, size: usize, sha256: Option<&str>) -> BoxResult<Value> {
+/// 申请上传 token。申报的是**明文**大小与**明文**摘要——判重键就是它。
+async fn request_token(
+    sdk: &PrivchatSdk,
+    plaintext_size: usize,
+    plaintext_sha256: Option<&str>,
+) -> BoxResult<Value> {
     let mut body = json!({
         "user_id": 0,
         "filename": "dedup-probe.bin",
-        "file_size": size as i64,
+        "plaintext_size": plaintext_size as i64,
         "mime_type": "application/octet-stream",
         "file_type": "file",
         "business_type": "message",
-        "transform_version": 0,
     });
-    if let Some(d) = sha256 {
-        body["sha256"] = json!(d);
+    if let Some(d) = plaintext_sha256 {
+        body["plaintext_sha256"] = json!(d);
     }
     Ok(serde_json::from_str(
         &sdk.rpc_call("file/request_upload_token".to_string(), body.to_string())
             .await?,
     )?)
+}
+
+/// 用 token 下发的密钥与块大小封装明文。
+///
+/// 🔴 封装只能发生在**拿到 token 之后**：密钥和块大小都是响应带回来的，
+/// 提前封没有密钥可用。这也是"复用已有密文"那条捷径不存在的原因。
+fn seal_with_token(token: &Value, plaintext: &[u8]) -> BoxResult<Vec<u8>> {
+    let key_b64 = token["attachment_key"]["key"]
+        .as_str()
+        .ok_or("token response missing attachment_key.key")?;
+    let key_id = token["attachment_key"]["key_id"]
+        .as_u64()
+        .ok_or("token response missing attachment_key.key_id")? as u8;
+    let chunk = token["chunk_plain_size"]
+        .as_u64()
+        .ok_or("token response missing chunk_plain_size")? as u32;
+    let key = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        key_b64,
+    )?;
+    let sealed = privchat_protocol::attachment_crypto::encrypt_attachment_with_chunk_size(
+        plaintext, &key, key_id, chunk,
+    )?;
+    // 服务端按 token 里签好的 total_size 收字节，对不上直接拒绝。
+    let expected = token["total_size"]
+        .as_u64()
+        .ok_or("token response missing total_size")?;
+    if sealed.len() as u64 != expected {
+        return Err(format!(
+            "sealed length {} does not match the signed total_size {}",
+            sealed.len(),
+            expected
+        )
+        .into());
+    }
+    Ok(sealed)
 }
 
 async fn upload_blob(token: &Value, blob: &[u8]) -> BoxResult<Value> {
