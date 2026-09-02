@@ -7379,14 +7379,13 @@ impl PrivchatClient {
         let mut req = FileRequestUploadTokenRequest {
             user_id: 0,
             filename: payload.filename,
-            file_size: payload.file_size,
+            plaintext_size: payload.file_size,
             mime_type: payload.mime_type,
             file_type: payload.file_type,
             business_type: payload.business_type,
-            // 这个入口是给上层「自己准备好字节再传」用的，没有走 SDK 内部的封装步骤，
-            // 因此没有可报的最终 blob 摘要；不带摘要 = 照常完整上传（服务端兼容）。
-            sha256: None,
-            transform_version: 0,
+            // 这个入口是给上层「自己准备好字节再传」用的，没走 SDK 内部的封装步骤，
+            // 也就没有可报的明文摘要；不带 = 不参与秒传预检，照常完整上传。
+            plaintext_sha256: None,
         };
         req.user_id = 0;
         let resp: FileRequestUploadTokenResponse =
@@ -8895,12 +8894,12 @@ impl PrivchatClient {
                 }
             })?;
 
-        if let Some((blob, cek)) = sealed {
+        if let Some(blob) = sealed {
+            // 只缓存密文；密钥是全站的、由服务端下发，不落本地。
             privchat_sdk::media_download::write_sealed_cache(
                 dir,
                 &format!("{file_name}.sealed"),
                 &blob,
-                &cek,
             );
         }
 
@@ -8948,14 +8947,13 @@ impl PrivchatClient {
 
         // 把原始密文留在文件旁边：这份内容再发一次时原样上传，服务端按摘要认出
         // 「已经有了」，正文一个字节都不用传。
-        if let (Some((blob, cek)), Some(dir), Some(name)) =
+        if let (Some(blob), Some(dir), Some(name)) =
             (sealed, target.parent(), target.file_name())
         {
             privchat_sdk::media_download::write_sealed_cache(
                 dir,
                 &format!("{}.sealed", name.to_string_lossy()),
                 &blob,
-                &cek,
             );
         }
         Ok(target_path)
@@ -9572,7 +9570,7 @@ impl PrivchatClient {
     async fn resolve_attachment_bytes(
         &self,
         source_path: &str,
-    ) -> Result<(Vec<u8>, Option<(Vec<u8>, String)>), PrivchatFfiError> {
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), PrivchatFfiError> {
         self.resolve_attachment_bytes_with_meta(source_path)
             .await
             .map(|(bytes, sealed, _)| (bytes, sealed))
@@ -9587,7 +9585,7 @@ impl PrivchatClient {
         &self,
         source_path: &str,
     ) -> Result<
-        (Vec<u8>, Option<(Vec<u8>, String)>, Option<FileGetUrlResponse>),
+        (Vec<u8>, Option<Vec<u8>>, Option<FileGetUrlResponse>),
         PrivchatFfiError,
     > {
         let source = source_path.trim();
@@ -9609,8 +9607,9 @@ impl PrivchatClient {
 
         // 加密附件（enc_v=1）在服务端存的是密文，CEK 只在 `file/get_url` 的响应里。
         // 调用方直接给 URL 时没有这条信息，只能按明文处理。
-        let mut encryption_version = 0;
-        let mut cek: Option<String> = None;
+        // 🔴 密钥来自 get_url 的响应（全站密钥，按对象行的 key_id 选出的那一把）。
+        // 没有密钥 = 这是明文对象（公开资源）；不再有 per-file CEK 这回事。
+        let mut attachment_key: Option<String> = None;
         let mut meta: Option<FileGetUrlResponse> = None;
         let download_url = if source.starts_with("http://") || source.starts_with("https://") {
             source.to_string()
@@ -9621,8 +9620,7 @@ impl PrivchatClient {
             };
             let resp: FileGetUrlResponse =
                 rpc_call_typed(&self.inner, routes::file::GET_URL, &req).await?;
-            encryption_version = resp.encryption_version;
-            cek = resp.cek.clone();
+            attachment_key = resp.attachment_key.as_ref().map(|k| k.key.clone());
             let url = resp.file_url.clone();
             meta = Some(resp);
             url
@@ -9673,19 +9671,31 @@ impl PrivchatClient {
                 detail: format!("download attachment task failed: {e}"),
             })??;
 
-        // 🔴 落盘的必须是明文，而且**解不开就要报错**：v1 缺 CEK、或者遇到不认识的
-        // 加密版本时把密文当明文返回，产出的就是一张坏图/一个坏文件——错误被藏起来，
-        // 只在用户眼前显形。严格版判据见 attachment_crypto。
-        let plain = privchat_sdk::attachment_crypto::decrypt_downloaded_attachment_bytes(
-            encryption_version,
-            cek.as_deref(),
-            &blob,
-        )
-        .map_err(|e| PrivchatFfiError::SdkError {
-            code: privchat_protocol::ErrorCode::InternalError as u32,
-            detail: format!("decrypt attachment failed: {e}"),
-        })?;
-        let sealed = cek.filter(|_| encryption_version == 1).map(|c| (blob, c));
+        // 🔴 落盘的必须是明文，而且**解不开就要报错**：把密文当明文返回产出的是
+        // 一张坏图/一个坏文件——错误被藏起来，只在用户眼前显形。
+        //
+        // 分流由票据说了算（有没有密钥），不由字节的 magic 说了算。
+        let (plain, sealed) = match attachment_key.as_deref() {
+            Some(encoded) => {
+                let site_key = privchat_sdk::attachment_crypto::decode_site_key(encoded)
+                    .map_err(|e| PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::InternalError as u32,
+                        detail: format!("attachment key unusable: {e}"),
+                    })?;
+                let plain =
+                    privchat_sdk::attachment_crypto::decrypt_downloaded_attachment_bytes(
+                        &site_key, &blob,
+                    )
+                    .map_err(|e| PrivchatFfiError::SdkError {
+                        code: privchat_protocol::ErrorCode::InternalError as u32,
+                        detail: format!("decrypt attachment failed: {e}"),
+                    })?;
+                // 密文留一份：再发这份内容时可以直接复用，不必重新封装。
+                (plain, Some(blob))
+            }
+            // 明文对象（公开资源）：原样就是内容，没有可缓存的密文。
+            None => (blob, None),
+        };
         Ok((plain, sealed, meta))
     }
 }

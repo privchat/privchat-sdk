@@ -1827,12 +1827,15 @@ dependencies = [
 name = "privchat-protocol"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm",
  "base64",
  "chrono",
  "flatbuffers",
  "num-bigint",
+ "rand 0.8.5",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 

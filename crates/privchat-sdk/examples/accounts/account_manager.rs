@@ -1179,12 +1179,12 @@ impl MultiAccountManager {
                 &FileRequestUploadTokenRequest {
                     user_id: self.user_id(key)?,
                     filename: Some(filename.to_string()),
-                    file_size: size,
+                    plaintext_size: size,
                     mime_type: mime.to_string(),
                     file_type: file_type.to_string(),
                     business_type: "message".to_string(),
-                sha256: None,
-                transform_version: 0,
+                    // 这个 smoke 例子自己准备字节，不参与秒传预检。
+                    plaintext_sha256: None,
                 },
             )
             .await?;
@@ -1197,6 +1197,10 @@ impl MultiAccountManager {
                 .unwrap_or_else(|| "unknown-file-id".to_string()),
             expires_at: None,
             max_size: None,
+            // 这个兼容壳只转发老字段，加密参数由真实服务端下发，这里没有。
+            attachment_key: None,
+            chunk_plain_size: None,
+            total_size: None,
             // 这个假实现只走整包路径，不下发分片方案。
             upload_plan: None,
         })

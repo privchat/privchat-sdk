@@ -249,7 +249,7 @@ impl DownloadManager {
         self.start_with_ticket(
             sdk,
             key,
-            ResolvedFileDownload::legacy_url(download_url),
+            ResolvedFileDownload::plaintext_url(download_url),
             target_dir,
             payload_filename,
         )
@@ -642,7 +642,17 @@ async fn run_download(
     // as the final file. A decrypt failure deletes the .part (it is unusable and
     // must NOT masquerade as resumable data) and surfaces as a hard failure — we
     // never fall back to writing the encrypted bytes.
-    if ticket.encryption_version == 0 {
+    // 🔴 分流由**票据**说了算：`get_url` 按对象行上的 encryption_key_id 决定发不发
+    // 密钥。没有密钥 = 这是明文对象（公开资源），原样改名；有密钥 = 密文，必须解开。
+    //
+    // 不看字节的 magic：那只是一段可以被构造出来的前缀，一个恰好以 `PC\x01` 开头的
+    // 公开文件会被误判成密文。
+    if ticket.attachment_key.is_none() {
+        // 明文对象：`.part` 原样改名即成品，没有可解的东西。
+        //
+        // 🔴 这里**必须真的改名**。分支空着的话后面照样报"下载成功"并把 final_path
+        // 交出去，而那个路径上根本没有文件——每一个合法的明文资源都会拿到一个
+        // 不存在的路径，错误还要等到用户点开时才显形。
         if let Err(e) = fs::rename(&part_path, &final_path) {
             fail(
                 &sdk,
@@ -669,9 +679,28 @@ async fn run_download(
                 return;
             }
         };
+        let site_key = match ticket
+            .attachment_key
+            .as_deref()
+            .ok_or_else(|| "ticket has no attachment key".to_string())
+            .and_then(crate::attachment_crypto::decode_site_key)
+        {
+            Ok(k) => k,
+            Err(e) => {
+                let _ = fs::remove_file(&part_path);
+                fail(
+                    &sdk,
+                    &manager,
+                    &key,
+                    ErrorCode::InternalError as u32,
+                    format!("attachment key unusable: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
         let plaintext = match crate::attachment_crypto::decrypt_downloaded_attachment_bytes(
-            ticket.encryption_version,
-            ticket.cek.as_deref(),
+            &site_key,
             &blob,
         ) {
             Ok(p) => p,
@@ -720,10 +749,10 @@ async fn run_download(
         //
         // 明文成品照常保留给播放器/预览。两份都在，磁盘是双倍——所以有保留窗口，
         // 见 `prune_sealed_caches`。
-        if let Some(cek) = ticket.cek.as_deref() {
-            if let Some(dir) = final_path.parent() {
-                write_sealed_cache(dir, sealed_cache_name(&final_path), &blob, cek);
-            }
+        // 🔴 只缓存密文本身，不缓存密钥：密钥是**全站**的，由服务端在 get_url /
+        // 上传 token 里下发，本地留一份既没必要也扩大暴露面。
+        if let Some(dir) = final_path.parent() {
+            write_sealed_cache(dir, sealed_cache_name(&final_path), &blob);
         }
         let _ = fs::remove_file(&part_path);
     }
@@ -808,12 +837,7 @@ fn sealed_cache_name(final_path: &std::path::Path) -> &'static str {
 ///
 /// best-effort：写失败不影响下载本身，只是这次转发省不掉上传。
 /// 把密文和它的 CEK 留在文件旁边，供"同一份内容再发一次"时原样上传。
-pub fn write_sealed_cache(
-    dir: &std::path::Path,
-    cache_name: &str,
-    blob: &[u8],
-    cek: &str,
-) {
+pub fn write_sealed_cache(dir: &std::path::Path, cache_name: &str, blob: &[u8]) {
     use sha2::Digest as _;
     let cache = dir.join(cache_name);
     let meta_path = cache.with_extension("sealed.json");
@@ -830,8 +854,8 @@ pub fn write_sealed_cache(
     }
     let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
     hasher.update(blob);
+    // 元数据只剩摘要：密钥是全站的、由服务端下发，不落本地。
     let meta = serde_json::json!({
-        "cek": cek,
         "sha256": hex::encode(hasher.finalize()),
     });
     let meta_tmp = meta_path.with_extension("tmp");
@@ -1007,8 +1031,8 @@ mod sealed_cache_tests {
         let dir = message_dir(&root);
         let blob = b"nonce-and-ciphertext-and-tag".to_vec();
 
-        write_sealed_cache(&dir, "body.sealed", &blob, "cek-under-test");
-        write_sealed_cache(&dir, "thumb.sealed", b"thumb-blob", "thumb-cek");
+        write_sealed_cache(&dir, "body.sealed", &blob);
+        write_sealed_cache(&dir, "thumb.sealed", b"thumb-blob");
 
         let cache = dir.join("body.sealed");
         assert_eq!(fs::read(&cache).expect("blob"), blob);
@@ -1016,7 +1040,9 @@ mod sealed_cache_tests {
             &fs::read_to_string(cache.with_extension("sealed.json")).expect("meta"),
         )
         .expect("parse meta");
-        assert_eq!(meta["cek"], "cek-under-test");
+        // 🔴 元数据里**不该有密钥**：密钥是全站的、由服务端下发，本地缓存留一份
+        // 只会白白扩大暴露面。写进去就是把它散到每台设备的托管目录里。
+        assert!(meta.get("cek").is_none(), "缓存元数据不得包含任何密钥");
         // 摘要必须是**真实字节**的摘要——写错了发送侧会当成损坏缓存丢弃，
         // 表现就是转发永远省不掉上传，而且没有任何报错。
         use sha2::Digest as _;
@@ -1060,7 +1086,7 @@ mod sealed_cache_tests {
         let stale = root.join("files").join("202608").join("2");
         for dir in [&fresh, &stale] {
             fs::create_dir_all(dir).expect("create dir");
-            write_sealed_cache(dir, "body.sealed", b"blob", "cek");
+            write_sealed_cache(dir, "body.sealed", b"blob");
             fs::write(dir.join("payload.png"), b"plaintext").expect("write plaintext");
             fs::write(dir.join("thumb.webp"), b"thumb").expect("write thumb");
         }

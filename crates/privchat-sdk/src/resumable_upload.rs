@@ -729,6 +729,22 @@ pub struct UploadSessionRecord {
     /// 仅 S3 面：总片数。
     #[serde(default)]
     pub total_parts: Option<u32>,
+    /// 🔴 这张 token 的封装参数，恢复时要原样用回去。
+    ///
+    /// 不记的话，重启后续传会拿新参数重新封装——那是另一串字节，与这张 token
+    /// 冻结的长度对不上，续传必然在 complete 处失败。
+    ///
+    /// 🔴 **只记 key_id，不记密钥本身。** 这份 JSON 就躺在密文缓存旁边，把全站
+    /// 密钥写进去等于让「拿到这台设备的文件」直接升级成「能解开同一代的全部附件」。
+    /// 恢复时不需要密钥：那串密文已经在缓存里，按 key_id + 块大小认出来直接用；
+    /// 缓存不在了就作废这个会话重新申请，服务端会重新下发密钥。
+    #[serde(default)]
+    pub encryption_key_id: Option<u8>,
+    #[serde(default)]
+    pub chunk_plain_size: Option<u32>,
+    /// 服务端算出的密文总长（= 要传的字节数）。
+    #[serde(default)]
+    pub total_size: Option<u64>,
 }
 
 fn default_transport() -> String {
@@ -945,6 +961,9 @@ mod session_tests {
             transport: default_transport(),
             part_size: None,
             total_parts: None,
+            encryption_key_id: None,
+            chunk_plain_size: None,
+            total_size: None,
             sealed_sha256: "aa".repeat(32),
             sealed_size: 4096,
             user_id: 7,

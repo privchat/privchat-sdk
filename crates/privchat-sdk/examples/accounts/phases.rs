@@ -5063,12 +5063,13 @@ impl TestPhases {
                                 metrics
                                     .errors
                                     .push("downloaded attachment is empty".to_string());
-                            } else if url.encryption_version == 0
+                            } else if url.attachment_key.is_none()
                                 && bytes.as_ref() != std::fs::read(&source_path)?.as_slice()
                             {
-                                // 明文才能逐字节比。加密附件（enc_v=1）下载到的是
-                                // 密文，长度带 nonce/tag 头，跟源文件不等长是正常的
-                                // ——那里能断言的只有「拿得到、非空」。
+                                // 明文对象（票据里没有密钥）才能逐字节比。加密附件
+                                // 下载到的是密文，带文件头和每块的 nonce/tag，
+                                // 跟源文件不等长是正常的——那里能断言的只有
+                                // 「拿得到、非空」。
                                 metrics.errors.push(format!(
                                     "downloaded plaintext differs from source ({} vs {source_bytes} bytes)",
                                     bytes.len()

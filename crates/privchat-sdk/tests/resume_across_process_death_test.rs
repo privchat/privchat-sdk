@@ -240,6 +240,11 @@ async fn child_main(base: String, cache: std::path::PathBuf) {
             transport: "proxy_offset_v1".into(),
             part_size: None,
             total_parts: None,
+            // 🔴 封装参数要跟着会话过命：重启之后手上没有密钥（它不落盘），
+            // 靠 key_id + 块大小认出缓存里那串已经封好的密文，续传才可能接上。
+            encryption_key_id: Some(1),
+            chunk_plain_size: Some(privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE),
+            total_size: Some(data.len() as u64),
         };
         rec.store(&sealed).expect("store session");
     }

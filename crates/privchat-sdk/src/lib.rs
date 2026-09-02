@@ -73,6 +73,10 @@ use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
 /// 一次读取最多顺带修几条:repair 走网络,不能让打开会话变成一次批量拉取。
 /// 没修完的下次读取继续。
+/// 平台保留的系统账号 uid。它会往**普通 DM** 里注入系统消息（例如加好友成功后的
+/// 「我们已经是好友了」），所以「消息发送者 == DM 对端」这个推断对它不成立。
+const SYSTEM_ACCOUNT_UID: u64 = 1;
+
 const REPAIR_BATCH_LIMIT: usize = 5;
 /// 队列上限。排不下的留给下一次读取重新发现——损坏是从数据本身发现的,不会丢。
 const REPAIR_QUEUE_LIMIT: usize = 64;
@@ -82,7 +86,6 @@ const REPAIR_TIMEOUT_MS: u64 = 15_000;
 const REPAIR_BACKOFF_BASE_MS: u64 = 2_000;
 const REPAIR_BACKOFF_MAX_SHIFT: u32 = 6;
 
-pub mod attachment_crypto;
 mod avatar_cache;
 pub mod canonical_inbound;
 pub mod error_codes;
@@ -107,22 +110,30 @@ pub use sync_coordinator::{
 };
 use task::task_registry::TaskRegistry;
 
-/// 下载票据：下载前由 `file/get_url` 解析（file_id 路径），或由 legacy file_url 构造
-/// （`encryption_version=0, cek=None`）。DownloadManager / run_download 只认这个，不关心来源。
+/// 密文格式与协议同源：客户端封、服务端在首传时验，两边必须是同一份实现。
+pub use privchat_protocol::attachment_crypto;
+
+/// 下载票据：下载前由 `file/get_url` 解析（file_id 路径），或由明文 file_url 构造
+/// （`attachment_key=None`）。DownloadManager / run_download 只认这个，不关心来源。
+///
+/// 🔴 票据里**没有**「这份是不是加密的」标志位。是不是密文由字节自己说了算
+/// （`attachment_crypto::looks_like_attachment`）——标志位和字节一旦不一致，
+/// 结果就是把密文当图片写进缓存。
 #[derive(Debug, Clone)]
 pub struct ResolvedFileDownload {
     pub url: String,
-    pub encryption_version: i32,
-    pub cek: Option<String>,
+    /// 解开**这一个**附件的密钥，base64url(no-pad)。明文对象为 None。
+    ///
+    /// **绝不进日志。**
+    pub attachment_key: Option<String>,
 }
 
 impl ResolvedFileDownload {
-    /// 旧消息只有 file_url 时的 legacy 明文票据。
-    pub fn legacy_url(url: String) -> Self {
+    /// 只有 file_url、没有走 get_url 时的明文票据。
+    pub fn plaintext_url(url: String) -> Self {
         Self {
             url,
-            encryption_version: 0,
-            cek: None,
+            attachment_key: None,
         }
     }
 }
@@ -925,6 +936,23 @@ struct LiveAttachmentUploadIo<'a> {
     server_identity: String,
 }
 
+impl LiveAttachmentUploadIo<'_> {
+    /// 🔴 封完先和服务端算的长度对一次。
+    ///
+    /// 对不上说明两边的分块几何不一致（块大小取错、或明文在这中间变了）。此刻发现
+    /// 只是一次本地失败；传完再发现就是白传一整个文件，而且报出来的是一个跟成因
+    /// 毫无关系的"长度不符"。
+    fn check_sealed_len(blob: &[u8], expected: Option<u64>) -> Result<()> {
+        match expected {
+            Some(want) if want != blob.len() as u64 => Err(Error::Serialization(format!(
+                "封装长度与服务端冻结的不一致：本地 {}，服务端 {want}",
+                blob.len()
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
 impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
     async fn prepare(
         &mut self,
@@ -986,6 +1014,11 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                             transport: rec.transport,
                             part_size: rec.part_size,
                             total_parts: rec.total_parts,
+                            // 恢复的会话没有密钥（不落盘），只有 key_id。
+                            attachment_key: None,
+                            encryption_key_id: rec.encryption_key_id,
+                            chunk_plain_size: rec.chunk_plain_size,
+                            total_size: rec.total_size,
                         }));
                     }
                     verdict => {
@@ -1040,7 +1073,22 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                 .unwrap_or_else(|| TRANSPORT_PROXY_OFFSET_V1.to_string()),
             part_size: response.part_size.filter(|v| *v > 0),
             total_parts: response.total_parts.filter(|v| *v > 0),
+            encryption_key_id: response.attachment_key.as_ref().map(|k| k.key_id),
+            attachment_key: response.attachment_key.clone(),
+            chunk_plain_size: response.chunk_plain_size.filter(|v| *v > 0),
+            total_size: response.total_size.filter(|v| *v > 0),
         };
+        // 🔴 缺封装参数 = 会话不可用。没有密钥就封不出服务端认的密文；没有块大小
+        // 就封不出它冻结的长度。当场报错，别把一堆注定被拒的字节传上去。
+        if session.attachment_key.is_none()
+            || session.chunk_plain_size.is_none()
+            || session.total_size.is_none()
+        {
+            return Err(Error::Serialization(
+                "decode file/request_chunked_upload_token: 缺 attachment_key/chunk_plain_size/total_size"
+                    .to_string(),
+            ));
+        }
         // 🔴 S3 面缺几何 = 会话不可用：宁可当场报错，也不要拿 None 去算片号，
         // 那会退化成「传了一堆对不上的片」，直到 complete 才炸。
         if session.transport == TRANSPORT_S3_MULTIPART_V1
@@ -1067,6 +1115,9 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
             transport: session.transport.clone(),
             part_size: session.part_size,
             total_parts: session.total_parts,
+            encryption_key_id: session.encryption_key_id,
+            chunk_plain_size: session.chunk_plain_size,
+            total_size: session.total_size,
         };
         if let Err(e) = rec.store(self.sealed_cache) {
             eprintln!("[SDK.upload] 上传会话落盘失败（下次将从头传）: {e}");
@@ -1085,7 +1136,6 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                 &self.mime_type,
                 self.sealed_cache,
                 &payload.blob,
-                payload.cek_b64.clone(),
                 &self.local_message_id,
             )
             .await
@@ -1102,6 +1152,51 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
         self.state.claim_existing_file(token, digest).await
     }
 
+    fn seal(
+        &mut self,
+        token: &FileRequestUploadTokenResponse,
+        plaintext: &[u8],
+    ) -> Result<SealedPayload> {
+        let key = token.attachment_key.as_ref().ok_or_else(|| {
+            // 🔴 没有密钥不是"那就传明文"：服务端 fail-closed 地拒绝签发，能走到这里
+            // 却没有密钥说明响应不完整，明文上桶是绝不能发生的降级。
+            Error::Serialization("upload token 未下发附件密钥，拒绝上传".to_string())
+        })?;
+        let chunk = token.chunk_plain_size.ok_or_else(|| {
+            Error::Serialization("upload token 未下发块大小，拒绝上传".to_string())
+        })?;
+        let (blob, sha256) = State::seal_once(self.sealed_cache, plaintext, key, chunk)?;
+        Self::check_sealed_len(&blob, token.total_size)?;
+        Ok(SealedPayload { blob, sha256 })
+    }
+
+    fn seal_chunked(
+        &mut self,
+        session: &ChunkedSession,
+        plaintext: &[u8],
+    ) -> Result<SealedPayload> {
+        let chunk = session.chunk_plain_size.ok_or_else(|| {
+            Error::Serialization("分片会话未下发块大小，拒绝上传".to_string())
+        })?;
+        let (blob, sha256) = match session.attachment_key.as_ref() {
+            // 刚签发的会话：密钥在手，正常封装（命中缓存就直接复用）。
+            Some(key) => State::seal_once(self.sealed_cache, plaintext, key, chunk)?,
+            // 🔴 从磁盘恢复的会话：手上**没有**密钥（它不落盘）。续传要上传的就是
+            // 当初封好的那串字节，缓存里认得出来就直接用；认不出来说明缓存丢了或
+            // 参数变了，这个会话作废，交给上层重新申请（新 token 会带新密钥）。
+            None => {
+                let key_id = session.encryption_key_id.ok_or_else(|| {
+                    Error::Serialization("恢复的分片会话缺少 key_id，无法认出密文缓存".to_string())
+                })?;
+                State::load_sealed_cache(self.sealed_cache, key_id, chunk).ok_or(
+                    Error::UploadSessionGone,
+                )?
+            }
+        };
+        Self::check_sealed_len(&blob, session.total_size)?;
+        Ok(SealedPayload { blob, sha256 })
+    }
+
     async fn upload(
         &mut self,
         token: &FileRequestUploadTokenResponse,
@@ -1114,7 +1209,6 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                 &self.filename,
                 &self.mime_type,
                 payload.blob.clone(),
-                payload.cek_b64.clone(),
             )
             .await
     }
@@ -1136,6 +1230,19 @@ pub(crate) struct ChunkedSession {
     pub part_size: Option<u64>,
     /// 仅 `s3_multipart_v1`：总分片数。
     pub total_parts: Option<u32>,
+    /// 🔴 本次会话的封装参数，全部由服务端下发，客户端**不自选**。
+    ///
+    /// 顺序是这套设计的关键：密钥在 token 响应里，所以只能"先申请、后封装"。
+    /// 反过来（先封装再申请）根本走不通——那需要一把此刻还没拿到的密钥。
+    /// 🔴 只有**刚签发**的会话带得到密钥；从磁盘恢复的会话是 `None`
+    /// （密钥不落盘）。恢复时靠缓存里那串已经封好的密文，不需要再封一次。
+    pub attachment_key: Option<privchat_protocol::rpc::file::upload::AttachmentKey>,
+    /// 这串密文是用哪一把密钥封的。恢复时用它认缓存。
+    pub encryption_key_id: Option<u8>,
+    /// 服务端冻结的块大小：必须原样用，否则封出来的长度与 token 冻结的对不上。
+    pub chunk_plain_size: Option<u32>,
+    /// 服务端算出的密文总长 = 真正要传的字节数，也是分片几何的基准。
+    pub total_size: Option<u64>,
 }
 
 /// 内置面：分片字节走文件服务的 `PUT /files/chunk?offset=`（RESUMABLE §8.1）。
@@ -1196,6 +1303,25 @@ trait AttachmentUploadIo {
         -> Result<FileRequestUploadTokenResponse>;
     /// 秒传取用：换一个属于自己的 file_id，不传正文。
     async fn claim(&mut self, token: &str, digest: &str) -> Result<UploadedFileInfo>;
+
+    /// 🔴 用**这张 token 下发的**密钥与块大小把明文封装成待上传字节。
+    ///
+    /// 单独抽成一步，是为了把"必须先拿到 token 才能封装"这件事写进类型里：
+    /// 封装的入参只能来自 token 响应，谁也没法在 prepare 之前调它。
+    fn seal(
+        &mut self,
+        token: &FileRequestUploadTokenResponse,
+        plaintext: &[u8],
+    ) -> Result<SealedPayload>;
+
+    /// 分片会话版本，同理。
+    fn seal_chunked(
+        &mut self,
+        _session: &ChunkedSession,
+        _plaintext: &[u8],
+    ) -> Result<SealedPayload> {
+        Err(Error::Transport("seal_chunked 未实现".to_string()))
+    }
     /// 传字节：传的必须是 [`AttachmentUploadIo::seal`] 那一次的产物。
     async fn upload(
         &mut self,
@@ -1232,19 +1358,25 @@ trait AttachmentUploadIo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SealedPayload {
     blob: Vec<u8>,
-    cek_b64: String,
-    /// 密文（不是明文）的 SHA-256：服务端按最终上传字节判重。
+    /// 密文的 SHA-256。**只用于本地缓存自检**（这份 blob 有没有写坏），
+    /// 不是判重键——判重键是明文摘要，密文每次封装都不同。
     sha256: String,
 }
 
 /// 封装缓存的伴生元数据：密文本身在旁边那个文件里。
 ///
-/// CEK 落在本机托管目录，与明文同一信任域——它本来就是给这台设备重试用的。
-/// **绝不进消息 metadata，也绝不进日志。**
+/// 🔴 这里**不再存密钥**。密钥是全站的、由服务端在 token 响应里下发，本地留一份
+/// 既没必要也白白扩大暴露面。
+///
+/// 存的是"这份密文是用哪套参数封出来的"：密钥 id 或块大小一变，缓存就不能复用了
+/// （用旧参数封的字节与新 token 冻结的长度对不上，传上去必被拒）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SealedCacheMeta {
-    cek: String,
     sha256: String,
+    #[serde(default)]
+    encryption_key_id: u8,
+    #[serde(default)]
+    chunk_plain_size: u32,
 }
 
 /// [`State::build_attachment_wire_content`] 的输入。
@@ -11232,8 +11364,7 @@ impl State {
         }
         Some(ResolvedFileDownload {
             url: resp.file_url,
-            encryption_version: resp.encryption_version,
-            cek: resp.cek,
+            attachment_key: resp.attachment_key.map(|k| k.key),
         })
     }
 
@@ -11253,12 +11384,12 @@ impl State {
         channel_id: u64,
         channel_type: i32,
     ) -> Option<ThumbnailDownloadOutcome> {
-        let (thumb_url, thumb_enc_version, thumb_cek) = match ticket {
-            // v1：get_url 解析的票据，密文 blob，用票据里的 cek 解密。
-            Some(t) if t.url.starts_with("http") => (t.url, t.encryption_version, t.cek),
-            // legacy：消息里只有明文 thumbnail_url（旧 v0 附件）。
+        let (thumb_url, thumb_key) = match ticket {
+            // get_url 解析的票据：密文 blob，用票据里的密钥解开。
+            Some(t) if t.url.starts_with("http") => (t.url, t.attachment_key),
+            // 消息里只带明文 thumbnail_url 的情况。
             _ => match Self::extract_thumbnail_url(content) {
-                Some(url) if url.starts_with("http") => (url, 0, None),
+                Some(url) if url.starts_with("http") => (url, None),
                 _ => {
                     // thumb_status=3 是**终态**：写下去之后永不重试，UI 从此渲染
                     // 静态占位符。所以它只能表示「已经看清楚了,这条消息确实没有
@@ -11315,8 +11446,7 @@ impl State {
                 &thumb_url,
                 &dir,
                 &thumb_path,
-                thumb_enc_version,
-                thumb_cek.as_deref(),
+                thumb_key.as_deref(),
             )
             .await
             {
@@ -11366,8 +11496,7 @@ impl State {
         url: &str,
         dir: &Path,
         thumb_path: &Path,
-        encryption_version: i32,
-        cek: Option<&str>,
+        attachment_key: Option<&str>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let resp = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -11379,13 +11508,10 @@ impl State {
             return Err(format!("HTTP {}", resp.status()).into());
         }
         let bytes = resp.bytes().await?;
-        // 附件加密 v1：缩略图 blob 同样是 nonce||ct||tag，用 file/get_url 票据里的 cek
-        // 本地解密后再落盘；v0（legacy 明文）原样写入。解密失败直接报错，绝不写密文当图片。
-        let plaintext = crate::attachment_crypto::decrypt_downloaded_attachment_bytes(
-            encryption_version,
-            cek,
-            &bytes,
-        )?;
+        // 缩略图和正文附件同构：同一套分块密文格式，用 file/get_url 票据里的密钥解开
+        // 再落盘。解密失败直接报错，绝不写密文当图片。
+        let plaintext =
+            crate::attachment_crypto::open_downloaded_bytes(bytes.to_vec(), attachment_key)?;
         std::fs::create_dir_all(dir)?;
         let part_path = thumb_path.with_extension(format!(
             "{}.part",
@@ -11401,10 +11527,9 @@ impl State {
         }
         std::fs::rename(&part_path, thumb_path)?;
         eprintln!(
-            "[SDK.thumb] auto-download ok: {} ({} bytes, enc_v={})",
+            "[SDK.thumb] auto-download ok: {} ({} bytes)",
             thumb_path.display(),
-            plaintext.len(),
-            encryption_version
+            plaintext.len()
         );
         Ok(())
     }
@@ -11662,22 +11787,20 @@ impl State {
         &mut self,
         user_id: u64,
         filename: String,
-        file_size: i64,
+        plaintext_size: i64,
         mime_type: String,
         file_type: String,
-        // **最终待上传 blob** 的 SHA-256（加密之后那串字节）。
-        // `None` = 不参与秒传，照常完整上传。
-        sha256: Option<&str>,
+        // **明文**的 SHA-256（判重键）。`None` = 不参与秒传，照常完整上传。
+        plaintext_sha256: Option<&str>,
     ) -> Result<FileRequestUploadTokenResponse> {
         let payload = FileRequestUploadTokenRequest {
             user_id,
             filename: Some(filename),
-            file_size,
+            plaintext_size,
             mime_type,
             file_type,
             business_type: "message".to_string(),
-            sha256: sha256.map(str::to_string),
-            transform_version: 0,
+            plaintext_sha256: plaintext_sha256.map(str::to_string),
         };
         let response: FileRequestUploadTokenResponse = self
             .rpc_call_typed(routes::file::REQUEST_UPLOAD_TOKEN, &payload)
@@ -11699,20 +11822,19 @@ impl State {
     async fn request_chunked_upload_token(
         &mut self,
         filename: String,
-        file_size: i64,
+        plaintext_size: i64,
         mime_type: String,
         file_type: String,
-        sha256: &str,
+        plaintext_sha256: &str,
         force_upload: bool,
     ) -> Result<FileRequestChunkedUploadTokenResponse> {
         let payload = FileRequestChunkedUploadTokenRequest {
             file_type,
             business_type: "message".to_string(),
-            file_size,
-            file_hash: sha256.to_string(),
+            plaintext_size,
+            plaintext_sha256: plaintext_sha256.to_string(),
             mime_type,
             filename: Some(filename),
-            transform_version: 0,
             force_upload,
             // 能力协商（RESUMABLE_UPLOAD_SPEC §8.2）：两种数据面都实现了，都声明。
             // 服务端按自己的配置单选一种并在响应里下发，客户端不挑、也没有回退。
@@ -11725,18 +11847,30 @@ impl State {
             .await
     }
 
-    /// 明文 → **最终待上传 blob**：加密一次，算一次摘要，之后都用它。
+    /// 明文 → 待上传密文，用**服务端下发的**全站密钥与冻结的块大小。
     ///
-    /// 🔴 顺序不能反。秒传按「最终上传字节」判重，而加密用的是随机 CEK/nonce——
-    /// 预检之后再加密一次，字节就变了、摘要也变了，本来就不该命中。
-    /// 所以这里产出的 blob 必须留住：上传用它，重试也用它。
-    fn seal_for_upload(data: &[u8]) -> Result<(Vec<u8>, String, String)> {
-        // 附件加密 v1（ATTACHMENT_ENCRYPTION_SPEC）：整文件 AES-256-GCM，
-        // 密文 blob = nonce||ct||tag。对象存储只存密文。CEK 不进日志。
-        let (blob, cek_b64) = crate::attachment_crypto::encrypt_attachment(data)
-            .map_err(|e| Error::Serialization(format!("attachment encrypt failed: {e}")))?;
+    /// 🔴 顺序是"先申请 token、后封装"，不能反：密钥在 token 响应里，此刻之前
+    /// 客户端手上根本没有可用的密钥。旧实现是"先封装再申请"（自造随机 CEK），
+    /// 那套已经不成立——服务端只认全站密钥，而且判重键改成了明文摘要。
+    ///
+    /// 块大小必须原样用服务端给的：token 冻结的密文长度是按它算的，用别的值封出来
+    /// 的对象在 complete 的长度核对上必然被拒。
+    fn seal_for_upload(
+        data: &[u8],
+        key: &privchat_protocol::rpc::file::upload::AttachmentKey,
+        chunk_plain_size: u32,
+    ) -> Result<(Vec<u8>, String)> {
+        let site_key = crate::attachment_crypto::decode_site_key(&key.key)
+            .map_err(|e| Error::Serialization(format!("attachment key unusable: {e}")))?;
+        let blob = crate::attachment_crypto::encrypt_attachment_with_chunk_size(
+            data,
+            &site_key,
+            key.key_id,
+            chunk_plain_size,
+        )
+        .map_err(|e| Error::Serialization(format!("attachment encrypt failed: {e}")))?;
         let sha256 = Self::sha256_hex(&blob);
-        Ok((blob, cek_b64, sha256))
+        Ok((blob, sha256))
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -11756,11 +11890,12 @@ impl State {
     /// 这里不碰网络，也不碰文件。
     async fn plan_attachment_upload<Io: AttachmentUploadIo>(
         io: &mut Io,
-        // 🔴 封装好的 payload 从外面传进来，这里**没有**重新封装的能力——
-        // 再封一次就是另一串密文：摘要对不上，秒传落空，服务端多存一份。
-        payload: &SealedPayload,
+        // 🔴 传进来的是**明文**：封装必须发生在 prepare 之后（密钥由响应下发），
+        // 所以这一层拿着明文，等拿到会话参数再封。
+        plaintext: &[u8],
+        // 明文摘要 = 判重键。
+        sha256: &str,
     ) -> Result<(UploadedFileInfo, String)> {
-        let sha256 = payload.sha256.as_str();
 
         // 🔴 任何大小都走分片编排（RESUMABLE §2.4 第三十轮修订）。
         //
@@ -11770,11 +11905,11 @@ impl State {
         // 现在客户端只有一条编排，数据面由服务端在 token 响应里下发。
         // 小文件在两面都表现为「只有一片的分片上传」。
         if io.uses_chunked_orchestration() {
-            return Self::plan_chunked_upload(io, payload).await;
+            return Self::plan_chunked_upload(io, plaintext, sha256).await;
         }
 
-        // 第一次带摘要，给服务端说「这串字节我已经有了」的机会。
-        let token = io.prepare(Some(sha256), payload.blob.len()).await?;
+        // 第一次带摘要，给服务端说「这份内容我已经有了」的机会。
+        let token = io.prepare(Some(sha256), plaintext.len()).await?;
 
         if token.already_exists {
             match io.claim(&token.token, sha256).await {
@@ -11789,8 +11924,9 @@ impl State {
                     eprintln!("[SDK.actor] claim missed, falling back to a normal upload: {e}");
                     // 🔴 第二次**不带**摘要。带着的话服务端还会说「已经有了」，
                     // 又绕回 claim —— 转成死循环。
-                    let token = io.prepare(None, payload.blob.len()).await?;
-                    let info = io.upload(&token, payload).await?;
+                    let token = io.prepare(None, plaintext.len()).await?;
+                    let payload = io.seal(&token, plaintext)?;
+                    let info = io.upload(&token, &payload).await?;
                     io.on_upload_finished();
                     return Ok((info, token.token));
                 }
@@ -11798,7 +11934,8 @@ impl State {
             }
         }
 
-        let info = io.upload(&token, payload).await?;
+        let payload = io.seal(&token, plaintext)?;
+        let info = io.upload(&token, &payload).await?;
         io.on_upload_finished();
         Ok((info, token.token))
     }
@@ -11811,10 +11948,10 @@ impl State {
     ///   完成过，预检会命中 → claim 拿到 file_id。
     async fn plan_chunked_upload<Io: AttachmentUploadIo>(
         io: &mut Io,
-        payload: &SealedPayload,
+        plaintext: &[u8],
+        sha256: &str,
     ) -> Result<(UploadedFileInfo, String)> {
-        let sha256 = payload.sha256.as_str();
-        let size = payload.blob.len();
+        let size = plaintext.len();
 
         let mut prepared = io.prepare_chunked(sha256, size, false).await?;
         if let ChunkedPrepared::Claim { claim_token } = &prepared {
@@ -11839,7 +11976,9 @@ impl State {
             }
         };
 
-        match io.upload_chunked(&session, payload).await {
+        // 🔴 到这里才封装：密钥与块大小都在 session 上，是服务端刚下发的。
+        let payload = io.seal_chunked(&session, plaintext)?;
+        match io.upload_chunked(&session, &payload).await {
             Ok(info) => {
                 io.on_upload_finished();
                 Ok((info, session.upload_token))
@@ -11854,7 +11993,9 @@ impl State {
                         Ok((info, claim_token))
                     }
                     ChunkedPrepared::Session(again) => {
-                        let info = io.upload_chunked(&again, payload).await?;
+                        // 新会话可能换了密钥/块大小，必须按它重新封（缓存会自己判）。
+                        let payload = io.seal_chunked(&again, plaintext)?;
+                        let info = io.upload_chunked(&again, &payload).await?;
                         io.on_upload_finished();
                         Ok((info, again.upload_token))
                     }
@@ -11882,44 +12023,54 @@ impl State {
 
     /// 一条 outbox 任务只封装**一次**，结果落盘；重试读回同一份。
     ///
-    /// 🔴 不这样做的话，秒传对「重试」这个最常见的重复来源完全无效：加密用随机
-    /// CEK/nonce，重新封装出来的字节不同、摘要不同，预检必然 miss，于是同一条
-    /// 逻辑消息在服务端留下第二份物理文件。上一次上传如果其实成功了、只是响应
-    /// 丢了，那第二份就永远没人引用。
+    /// 🔴 不这样做的话，重试会把同一条逻辑消息在服务端留下第二份物理对象：每块
+    /// 都用新的随机 nonce，重新封装出来就是另一串字节。上一次上传如果其实成功了、
+    /// 只是响应丢了，那第二份就永远没人引用。
+    ///
+    /// 🔴 缓存的复用条件里必须带上**封装参数**（密钥 id + 块大小）。密钥轮换或
+    /// 服务端调整块大小之后，旧缓存封出来的字节与新 token 冻结的长度对不上，
+    /// 拿它去传是稳定失败；参数一变就重新封装。
     ///
     /// 缓存随这条消息的托管目录一起存在，发送成功后由调用方删掉。
+    /// 只读缓存：这份密文是不是用 `(key_id, chunk_plain_size)` 封的、且字节没坏。
+    ///
+    /// 🔴 恢复路径**只能**走这里：重启之后手上没有密钥（不落盘），而续传必须上传
+    /// 与 token 冻结的长度一致的那串字节——也就是当初封好的这一份。缓存不在了就
+    /// 只能作废会话重新申请。
+    fn load_sealed_cache(
+        cache_path: &std::path::Path,
+        encryption_key_id: u8,
+        chunk_plain_size: u32,
+    ) -> Option<(Vec<u8>, String)> {
+        let meta_path = cache_path.with_extension("sealed.json");
+        let (blob, meta_raw) = (
+            std::fs::read(cache_path).ok()?,
+            std::fs::read_to_string(&meta_path).ok()?,
+        );
+        let meta = serde_json::from_str::<SealedCacheMeta>(&meta_raw).ok()?;
+        let ok = !blob.is_empty()
+            && meta.encryption_key_id == encryption_key_id
+            && meta.chunk_plain_size == chunk_plain_size
+            && Self::sha256_hex(&blob) == meta.sha256;
+        ok.then_some((blob, meta.sha256))
+    }
+
     fn seal_once(
         cache_path: &std::path::Path,
         plaintext: &[u8],
-    ) -> Result<(Vec<u8>, String, String)> {
+        key: &privchat_protocol::rpc::file::upload::AttachmentKey,
+        chunk_plain_size: u32,
+    ) -> Result<(Vec<u8>, String)> {
         let meta_path = cache_path.with_extension("sealed.json");
 
         // 🔴 metadata 是**提交标记**：它存在，才代表旁边那个 blob 写完了。
         // 而且必须重算摘要——两个文件分两次 rename，中间崩一次就可能凑出
-        // 「新 blob + 旧 CEK/摘要」。那种组合每次上传都会被服务端拒，而且自己
-        // 好不了：每次重试都读回同一份对不上的缓存。
-        if let (Ok(blob), Ok(meta_raw)) = (
-            std::fs::read(cache_path),
-            std::fs::read_to_string(&meta_path),
-        ) {
-            if let Ok(meta) = serde_json::from_str::<SealedCacheMeta>(&meta_raw) {
-                // 摘要对上只说明**字节**没坏。CEK 坏了而摘要还对（元数据被改、
-                // 或两个文件来自不同轮次）的话，传上去的密文没人解得开，服务端
-                // 拒了之后下一轮又读回同一份——永久失败。
-                //
-                // 解一次就能判：AES-GCM 的认证标签在密钥不对时直接失败。这只发生
-                // 在重试路径（首次封装根本不读缓存），多这一次解密换的是不会卡死。
-                if !blob.is_empty()
-                    && Self::sha256_hex(&blob) == meta.sha256
-                    && crate::attachment_crypto::decrypt_attachment(&blob, &meta.cek)
-                        .is_ok_and(|decoded| decoded == plaintext)
-                {
-                    return Ok((blob, meta.cek, meta.sha256));
-                }
-            }
+        // 「新 blob + 旧摘要」，那种组合每次上传都会被拒，而且自己好不了。
+        if let Some(hit) = Self::load_sealed_cache(cache_path, key.key_id, chunk_plain_size) {
+            return Ok(hit);
         }
 
-        let (blob, cek_b64, sha256) = Self::seal_for_upload(plaintext)?;
+        let (blob, sha256) = Self::seal_for_upload(plaintext, key, chunk_plain_size)?;
 
         // 顺序不能变：先撤掉旧标记，再写 blob，最后立标记。
         // 反过来的话，新 blob 落地而旧 metadata 还在的那一瞬间，缓存看着是完整的。
@@ -11929,8 +12080,9 @@ impl State {
             .and_then(|_| std::fs::rename(&tmp, cache_path))
             .map_err(|e| Error::Storage(format!("write sealed cache failed: {e}")))?;
         let meta = SealedCacheMeta {
-            cek: cek_b64.clone(),
             sha256: sha256.clone(),
+            encryption_key_id: key.key_id,
+            chunk_plain_size,
         };
         let meta_tmp = meta_path.with_extension("tmp");
         std::fs::write(
@@ -11940,7 +12092,7 @@ impl State {
         )
         .and_then(|_| std::fs::rename(&meta_tmp, &meta_path))
         .map_err(|e| Error::Storage(format!("write sealed meta failed: {e}")))?;
-        Ok((blob, cek_b64, sha256))
+        Ok((blob, sha256))
     }
 
     /// 删掉封装缓存。发送真正完成之后才调用——在那之前任何一次重试都还需要它。
@@ -11962,7 +12114,6 @@ impl State {
         mime_type: &str,
         sealed_cache: &std::path::Path,
         blob: &[u8],
-        cek_b64: String,
         local_message_id: &str,
     ) -> Result<UploadedFileInfo> {
         use crate::resumable_upload::{ChunkTimer, ChunkVerdict, ResumableUpload, CHUNK_RETRIES};
@@ -11971,7 +12122,7 @@ impl State {
         // status、complete、abort 与全部落盘/进度逻辑，差别只有「分片字节发给谁」。
         if session.transport == TRANSPORT_S3_MULTIPART_V1 {
             return self
-                .upload_in_parts(session, mime_type, sealed_cache, blob, cek_b64, local_message_id)
+                .upload_in_parts(session, mime_type, sealed_cache, blob, local_message_id)
                 .await;
         }
 
@@ -11990,7 +12141,7 @@ impl State {
         };
         if completed {
             // 上次 complete 成功但回执没到：直接再要一次结果。
-            return self.complete_upload(&client, &base, token, mime_type, cek_b64).await;
+            return self.complete_upload(&client, &base, token, mime_type).await;
         }
         let mut up = ResumableUpload::from_missing(total, plan, &missing);
         self.emit_upload_progress(local_message_id, up.progress());
@@ -12072,7 +12223,7 @@ impl State {
             }
         }
 
-        let info = self.complete_upload(&client, &base, token, mime_type, cek_b64).await?;
+        let info = self.complete_upload(&client, &base, token, mime_type).await?;
         self.attachment_transfers
             .body_uploads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12095,7 +12246,6 @@ impl State {
         mime_type: &str,
         sealed_cache: &std::path::Path,
         blob: &[u8],
-        cek_b64: String,
         local_message_id: &str,
     ) -> Result<UploadedFileInfo> {
         use crate::resumable_upload::{
@@ -12125,7 +12275,7 @@ impl State {
         };
         if completed {
             // complete 成功但回执丢了：直接再要一次结果（§3.3.1，与 proxy 面同口径）。
-            return self.complete_upload(&client, &base, token, mime_type, cek_b64).await;
+            return self.complete_upload(&client, &base, token, mime_type).await;
         }
 
         let mut todo = parts_from_missing(&missing, part_size, total_parts);
@@ -12196,7 +12346,7 @@ impl State {
             }
         }
 
-        self.complete_upload(&client, &base, token, mime_type, cek_b64).await
+        self.complete_upload(&client, &base, token, mime_type).await
     }
 
     /// 签一张预签名 URL 并把这一片直传对象存储。
@@ -12370,11 +12520,12 @@ impl State {
         base: &str,
         token: &str,
         mime_type: &str,
-        cek_b64: String,
     ) -> Result<UploadedFileInfo> {
         let resp = self
             .with_upload_token(client.post(format!("{base}/complete")), token)
-            .json(&serde_json::json!({ "cek": cek_b64, "encryption_version": 1 }))
+            // 🔴 complete 只带业务字段：加密参数与身份全部由 token 冻结，
+            // 客户端在这里自报什么都不作数（服务端已删掉这些入参）。
+            .json(&serde_json::json!({}))
             .send()
             .await
             .map_err(|e| Error::Transport(format!("complete request failed: {e}")))?;
@@ -12417,7 +12568,6 @@ impl State {
         // 🔴 已经封好的那个 blob，**不在这里再加密一次**：重新加密会产出另一串字节，
         // 与 prepare 时报的摘要对不上，服务端会拒；重试同理必须复用同一个 blob。
         blob: Vec<u8>,
-        cek_b64: String,
     ) -> Result<UploadedFileInfo> {
         let part = reqwest::multipart::Part::bytes(blob)
             .file_name(filename.to_string())
@@ -12426,7 +12576,7 @@ impl State {
         let form = reqwest::multipart::Form::new()
             .part("file", part)
             .text("encryption_version", "1")
-            .text("cek", cek_b64);
+            ;
         // 整文件上传打的也是我们自己的服务器（不是对象存储），走控制面 pin。
         let response = file_plane_http::control_client(upload_url, &self.config.spki_pins)?
             .post(upload_url)
@@ -12546,11 +12696,13 @@ impl State {
         Ok(info)
     }
 
-    /// 发一份附件：**封装一次** → 预检 → 命中就换 id，未命中才传那同一个 blob。
+    /// 发一份附件：**先拿明文身份预检** → 命中就换 id → 未命中才用服务端下发的
+    /// 密钥封装并上传。
     ///
-    /// 顺序是整件事的关键：秒传按「最终上传字节」判重，而加密用随机 CEK/nonce，
-    /// 所以必须先封装、对封装结果求摘要，再拿这个摘要去预检。预检之后重新加密，
-    /// 字节就变了，命中率恒为 0。
+    /// 🔴 顺序在这一版**反过来了**，而且只能这样：
+    ///   · 判重键是**明文**摘要（密文每块随机 nonce，跨用户永远命不中）；
+    ///   · 封装要用的全站密钥在 token 响应里——预检之前客户端根本没有它。
+    /// 旧版"先自造 CEK 封装、再拿密文摘要预检"两条都不成立。
     async fn send_one_attachment(
         &mut self,
         user_id: u64,
@@ -12563,13 +12715,8 @@ impl State {
         // 进度事件归到哪条消息名下。UI 靠它更新对应的气泡。
         local_message_id: &str,
     ) -> Result<(UploadedFileInfo, String)> {
-        // 封装一次，之后的分支都用它。
-        let (blob, cek_b64, sha256) = Self::seal_once(sealed_cache, &plaintext)?;
-        let payload = SealedPayload {
-            blob,
-            cek_b64,
-            sha256,
-        };
+        // 只算明文身份；封装推迟到拿到 token（连带密钥与块大小）之后。
+        let plaintext_sha256 = Self::sha256_hex(&plaintext);
         let server_identity = self.server_identity_for_uploads();
         let mut io = LiveAttachmentUploadIo {
             state: self,
@@ -12583,7 +12730,7 @@ impl State {
             // 旧会话在新服务器上根本不存在，必须作废重来。
             server_identity,
         };
-        Self::plan_attachment_upload(&mut io, &payload).await
+        Self::plan_attachment_upload(&mut io, &plaintext, &plaintext_sha256).await
     }
 
     async fn upload_callback(
@@ -13566,9 +13713,21 @@ impl State {
                 //
                 // 对端身份改存到 `peer_user_id` 结构化字段——那才是它该待的地方，
                 // 列表查询据此 JOIN user 表拿真名，user 实体一到名字自然就对了。
+                //
+                // 🔴 系统账号（uid=1）不算数：它会往**普通 DM** 里注入系统消息
+                // （加好友成功后的「我们已经是好友了」就是它发的，type=5）。新 DM 的
+                // 第一条消息往往正是这条，于是会话行被就地建出来、对端被推断成 1，
+                // 列表 JOIN user 表拿到的名字就成了「系统消息」、user_type=1。
+                // 频道实体随后同步到会修正这一行，但期间已经渲染出去的会话对象
+                // （聊天页在导航时抓的快照）会一直顶着「系统消息」的标题。
+                // 推断本来就只是兜底，宁可留空等实体，也不能把 DM 永久贴错人。
                 let inferred_peer_user_id = if channel_type == 1 {
                     match from_uid {
-                        Some(uid) if uid > 0 && uid != current_uid => Some(uid),
+                        Some(uid)
+                            if uid > 0 && uid != current_uid && uid != SYSTEM_ACCOUNT_UID =>
+                        {
+                            Some(uid)
+                        }
                         _ => None,
                     }
                 } else {
@@ -18188,8 +18347,7 @@ impl PrivchatSdk {
         }
         Ok(ResolvedFileDownload {
             url: resp.file_url,
-            encryption_version: resp.encryption_version,
-            cek: resp.cek,
+            attachment_key: resp.attachment_key.map(|k| k.key),
         })
     }
 
@@ -20352,8 +20510,64 @@ impl PrivchatSdk {
     }
 }
 
+
+
+/// 断言这串密文确实是"用这把密钥封的这份明文"。
+///
+/// 🔴 不能拿字节做相等断言：每块都用新的随机 nonce，同一份明文封两次必然不同。
+/// 真正要守的性质是「传上去的东西解开来就是原文，且用的是服务端给的那把钥匙」。
+#[cfg(test)]
+fn assert_sealed_plaintext(
+    blob: &[u8],
+    key: &privchat_protocol::rpc::file::upload::AttachmentKey,
+    plaintext: &[u8],
+) {
+    let site_key =
+        privchat_protocol::attachment_crypto::decode_site_key(&key.key).expect("test key");
+    let opened = privchat_protocol::attachment_crypto::decrypt_attachment(blob, &site_key)
+        .expect("上传的字节必须能用 token 下发的密钥解开");
+    assert_eq!(opened, plaintext, "解出来必须就是原文");
+}
+
+#[cfg(test)]
+/// 用**给定的密钥**封装出来的产物。
+///
+/// 参数里带着 key 不是摆设：它把"这串密文是用哪把钥匙封的"钉进了类型，
+/// 让"先封装后拿钥匙"在测试里根本写不出来。
+fn sealed_with(
+    key: &privchat_protocol::rpc::file::upload::AttachmentKey,
+    plaintext: &[u8],
+) -> SealedPayload {
+    let site_key =
+        privchat_protocol::attachment_crypto::decode_site_key(&key.key).expect("test key");
+    let blob = privchat_protocol::attachment_crypto::encrypt_attachment_with_chunk_size(
+        plaintext,
+        &site_key,
+        key.key_id,
+        TEST_CHUNK_PLAIN_SIZE,
+    )
+    .expect("seal");
+    let sha256 = State::sha256_hex(&blob);
+    SealedPayload { blob, sha256 }
+}
+
+/// 测试用的固定全站密钥：真实链路里它由服务端在 token 响应里下发。
+/// 放在 crate 级是因为上传编排与 ack 缓存两个测试模块都要用同一把。
+#[cfg(test)]
+fn test_attachment_key() -> privchat_protocol::rpc::file::upload::AttachmentKey {
+    use base64::Engine as _;
+    privchat_protocol::rpc::file::upload::AttachmentKey {
+        key_id: 1,
+        key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x5au8; 32]),
+    }
+}
+
+#[cfg(test)]
+const TEST_CHUNK_PLAIN_SIZE: u32 = privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE;
+
 #[cfg(test)]
 mod tests {
+
     /// Receiver media work is keyed by account + session + message + kind,
     /// remains singleflight until completion, is bounded, and is aborted on a
     /// session reset. This calls the production manager rather than duplicating
@@ -23849,6 +24063,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 加好友成功后服务端会往**新建的普通 DM** 里注入一条系统消息（sender=1）。
+    /// 那条消息常常先于 channel 实体到达，会话行由它就地建出来——如果拿发送者
+    /// 当对端，这个 DM 就被贴上系统账号的身份（标题「系统消息」、user_type=1）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn system_account_sender_never_becomes_the_dm_peer() {
+        let (mut state, dir) = new_seeded_state("system-sender-not-dm-peer").await;
+
+        // 频道实体还没到，第一条消息来自系统账号。
+        state
+            .update_channel_last_message(
+                96101,
+                1,
+                "{\"content\":\"我们已经是好友了\"}",
+                1_710_400_000_000,
+                12345,
+                Some(crate::SYSTEM_ACCOUNT_UID),
+                true,
+            )
+            .await
+            .expect("update local last message");
+
+        let created = state
+            .storage
+            .get_channel_by_id(96101)
+            .await
+            .expect("read channel")
+            .expect("channel exists");
+        assert_eq!(
+            created.peer_user_id, None,
+            "系统账号不能被推断成 DM 对端；宁可留空等 channel 实体"
+        );
+
+        // 真实对端发消息时，推断照常生效。
+        state
+            .update_channel_last_message(
+                96102,
+                1,
+                "{\"content\":\"hi\"}",
+                1_710_400_000_001,
+                12346,
+                Some(20001),
+                true,
+            )
+            .await
+            .expect("update local last message");
+
+        let real_peer = state
+            .storage
+            .get_channel_by_id(96102)
+            .await
+            .expect("read channel")
+            .expect("channel exists");
+        assert_eq!(real_peer.peer_user_id, Some(20001));
+
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn local_last_message_refresh_does_not_block_newer_channel_entity_state() {
         let (mut state, dir) = new_seeded_state("channel-entity-after-local-preview").await;
@@ -25393,8 +25665,8 @@ mod ack_before_cache_release_tests {
         );
         std::fs::create_dir_all(&dir).expect("create message dir");
         let cache = dir.join("body.sealed");
-        let (first_blob, _, first_sha) =
-            State::seal_once(&cache, b"the picture bytes").expect("seal");
+        let (first_blob, first_sha) =
+            State::seal_once(&cache, b"the picture bytes", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("seal");
 
         // ---- ack 失败 ----
         arm_ack_failure(&paths.db_path, &uid.to_string());
@@ -25416,8 +25688,8 @@ mod ack_before_cache_release_tests {
         );
 
         // ---- 重试：必须是同一串密文 ----
-        let (retry_blob, _, retry_sha) =
-            State::seal_once(&cache, b"the picture bytes").expect("reseal");
+        let (retry_blob, retry_sha) =
+            State::seal_once(&cache, b"the picture bytes", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("reseal");
         assert_eq!(retry_blob, first_blob, "🔴 重试必须上传同一串字节");
         assert_eq!(retry_sha, first_sha);
 
@@ -25762,14 +26034,26 @@ mod attachment_upload_plan_tests {
         /// 每次 prepare 收到的 (摘要, 字节数)。`None` = 这次不参与秒传。
         prepares: Vec<(Option<String>, usize)>,
         claims: usize,
-        /// 每次 upload 的 (token, 上传的 blob, 上传的 CEK)。
-        uploads: Vec<(String, Vec<u8>, String)>,
+        /// 每次 upload 的 (token, 上传的 blob)。
+        uploads: Vec<(String, Vec<u8>)>,
+        /// 封装了几次。🔴 用来钉住"封装发生在 prepare 之后、且只发生一次"。
+        seals: usize,
         already_exists: bool,
         claim_result: Option<Error>,
     }
 
     fn token(name: &str, already_exists: bool) -> FileRequestUploadTokenResponse {
         FileRequestUploadTokenResponse {
+            // 服务端连同 token 一起下发封装参数——没有它们就封不出它认的密文。
+            attachment_key: Some(test_attachment_key()),
+            chunk_plain_size: Some(TEST_CHUNK_PLAIN_SIZE),
+            total_size: Some(
+                privchat_protocol::attachment_crypto::sealed_len(
+                    PLAINTEXT.len() as u64,
+                    TEST_CHUNK_PLAIN_SIZE,
+                )
+                .expect("sealed_len"),
+            ),
             token: name.to_string(),
             upload_url: format!("http://cdn/upload/{name}"),
             already_exists,
@@ -25807,6 +26091,38 @@ mod attachment_upload_plan_tests {
             Ok(token(&format!("token-{}", self.prepares.len()), hit))
         }
 
+
+        /// 🔴 门禁：封装只能拿 token 里的东西。
+        ///
+        /// 假实现照样从 `token.attachment_key` 取密钥——取不到就报错。这样"prepare
+        /// 之前就封装"这种回退在测试里会直接炸，而不是悄悄用一把本地自造的密钥
+        /// 蒙混过去（那正是旧实现的样子）。
+        fn seal(
+            &mut self,
+            token: &FileRequestUploadTokenResponse,
+            plaintext: &[u8],
+        ) -> Result<SealedPayload> {
+            let key = token
+                .attachment_key
+                .as_ref()
+                .ok_or_else(|| Error::Serialization("token 没有下发密钥".to_string()))?;
+            self.seals += 1;
+            Ok(sealed_with(key, plaintext))
+        }
+
+        fn seal_chunked(
+            &mut self,
+            session: &ChunkedSession,
+            plaintext: &[u8],
+        ) -> Result<SealedPayload> {
+            let key = session
+                .attachment_key
+                .as_ref()
+                .ok_or_else(|| Error::Serialization("会话没有下发密钥".to_string()))?;
+            self.seals += 1;
+            Ok(sealed_with(key, plaintext))
+        }
+
         async fn claim(&mut self, _token: &str, _digest: &str) -> Result<UploadedFileInfo> {
             self.claims += 1;
             match self.claim_result.take() {
@@ -25823,39 +26139,33 @@ mod attachment_upload_plan_tests {
             self.uploads.push((
                 token.token.clone(),
                 payload.blob.clone(),
-                payload.cek_b64.clone(),
             ));
             Ok(uploaded())
         }
     }
 
-    /// 一次封装的产物。整条链路只有它，两条分支都得用它。
-    fn sealed() -> SealedPayload {
-        SealedPayload {
-            blob: b"sealed!!".to_vec(),
-            cek_b64: "cek-1".to_string(),
-            sha256: SHA.to_string(),
-        }
-    }
 
-    const SHA: &str = "d1e8a70b5ccab1dc2f56bbf7e99f064a660c08e361a35751b9c483c88943d082";
+    /// 测试用明文；SHA 是它的**明文**摘要——判重键就是这个。
+    const PLAINTEXT: &[u8] = b"a picture";
+    fn plaintext_sha() -> String {
+        State::sha256_hex(PLAINTEXT)
+    }
 
     /// 预检未命中：一次 prepare（带摘要）+ 一次上传，不 claim。
     #[tokio::test]
     async fn a_miss_uploads_once() {
         let mut io = Recorder::default();
-        let payload = sealed();
-        State::plan_attachment_upload(&mut io, &payload)
+        let sha = plaintext_sha();
+        State::plan_attachment_upload(&mut io, PLAINTEXT, &sha)
             .await
             .expect("send");
 
-        assert_eq!(io.prepares, vec![(Some(SHA.to_string()), 8)]);
+        assert_eq!(io.prepares, vec![(Some(plaintext_sha()), PLAINTEXT.len())]);
         assert_eq!(io.claims, 0);
-        assert_eq!(
-            io.uploads,
-            vec![("token-1".to_string(), payload.blob.clone(), payload.cek_b64)],
-            "传的必须是封装出来的那串字节"
-        );
+        assert_eq!(io.uploads.len(), 1, "只传一次");
+        assert_eq!(io.uploads[0].0, "token-1");
+        assert_sealed_plaintext(&io.uploads[0].1, &test_attachment_key(), PLAINTEXT);
+        assert_eq!(io.seals, 1, "🔴 封装只发生一次，而且在 prepare 之后");
     }
 
     /// 命中且 claim 成功：一次 prepare + 一次 claim，**一个字节都不传**。
@@ -25865,11 +26175,11 @@ mod attachment_upload_plan_tests {
             already_exists: true,
             ..Default::default()
         };
-        State::plan_attachment_upload(&mut io, &sealed())
+        State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha())
             .await
             .expect("send");
 
-        assert_eq!(io.prepares, vec![(Some(SHA.to_string()), 8)]);
+        assert_eq!(io.prepares, vec![(Some(plaintext_sha()), PLAINTEXT.len())]);
         assert_eq!(io.claims, 1);
         assert!(io.uploads.is_empty(), "🔴 秒传命中还传字节就白传了");
     }
@@ -25889,26 +26199,26 @@ mod attachment_upload_plan_tests {
             }),
             ..Default::default()
         };
-        let payload = sealed();
-        State::plan_attachment_upload(&mut io, &payload)
+        let sha = plaintext_sha();
+        State::plan_attachment_upload(&mut io, PLAINTEXT, &sha)
             .await
             .expect("send falls back");
 
         assert_eq!(
             io.prepares,
-            vec![(Some(SHA.to_string()), 8), (None, 8)],
+            vec![
+                (Some(plaintext_sha()), PLAINTEXT.len()),
+                (None, PLAINTEXT.len())
+            ],
             "🔴 第一次带摘要给秒传机会，第二次必须不带——带了就绕回 claim"
         );
         assert_eq!(io.claims, 1, "只 claim 一次，失败就不再试");
+        assert_eq!(io.uploads.len(), 1, "只传一次");
         assert_eq!(
-            io.uploads,
-            vec![(
-                "token-2".to_string(),
-                payload.blob.clone(),
-                payload.cek_b64.clone(),
-            )],
-            "🔴 用第二张 token 传第一次封装的字节和 CEK；第一张已被 claim 消费过"
+            io.uploads[0].0, "token-2",
+            "🔴 用第二张 token 传字节；第一张已被 claim 消费过"
         );
+        assert_sealed_plaintext(&io.uploads[0].1, &test_attachment_key(), PLAINTEXT);
     }
 
     /// 其它失败不吞成一次上传：不该白传字节，也不该把真问题盖掉。
@@ -25923,7 +26233,7 @@ mod attachment_upload_plan_tests {
                 }),
                 ..Default::default()
             };
-            let out = State::plan_attachment_upload(&mut io, &sealed()).await;
+            let out = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await;
             assert!(out.is_err(), "{code:?} 该原样抛出");
             assert!(io.uploads.is_empty(), "{code:?} 不该触发上传");
             assert_eq!(io.prepares.len(), 1, "{code:?} 不该再要一张 token");
@@ -25936,10 +26246,16 @@ mod attachment_upload_plan_tests {
 mod chunked_upload_plan_tests {
     use super::*;
 
-    const SHA: &str = "d1e8a70b5ccab1dc2f56bbf7e99f064a660c08e361a35751b9c483c88943d082";
+    /// 测试用明文；SHA 是它的**明文**摘要——判重键就是这个。
+    const PLAINTEXT: &[u8] = b"a picture";
+    fn plaintext_sha() -> String {
+        State::sha256_hex(PLAINTEXT)
+    }
 
     #[derive(Default)]
     struct Recorder {
+        /// 封装了几次。🔴 钉住"封装在 prepare 之后"。
+        seals: usize,
         /// 每次 prepare_chunked 的 (digest, size, force_upload)。
         prepares: Vec<(String, usize, bool)>,
         /// 第 n 次 prepare 返回命中？（索引 = 第几次）
@@ -25961,6 +26277,17 @@ mod chunked_upload_plan_tests {
             transport: TRANSPORT_PROXY_OFFSET_V1.to_string(),
             part_size: None,
             total_parts: None,
+            // 会话把封装参数一起带下来：客户端只能用它给的这套。
+            attachment_key: Some(test_attachment_key()),
+            encryption_key_id: Some(test_attachment_key().key_id),
+            chunk_plain_size: Some(TEST_CHUNK_PLAIN_SIZE),
+            total_size: Some(
+                privchat_protocol::attachment_crypto::sealed_len(
+                    PLAINTEXT.len() as u64,
+                    TEST_CHUNK_PLAIN_SIZE,
+                )
+                .expect("sealed_len"),
+            ),
         }
     }
 
@@ -25985,6 +26312,38 @@ mod chunked_upload_plan_tests {
         async fn prepare(&mut self, _d: Option<&str>, _s: usize) -> Result<FileRequestUploadTokenResponse> {
             panic!("大文件不该走整包 prepare");
         }
+
+        /// 🔴 门禁：封装只能拿 token 里的东西。
+        ///
+        /// 假实现照样从 `token.attachment_key` 取密钥——取不到就报错。这样"prepare
+        /// 之前就封装"这种回退在测试里会直接炸，而不是悄悄用一把本地自造的密钥
+        /// 蒙混过去（那正是旧实现的样子）。
+        fn seal(
+            &mut self,
+            token: &FileRequestUploadTokenResponse,
+            plaintext: &[u8],
+        ) -> Result<SealedPayload> {
+            let key = token
+                .attachment_key
+                .as_ref()
+                .ok_or_else(|| Error::Serialization("token 没有下发密钥".to_string()))?;
+            self.seals += 1;
+            Ok(sealed_with(key, plaintext))
+        }
+
+        fn seal_chunked(
+            &mut self,
+            session: &ChunkedSession,
+            plaintext: &[u8],
+        ) -> Result<SealedPayload> {
+            let key = session
+                .attachment_key
+                .as_ref()
+                .ok_or_else(|| Error::Serialization("会话没有下发密钥".to_string()))?;
+            self.seals += 1;
+            Ok(sealed_with(key, plaintext))
+        }
+
         async fn claim(&mut self, _token: &str, _digest: &str) -> Result<UploadedFileInfo> {
             self.claims += 1;
             match self.claim_result.take() {
@@ -26020,16 +26379,15 @@ mod chunked_upload_plan_tests {
     fn sealed() -> SealedPayload {
         SealedPayload {
             blob: b"sealed!!".to_vec(),
-            cek_b64: "cek-1".to_string(),
-            sha256: SHA.to_string(),
+            sha256: plaintext_sha(),
         }
     }
 
     #[tokio::test]
     async fn a_large_payload_takes_the_chunked_path_and_uploads_once() {
         let mut io = Recorder::default();
-        let (_, token) = State::plan_attachment_upload(&mut io, &sealed()).await.unwrap();
-        assert_eq!(io.prepares, vec![(SHA.to_string(), 8, false)]);
+        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
+        assert_eq!(io.prepares, vec![(plaintext_sha(), PLAINTEXT.len(), false)]);
         assert_eq!(io.uploads.len(), 1);
         assert_eq!(io.claims, 0);
         assert_eq!(token, session(0).upload_token, "回调要用分片 token");
@@ -26039,7 +26397,7 @@ mod chunked_upload_plan_tests {
     #[tokio::test]
     async fn a_hit_claims_and_uploads_nothing() {
         let mut io = Recorder { hits: vec![true], ..Default::default() };
-        let (_, token) = State::plan_attachment_upload(&mut io, &sealed()).await.unwrap();
+        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
         assert_eq!(io.claims, 1);
         assert!(io.uploads.is_empty());
         assert_eq!(token, "claim-0");
@@ -26056,10 +26414,10 @@ mod chunked_upload_plan_tests {
             }),
             ..Default::default()
         };
-        State::plan_attachment_upload(&mut io, &sealed()).await.unwrap();
+        State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
         assert_eq!(
             io.prepares,
-            vec![(SHA.to_string(), 8, false), (SHA.to_string(), 8, true)]
+            vec![(plaintext_sha(), PLAINTEXT.len(), false), (plaintext_sha(), PLAINTEXT.len(), true)]
         );
         assert_eq!(io.claims, 1);
         assert_eq!(io.uploads, vec![session(1).upload_token]);
@@ -26073,7 +26431,7 @@ mod chunked_upload_plan_tests {
             first_upload_error: Some(Error::UploadSessionGone),
             ..Default::default()
         };
-        let (_, token) = State::plan_attachment_upload(&mut io, &sealed()).await.unwrap();
+        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
         assert_eq!(io.prepares.len(), 2);
         assert_eq!(io.uploads.len(), 1);
         assert_eq!(io.claims, 1);
@@ -26091,9 +26449,9 @@ mod chunked_upload_plan_tests {
             first_upload_error: Some(Error::UploadSessionGone),
             ..Default::default()
         };
-        let (_, token) = State::plan_attachment_upload(&mut io, &sealed()).await.unwrap();
+        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
         // 两次 prepare 都不带 force：这不是 claim miss，没有理由跳过预检。
-        assert_eq!(io.prepares, vec![(SHA.to_string(), 8, false), (SHA.to_string(), 8, false)]);
+        assert_eq!(io.prepares, vec![(plaintext_sha(), PLAINTEXT.len(), false), (plaintext_sha(), PLAINTEXT.len(), false)]);
         assert_eq!(io.uploads, vec![session(0).upload_token, session(1).upload_token]);
         assert_eq!(io.claims, 0);
         assert_eq!(token, session(1).upload_token, "回调用新会话的 token");
@@ -26106,7 +26464,7 @@ mod chunked_upload_plan_tests {
             first_upload_error: Some(Error::Transport("boom".into())),
             ..Default::default()
         };
-        assert!(State::plan_attachment_upload(&mut io, &sealed()).await.is_err());
+        assert!(State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.is_err());
         assert_eq!(io.prepares.len(), 1, "不该再申请");
     }
 }
@@ -26181,12 +26539,14 @@ mod seal_once_tests {
         let cache = dir.join("body.sealed");
         let plaintext = b"the same picture, sent twice".to_vec();
 
-        let (blob1, cek1, sha1) = State::seal_once(&cache, &plaintext).expect("first seal");
-        let (blob2, cek2, sha2) = State::seal_once(&cache, &plaintext).expect("retry");
+        let key = test_attachment_key();
+        let (blob1, sha1) =
+            State::seal_once(&cache, &plaintext, &key, TEST_CHUNK_PLAIN_SIZE).expect("first seal");
+        let (blob2, sha2) =
+            State::seal_once(&cache, &plaintext, &key, TEST_CHUNK_PLAIN_SIZE).expect("retry");
 
         assert_eq!(blob1, blob2, "🔴 重试必须上传同一串字节");
-        assert_eq!(sha1, sha2, "🔴 摘要不同就等于服务端多一份物理文件");
-        assert_eq!(cek1, cek2, "🔴 CEK 换了，接收端就解不开这份密文");
+        assert_eq!(sha1, sha2, "🔴 摘要不同就等于服务端多一份物理对象");
     }
 
     /// 不带缓存时每次封装都是新的——这正是为什么必须缓存。
@@ -26195,12 +26555,16 @@ mod seal_once_tests {
         let dir = tmp_dir();
         let plaintext = b"the same picture, sent twice".to_vec();
 
-        let (_, _, sha_a) = State::seal_once(&dir.join("a.sealed"), &plaintext).expect("seal a");
-        let (_, _, sha_b) = State::seal_once(&dir.join("b.sealed"), &plaintext).expect("seal b");
+        let key = test_attachment_key();
+        let (_, sha_a) = State::seal_once(&dir.join("a.sealed"), &plaintext, &key, TEST_CHUNK_PLAIN_SIZE)
+            .expect("seal a");
+        let (_, sha_b) = State::seal_once(&dir.join("b.sealed"), &plaintext, &key, TEST_CHUNK_PLAIN_SIZE)
+            .expect("seal b");
 
         assert_ne!(
             sha_a, sha_b,
-            "随机 CEK/nonce 下同一份明文封两次本来就是两串不同的字节"
+            "🔴 每块随机 nonce：同一把密钥、同一份明文，封两次也是两串不同的字节。\
+             这正是判重键必须用明文摘要、以及重试必须复用缓存的原因。"
         );
     }
 
@@ -26213,12 +26577,15 @@ mod seal_once_tests {
         let dir = tmp_dir();
         let cache = dir.join("body.sealed");
         let plaintext = b"a payload long enough to truncate".to_vec();
-        let (good_blob, _, good_sha) = State::seal_once(&cache, &plaintext).expect("first seal");
+        let key = test_attachment_key();
+        let (good_blob, good_sha) =
+            State::seal_once(&cache, &plaintext, &key, TEST_CHUNK_PLAIN_SIZE).expect("first seal");
 
         // 写到一半崩了：blob 短了一截，metadata 还是完整的。
         std::fs::write(&cache, &good_blob[..good_blob.len() / 2]).expect("truncate blob");
 
-        let (blob, _, sha) = State::seal_once(&cache, &plaintext).expect("reseal");
+        let (blob, sha) =
+            State::seal_once(&cache, &plaintext, &key, TEST_CHUNK_PLAIN_SIZE).expect("reseal");
         assert_eq!(
             sha,
             State::sha256_hex(&blob),
@@ -26243,52 +26610,54 @@ mod seal_once_tests {
         let cache = dir.join("body.sealed");
         let meta_path = cache.with_extension("sealed.json");
 
-        let (_, _, first_sha) = State::seal_once(&cache, b"first").expect("first seal");
+        let (_, first_sha) = State::seal_once(&cache, b"first", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("first seal");
         let stale_meta = std::fs::read_to_string(&meta_path).expect("read meta");
         // 换了 blob，metadata 留在上一轮。
         State::drop_sealed_cache(&cache);
-        let (_, _, second_sha) = State::seal_once(&cache, b"second").expect("second seal");
+        let (_, second_sha) = State::seal_once(&cache, b"second", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("second seal");
         assert_ne!(first_sha, second_sha);
         std::fs::write(&meta_path, &stale_meta).expect("restore stale meta");
 
-        let (blob, _, sha) = State::seal_once(&cache, b"second").expect("reseal");
+        let (blob, sha) = State::seal_once(&cache, b"second", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("reseal");
         assert_eq!(sha, State::sha256_hex(&blob), "🔴 摘要必须对应真实字节");
         assert_ne!(sha, first_sha, "🔴 不能沿用那份对不上的旧 metadata");
     }
 
-    /// CEK 坏了但摘要还对：必须识破。
+    /// 🔴 封装参数变了：缓存必须作废重封。
     ///
-    /// 摘要只证明**字节**没坏。metadata 被改、或两个文件来自不同轮次时，会凑出
-    /// 「密文完好 + 密钥不对」——传上去没人解得开，服务端拒了之后下一轮又读回
-    /// 同一份，永久失败。AES-GCM 的认证标签能直接判出来，所以读缓存时解一次。
+    /// 这条取代了旧的"CEK 坏了要识破"——per-file CEK 已经没有了，密钥是全站的。
+    /// 但同一类危险换了个面孔：密钥轮换（key_id 变）或服务端调整块大小之后，
+    /// 旧缓存里那串字节是用**另一套参数**封的，长度与新 token 冻结的对不上，
+    /// 拿它去传是稳定失败，而且每轮重试都读回同一份——自己好不了。
     #[test]
-    fn a_cache_with_a_broken_cek_is_rejected() {
+    fn a_cache_sealed_with_other_parameters_is_rejected() {
         let dir = tmp_dir();
         let cache = dir.join("body.sealed");
-        let meta_path = cache.with_extension("sealed.json");
         let plaintext = b"a payload sealed under one key".to_vec();
 
-        let (_, good_cek, good_sha) = State::seal_once(&cache, &plaintext).expect("first seal");
+        let old_key = test_attachment_key();
+        let (_, old_sha) =
+            State::seal_once(&cache, &plaintext, &old_key, TEST_CHUNK_PLAIN_SIZE).expect("first seal");
 
-        // 换成另一次封装的 CEK：blob 一个字节没动，摘要照旧对得上。
-        let other_dir = tmp_dir();
-        let (_, other_cek, _) =
-            State::seal_once(&other_dir.join("other.sealed"), &plaintext).expect("other seal");
-        assert_ne!(good_cek, other_cek);
-        std::fs::write(
-            &meta_path,
-            serde_json::json!({ "cek": other_cek, "sha256": good_sha }).to_string(),
+        // 密钥轮换：同样的明文、同样的块大小，但 key_id 换了。
+        let new_key = privchat_protocol::rpc::file::upload::AttachmentKey {
+            key_id: old_key.key_id + 1,
+            key: old_key.key.clone(),
+        };
+        let (blob, sha) =
+            State::seal_once(&cache, &plaintext, &new_key, TEST_CHUNK_PLAIN_SIZE).expect("reseal");
+        assert_ne!(sha, old_sha, "🔴 key_id 变了必须重新封装，不能沿用旧缓存");
+        assert_eq!(sha, State::sha256_hex(&blob), "摘要必须对应真实字节");
+
+        // 块大小变了同理。
+        let (_, sha_other_chunk) = State::seal_once(
+            &cache,
+            &plaintext,
+            &new_key,
+            TEST_CHUNK_PLAIN_SIZE * 2,
         )
-        .expect("swap cek");
-
-        let (blob, cek, sha) = State::seal_once(&cache, &plaintext).expect("reseal");
-        assert_ne!(sha, good_sha, "🔴 CEK 对不上就必须重新封装，不能沿用");
-        assert_eq!(sha, State::sha256_hex(&blob));
-        assert_eq!(
-            crate::attachment_crypto::decrypt_attachment(&blob, &cek).expect("decrypt"),
-            plaintext,
-            "重新封装的结果必须自洽：这个 CEK 能解开这份密文"
-        );
+        .expect("reseal with another chunk size");
+        assert_ne!(sha_other_chunk, sha, "🔴 块大小变了封出来就是另一串字节");
     }
 
     /// metadata 是提交标记：它不在，缓存就不算数。
@@ -26297,11 +26666,14 @@ mod seal_once_tests {
         let dir = tmp_dir();
         let cache = dir.join("body.sealed");
         let plaintext = b"payload".to_vec();
-        let (_, _, good_sha) = State::seal_once(&cache, &plaintext).expect("first seal");
+        let key = test_attachment_key();
+        let (_, good_sha) =
+            State::seal_once(&cache, &plaintext, &key, TEST_CHUNK_PLAIN_SIZE).expect("first seal");
 
         std::fs::remove_file(cache.with_extension("sealed.json")).expect("drop marker");
-        let (_, _, sha) = State::seal_once(&cache, &plaintext).expect("reseal");
-        assert_ne!(sha, good_sha, "没有 CEK 的密文传上去没人能解开");
+        let (_, sha) =
+            State::seal_once(&cache, &plaintext, &key, TEST_CHUNK_PLAIN_SIZE).expect("reseal");
+        assert_ne!(sha, good_sha, "没有提交标记的缓存不算数，必须重新封装");
         assert!(
             cache.with_extension("sealed.json").exists(),
             "重新封装之后标记要补齐"
@@ -26313,7 +26685,7 @@ mod seal_once_tests {
     fn the_cache_is_dropped_once_the_send_completes() {
         let dir = tmp_dir();
         let cache = dir.join("body.sealed");
-        State::seal_once(&cache, b"payload").expect("seal");
+        State::seal_once(&cache, b"payload", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("seal");
         assert!(cache.exists() && cache.with_extension("sealed.json").exists());
 
         State::drop_sealed_cache(&cache);
