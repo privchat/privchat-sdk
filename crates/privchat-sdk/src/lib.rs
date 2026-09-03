@@ -16829,10 +16829,24 @@ impl PrivchatSdk {
                         let _ = resp.send(result);
                     }
                     Command::UpdateUserAlias { user_id, alias, resp } => {
-                        let result = match state.current_uid_required() {
-                            Ok(_) => state.storage.update_user_alias(user_id, alias).await,
-                            Err(e) => Err(e),
-                        };
+                        // 🔴 备注是**账号级**数据，先落服务端再写本地。
+                        //
+                        // 这里原来只写 local_store：备注只活在这台设备的 SQLCipher 里，
+                        // 换设备看不到、重装就没了。微信/Telegram 的备注都是跟账号走的，
+                        // TS SDK 也一直在调 contact/friend/set_alias——只有原生这条漏了。
+                        //
+                        // 顺序是先远端后本地：服务端拒绝时本地不该留下一个假的备注。
+                        let result = async {
+                            state.current_uid_required()?;
+                            let req = privchat_protocol::rpc::contact::friend::FriendSetAliasRequest {
+                                user_id,
+                                alias: alias.clone(),
+                            };
+                            let _: privchat_protocol::rpc::contact::friend::FriendSetAliasResponse =
+                                state.rpc_call_typed(routes::friend::SET_ALIAS, &req).await?;
+                            state.storage.update_user_alias(user_id, alias).await
+                        }
+                        .await;
                         let _ = resp.send(result);
                     }
                     Command::GetUserById { user_id, resp } => {
