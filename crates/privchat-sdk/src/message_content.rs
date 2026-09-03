@@ -294,12 +294,24 @@ fn scan_entities(text: &str, mentions: &[u64]) -> Vec<MessageTextEntity> {
         ("url", r#"https?://[^\s<>{}\[\]\"']+"#),
         ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
         ("phone", r"(?:\+?86[- ]?)?1[3-9][0-9]{9}"),
-        ("number", r"[0-9]+"),
+        // 🔴 「连续数字」是给验证码/订单号用的——点一下能复制那种。
+        //
+        // 原来是 `[0-9]+`：**任何一个数字**都成实体。于是 `ios2and-145737` 里的 `2`、
+        // 「我9点到」里的 `9` 全都变成蓝色带下划线、点了还弹菜单的片段。带数字的
+        // 普通消息占绝大多数，这个识别是负收益。
+        //
+        // 至少 4 位（验证码通常 4–8 位），且不能嵌在字母/数字中间。
+        ("number", r"[0-9]{4,}"),
     ];
     let mut out = Vec::new();
     for (kind, pattern) in patterns {
         for m in Regex::new(pattern).expect("static regex").find_iter(text) {
             if kind == "phone" && has_adjacent_digit(text, m.start(), m.end()) {
+                continue;
+            }
+            // 词内数字不是可复制的号码，是标识符的一部分（`ios2and-145737`、
+            // `v2ray`、文件名）。按 token 判断，不是只看紧邻一个字符。
+            if kind == "number" && !is_standalone_number(text, m.start(), m.end()) {
                 continue;
             }
             out.push(entity(kind, text, m.start(), m.end(), None));
@@ -326,6 +338,31 @@ fn scan_entities(text: &str, mentions: &[u64]) -> Vec<MessageTextEntity> {
         }
     }
     accepted
+}
+
+/// 数字串所在的**整个 token** 是不是纯数字。
+///
+/// 只看紧邻一个字符不够：`ios2and-145737` 里 `145737` 左边是 `-`，看着像边界，
+/// 其实它是标识符的一部分。所以按 token 判断——向两侧扩到分隔符为止，扩出来的
+/// 东西里只要有字母，这串数字就不是独立的号码。
+fn is_standalone_number(text: &str, start: usize, end: usize) -> bool {
+    // `-_./` 连接 token（`ios2and-145737`、`v2.1`、`a/3`），不作为边界。
+    let joins = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/');
+    let mut left = start;
+    for (i, c) in text[..start].char_indices().rev() {
+        if !joins(c) {
+            break;
+        }
+        left = i;
+    }
+    let mut right = end;
+    for (i, c) in text[end..].char_indices() {
+        if !joins(c) {
+            break;
+        }
+        right = end + i + c.len_utf8();
+    }
+    !text[left..right].chars().any(char::is_alphabetic)
 }
 
 fn has_adjacent_digit(text: &str, start: usize, end: usize) -> bool {
@@ -386,6 +423,33 @@ mod tests {
         assert_eq!(entities[0].text, "422124195812090021");
         assert_eq!(entities[1].kind, "phone");
         assert_eq!(entities[1].text, "13684915671");
+    }
+
+    /// 「连续数字」这条实体是给验证码/订单号用的（点一下能复制）。它不该把
+    /// 普通文本里顺带出现的数字也变成蓝色下划线的可点片段——那种消息占绝大多数。
+    #[test]
+    fn stray_digits_in_ordinary_text_are_not_entities() {
+        // 词里夹的数字：`ios2and-145737` 这种标识符/文件名到处都是
+        let e = scan_entities("ios2and-145737", &[]);
+        assert!(
+            e.is_empty(),
+            "词内数字不该成为实体，实际={:?}",
+            e.iter().map(|x| (&x.kind, &x.text)).collect::<Vec<_>>()
+        );
+
+        // 日常口语里的短数字
+        for text in ["我9点到", "第3个", "等 10 分钟"] {
+            assert!(
+                scan_entities(text, &[]).is_empty(),
+                "「{text}」里的短数字不该成为实体"
+            );
+        }
+
+        // 但真正值得复制的长数字串仍要识别
+        let code = scan_entities("验证码 483920 五分钟内有效", &[]);
+        assert_eq!(code.len(), 1, "验证码应当仍被识别");
+        assert_eq!(code[0].kind, "number");
+        assert_eq!(code[0].text, "483920");
     }
 
     #[test]
