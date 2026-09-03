@@ -48,6 +48,31 @@ use sha2::Digest as _;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxResult<T> = Result<T, BoxError>;
 
+/// PLATFORM 模式的部署里 server 的内置注册是关掉的（account.mode=PLATFORM），
+/// 账号由 platform 侧签发。所以这里允许直接喂一组已有凭据：
+///   PRIVCHAT_UID_A / PRIVCHAT_TOKEN_A / PRIVCHAT_DEVICE_A（第二个用户用 _B）
+/// 三个都给了就跳过注册，否则走 server 内置注册（BUILTIN 本地环境）。
+async fn sign_in(
+    sdk: &PrivchatSdk,
+    suffix: &str,
+    fallback_username: String,
+) -> BoxResult<u64> {
+    let uid = std::env::var(format!("PRIVCHAT_UID_{suffix}")).ok();
+    let token = std::env::var(format!("PRIVCHAT_TOKEN_{suffix}")).ok();
+    let device = std::env::var(format!("PRIVCHAT_DEVICE_{suffix}")).ok();
+    if let (Some(uid), Some(token), Some(device)) = (uid, token, device) {
+        let uid: u64 = uid.parse()?;
+        sdk.authenticate(uid, token, device).await?;
+        return Ok(uid);
+    }
+    let login = sdk
+        .register(fallback_username, "password123".to_string(), uuid_like())
+        .await?;
+    sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
+        .await?;
+    Ok(login.user_id)
+}
+
 #[tokio::main]
 async fn main() -> BoxResult<()> {
     let host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -66,12 +91,8 @@ async fn main() -> BoxResult<()> {
     println!("1) connect + register + authenticate");
     sdk.connect().await?;
     let username = format!("dedup_{}{}", ts % 100000, std::process::id());
-    let login = sdk
-        .register(username.clone(), "password123".to_string(), uuid_like())
-        .await?;
-    sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
-        .await?;
-    println!("   user_id={}", login.user_id);
+    let my_uid = sign_in(&sdk, "A", username.clone()).await?;
+    println!("   user_id={}", my_uid);
 
     // ---------------------------------------------------------------- 场景 1
     println!("\n2) 全新内容 → 必须 miss，走完整上传");
@@ -183,16 +204,8 @@ async fn main() -> BoxResult<()> {
     let other = PrivchatSdk::new(sdk_config(&host, tcp_port, &other_dir));
     other.connect().await?;
     let other_name = format!("dedup_other_{}", ts);
-    let other_login = other
-        .register(other_name, "password123".to_string(), uuid_like())
-        .await?;
-    other
-        .authenticate(
-            other_login.user_id,
-            other_login.token.clone(),
-            other_login.device_id.clone(),
-        )
-        .await?;
+    let other_uid = sign_in(&other, "B", other_name).await?;
+    let _ = other_uid;
     let token_x = request_token(&other, blob_a.len(), Some(&digest_a)).await?;
     assert_eq!(
         token_x["already_exists"].as_bool(),

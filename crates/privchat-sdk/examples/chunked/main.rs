@@ -51,6 +51,24 @@ type BoxResult<T> = Result<T, BoxError>;
 /// 明文取 300 KiB：密文必然超过服务端 64 KiB 的分片阈值，又不至于让这个例子跑很久。
 const PLAINTEXT_LEN: usize = 300 * 1024;
 
+/// 见 examples/dedup：PLATFORM 部署里 server 内置注册是关的，凭据从环境变量喂。
+async fn sign_in(sdk: &PrivchatSdk, fallback_username: String) -> BoxResult<u64> {
+    let uid = std::env::var("PRIVCHAT_UID_A").ok();
+    let token = std::env::var("PRIVCHAT_TOKEN_A").ok();
+    let device = std::env::var("PRIVCHAT_DEVICE_A").ok();
+    if let (Some(uid), Some(token), Some(device)) = (uid, token, device) {
+        let uid: u64 = uid.parse()?;
+        sdk.authenticate(uid, token, device).await?;
+        return Ok(uid);
+    }
+    let login = sdk
+        .register(fallback_username, "password123".to_string(), uuid_like())
+        .await?;
+    sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
+        .await?;
+    Ok(login.user_id)
+}
+
 #[tokio::main]
 async fn main() -> BoxResult<()> {
     let host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -69,12 +87,8 @@ async fn main() -> BoxResult<()> {
     println!("1) connect + register + authenticate");
     sdk.connect().await?;
     let username = format!("chunked_{}{}", ts % 100000, std::process::id());
-    let login = sdk
-        .register(username, "password123".to_string(), uuid_like())
-        .await?;
-    sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
-        .await?;
-    println!("   user_id={}", login.user_id);
+    let my_uid = sign_in(&sdk, username).await?;
+    println!("   user_id={}", my_uid);
 
     // ---------------------------------------------------------------- 场景 1
     println!("\n2) 申请分片 token → 服务端必须下发分片方案");
@@ -98,10 +112,7 @@ async fn main() -> BoxResult<()> {
         as usize;
     assert!(base_unit > 0, "🔴 base_unit 必须为正");
     let transport = token["transport"].as_str().unwrap_or("proxy_offset_v1");
-    assert_eq!(
-        transport, "proxy_offset_v1",
-        "🔴 本机没配 S3，数据面只能是内置上传服务"
-    );
+    println!("   transport={transport}");
     let total_size = token["total_size"]
         .as_u64()
         .ok_or("token response missing total_size")?;
@@ -136,6 +147,44 @@ async fn main() -> BoxResult<()> {
     let base = upload_base(upload_url);
 
     // ---------------------------------------------------------------- 场景 3
+    if transport == "s3_multipart_v1" {
+        println!("\n4) s3_multipart_v1：换预签名 URL 直传 S3，再 complete");
+        let part_size = token["part_size"].as_u64().ok_or("s3 会话缺 part_size")? as usize;
+        put_parts_via_s3(&base, upload_token, &sealed, part_size).await?;
+        let done = complete(&base, upload_token).await?;
+        let file_id = payload(&done)["file_id"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| payload(&done)["file_id"].as_u64().map(|n| n.to_string()))
+            .ok_or_else(|| format!("complete 没有回 file_id: {done}"))?;
+        println!("   complete ok file_id={file_id}");
+        let detail = get_url(&sdk, file_id.parse::<u64>()?).await?;
+        assert_eq!(
+            payload(&detail)["plaintext_sha256"].as_str(),
+            Some(digest.as_str()),
+            "🔴 get_url 回的明文摘要必须就是申请时冻结的那个"
+        );
+        let url = payload(&detail)["file_url"].as_str().unwrap_or_default().to_string();
+        println!("   get_url ok，明文摘要一致");
+        // 真正下载回来解密，证明读地址可用（path-style 会 403）。
+        let fetched = reqwest::Client::new().get(&url).send().await?;
+        let st = fetched.status();
+        let body = fetched.bytes().await?;
+        assert!(st.is_success(), "🔴 下载附件失败 status={st}");
+        assert_eq!(body.len(), sealed.len(), "🔴 下载回来的密文长度不对");
+        let key_b64 = token["attachment_key"]["key"].as_str().unwrap();
+        let key = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            key_b64,
+        )?;
+        let plain = privchat_protocol::attachment_crypto::decrypt_attachment(&body, &key)
+            .map_err(|e| format!("解密失败: {e}"))?;
+        assert_eq!(sha256_hex(&plain), digest, "🔴 解密后明文摘要对不上");
+        println!("   下载 {} 字节 → 解密 → 明文摘要一致 ✅", body.len());
+        println!("\n✅ S3 直传 + 站点密钥加密 + 读回校验 全链路通过");
+        return Ok(());
+    }
+
     println!("\n4) 传一半 → status 报的已确认区间必须与真正传出去的字节吻合");
     let half = (sealed.len() / 2 / base_unit).max(1) * base_unit;
     let mut offset = 0usize;
@@ -224,6 +273,16 @@ fn sdk_config(host: &str, tcp_port: u16, data_dir: &std::path::Path) -> Privchat
     }
 }
 
+/// 控制面是自签证书 + SPKI pin，裸 `reqwest::Client` 会直接 UnknownIssuer。
+/// 复用 SDK 里那个带 pin 的构造，和真实客户端走同一条校验路径。
+fn control_http(url: &str) -> BoxResult<reqwest::Client> {
+    let pins: Vec<String> = std::env::var("PRIVCHAT_SPKI_PINS")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    Ok(privchat_sdk::file_plane_http::control_client(url, &pins)?)
+}
+
 async fn request_chunked_token(
     sdk: &PrivchatSdk,
     plaintext_size: usize,
@@ -238,7 +297,8 @@ async fn request_chunked_token(
         "mime_type": "application/octet-stream",
         "filename": "chunked-probe.bin",
         "force_upload": force_upload,
-        "supported_upload_transports": ["proxy_offset_v1"],
+        // 生产是 S3 直传，本机是内置上传服务。两个都声明，让服务端按它的配置挑。
+        "supported_upload_transports": ["proxy_offset_v1", "s3_multipart_v1"],
     });
     Ok(serde_json::from_str(
         &sdk.rpc_call(
@@ -277,8 +337,67 @@ fn upload_base(upload_url: &str) -> String {
     upload_url.trim_end_matches('/').to_string()
 }
 
+/// s3_multipart_v1：分片字节不经服务端，向 /files/part-url 换预签名 URL 后直传 S3。
+/// 服务端只在 complete 时读回、解密、重算明文摘要来核对。
+async fn put_parts_via_s3(
+    base: &str,
+    token: &str,
+    sealed: &[u8],
+    part_size: usize,
+) -> BoxResult<()> {
+    let mut items = Vec::new();
+    let mut ranges = Vec::new();
+    let mut off = 0usize;
+    let mut n = 1u32;
+    while off < sealed.len() {
+        let end = (off + part_size).min(sealed.len());
+        items.push(json!({
+            "part_number": n,
+            "content_length": (end - off) as u64,
+            "checksum_sha256_hex": sha256_hex(&sealed[off..end]),
+        }));
+        ranges.push((off, end));
+        off = end;
+        n += 1;
+    }
+    let signed = control_http(base)?
+        .post(format!("{base}/part-url"))
+        .header("X-Upload-Token", token)
+        .json(&json!({ "parts": items }))
+        .send()
+        .await?;
+    let status = signed.status();
+    let body: Value = signed.json().await?;
+    if !status.is_success() {
+        return Err(format!("part-url failed: status={status} body={body}").into());
+    }
+    let parts = payload(&body)["parts"]
+        .as_array()
+        .ok_or_else(|| format!("part-url 没有回 parts: {body}"))?
+        .clone();
+    // 对象存储用系统根证书，不 pin（它是公网 CA 签的）。
+    let s3 = reqwest::Client::new();
+    for (i, part) in parts.iter().enumerate() {
+        let url = part["url"].as_str().ok_or("signed part missing url")?;
+        let (a, b) = ranges[i];
+        let mut req = s3.put(url).body(sealed[a..b].to_vec());
+        if let Some(headers) = part["required_headers"].as_object() {
+            for (k, v) in headers {
+                // 🔴 头必须原样发：它们签进了 URL，少一个或改一个都会被 S3 拒。
+                req = req.header(k.as_str(), v.as_str().unwrap_or_default());
+            }
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let st = resp.status();
+            return Err(format!("S3 part {} failed: {st} {}", i + 1, resp.text().await.unwrap_or_default()).into());
+        }
+    }
+    Ok(())
+}
+
 async fn put_chunk(base: &str, token: &str, offset: usize, bytes: &[u8]) -> BoxResult<()> {
-    let response = reqwest::Client::new()
+    let response = control_http(base)?
         .put(format!("{base}/chunk?offset={offset}"))
         .header("X-Upload-Token", token)
         .header("X-Chunk-SHA256", sha256_hex(bytes))
@@ -294,7 +413,7 @@ async fn put_chunk(base: &str, token: &str, offset: usize, bytes: &[u8]) -> BoxR
 }
 
 async fn get_status(base: &str, token: &str) -> BoxResult<Value> {
-    let response = reqwest::Client::new()
+    let response = control_http(base)?
         .get(format!("{base}/status"))
         .header("X-Upload-Token", token)
         .send()
@@ -323,7 +442,7 @@ fn confirmed_bytes(status: &Value) -> u64 {
 }
 
 async fn complete(base: &str, token: &str) -> BoxResult<Value> {
-    let response = reqwest::Client::new()
+    let response = control_http(base)?
         .post(format!("{base}/complete"))
         .header("X-Upload-Token", token)
         .header("content-type", "application/json")
