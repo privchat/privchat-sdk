@@ -547,6 +547,26 @@ impl LocalStore {
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| Error::Storage(format!("set sync: {e}")))?;
 
+        // 🔴 1.0.0 beta1 把 22 条历史迁移合并成了单条 V1 基线，所以**装着旧版本的
+        // 设备升上来时，账本里全是编号远大于 1 的旧迁移**。refinery 见到这种账本
+        // 会判定发散并整体失败——那意味着用户升级后直接打不开数据库。
+        //
+        // 本地库是缓存不是真源（消息历史以服务端为权威），所以这里删库重建。
+        // 代价说清楚：**还没发出去的 outbox 消息会跟着没**。这是 beta1 一次性的
+        // 断代成本，换的是不用把 22 条迁移的修复逻辑永远背下去。
+        if Self::has_pre_baseline_ledger(&conn)? {
+            tracing::warn!(uid, "本地库来自 1.0.0 beta1 之前的版本，重建：未发送的消息会丢失");
+            drop(conn);
+            Self::remove_db_files(db_path)?;
+            conn = Connection::open(db_path).map_err(|e| Error::Storage(format!("open db: {e}")))?;
+            conn.pragma_update(None, "key", &key)
+                .map_err(|e| Error::Storage(format!("set db key: {e}")))?;
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| Error::Storage(format!("set wal: {e}")))?;
+            conn.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|e| Error::Storage(format!("set sync: {e}")))?;
+        }
+
         embedded::migrations::runner()
             .run(&mut conn)
             .map_err(|e| Error::Storage(format!("run migrations: {e}")))?;
@@ -562,6 +582,52 @@ impl LocalStore {
             );",
         )
         .map_err(|e| Error::Storage(format!("create auth_session: {e}")))?;
+        Ok(())
+    }
+
+    /// 账本里有没有编号大于基线的迁移 —— 也就是"这个库建于合并之前"。
+    ///
+    /// 不去解析 refinery 的报错文本：那是它的内部措辞，改一次我们就静默失灵。
+    /// 直接读它的账本表，判据是版本号本身。
+    fn has_pre_baseline_ledger(conn: &Connection) -> Result<bool> {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'refinery_schema_history'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("probe migration ledger: {e}")))?;
+        if exists == 0 {
+            return Ok(false);
+        }
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version > 1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("read migration ledger: {e}")))?;
+        Ok(legacy > 0)
+    }
+
+    /// 删库要连 WAL 和 shm 一起删：只删主文件的话，重开时 SQLite 会拿旧 WAL
+    /// 去重放，得到一个既不是旧库也不是新库的东西。
+    fn remove_db_files(db_path: &Path) -> Result<()> {
+        for suffix in ["", "-wal", "-shm"] {
+            let p = if suffix.is_empty() {
+                db_path.to_path_buf()
+            } else {
+                PathBuf::from(format!("{}{}", db_path.display(), suffix))
+            };
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::Storage(format!("remove {}: {e}", p.display())));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -5411,6 +5477,7 @@ mod tests {
         get_string, resolve_group_member_display_name, LegacyQueueKind, LocalStore,
         GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID,
     };
+    use rusqlite::Connection;
     use crate::{
         LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
         UpsertChannelInput, UpsertGroupInput, UpsertRemoteMessageInput, UpsertUserInput,
@@ -6131,108 +6198,6 @@ mod tests {
     /// 被正确合并/改指，而不是随重复行一起消失，也不因唯一索引冲突而炸掉。
     ///
     /// 用**真实 runner**而不是复制 SQL：复制出来的副本会和迁移文件各自演化，
-    /// 最后测的是副本、不是要发布的东西。
-    #[test]
-    fn real_migration_merges_duplicate_message_attachments() {
-        use rusqlite::Connection;
-
-        let dir = std::env::temp_dir().join(format!(
-            "privchat-mig-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).expect("tmp dir");
-        let db_path = dir.join("legacy.db");
-        let mut conn = Connection::open(&db_path).expect("open");
-        // 先升到**上一版**为止：这就是升级前用户手上的库形态，补偿表还在，
-        // outbox 还没出现。
-        super::embedded::migrations::runner()
-            .set_target(refinery::Target::Version(20_260_727_120_000))
-            .run(&mut conn)
-            .expect("migrate to the pre-outbox version");
-
-        // 保留行（待确认）与同步补进来的重复行，各自都有 reaction / extra，
-        // 且 reaction 完全相同 —— 直接 UPDATE 会撞唯一索引。
-        conn.execute_batch(
-            "INSERT INTO message (id, server_message_id, channel_id, channel_type, from_uid,
-                                  type, content, status, created_at, updated_at,
-                                  searchable_word, local_message_id, setting, extra)
-             VALUES (1, NULL, 100, 1, 200, 1, 'keep', 1, 0, 0, 'k', 777001, 0, '{}'),
-                    (2, 900123, 100, 1, 200, 1, 'dup', 2, 0, 0, 'k', 0, 0, '{}');
-
-             INSERT INTO outbound_ack_pending
-                 (message_id, server_message_id, message_seq, created_at, updated_at)
-             VALUES (1, 900123, 5, 0, 0);
-
-             -- 同一个 (消息,用户,emoji) 两边都有，但副本版本更新且已撤销：
-             -- 合并必须取新的那份状态，不能让旧的「未撤销」留下来。
-             INSERT INTO message_reaction (message_id, uid, emoji, seq, is_deleted, created_at)
-             VALUES (1, 200, '👍', 1, 0, 0),
-                    (2, 200, '👍', 7, 1, 0),
-                    (2, 300, '🎉', 3, 0, 0);
-
-             INSERT INTO message_extra (message_id, extra_version, readed)
-             VALUES (1, 5, 0), (2, 9, 1);",
-        )
-        .expect("seed conflicting data");
-
-        // 真实 runner 升到最新：旧实现会因唯一索引冲突整体失败，用户升级即
-        // 打不开数据库。
-        super::embedded::migrations::runner()
-            .run(&mut conn)
-            .expect("upgrade across conflicting attachments");
-
-        let keep_reactions: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM message_reaction WHERE message_id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .expect("count reactions");
-        assert_eq!(
-            keep_reactions, 2,
-            "相同的 reaction 合并成一条，副本独有的那条改指过来"
-        );
-        let (seq, is_deleted): (i64, i64) = conn
-            .query_row(
-                "SELECT seq, is_deleted FROM message_reaction
-                 WHERE message_id = 1 AND uid = 200 AND emoji = '👍'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .expect("merged reaction");
-        assert_eq!(seq, 7, "合并要取版本更新的那份");
-        assert_eq!(is_deleted, 1, "不能让已撤销的 reaction 复活");
-
-        let extra_version: i64 = conn
-            .query_row(
-                "SELECT extra_version FROM message_extra WHERE message_id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .expect("extra survived");
-        assert_eq!(extra_version, 9, "message_extra 取版本更新的那份");
-
-        let dup_left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM message WHERE id = 2", [], |r| {
-                r.get(0)
-            })
-            .expect("count dup");
-        assert_eq!(dup_left, 0, "重复行最后才删");
-
-        let server_id: i64 = conn
-            .query_row(
-                "SELECT server_message_id FROM message WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .expect("keep row");
-        assert_eq!(server_id, 900123, "待确认的 ack 被落实到保留行");
-
-        drop(conn);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// 附件的发送字节来自 SDK 托管的本地文件，**不是**存进 outbox 的 payload。
     ///
     /// 覆盖范围有限，别高估它：只验证到「命令不带字节 + 路径可读」这一层，
@@ -7896,63 +7861,6 @@ mod tests {
     }
 
     /// 写入侧修好之后，已经躺在老用户设备上的裸行还得清掉，否则列表看起来跟没修一样。
-    /// 判据必须精确到「只被 cursor 投影碰过」，这条测试盯的就是别删过头。
-    #[test]
-    fn the_migration_drops_only_cursor_materialized_channels() {
-        use rusqlite::Connection;
-
-        let dir = std::env::temp_dir().join(format!(
-            "privchat-mig-cursor-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).expect("tmp dir");
-        let db_path = dir.join("legacy.db");
-        let mut conn = Connection::open(&db_path).expect("open");
-        super::embedded::migrations::runner()
-            .set_target(refinery::Target::Version(20_260_803_120_000))
-            .run(&mut conn)
-            .expect("migrate to the version right before the cleanup");
-
-        conn.execute_batch(
-            "-- 1: cursor 投影造的裸行——要删
-             INSERT INTO channel (channel_id, channel_type, unread_count, version,
-                                  channel_name, channel_remark, avatar, created_at, updated_at)
-             VALUES (1, 1, 3, 0, '', '', '', 0, 0);
-
-             -- 2: 实体同步来的正常群——version 非 0，保留
-             INSERT INTO channel (channel_id, channel_type, unread_count, version,
-                                  channel_name, channel_remark, avatar, created_at, updated_at)
-             VALUES (2, 2, 0, 7, '真群', '', 'a.png', 0, 0);
-
-             -- 3: 实体同步来的 DM，展示字段恰好全空——但 version 非 0，不许误删
-             INSERT INTO channel (channel_id, channel_type, unread_count, version,
-                                  channel_name, channel_remark, avatar, created_at, updated_at)
-             VALUES (3, 1, 0, 12, '', '', '', 0, 0);",
-        )
-        .expect("seed channels");
-
-        super::embedded::migrations::runner()
-            .run(&mut conn)
-            .expect("run the cleanup migration");
-
-        let survivors: Vec<i64> = conn
-            .prepare("SELECT channel_id FROM channel ORDER BY channel_id")
-            .and_then(|mut s| {
-                s.query_map([], |r| r.get::<_, i64>(0))
-                    .and_then(|rows| rows.collect())
-            })
-            .expect("list survivors");
-        assert_eq!(
-            survivors,
-            vec![2, 3],
-            "只删 cursor 造的裸行；实体同步来的会话一条都不能少"
-        );
-
-        drop(conn);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// 会话列表的主数据源是 channel 表（CLIENT_UI_SPEC §3.1），会话行只能由 channel 实体
     /// 同步创建。read cursor 是读状态 projection（READ_STATUS_SPEC §6），不许拿它去物化会话。
     ///
@@ -9049,5 +8957,74 @@ mod tests {
         );
         drop(reopened);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 🔴 1.0.0 beta1 之前建的本地库必须被**重建**，而不是让 refinery 报发散后
+    /// 整体失败——那等于用户升级完就打不开数据库。
+    ///
+    /// 这条测试真的造一个"旧账本"：装作那台设备跑过合并前的迁移。
+    #[test]
+    fn a_pre_baseline_local_database_is_rebuilt_instead_of_failing_to_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-baseline-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db_path = dir.join("legacy.db");
+
+        {
+            // 真实的本地库是 SQLCipher 加密的，旧库同样如此——用同一把 key 造，
+            // 否则测的是"打不开明文文件"，跟升级路径无关。
+            let conn = Connection::open(&db_path).expect("open");
+            conn.pragma_update(None, "key", &LocalStore::derive_encryption_key("42"))
+                .expect("set key");
+            // refinery 的账本表 + 一条编号远大于基线的旧迁移。
+            conn.execute_batch(
+                "CREATE TABLE refinery_schema_history (
+                     version INT4 PRIMARY KEY,
+                     name VARCHAR(255),
+                     applied_on VARCHAR(255),
+                     checksum VARCHAR(255));
+                 INSERT INTO refinery_schema_history VALUES
+                     (20241119070909, 'init', '', '0');
+                 CREATE TABLE leftover_from_the_old_schema (x INTEGER);",
+            )
+            .expect("seed a pre-baseline ledger");
+            assert!(
+                LocalStore::has_pre_baseline_ledger(&conn).expect("probe"),
+                "编号大于 1 的账本行就是「合并之前建的库」"
+            );
+        }
+
+        let store = LocalStore::open_at(dir.clone()).expect("open store");
+        store.init_user_db("42", &db_path).expect("重建而不是失败");
+
+        let conn = Connection::open(&db_path).expect("reopen");
+        conn.pragma_update(None, "key", &LocalStore::derive_encryption_key("42"))
+            .expect("set key");
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'leftover_from_the_old_schema'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(leftovers, 0, "旧结构必须整个消失，而不是和基线混在一起");
+        let has_message: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='message'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(has_message, 1, "基线必须建出来");
+        assert!(
+            !LocalStore::has_pre_baseline_ledger(&conn).expect("probe"),
+            "重建之后账本里只该剩基线"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
