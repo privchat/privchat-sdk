@@ -122,21 +122,17 @@ pub use privchat_protocol::attachment_crypto;
 #[derive(Debug, Clone)]
 pub struct ResolvedFileDownload {
     pub url: String,
+    /// 这张票据什么时候失效（Unix 秒，服务端下发）。
+    ///
+    /// 🔴 **必须带着走。** 签名地址是有 TTL 的，缓存或排队时不看它，就会拿一张过期
+    /// 票据去下载——表现是下载失败，而不是"票据过期"，排查时看不出来。
+    pub expires_at: i64,
     /// 解开**这一个**附件的密钥，base64url(no-pad)。明文对象为 None。
     ///
     /// **绝不进日志。**
     pub attachment_key: Option<String>,
 }
 
-impl ResolvedFileDownload {
-    /// 只有 file_url、没有走 get_url 时的明文票据。
-    pub fn plaintext_url(url: String) -> Self {
-        Self {
-            url,
-            attachment_key: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransportProtocol {
@@ -9357,12 +9353,39 @@ impl State {
                 let Some(transport) = transport.as_ref() else {
                     return;
                 };
+                // 🔴 只重试**可重试**的失败。
+                //
+                // 复用 `Error::is_retryable()`——发送链路判定重试用的就是它，这里
+                // 再写一套判断迟早会跟它漂移。权限被拒（10004）不在白名单里：那是
+                // 终局答复，重试三次只是把同一个拒绝多问两遍，而这段下载会被后续的
+                // 投影反复触发，等于永远重试下去。
                 let mut resolved = None;
                 for attempt in 0..3u64 {
-                    resolved =
-                        State::resolve_thumbnail_ticket_detached(transport, file_id, timeout).await;
-                    if resolved.is_some() {
-                        break;
+                    match State::resolve_thumbnail_ticket_detached(transport, file_id, timeout)
+                        .await
+                    {
+                        Ok(ticket) => {
+                            resolved = Some(ticket);
+                            break;
+                        }
+                        Err(error) if !error.is_retryable() => {
+                            tracing::warn!(
+                                message_id,
+                                file_id,
+                                %error,
+                                "缩略图票据被终局拒绝，不重试"
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                message_id,
+                                file_id,
+                                attempt,
+                                %error,
+                                "缩略图票据这次没拿到，稍后重试"
+                            );
+                        }
                     }
                     if attempt < 2 {
                         tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
@@ -11407,27 +11430,33 @@ impl State {
     }
 
     /// 在 DownloadManager worker 内按 `thumbnail_file_id` 调 `file/get_url`，拿
-    /// signed_url + encryption_version + cek。失败返回 None（缩略图静默不下载，不阻塞）。
-    /// CEK 只来自此处，绝不取自消息 metadata。
+    /// signed_url + encryption_version + cek。CEK 只来自此处，绝不取自消息 metadata。
     /// 由 [`media_download::DownloadManager`] 的受控任务调用，不占 actor。
+    ///
+    /// 🔴 **返回 Result 而不是 Option。**
+    ///
+    /// 以前失败一律吞成 `None`，于是调用方分不清「这次没拿到」和「不该拿到」——
+    /// 权限被拒（10004）会和网络抖动一样被重试，而重试一个终局拒绝永远不会成功，
+    /// 只会在每次投影、每次重开 App 时再来一轮。
     async fn resolve_thumbnail_ticket_detached(
         transport: &TransportClient,
         thumbnail_file_id: u64,
         timeout: Duration,
-    ) -> Option<ResolvedFileDownload> {
+    ) -> Result<ResolvedFileDownload> {
         let req = FileGetUrlRequest {
             file_id: thumbnail_file_id,
             user_id: 0,
         };
         let resp: FileGetUrlResponse =
-            Self::rpc_call_typed_detached(transport, routes::file::GET_URL, &req, timeout)
-                .await
-                .ok()?;
+            Self::rpc_call_typed_detached(transport, routes::file::GET_URL, &req, timeout).await?;
         if resp.file_url.trim().is_empty() {
-            return None;
+            return Err(Error::Serialization(
+                "decode file/get_url response: missing file_url".to_string(),
+            ));
         }
-        Some(ResolvedFileDownload {
+        Ok(ResolvedFileDownload {
             url: resp.file_url,
+            expires_at: resp.expires_at,
             attachment_key: resp.attachment_key.map(|k| k.key),
         })
     }
@@ -17811,54 +17840,13 @@ impl PrivchatSdk {
     pub fn data_dir(&self) -> &str {
         self.data_dir.as_str()
     }
-
-    /// Start a Telegram-style streaming download for `message_id`.
-    ///
-    /// Resolves the canonical target directory via [`media_store`] and dispatches
-    /// to the embedded [`DownloadManager`](media_download::DownloadManager).
-    /// Emits [`SdkEvent::MediaDownloadStateChanged`] at ~5Hz plus on transitions.
-    pub async fn start_message_media_download(
-        &self,
-        message_id: u64,
-        download_url: String,
-        mime: String,
-        filename_hint: Option<String>,
-        created_at_ms: i64,
-    ) -> Result<()> {
-        let status = self.session_status().await?;
-        let owner_uid = status.account_uid.ok_or_else(|| {
-            Error::InvalidState("session is empty; login/authenticate required".to_string())
-        })?;
-        let uid = owner_uid
-            .parse::<u64>()
-            .map_err(|_| Error::InvalidState("active account uid is invalid".to_string()))?;
-        let key =
-            media_download::MediaTaskKey::payload(owner_uid, status.session_epoch, message_id);
-        let root = std::path::Path::new(self.data_dir.as_str());
-        let target_dir =
-            media_store::ensure_attachment_dir(root, uid, message_id as i64, created_at_ms)
-                .map_err(|e| Error::Storage(format!("ensure attachment dir failed: {e}")))?;
-        let payload_filename =
-            media_store::payload_filename_with_fallback(&mime, filename_hint.as_deref());
-        self.download_manager
-            .start(
-                self.clone(),
-                key,
-                download_url,
-                target_dir,
-                payload_filename,
-            )
-            .await
-            .map_err(Error::InvalidState)
-    }
-
     /// Start a streaming download for an attachment-encrypted (v1) message.
     ///
-    /// Resolves the canonical download ticket via [`file/get_url`](Self::resolve_file_download)
-    /// (signed URL + `encryption_version` + `cek`) and dispatches it. On completion
-    /// the blob is AES-GCM decrypted before becoming the on-disk file. Legacy
-    /// plaintext messages (no `file_id`) should keep using
-    /// [`start_message_media_download`](Self::start_message_media_download).
+    /// 🔴 **这是唯一的附件下载入口。**
+    ///
+    /// 用 `file_id` 走 `file/get_url` 换当次有效的票据（签名地址 + cek），下载完再
+    /// 解密落盘。收 URL 的那个入口已经删除：消息里不再携带地址（会过期、会被防盗链
+    /// 挡掉、还绕开鉴权），所以"调用方给一个 URL"这件事本身就不该存在。
     pub async fn start_message_media_download_by_file_id(
         &self,
         message_id: u64,
@@ -18430,6 +18418,7 @@ impl PrivchatSdk {
         }
         Ok(ResolvedFileDownload {
             url: resp.file_url,
+            expires_at: resp.expires_at,
             attachment_key: resp.attachment_key.map(|k| k.key),
         })
     }
@@ -26973,6 +26962,61 @@ mod wire_display_filename_tests {
             State::wire_display_filename(r#"{"file_name":".."}"#, "payload.bin"),
             "payload.bin"
         );
+    }
+}
+
+#[cfg(test)]
+mod download_ticket_policy_tests {
+    use super::*;
+
+    /// 🔴 终局拒绝不能被重试。
+    ///
+    /// 缩略图票据以前失败一律吞成 `None`，调用方分不清「这次没拿到」和「不该拿到」，
+    /// 于是权限被拒和网络抖动一样重试三次——而这段下载会被后续投影反复触发，等于
+    /// 永远重试一个永远不会成功的请求。
+    ///
+    /// 判据复用发送链路那一套 `Error::is_retryable()`：再写第二套迟早会跟它漂移。
+    #[test]
+    fn a_permission_denial_is_not_retryable() {
+        let denied = Error::Server {
+            code: privchat_protocol::ErrorCode::PermissionDenied as u32,
+            message: "无权访问该附件".to_string(),
+        };
+        assert!(
+            !denied.is_retryable(),
+            "权限被拒是终局答复，重试只会把同一个拒绝多问几遍"
+        );
+    }
+
+    /// 服务不可用是瞬时的——服务端签名暂时失败会回这个码，必须重试。
+    #[test]
+    fn a_transient_failure_is_retryable() {
+        for code in [
+            privchat_protocol::ErrorCode::ServiceUnavailable,
+            privchat_protocol::ErrorCode::SystemBusy,
+            privchat_protocol::ErrorCode::Timeout,
+        ] {
+            let err = Error::Server {
+                code: code as u32,
+                message: "busy".to_string(),
+            };
+            assert!(err.is_retryable(), "{code:?} 应当可重试");
+        }
+        assert!(Error::NotConnected.is_retryable(), "断网应当可重试");
+    }
+
+    /// 票据必须带着服务端下发的过期时间走。
+    ///
+    /// 不带它就没法判断手里这张还能不能用——排队或缓存时会拿过期票据去下载，
+    /// 表现是"下载失败"而不是"票据过期"，排查时看不出来。
+    #[test]
+    fn a_ticket_carries_its_expiry() {
+        let ticket = ResolvedFileDownload {
+            url: "https://example.invalid/signed".to_string(),
+            expires_at: 1_700_000_000,
+            attachment_key: None,
+        };
+        assert_eq!(ticket.expires_at, 1_700_000_000);
     }
 }
 

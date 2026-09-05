@@ -234,27 +234,6 @@ impl DownloadManager {
             .len()
     }
 
-    /// Start a download from a legacy plaintext URL (no attachment encryption).
-    /// Backwards-compatible entry: builds a v0 ticket and delegates to
-    /// [`start_with_ticket`](Self::start_with_ticket). Prefer the ticket form for
-    /// encrypted (v1) attachments so the blob is decrypted on completion.
-    pub(crate) async fn start(
-        &self,
-        sdk: PrivchatSdk,
-        key: MediaTaskKey,
-        download_url: String,
-        target_dir: PathBuf,
-        payload_filename: String,
-    ) -> Result<(), String> {
-        self.start_with_ticket(
-            sdk,
-            key,
-            ResolvedFileDownload::plaintext_url(download_url),
-            target_dir,
-            payload_filename,
-        )
-        .await
-    }
 
     /// Start (or no-op restart if already Downloading/Paused) a download from a
     /// resolved ticket (`url` + `encryption_version` + optional `cek`).

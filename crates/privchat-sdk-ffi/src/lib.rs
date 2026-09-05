@@ -9059,34 +9059,12 @@ impl PrivchatClient {
             })
     }
 
-    /// Start a streaming Telegram-style download for a message's primary attachment.
-    /// Delegates to [`PrivchatSdk::start_message_media_download`] — the core SDK owns
-    /// the state machine, so the Rust iced UI and the FFI Kotlin/iOS layer share it.
-    pub async fn start_message_media_download(
-        &self,
-        message_id: u64,
-        download_url: String,
-        mime: String,
-        filename_hint: Option<String>,
-        created_at_ms: i64,
-    ) -> Result<(), PrivchatFfiError> {
-        self.inner
-            .start_message_media_download(
-                message_id,
-                download_url,
-                mime,
-                filename_hint,
-                created_at_ms,
-            )
-            .await
-            .map_err(PrivchatFfiError::from)
-    }
 
     /// Start a streaming download for an attachment-encrypted (v1) message by
     /// `file_id`. The SDK resolves the signed URL + cek via `file/get_url` and
-    /// decrypts the blob on completion. Prefer this over the URL-driven entry for
-    /// any message that carries a `file_id`; the legacy URL form is retained only
-    /// for plaintext (pre-encryption) attachments.
+    /// decrypts the blob on completion.
+    ///
+    /// 🔴 这是唯一的下载入口。收 URL 的那个已经删除——消息里不再携带地址。
     pub async fn start_message_media_download_by_file_id(
         &self,
         message_id: u64,
