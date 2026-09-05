@@ -12809,16 +12809,18 @@ impl State {
         token: &str,
         uploaded: &UploadedFileInfo,
     ) -> Result<()> {
+        // 🔴 只报 token 和 file_id。
+        //
+        // 以前还回报 file_url / file_size / mime_type / 尺寸——服务端一个都不读。
+        // 其中 file_url 是**文件落在哪里**，那是服务端的知识：对象 key 由它按内容
+        // 摘要算，上传地址也由它签发。客户端回报存储位置既没用，又把存储布局的话语
+        // 权错放到了客户端这一侧。
+        //
+        // 这次上传是哪一次，靠 token（前半段就是 upload_id）定位；大小/类型/尺寸由
+        // 服务端在 complete 时读回密文自己算，不采信客户端的说法。
         let payload = serde_json::json!({
             "token": token,
             "file_id": uploaded.file_id,
-            "file_url": uploaded.file_url,
-            "thumbnail_url": uploaded.thumbnail_url,
-            "file_size": uploaded.file_size,
-            "original_size": uploaded.original_size,
-            "mime_type": uploaded.mime_type,
-            "width": uploaded.width,
-            "height": uploaded.height,
             "user_id": user_id,
             "status": "uploaded",
         });
