@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "privchat-sdk"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "privchat-sdk-c-api"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 dependencies = [
  "privchat-sdk",
  "serde",
@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "privchat-sdk-ffi"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 dependencies = [
  "hex",
  "image",
