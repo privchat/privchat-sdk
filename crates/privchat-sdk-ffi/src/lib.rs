@@ -1562,6 +1562,13 @@ pub enum SdkEvent {
         server_message_id: Option<u64>,
         timestamp: u64,
     },
+    /// app→user Channel Transfer push; see `privchat_sdk::SdkEvent::TransferReceived`.
+    TransferReceived {
+        channel_id: u64,
+        request_id: String,
+        route: String,
+        body: Vec<u8>,
+    },
     PeerReadPtsAdvanced {
         channel_id: u64,
         channel_type: i32,
@@ -2654,6 +2661,17 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             server_message_id,
             timestamp,
         },
+        privchat_sdk::SdkEvent::TransferReceived {
+            channel_id,
+            request_id,
+            route,
+            body,
+        } => SdkEvent::TransferReceived {
+            channel_id,
+            request_id,
+            route,
+            body,
+        },
         privchat_sdk::SdkEvent::PeerReadPtsAdvanced {
             channel_id,
             channel_type,
@@ -2975,6 +2993,18 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             "publisher": publisher,
             "server_message_id": server_message_id,
             "timestamp": timestamp
+        }),
+        SdkEvent::TransferReceived {
+            channel_id,
+            request_id,
+            route,
+            body,
+        } => json!({
+            "type": "transfer_received",
+            "channel_id": channel_id,
+            "request_id": request_id,
+            "route": route,
+            "body_len": body.len()
         }),
         SdkEvent::PeerReadPtsAdvanced {
             channel_id,

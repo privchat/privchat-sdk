@@ -707,6 +707,17 @@ pub enum SdkEvent {
         server_message_id: Option<u64>,
         timestamp: u64,
     },
+    /// app→user Channel Transfer push (`POST /api/service/transfer/send`, wire
+    /// `TransferRequest` biz_type=19 arriving at the client). Business modules use
+    /// it for PRIVATE per-user events on a channel (e.g. MMO battle slots), as
+    /// opposed to Room publishes that every subscriber sees. Fire-and-forget:
+    /// the server does not wait for a client `TransferResponse`.
+    TransferReceived {
+        channel_id: u64,
+        request_id: String,
+        route: String,
+        body: Vec<u8>,
+    },
     PeerReadPtsAdvanced {
         channel_id: u64,
         channel_type: i32,
@@ -10314,6 +10325,27 @@ impl State {
                         message_items.push(Self::push_message_to_sync_item(push));
                     }
                 }
+            }
+            MessageType::TransferRequest => {
+                // Inbound app→user transfer (server transfer §5.2). Outbound RPCs are
+                // matched on TransferResponse, so a TransferRequest here can only be a push.
+                let req: TransferRequest = decode_message(&data)
+                    .map_err(|e| Error::Serialization(format!("decode transfer request: {e}")))?;
+                if inbound_logs_enabled() {
+                    eprintln!(
+                        "[SDK.inbound] transfer push channel_id={} route={} body_len={}",
+                        req.channel_id,
+                        req.route,
+                        req.body.len()
+                    );
+                }
+                self.pending_events.push(SdkEvent::TransferReceived {
+                    channel_id: req.channel_id,
+                    request_id: req.request_id,
+                    route: req.route,
+                    body: req.body,
+                });
+                return Ok(0);
             }
             MessageType::PublishRequest => {
                 let req: PublishRequest = decode_message(&data)
