@@ -1399,11 +1399,10 @@ struct AttachmentWireInput<'a> {
     file_id: u64,
     storage_source_id: u32,
     file_size: u64,
-    file_url: &'a str,
-    /// 主文件上传响应自带的缩略图 URL；只在**没有**独立缩略图 file 时作 legacy 兜底。
-    main_thumbnail_url: Option<&'a str>,
-    /// 独立缩略图：`(file_id, file_url)`。图片没有它时会回退成引用主文件。
-    thumbnail: Option<(u64, &'a str)>,
+    /// 独立缩略图的 file_id。图片没有它时会回退成引用主文件。
+    ///
+    /// 这里只留 id：下载地址不进消息（见 build_attachment_wire_content 的说明）。
+    thumbnail: Option<u64>,
     filename: &'a str,
     mime_type: &'a str,
     width: Option<u32>,
@@ -11391,27 +11390,6 @@ impl State {
         None
     }
 
-    /// Extract thumbnail_url from message content JSON (supports envelope and flat formats).
-    fn extract_thumbnail_url(content: &str) -> Option<String> {
-        let json: serde_json::Value = serde_json::from_str(content).ok()?;
-        // Envelope format: {"content":"...","metadata":{"thumbnail_url":"..."}}
-        if let Some(url) = json
-            .get("metadata")
-            .and_then(|m| m.get("thumbnail_url"))
-            .and_then(|v| v.as_str())
-        {
-            if !url.is_empty() {
-                return Some(url.to_string());
-            }
-        }
-        // Flat format: {"thumbnail_url":"..."}
-        if let Some(url) = json.get("thumbnail_url").and_then(|v| v.as_str()) {
-            if !url.is_empty() {
-                return Some(url.to_string());
-            }
-        }
-        None
-    }
 
     /// 从消息内容 JSON 解析缩略图的协议权威 `thumbnail_file_id`（envelope `metadata` 或 flat）。
     /// Scheme B：接收端按此 file_id 走 `file/get_url` 拿 signed_url + cek 下载解密。
@@ -11473,10 +11451,17 @@ impl State {
         let (thumb_url, thumb_key) = match ticket {
             // get_url 解析的票据：密文 blob，用票据里的密钥解开。
             Some(t) if t.url.starts_with("http") => (t.url, t.attachment_key),
-            // 消息里只带明文 thumbnail_url 的情况。
-            _ => match Self::extract_thumbnail_url(content) {
-                Some(url) if url.starts_with("http") => (url, None),
-                _ => {
+            // 🔴 没有票据时**不再回落到消息里的 thumbnail_url**。
+            //
+            // 那条回落有两个问题。一是消息里的地址会过期——离线留言和历史记录被读到
+            // 时，当初写进去的签名早失效了，将来加了防盗链 token 更是必然失败。二是
+            // 这里的 `ticket == None` 并不只表示"没有缩略图"：`file/get_url` 因网络
+            // 抖动、token 过期、权限被拒而失败时同样是 None，于是一次抖动会让代码
+            // 绕过鉴权去打消息里那个地址。
+            //
+            // 现在只剩一条路：有 id 就走 get_url 换票据；换不到就按下面的规则区分
+            // "服务端明确说没有" 与 "这次没拿到"，后者保持待重试。
+            _ => {
                     // thumb_status=3 是**终态**：写下去之后永不重试，UI 从此渲染
                     // 静态占位符。所以它只能表示「已经看清楚了,这条消息确实没有
                     // 缩略图」,不能表示「我没看到缩略图字段」。
@@ -11515,9 +11500,8 @@ impl State {
                             "拿不到缩略图票据,但服务端未明确表示没有缩略图:保持待重试,不写终态"
                         );
                     }
-                    return None;
-                }
-            },
+                return None;
+            }
         };
         let dir = media_store::get_message_dir(user_root, message_id as i64, created_at_ms);
         let thumb_path = dir.join(Self::thumb_filename_for_url(&thumb_url));
@@ -12878,17 +12862,27 @@ impl State {
         // 图片消息协议必须带缩略图引用（server 校验拒绝缺失）。缩略图未产出时把
         // 原图 file 引用为缩略图（接收端按缩略图链路下载原图渲染），与 TS SDK 一致；
         // 视频/文件不强制。
-        let (thumbnail_file_id, thumbnail_url) = match input.thumbnail {
-            Some((id, url)) => (Some(id), url.to_string()),
-            None if input.file_type == "image" => {
-                (Some(input.file_id), input.file_url.to_string())
-            }
-            None => (None, String::new()),
+        // 🔴 **消息里只放稳定引用，绝不放下载地址。**
+        //
+        // 消息是持久的，下载地址不是：签名 URL 有 TTL，桶可能迁移，将来还会加防盗链
+        // token。一条离线留言、一段历史记录被读到的时候，当初写进去的那个地址早就
+        // 失效了——而失效的表现是图片变灰块，不是报错。把直链换成签名 URL 也不解决
+        // 问题：过期是时间问题，不是签不签的问题。
+        //
+        // 所以这里只写 file_id / thumbnail_file_id 加上渲染需要的展示信息，接收端在
+        // **要下载的那一刻**用 id 走 file/get_url 换当次有效的票据。
+        let thumbnail_file_id = match input.thumbnail {
+            Some(id) => Some(id),
+            // 图片消息协议必须带缩略图引用（server 校验拒绝缺失）。缩略图未产出时把
+            // 原图 file 引用为缩略图（接收端按缩略图链路下载原图渲染），与 TS SDK 一致；
+            // 视频/文件不强制。
+            None if input.file_type == "image" => Some(input.file_id),
+            None => None,
         };
 
         let mut content = if let Some(thumb_file_id) = thumbnail_file_id {
             // Scheme B：缩略图也是独立 file，接收端走 thumbnail_file_id -> file/get_url -> cek
-            // 统一下载解密。**CEK 永不进消息 metadata**。thumbnail_url 仅作 legacy 明文 fallback。
+            // 统一下载解密。**CEK 永不进消息 metadata**。
             serde_json::json!({
                 "file_type": input.file_type,
                 "file_id": input.file_id,
@@ -12897,8 +12891,6 @@ impl State {
                 "mime_type": input.mime_type,
                 "storage_source_id": input.storage_source_id,
                 "file_size": input.file_size,
-                "file_url": input.file_url,
-                "thumbnail_url": thumbnail_url,
                 // 原图尺寸（客户端加密前解码得到）。加密后服务端拿不到密文图片尺寸，
                 // 必须客户端带上，否则接收端 UI 没法按原比例渲染气泡（只能正方形兜底）。
                 "width": input.width.unwrap_or(0),
@@ -12912,8 +12904,6 @@ impl State {
                 "mime_type": input.mime_type,
                 "storage_source_id": input.storage_source_id,
                 "file_size": input.file_size,
-                "file_url": input.file_url,
-                "thumbnail_url": input.main_thumbnail_url,
                 "width": input.width.unwrap_or(0),
                 "height": input.height.unwrap_or(0),
             })
@@ -13581,17 +13571,7 @@ impl State {
             file_id: uploaded_file_id,
             storage_source_id: uploaded.storage_source_id,
             file_size: uploaded.file_size,
-            file_url: &uploaded.file_url,
-            main_thumbnail_url: uploaded.thumbnail_url.as_deref(),
-            thumbnail: thumbnail_file_id_u64.map(|id| {
-                (
-                    id,
-                    uploaded_thumbnail
-                        .as_ref()
-                        .map(|v| v.file_url.as_str())
-                        .unwrap_or_default(),
-                )
-            }),
+            thumbnail: thumbnail_file_id_u64,
             // 传的是 payload.{ext}，显示的是它本来的名字。
             filename: &Self::wire_display_filename(&message.extra, &upload_filename),
             mime_type: &mime_type,
@@ -17550,9 +17530,9 @@ impl PrivchatSdk {
                             // block this UI command on `message/history/around`. Queue the
                             // existing repair path and return; its TimelineUpdated event
                             // causes the visible bubble to submit again with fresh metadata.
-                            if State::extract_thumbnail_file_id(&msg.extra).is_none()
-                                && State::extract_thumbnail_url(&msg.extra).is_none()
-                            {
+                            // 只看 thumbnail_file_id：消息里不再带下载地址，
+                            // 再去看 URL 只会把每一条新消息都判成「metadata 缺失」。
+                            if State::extract_thumbnail_file_id(&msg.extra).is_none() {
                                 if let Some(server_id) = msg.server_message_id.filter(|id| *id != 0)
                                 {
                                     state.enqueue_projection_repair(
@@ -20899,10 +20879,6 @@ mod tests {
         let mut metadata = serde_json::Map::new();
         metadata.insert("file_id".into(), serde_json::json!(7120));
         metadata.insert("thumbnail_file_id".into(), serde_json::json!(7119));
-        metadata.insert(
-            "thumbnail_url".into(),
-            serde_json::json!("https://example.invalid/7119.webp"),
-        );
         let item = privchat_protocol::rpc::message::history::MessageHistoryItem {
             message_id: 604_621_803_637_178_368,
             channel_id: 45,
@@ -20931,10 +20907,6 @@ mod tests {
             State::extract_thumbnail_file_id(&input.extra),
             Some(7119),
             "缩略图下载靠这个 file_id;取不到就会被判成「没有缩略图」"
-        );
-        assert_eq!(
-            State::extract_thumbnail_url(&input.extra).as_deref(),
-            Some("https://example.invalid/7119.webp"),
         );
     }
 
@@ -27003,229 +26975,98 @@ mod wire_display_filename_tests {
 }
 
 #[cfg(test)]
-mod attachment_wire_equivalence_tests {
+mod attachment_wire_contract_tests {
     use super::*;
 
-    /// 抽取前的原始构造（privchat-sdk 7bacee7，`process_outbound_file` 内联段）。
-    fn legacy_wire_content(
-        file_type: &str,
-        uploaded_file_id: u64,
-        storage_source_id: u32,
-        file_size: u64,
-        file_url: &str,
-        uploaded_thumbnail_url: Option<&str>,
-        thumbnail: Option<(u64, &str)>,
-        upload_filename: &str,
-        mime_type: &str,
-        source_width: Option<u32>,
-        source_height: Option<u32>,
-    ) -> serde_json::Value {
-        let thumbnail_file_id_u64 = thumbnail.map(|(id, _)| id);
-        let (thumbnail_file_id_u64, fallback_thumb_url) = match thumbnail_file_id_u64 {
-            Some(id) => (Some(id), None),
-            None if file_type == "image" => (Some(uploaded_file_id), Some(file_url.to_string())),
-            None => (None, None),
-        };
-        if let Some(thumb_file_id) = thumbnail_file_id_u64 {
-            let thumbnail_url = thumbnail
-                .map(|(_, url)| url.to_string())
-                .or(fallback_thumb_url)
-                .unwrap_or_default();
-            serde_json::json!({
-                "file_type": file_type,
-                "file_id": uploaded_file_id,
-                "thumbnail_file_id": thumb_file_id,
-                "filename": upload_filename,
-                "mime_type": mime_type,
-                "storage_source_id": storage_source_id,
-                "file_size": file_size,
-                "file_url": file_url,
-                "thumbnail_url": thumbnail_url,
-                "width": source_width.unwrap_or(0),
-                "height": source_height.unwrap_or(0),
-            })
-        } else {
-            serde_json::json!({
-                "file_type": file_type,
-                "file_id": uploaded_file_id,
-                "filename": upload_filename,
-                "mime_type": mime_type,
-                "storage_source_id": storage_source_id,
-                "file_size": file_size,
-                "file_url": file_url,
-                "thumbnail_url": uploaded_thumbnail_url,
-                "width": source_width.unwrap_or(0),
-                "height": source_height.unwrap_or(0),
-            })
+    /// 🔴 **消息里不许出现下载地址。**
+    ///
+    /// 这个模块原来是「重构等价性」测试：把重构前的实现抄一份，断言抽取出来的函数
+    /// 产出逐字相同。那个目的已经达到了，而现在行为是**故意改的**——继续钉旧形态
+    /// 只会把要防的东西钉死在代码里。
+    ///
+    /// 现在钉的是契约本身：消息是持久的，地址不是。签名 URL 有 TTL、桶会迁移、将来
+    /// 还要加防盗链 token，所以一条离线留言或历史记录被读到的时候，当初写进去的地址
+    /// 必然已经失效——而失效的表现是图片变灰块，不是报错。接收端只能拿 file_id 在
+    /// 下载那一刻走 file/get_url 换票据。
+    fn wire(file_type: &str, thumbnail: Option<u64>) -> serde_json::Value {
+        State::build_attachment_wire_content(AttachmentWireInput {
+            file_type,
+            file_id: 7001,
+            storage_source_id: 1,
+            file_size: 1024,
+            thumbnail,
+            filename: "payload.bin",
+            mime_type: "application/octet-stream",
+            width: Some(640),
+            height: Some(480),
+            message_type: 2,
+            extra: "{}",
+        })
+    }
+
+    /// 递归找任何看起来像地址的值——只查已知键名会漏掉将来新加的字段。
+    fn urls_in(v: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => {
+                if s.starts_with("http://") || s.starts_with("https://") {
+                    out.push(format!("{path} = {s}"));
+                }
+            }
+            serde_json::Value::Object(m) => {
+                for (k, vv) in m {
+                    urls_in(vv, &format!("{path}.{k}"), out);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for (i, vv) in a.iter().enumerate() {
+                    urls_in(vv, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// 带上 message_type / extra 的完整比对：Voice 与 Video 的合并分支只有在
-    /// message_type 对得上时才会执行，光换 `file_type` 字符串是走不到的。
-    fn check_typed(
-        file_type: &str,
-        thumbnail: Option<(u64, &str)>,
-        uploaded_thumbnail_url: Option<&str>,
-        width: Option<u32>,
-        height: Option<u32>,
-        message_type: i32,
-        extra: &str,
-    ) {
-        let mut expected = legacy_wire_content(
-            file_type,
-            7001,
-            3,
-            4096,
-            "http://cdn/7001.bin",
-            uploaded_thumbnail_url,
-            thumbnail,
-            "photo.png",
-            "image/png",
-            width,
-            height,
-        );
-        // 抽取前，两个 merge 就是紧跟在 json! 之后原样调用的。
-        if message_type == (privchat_protocol::message::ContentMessageType::Voice as i32) {
-            State::merge_voice_metadata(extra, &mut expected);
-        } else if message_type == (privchat_protocol::message::ContentMessageType::Video as i32) {
-            State::merge_video_metadata(extra, &mut expected);
+    #[test]
+    fn the_wire_content_never_carries_a_download_url() {
+        for (file_type, thumb) in [
+            ("image", None),
+            ("image", Some(7119u64)),
+            ("video", Some(7119)),
+            ("file", None),
+            ("voice", None),
+        ] {
+            let content = wire(file_type, thumb);
+            let mut found = Vec::new();
+            urls_in(&content, file_type, &mut found);
+            assert!(
+                found.is_empty(),
+                "消息内容里出现了下载地址（它会过期）：{found:?}"
+            );
+            // 明确点名这两个曾经存在的键，报错信息才指得出是哪一步回退了。
+            assert!(content.get("file_url").is_none(), "{file_type}: file_url 不该进消息");
+            assert!(
+                content.get("thumbnail_url").is_none(),
+                "{file_type}: thumbnail_url 不该进消息"
+            );
         }
-
-        let actual = State::build_attachment_wire_content(AttachmentWireInput {
-            file_type,
-            file_id: 7001,
-            storage_source_id: 3,
-            file_size: 4096,
-            file_url: "http://cdn/7001.bin",
-            main_thumbnail_url: uploaded_thumbnail_url,
-            thumbnail,
-            filename: "photo.png",
-            mime_type: "image/png",
-            width,
-            height,
-            message_type,
-            extra,
-        });
-        assert_eq!(
-            actual, expected,
-            "file_type={file_type} message_type={message_type} extra={extra}"
-        );
-    }
-
-    fn check(
-        file_type: &str,
-        thumbnail: Option<(u64, &str)>,
-        uploaded_thumbnail_url: Option<&str>,
-        width: Option<u32>,
-        height: Option<u32>,
-    ) {
-        let expected = legacy_wire_content(
-            file_type,
-            7001,
-            3,
-            4096,
-            "http://cdn/7001.bin",
-            uploaded_thumbnail_url,
-            thumbnail,
-            "photo.png",
-            "image/png",
-            width,
-            height,
-        );
-        // message_type 取 Image：Voice/Video 的合并分支读的是本地 `extra`，
-        // 与本次抽取无关，单独覆盖。
-        let actual = State::build_attachment_wire_content(AttachmentWireInput {
-            file_type,
-            file_id: 7001,
-            storage_source_id: 3,
-            file_size: 4096,
-            file_url: "http://cdn/7001.bin",
-            main_thumbnail_url: uploaded_thumbnail_url,
-            thumbnail,
-            filename: "photo.png",
-            mime_type: "image/png",
-            width,
-            height,
-            message_type: privchat_protocol::message::ContentMessageType::Image as i32,
-            extra: "",
-        });
-        assert_eq!(actual, expected, "file_type={file_type} thumbnail={thumbnail:?}");
     }
 
     #[test]
-    fn matches_the_pre_extraction_output() {
-        // 有独立缩略图
-        check("image", Some((7002, "http://cdn/7002.bin")), None, Some(96), Some(64));
-        // 图片缺缩略图 → 必须回退引用主文件，否则服务端拒收
-        check("image", None, None, Some(96), Some(64));
-        // 视频/文件不强制缩略图，走无 thumbnail 分支
-        check("video", None, Some("http://cdn/legacy-thumb"), Some(1280), Some(720));
-        check("file", None, None, None, None);
-        check("voice", None, None, None, None);
-    }
+    fn the_wire_content_still_carries_the_stable_references() {
+        let content = wire("image", Some(7119));
+        assert_eq!(content["file_id"], serde_json::json!(7001));
+        assert_eq!(content["thumbnail_file_id"], serde_json::json!(7119));
+        assert_eq!(content["width"], serde_json::json!(640));
+        assert_eq!(content["height"], serde_json::json!(480));
+        assert_eq!(content["filename"], serde_json::json!("payload.bin"));
 
-    #[test]
-    fn voice_merges_duration_from_extra() {
-        let voice = privchat_protocol::message::ContentMessageType::Voice as i32;
-        check_typed("voice", None, None, None, None, voice, r#"{"duration":7}"#);
-        // extra 里没有 duration 时协议要求补 1（0 秒语音条渲染不出来）。
-        check_typed("voice", None, None, None, None, voice, "");
+        // 图片没有独立缩略图时引用主文件——服务端校验要求图片必须带缩略图引用。
+        let fallback = wire("image", None);
+        assert_eq!(fallback["thumbnail_file_id"], serde_json::json!(7001));
 
-        // 光比对「新 == 旧」还不够：两边都不合并也能相等。所以直接钉住结果本身。
-        let content = State::build_attachment_wire_content(AttachmentWireInput {
-            file_type: "voice",
-            file_id: 7001,
-            storage_source_id: 3,
-            file_size: 4096,
-            file_url: "http://cdn/7001.bin",
-            main_thumbnail_url: None,
-            thumbnail: None,
-            filename: "clip.amr",
-            mime_type: "audio/amr",
-            width: None,
-            height: None,
-            message_type: voice,
-            extra: r#"{"duration":7}"#,
-        });
-        assert_eq!(content["duration"], serde_json::json!(7));
-    }
-
-    #[test]
-    fn video_merges_duration_and_both_sizes_from_extra() {
-        let video = privchat_protocol::message::ContentMessageType::Video as i32;
-        let extra = r#"{"duration":42,"width":1920,"height":1080,
-                        "thumbnail_width":320,"thumbnail_height":180}"#;
-        check_typed(
-            "video",
-            Some((7002, "http://cdn/7002.bin")),
-            None,
-            Some(1280),
-            Some(720),
-            video,
-            extra,
-        );
-
-        let content = State::build_attachment_wire_content(AttachmentWireInput {
-            file_type: "video",
-            file_id: 7001,
-            storage_source_id: 3,
-            file_size: 4096,
-            file_url: "http://cdn/7001.bin",
-            main_thumbnail_url: None,
-            thumbnail: Some((7002, "http://cdn/7002.bin")),
-            filename: "clip.mp4",
-            mime_type: "video/mp4",
-            // 🔴 extra 里的尺寸必须**覆盖**这里传进来的：视频的权威尺寸来自抽帧那步。
-            width: Some(1280),
-            height: Some(720),
-            message_type: video,
-            extra,
-        });
-        assert_eq!(content["duration"], serde_json::json!(42));
-        assert_eq!(content["width"], serde_json::json!(1920));
-        assert_eq!(content["height"], serde_json::json!(1080));
-        assert_eq!(content["thumbnail_width"], serde_json::json!(320));
-        assert_eq!(content["thumbnail_height"], serde_json::json!(180));
+        // 非图片不强制。
+        let plain = wire("file", None);
+        assert!(plain.get("thumbnail_file_id").is_none());
     }
 }
 
