@@ -5945,11 +5945,20 @@ impl PrivchatClient {
         Ok(resp)
     }
 
+    /// 上报本设备的推送状态。
+    ///
+    /// `vendor` 和 `locale` 都由宿主给：
+    /// - vendor：服务端能从 platform 猜（ios→apns / android→fcm），但装了国内厂商
+    ///   通道的 Android 包必须显式说自己是 hms/xiaomi/…，猜是猜不出来的。
+    /// - locale：iOS 的通知由系统直接展示，App 没机会本地化，服务端得知道用哪种
+    ///   语言拼文案。不传的话服务端按简体中文兜底。
     pub async fn update_device_push_state(
         &self,
         device_id: String,
         apns_armed: bool,
         push_token: Option<String>,
+        vendor: Option<String>,
+        locale: Option<String>,
     ) -> Result<DevicePushUpdateView, PrivchatFfiError> {
         let resp: DevicePushUpdateResponse = rpc_call_typed(
             &self.inner,
@@ -5958,7 +5967,8 @@ impl PrivchatClient {
                 device_id,
                 apns_armed,
                 push_token,
-                vendor: None,
+                vendor: vendor.map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty()),
+                locale: locale.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
             },
         )
         .await?;
