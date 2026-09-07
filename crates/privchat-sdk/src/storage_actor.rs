@@ -143,6 +143,16 @@ enum StorageCmd {
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredChannel>>>,
     },
+    /// 反查依赖：这个 user 的实体变化会影响哪些 DM 会话的投影。
+    DmChannelsForPeer {
+        peer_user_id: u64,
+        resp: oneshot::Sender<Result<Vec<u64>>>,
+    },
+    /// 会话列表里标题尚未就绪的 DM 对端（本地缺 user 实体）。
+    UnresolvedDmPeers {
+        limit: usize,
+        resp: oneshot::Sender<Result<Vec<u64>>>,
+    },
     ListChannelIdentifiersAfter {
         after_channel_id: u64,
         after_channel_type: i32,
@@ -858,6 +868,28 @@ impl StorageHandle {
         self.tx
             .send(StorageCmd::GetChannelById {
                 channel_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn dm_channels_for_peer(&self, peer_user_id: u64) -> Result<Vec<u64>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::DmChannelsForPeer {
+                peer_user_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn unresolved_dm_peers(&self, limit: usize) -> Result<Vec<u64>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::UnresolvedDmPeers {
+                limit,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -2260,6 +2292,12 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::GetChannelById { channel_id, resp } => {
             with_uid!(resp, |uid| store.get_channel_by_id(&uid, channel_id));
+        }
+        StorageCmd::DmChannelsForPeer { peer_user_id, resp } => {
+            with_uid!(resp, |uid| store.dm_channels_for_peer(&uid, peer_user_id));
+        }
+        StorageCmd::UnresolvedDmPeers { limit, resp } => {
+            with_uid!(resp, |uid| store.unresolved_dm_peers(&uid, limit));
         }
         StorageCmd::ListChannels {
             limit,

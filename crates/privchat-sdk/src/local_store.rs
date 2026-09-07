@@ -2808,6 +2808,84 @@ impl LocalStore {
     /// 设置本地 channel 隐藏标记。纯本地操作，不触达服务端。
     /// hidden=true 对应 is_deleted=1（主页列表不再显示）；hidden=false 取消隐藏。
     /// 返回值：true 表示命中行被更新，false 表示 channel 不存在。
+    /// 会话行的投影依赖哪个 user —— 反查：这个 user 的实体一旦落库/更新，
+    /// 哪些会话的标题、头像需要重算。
+    ///
+    /// 目前只覆盖 DM：`list_channels` 里 DM 的标题是 JOIN `user` 表算出来的，
+    /// user 不在本地时那一列是空串（**刻意不回退 uid**），UI 显示 typed loading。
+    /// 群名以 `group` 实体为权威，成员变化不影响标题，故不在此列。
+    ///
+    /// 存量兼容：老版本把对端 uid 写进了 `channel_name`，与 `list_channels`
+    /// 的解析口径保持一致，否则老会话补齐后依然刷不出名字。
+    pub fn dm_channels_for_peer(&self, uid: &str, peer_user_id: u64) -> Result<Vec<u64>> {
+        let conn = self.conn_for_user(uid)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT channel_id FROM channel
+                 WHERE channel_type = 1
+                   AND COALESCE(
+                         peer_user_id,
+                         CASE
+                             WHEN channel_name GLOB '[0-9]*' AND channel_name <> ''
+                             THEN CAST(channel_name AS INTEGER)
+                             ELSE NULL
+                         END
+                       ) = ?1",
+            )
+            .map_err(|e| Error::Storage(format!("dm_channels_for_peer prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![peer_user_id as i64], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Storage(format!("dm_channels_for_peer query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| Error::Storage(format!("dm_channels_for_peer row: {e}")))? as u64);
+        }
+        Ok(out)
+    }
+
+    /// 会话列表里**标题尚未就绪**的 DM 对端 uid（本地没有 user 实体）。
+    ///
+    /// 用于定向补齐：缺哪个补哪个，绝不因为一行缺名字就触发全量 user sync
+    /// （CONVERSATION_DEPENDENCY_READINESS_SPEC §5.2）。
+    pub fn unresolved_dm_peers(&self, uid: &str, limit: usize) -> Result<Vec<u64>> {
+        let conn = self.conn_for_user(uid)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT peer FROM (
+                     SELECT COALESCE(
+                         c.peer_user_id,
+                         CASE
+                             WHEN c.channel_name GLOB '[0-9]*' AND c.channel_name <> ''
+                             THEN CAST(c.channel_name AS INTEGER)
+                             ELSE NULL
+                         END
+                     ) AS peer
+                     FROM channel c
+                     WHERE c.channel_type = 1 AND c.is_deleted = 0
+                 )
+                 WHERE peer IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM \"user\" u
+                       WHERE u.user_id = peer
+                         AND COALESCE(
+                               NULLIF(u.alias, ''),
+                               NULLIF(u.nickname, ''),
+                               NULLIF(u.username, '')
+                             ) IS NOT NULL
+                   )
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Storage(format!("unresolved_dm_peers prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Storage(format!("unresolved_dm_peers query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| Error::Storage(format!("unresolved_dm_peers row: {e}")))? as u64);
+        }
+        Ok(out)
+    }
+
     pub fn set_channel_hidden(&self, uid: &str, channel_id: u64, hidden: bool) -> Result<bool> {
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -8910,6 +8988,176 @@ mod tests {
             .expect("get channel")
             .expect("channel exists");
         assert_eq!(single.channel_name, "9900000001");
+    }
+
+    /// 邀请码注册回归（真机 2026-09-08）：新用户绑码 → 服务端自动加好友 + 发欢迎语，
+    /// 会话行先到、对端 user 后到，标题卡在「加载中」直到重启。
+    ///
+    /// 这里锁住修复所依赖的两条查询：
+    /// 1. 缺 user 时该 DM 能被识别为「未就绪」（→ 触发定向补齐）；
+    /// 2. user 一落库，就能反查出受影响的会话（→ 补发投影失效事件）。
+    ///
+    /// 少了第 2 条，补齐做了也白做——这正是原来的 bug：user 落库了，没人重算会话。
+    #[test]
+    fn a_dm_whose_peer_is_missing_is_unresolved_until_the_user_lands() {
+        let store = test_store();
+        let uid = "10101";
+        store.ensure_user_storage(uid).expect("ensure storage");
+        let peer_id: u64 = 22;
+        let channel_id: u64 = 7001;
+
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id,
+                    channel_type: 1,
+                    channel_name: String::new(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 1,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 100,
+                    last_local_message_id: 0,
+                    last_msg_content: "欢迎体验".to_string(),
+                    version: 1,
+                    peer_user_id: Some(peer_id),
+                },
+            )
+            .expect("upsert dm channel");
+
+        // 对端 user 还没到：标题算不出来（**空串，绝不回退 uid**），且被识别为未就绪。
+        let rows = store.list_channels(uid, 20, 0).expect("list channels");
+        let row = rows
+            .iter()
+            .find(|c| c.channel_id == channel_id)
+            .expect("dm row present");
+        assert_eq!(
+            row.channel_name, "",
+            "对端 user 缺失时标题必须留空由 UI 显示 typed loading，不能出现裸 uid"
+        );
+        assert_eq!(
+            store.unresolved_dm_peers(uid, 10).expect("unresolved"),
+            vec![peer_id],
+            "缺 user 的 DM 必须被识别出来，否则没人去补"
+        );
+
+        // user 落库后：反查得到受影响的会话，且标题立刻算得出来。
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: peer_id,
+                    username: Some("demo".to_string()),
+                    nickname: Some("Demo".to_string()),
+                    alias: None,
+                    avatar: String::new(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 1,
+                    updated_at: 1,
+                },
+            )
+            .expect("upsert peer user");
+
+        assert_eq!(
+            store
+                .dm_channels_for_peer(uid, peer_id)
+                .expect("dm channels for peer"),
+            vec![channel_id],
+            "user 落库后必须能反查出依赖它的会话，否则投影永远不会重算"
+        );
+        assert!(
+            store
+                .unresolved_dm_peers(uid, 10)
+                .expect("unresolved")
+                .is_empty(),
+            "user 已就位，不该再排队补齐"
+        );
+        let rows = store.list_channels(uid, 20, 0).expect("list channels again");
+        let row = rows
+            .iter()
+            .find(|c| c.channel_id == channel_id)
+            .expect("dm row present");
+        assert_eq!(row.channel_name, "Demo");
+    }
+
+    /// 存量兼容：老版本把对端 uid 写进了 `channel_name`。反查依赖必须与
+    /// `list_channels` 的解析口径一致，否则老会话补齐后依然刷不出名字。
+    #[test]
+    fn legacy_dm_rows_that_stored_uid_in_the_name_are_still_resolvable() {
+        let store = test_store();
+        let uid = "10102";
+        store.ensure_user_storage(uid).expect("ensure storage");
+        let peer_id: u64 = 33;
+        let channel_id: u64 = 7002;
+
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id,
+                    channel_type: 1,
+                    channel_name: peer_id.to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 0,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 100,
+                    last_local_message_id: 0,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: None,
+                },
+            )
+            .expect("upsert legacy dm channel");
+
+        assert_eq!(
+            store.unresolved_dm_peers(uid, 10).expect("unresolved"),
+            vec![peer_id]
+        );
+        assert_eq!(
+            store
+                .dm_channels_for_peer(uid, peer_id)
+                .expect("dm channels"),
+            vec![channel_id]
+        );
+    }
+
+    /// 群会话不依赖 DM 对端：群名以 `group` 实体为权威，不能被误判成待补齐，
+    /// 否则每次读列表都会为群排一堆无意义的定向 user sync。
+    #[test]
+    fn group_channels_are_not_treated_as_unresolved_dms() {
+        let store = test_store();
+        let uid = "10103";
+        store.ensure_user_storage(uid).expect("ensure storage");
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: 7003,
+                    channel_type: 2,
+                    channel_name: String::new(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 0,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 1,
+                    last_local_message_id: 0,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: None,
+                },
+            )
+            .expect("upsert group channel");
+        assert!(store
+            .unresolved_dm_peers(uid, 10)
+            .expect("unresolved")
+            .is_empty());
     }
 
     #[test]

@@ -80,6 +80,13 @@ const SYSTEM_ACCOUNT_UID: u64 = 1;
 const REPAIR_BATCH_LIMIT: usize = 5;
 /// 队列上限。排不下的留给下一次读取重新发现——损坏是从数据本身发现的,不会丢。
 const REPAIR_QUEUE_LIMIT: usize = 64;
+/// 一次最多排队多少个待补齐的 DM 对端。会话列表本身就是分页的，
+/// 补齐按 tick 逐个进行，队列只要够覆盖首屏即可。
+const PEER_HYDRATION_QUEUE_LIMIT: usize = 32;
+/// 定向补齐失败后的退避基数（秒），指数增长封顶 5 分钟。
+/// 离线时不空转；恢复后由下一次读会话列表重新发现。
+const PEER_HYDRATION_BACKOFF_BASE_SECS: u64 = 5;
+const PEER_HYDRATION_BACKOFF_MAX_SECS: u64 = 300;
 /// 单条 repair 的超时。卡住的请求不该拖住整个 tick。
 const REPAIR_TIMEOUT_MS: u64 = 15_000;
 /// 退避基数与最大指数(2^6 × 2s ≈ 2 分钟封顶)。
@@ -4149,6 +4156,16 @@ struct State {
     repair_seen: HashSet<(i32, u64, u64)>,
     /// 失败后的退避到期时间与次数：离线时不空转，恢复后由下一次读取重新发现。
     repair_backoff: HashMap<(i32, u64, u64), (u32, std::time::Instant)>,
+    /// 待定向补齐的 DM 对端 uid（本地缺 user 实体 → 会话标题算不出来）。
+    ///
+    /// 与 `repair_queue` 同样**不落库**：未就绪不是一种需要持久化的状态，
+    /// 它是「本地有没有这行 user」算出来的结果，重启后读一次会话列表就重新发现。
+    /// 为它建表反而会出现「表说 pending、实体其实已经到了」的不一致。
+    peer_hydration_queue: VecDeque<u64>,
+    /// singleflight：同一个 peer 不重复排队。
+    peer_hydration_seen: HashSet<u64>,
+    /// 失败退避（次数, 下次可重试时刻）。
+    peer_hydration_backoff: HashMap<u64, (u32, std::time::Instant)>,
     /// AVATAR_CACHE_SPEC P1: user 头像本地缓存管理器（in-flight/verified 去重）。
     avatar_cache: avatar_cache::AvatarCacheManager,
 }
@@ -5200,6 +5217,9 @@ impl State {
         self.cache_miss_count = 0;
 
         self.repair_queue.clear();
+        self.peer_hydration_queue.clear();
+        self.peer_hydration_seen.clear();
+        self.peer_hydration_backoff.clear();
         self.repair_seen.clear();
         self.repair_backoff.clear();
 
@@ -6389,6 +6409,12 @@ impl State {
             .and_then(|v| v.parse::<u64>().ok());
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut emitted = Vec::new();
+        // 本批实际写入 `user` 表的 uid。会话行的标题/头像是 JOIN user 算出来的
+        // （见 local_store::list_channels），user 一到就必须让受影响的会话重算投影，
+        // 否则 UI 会一直停在 typed loading 直到下次冷启动重查。
+        // 收在这里而不是各分支各发一遍：user 可能经 friend 内嵌、user 集合、
+        // channel_member 三条路进来，任何一条漏掉都是同一个 bug 的新实例。
+        let mut hydrated_user_ids: Vec<u64> = Vec::new();
 
         match entity_type {
             "friend" => {
@@ -6484,6 +6510,7 @@ impl State {
                         if let Some(avatar_url) = embedded_user.avatar.as_deref() {
                             self.ensure_avatar_cached(user_id, avatar_url);
                         }
+                        hydrated_user_ids.push(user_id);
                     }
                     if actor_logs_enabled() {
                         eprintln!(
@@ -6578,6 +6605,7 @@ impl State {
                         entity_id: item.entity_id.clone(),
                         deleted: item.deleted,
                     });
+                    hydrated_user_ids.push(user_id);
                 }
                 self.storage.batch_upsert_users(user_inputs).await?;
                 // A global user page can contain thousands of identities. Their metadata is a
@@ -6928,6 +6956,7 @@ impl State {
                             })
                             .await;
                         self.ensure_avatar_cached(member_uid, &inferred_avatar);
+                        hydrated_user_ids.push(member_uid);
                     }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "channel_member".to_string(),
@@ -7658,6 +7687,41 @@ impl State {
             }
             _ => {}
         }
+        // 依赖收敛：user 落库 → 找出投影依赖它的 DM 会话 → 补发 channel 变更事件。
+        //
+        // 这一步是「任何入口都能自行收敛」的关键。上游 App 只有一张
+        // entity_type → 刷新动作 的手写映射表，它不可能知道「friend 事件其实也带来了
+        // user，而 user 决定 DM 标题」——真机实测就是这么漏的：邀请码注册后
+        // `friend` 事件到了、Demo 的 user 也落库了，但 App 只刷好友列表不刷会话列表，
+        // 会话标题卡在「加载中」直到重启。依赖关系只有 SDK 知道，就该由 SDK 广播。
+        if !hydrated_user_ids.is_empty() {
+            hydrated_user_ids.sort_unstable();
+            hydrated_user_ids.dedup();
+            let mut invalidated: Vec<u64> = Vec::new();
+            for user_id in &hydrated_user_ids {
+                match self.storage.dm_channels_for_peer(*user_id).await {
+                    Ok(channel_ids) => invalidated.extend(channel_ids),
+                    Err(e) => {
+                        // 查不到就少发一次刷新，不影响已经落库的数据；下次同步/冷启动仍会收敛。
+                        tracing::warn!(
+                            "dm_channels_for_peer failed for user {}: {}",
+                            user_id,
+                            e
+                        );
+                    }
+                }
+            }
+            invalidated.sort_unstable();
+            invalidated.dedup();
+            for channel_id in invalidated {
+                emitted.push(SdkEvent::SyncEntityChanged {
+                    entity_type: "channel".to_string(),
+                    entity_id: channel_id.to_string(),
+                    deleted: false,
+                });
+            }
+        }
+
         Ok(emitted)
     }
 
@@ -9493,6 +9557,87 @@ impl State {
     ///
     /// 修好后**只发一次** TimelineUpdated：投影是原地更新的，message.id 不变、
     /// 未读不动、cursor 不动 —— repair 不是「收到新消息」。
+    /// 扫描会话列表里标题未就绪的 DM，把对端 uid 排进定向补齐队列。
+    ///
+    /// **只补缺的那几个**，绝不因为一行缺名字就触发全量 user sync
+    /// （CONVERSATION_DEPENDENCY_READINESS_SPEC §5.2：全量兜底会把一次
+    /// 局部缺失放大成整库同步）。
+    async fn enqueue_unresolved_dm_peers(&mut self) {
+        if self.peer_hydration_queue.len() >= PEER_HYDRATION_QUEUE_LIMIT {
+            return;
+        }
+        let peers = match self
+            .storage
+            .unresolved_dm_peers(PEER_HYDRATION_QUEUE_LIMIT)
+            .await
+        {
+            Ok(peers) => peers,
+            Err(e) => {
+                tracing::warn!("unresolved_dm_peers failed: {}", e);
+                return;
+            }
+        };
+        for peer in peers {
+            if peer == 0 {
+                continue;
+            }
+            if self.peer_hydration_queue.len() >= PEER_HYDRATION_QUEUE_LIMIT {
+                break;
+            }
+            if !self.peer_hydration_seen.insert(peer) {
+                continue;
+            }
+            self.peer_hydration_queue.push_back(peer);
+        }
+    }
+
+    /// 取一个到期可补的 peer。退避未到的放回队尾，避免离线时空转。
+    fn next_peer_to_hydrate(&mut self) -> Option<u64> {
+        let now = std::time::Instant::now();
+        for _ in 0..self.peer_hydration_queue.len() {
+            let peer = self.peer_hydration_queue.pop_front()?;
+            match self.peer_hydration_backoff.get(&peer) {
+                Some((_, until)) if *until > now => {
+                    self.peer_hydration_queue.push_back(peer);
+                }
+                _ => return Some(peer),
+            }
+        }
+        None
+    }
+
+    /// 记录一次补齐结果：成功清状态，失败按指数退避排回队列。
+    fn note_peer_hydration_result(&mut self, peer: u64, ok: bool) {
+        self.peer_hydration_seen.remove(&peer);
+        if ok {
+            self.peer_hydration_backoff.remove(&peer);
+            return;
+        }
+        let attempts = self
+            .peer_hydration_backoff
+            .get(&peer)
+            .map(|(n, _)| *n)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let delay_secs = PEER_HYDRATION_BACKOFF_BASE_SECS
+            .saturating_mul(1u64 << attempts.min(6))
+            .min(PEER_HYDRATION_BACKOFF_MAX_SECS);
+        self.peer_hydration_backoff.insert(
+            peer,
+            (
+                attempts,
+                std::time::Instant::now() + Duration::from_secs(delay_secs),
+            ),
+        );
+        // 排回队列：下一次读会话列表也会重新发现它，这里保留是为了断网恢复后
+        // 不必等用户再拉一次列表。
+        if self.peer_hydration_queue.len() < PEER_HYDRATION_QUEUE_LIMIT
+            && self.peer_hydration_seen.insert(peer)
+        {
+            self.peer_hydration_queue.push_back(peer);
+        }
+    }
+
     async fn drain_projection_repairs(&mut self) {
         for _ in 0..REPAIR_BATCH_LIMIT {
             let Some(key) = self.repair_queue.pop_front() else {
@@ -10304,13 +10449,41 @@ impl State {
                 } else if let Some(count) = self.apply_canonical_timeline_push(&req).await? {
                     direct_applied += count;
                 } else if let Some(peer_uid) = Self::push_message_to_friend_event(&req) {
-                    // F-sync.2: 转 entity_type="friend"，让 SDK 走 entity sync
-                    // 把 pending/rejected/recalled 状态从 server 拉到本地 friend 表。
-                    self.pending_events.push(SdkEvent::SyncEntityChanged {
-                        entity_type: "friend".to_string(),
-                        entity_id: peer_uid.to_string(),
-                        deleted: false,
-                    });
+                    // 好友状态变化推送**只是一个提醒**，权威数据必须自己去拉。
+                    //
+                    // 🔴 这里以前只发了个 `SyncEntityChanged{friend}` 事件就完事，
+                    // 注释写着「让 SDK 走 entity sync」，但没有任何人真的去同步——
+                    // 上层收到事件后调的是 `loadFriends()`（读本地库），于是 friend 表
+                    // 和随 friend payload 内嵌下发的 user 实体**都不会更新**。
+                    //
+                    // 真机后果（2026-09-08 邀请码注册复现）：服务端自动加好友并发欢迎语，
+                    // 客户端收到 `friend.request.status_changed` → 只发事件 → 本地没有对端
+                    // user → DM 会话标题一直停在 typed loading，直到下次冷启动跑
+                    // resume sync 才补上。
+                    //
+                    // friend 是增量集合（服务端按 since_version 分页），拉一次很便宜；
+                    // scope 在服务端 friend 分支是忽略的，传 None 即可。
+                    match self.sync_entities("friend".to_string(), None).await {
+                        Ok(applied) => {
+                            direct_applied += applied;
+                            self.pending_events
+                                .extend(self.last_sync_entity_events.iter().cloned());
+                        }
+                        Err(error) => {
+                            // 拉不动就退回「只提醒」：好友关系确实变了，UI 该知道；
+                            // 数据由下一次 resume sync / 读列表重新收敛。
+                            tracing::warn!(
+                                %error,
+                                peer_uid,
+                                "friend hint received but entity sync failed"
+                            );
+                            self.pending_events.push(SdkEvent::SyncEntityChanged {
+                                entity_type: "friend".to_string(),
+                                entity_id: peer_uid.to_string(),
+                                deleted: false,
+                            });
+                        }
+                    }
                 } else if let Some(status_item) = Self::push_message_to_status_sync_item(&req) {
                     read_cursor_items.push(status_item);
                 } else if let Some(receipt) = Self::push_message_to_delivery_receipt(&req) {
@@ -14291,6 +14464,9 @@ impl PrivchatSdk {
                 repair_queue: VecDeque::new(),
                 repair_seen: HashSet::new(),
                 repair_backoff: HashMap::new(),
+                peer_hydration_queue: VecDeque::new(),
+                peer_hydration_seen: HashSet::new(),
+                peer_hydration_backoff: HashMap::new(),
                 avatar_cache: avatar_cache::AvatarCacheManager::default(),
             };
             let mut inbound_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -14390,6 +14566,40 @@ impl PrivchatSdk {
                             && !state.repair_queue.is_empty()
                         {
                             state.drain_projection_repairs().await;
+                        }
+                        // 定向补齐一个 DM 对端资料。每个 tick 一个：既限了并发，
+                        // 也不会把 actor 占住——这条路径上还有命令要处理。
+                        // 补齐成功后 apply_sync_entities 会自动为受影响的会话
+                        // 发 channel 变更事件，UI 无需知道补齐这回事。
+                        if state.session_state == SessionState::Authenticated {
+                            if let Some(peer_id) = state.next_peer_to_hydrate() {
+                                let outcome = timeout(
+                                    Duration::from_secs(15),
+                                    state.sync_entities(
+                                        "user".to_string(),
+                                        Some(format!("user:{peer_id}")),
+                                    ),
+                                )
+                                .await;
+                                let ok = matches!(outcome, Ok(Ok(_)));
+                                if ok {
+                                    for evt in state.last_sync_entity_events.clone() {
+                                        emit_sequenced_event(
+                                            &actor_event_tx,
+                                            &actor_event_history,
+                                            &actor_event_seq,
+                                            event_history_limit,
+                                            evt,
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "targeted user hydration failed for peer {}",
+                                        peer_id
+                                    );
+                                }
+                                state.note_peer_hydration_result(peer_id, ok);
+                            }
                         }
                         // Phase 3 后台收敛：一次一小批 stale 频道（run_anti_entropy_once
                         // 内部用 batch_get_channel_pts 批量比对 + WiFi/蜂窝预算）。
@@ -16204,6 +16414,12 @@ impl PrivchatSdk {
                             },
                             Err(e) => Err(e),
                         };
+                        // 读到会话列表就顺手看一眼有没有标题算不出来的 DM（本地缺对端 user）。
+                        // 补齐在后台 tick 里做，**不阻塞这次返回**：宁可先把会话给出去、
+                        // 名字随后到位，也不要为了一个名字把整个列表卡住。
+                        if result.is_ok() {
+                            state.enqueue_unresolved_dm_peers().await;
+                        }
                         let _ = resp.send(result);
                     }
                     Command::UpsertChannelExtra { input, resp } => {
@@ -21377,6 +21593,9 @@ mod tests {
             active_subscriptions: HashMap::new(),
             avatar_cache: crate::avatar_cache::AvatarCacheManager::default(),
             repair_queue: std::collections::VecDeque::new(),
+            peer_hydration_queue: std::collections::VecDeque::new(),
+            peer_hydration_seen: std::collections::HashSet::new(),
+            peer_hydration_backoff: std::collections::HashMap::new(),
             repair_seen: std::collections::HashSet::new(),
             repair_backoff: std::collections::HashMap::new(),
         };
