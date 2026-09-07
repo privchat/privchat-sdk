@@ -73,6 +73,9 @@ use privchat_protocol::rpc::{
     ClientSubmitResponse,
     DevicePushStatusRequest,
     DevicePushStatusResponse,
+    DevicePushPreferenceGetRequest,
+    DevicePushPreferenceResponse,
+    DevicePushPreferenceUpdateRequest,
     DevicePushUpdateRequest,
     DevicePushUpdateResponse,
     FileGetUrlRequest,
@@ -991,6 +994,15 @@ pub struct DevicePushUpdateView {
     pub device_id: String,
     pub apns_armed: bool,
     pub user_push_enabled: bool,
+}
+
+/// 账号级推送偏好。跨设备一致，不是设备状态。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PushPreferenceView {
+    /// 通知里是否显示消息内容。false = 只显示"你收到一条新消息"。
+    pub show_preview: bool,
+    /// 全局免打扰：所有会话都不推送。
+    pub global_mute: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -5976,6 +5988,44 @@ impl PrivchatClient {
             device_id: resp.device_id,
             apns_armed: resp.apns_armed,
             user_push_enabled: resp.user_push_enabled,
+        })
+    }
+
+    /// 读取账号级推送偏好。
+    pub async fn get_push_preference(&self) -> Result<PushPreferenceView, PrivchatFfiError> {
+        let resp: DevicePushPreferenceResponse = rpc_call_typed(
+            &self.inner,
+            routes::device::PUSH_PREFERENCE_GET,
+            &DevicePushPreferenceGetRequest {},
+        )
+        .await?;
+        Ok(PushPreferenceView {
+            show_preview: resp.show_preview,
+            global_mute: resp.global_mute,
+        })
+    }
+
+    /// 更新账号级推送偏好。
+    ///
+    /// 两个字段都可选，只传要改的那个：读改写在服务端完成，两台设备同时改不同
+    /// 开关时不会互相覆盖。
+    pub async fn update_push_preference(
+        &self,
+        show_preview: Option<bool>,
+        global_mute: Option<bool>,
+    ) -> Result<PushPreferenceView, PrivchatFfiError> {
+        let resp: DevicePushPreferenceResponse = rpc_call_typed(
+            &self.inner,
+            routes::device::PUSH_PREFERENCE_UPDATE,
+            &DevicePushPreferenceUpdateRequest {
+                show_preview,
+                global_mute,
+            },
+        )
+        .await?;
+        Ok(PushPreferenceView {
+            show_preview: resp.show_preview,
+            global_mute: resp.global_mute,
         })
     }
 
