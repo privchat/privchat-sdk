@@ -5964,6 +5964,8 @@ impl PrivchatClient {
     ///   通道的 Android 包必须显式说自己是 hms/xiaomi/…，猜是猜不出来的。
     /// - locale：iOS 的通知由系统直接展示，App 没机会本地化，服务端得知道用哪种
     ///   语言拼文案。不传的话服务端按简体中文兜底。
+    /// - push_sound：远程通知是否带提示音。`sound` 在 APNs payload 里，App 拦不住
+    ///   自己的远程通知，所以这个开关也只能由服务端执行。
     pub async fn update_device_push_state(
         &self,
         device_id: String,
@@ -5971,6 +5973,7 @@ impl PrivchatClient {
         push_token: Option<String>,
         vendor: Option<String>,
         locale: Option<String>,
+        push_sound: Option<bool>,
     ) -> Result<DevicePushUpdateView, PrivchatFfiError> {
         let resp: DevicePushUpdateResponse = rpc_call_typed(
             &self.inner,
@@ -5981,6 +5984,7 @@ impl PrivchatClient {
                 push_token,
                 vendor: vendor.map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty()),
                 locale: locale.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+                push_sound,
             },
         )
         .await?;
