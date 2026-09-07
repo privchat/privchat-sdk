@@ -20871,6 +20871,57 @@ const TEST_CHUNK_PLAIN_SIZE: u32 = privchat_protocol::attachment_crypto::DEFAULT
 #[cfg(test)]
 mod tests {
 
+    /// 定向补齐失败不能变成空转：同一个 peer 退避后才重试，且**永远不会**
+    /// 升级成全量 user sync（CONVERSATION_DEPENDENCY_READINESS_SPEC §5.2）。
+    ///
+    /// 队列本身不落库——就绪与否是「本地有没有这行 user」算出来的，重启后读一次
+    /// 会话列表就重新发现。为它建表反而会出现「表说 pending、实体其实已经到了」。
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_peer_hydration_backs_off_before_retrying_the_same_peer() {
+        let (mut state, _dir) = new_seeded_state("peer_hydration_backoff").await;
+
+        state.peer_hydration_queue.push_back(4242);
+        state.peer_hydration_seen.insert(4242);
+
+        let peer = state.next_peer_to_hydrate().expect("peer is due immediately");
+        assert_eq!(peer, 4242);
+
+        // 失败一次 → 退避，同一 tick 不该再被取出来。
+        state.note_peer_hydration_result(peer, false);
+        assert!(
+            state.next_peer_to_hydrate().is_none(),
+            "退避未生效，失败的 peer 会被立刻重试 —— 离线时这就是一个空转循环"
+        );
+        // 但它必须还在队列里：网络恢复后不必等用户重新拉一次列表。
+        assert!(state.peer_hydration_queue.contains(&4242));
+
+        // 退避到期后重新可取。
+        state.peer_hydration_backoff.insert(
+            4242,
+            (1, std::time::Instant::now() - Duration::from_secs(1)),
+        );
+        assert_eq!(state.next_peer_to_hydrate(), Some(4242));
+
+        // 成功后清干净，不再占用 singleflight 名额。
+        state.note_peer_hydration_result(4242, true);
+        assert!(!state.peer_hydration_backoff.contains_key(&4242));
+        assert!(!state.peer_hydration_seen.contains(&4242));
+    }
+
+    /// 同一个 peer 不重复排队：一个对端在会话列表里出现多次（多个 DM 行、
+    /// 反复读列表）只应触发一次定向补齐。
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_hydration_is_singleflight_per_peer() {
+        let (mut state, _dir) = new_seeded_state("peer_hydration_singleflight").await;
+
+        for _ in 0..5 {
+            if state.peer_hydration_seen.insert(777) {
+                state.peer_hydration_queue.push_back(777);
+            }
+        }
+        assert_eq!(state.peer_hydration_queue.len(), 1);
+    }
+
     /// Receiver media work is keyed by account + session + message + kind,
     /// remains singleflight until completion, is bounded, and is aborted on a
     /// session reset. This calls the production manager rather than duplicating
