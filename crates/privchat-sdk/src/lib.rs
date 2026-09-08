@@ -10209,6 +10209,9 @@ impl State {
             return Err(err);
         }
 
+        // resume sync 跑完后重扫一遍未就绪的 DM 对端：断网期间失败的定向补齐、
+        // 进程重启丢掉的队列，都在这里重新发现。未就绪是「本地有没有这行 user」
+        // 算出来的，所以重扫总能找回，不需要持久化队列。
         let entity_order = ["friend", "group", "channel", "user", "channel_read_cursor"];
         for entity_type in entity_order {
             match self.sync_entities(entity_type.to_string(), None).await {
@@ -10232,6 +10235,12 @@ impl State {
                 }
             }
         }
+
+        // 实体拉完后重扫一遍未就绪的 DM 对端：断网期间失败的定向补齐、进程重启
+        // 丢掉的队列，都在这里重新发现。未就绪是「本地有没有这行 user」算出来的，
+        // 重扫总能找回——所以队列不必持久化，也就不会出现「队列说没了、实体其实
+        // 还缺着」的第二份真源。
+        self.enqueue_unresolved_dm_peers().await;
 
         // ── Phase 2 到此为止（spec SDK_SYNC_RESUME_SPEC §Startup Phases）──
         //
@@ -14581,7 +14590,18 @@ impl PrivchatSdk {
                                     ),
                                 )
                                 .await;
-                                let ok = matches!(outcome, Ok(Ok(_)));
+                                // 🔴 完成判据是**目标实体真的到了**，不是 RPC 没报错。
+                                // 服务端可能因为可见性遮蔽、实体尚未生成或分页边界
+                                // 返回空页——那时请求成功、依赖仍然缺着。拿返回码当
+                                // 完成信号，这个对端就再也不会被重试，会话标题永久空着。
+                                let ok = match outcome {
+                                    Ok(Ok(_)) => state
+                                        .storage
+                                        .has_displayable_user(peer_id)
+                                        .await
+                                        .unwrap_or(false),
+                                    _ => false,
+                                };
                                 if ok {
                                     for evt in state.last_sync_entity_events.clone() {
                                         emit_sequenced_event(
@@ -14594,7 +14614,7 @@ impl PrivchatSdk {
                                     }
                                 } else {
                                     tracing::warn!(
-                                        "targeted user hydration failed for peer {}",
+                                        "targeted user hydration did not resolve peer {}",
                                         peer_id
                                     );
                                 }

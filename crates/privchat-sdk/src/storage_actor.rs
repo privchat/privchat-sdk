@@ -143,6 +143,11 @@ enum StorageCmd {
         offset: usize,
         resp: oneshot::Sender<Result<Vec<StoredChannel>>>,
     },
+    /// 定向补齐的**完成判据**：目标 user 是否已经能算出显示名。
+    HasDisplayableUser {
+        user_id: u64,
+        resp: oneshot::Sender<Result<bool>>,
+    },
     /// 反查依赖：这个 user 的实体变化会影响哪些 DM 会话的投影。
     DmChannelsForPeer {
         peer_user_id: u64,
@@ -868,6 +873,17 @@ impl StorageHandle {
         self.tx
             .send(StorageCmd::GetChannelById {
                 channel_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| Error::ActorClosed)?;
+        resp_rx.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub async fn has_displayable_user(&self, user_id: u64) -> Result<bool> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::HasDisplayableUser {
+                user_id,
                 resp: resp_tx,
             })
             .map_err(|_| Error::ActorClosed)?;
@@ -2292,6 +2308,9 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         }
         StorageCmd::GetChannelById { channel_id, resp } => {
             with_uid!(resp, |uid| store.get_channel_by_id(&uid, channel_id));
+        }
+        StorageCmd::HasDisplayableUser { user_id, resp } => {
+            with_uid!(resp, |uid| store.has_displayable_user(&uid, user_id));
         }
         StorageCmd::DmChannelsForPeer { peer_user_id, resp } => {
             with_uid!(resp, |uid| store.dm_channels_for_peer(&uid, peer_user_id));

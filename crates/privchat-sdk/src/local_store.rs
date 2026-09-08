@@ -2808,6 +2808,34 @@ impl LocalStore {
     /// 设置本地 channel 隐藏标记。纯本地操作，不触达服务端。
     /// hidden=true 对应 is_deleted=1（主页列表不再显示）；hidden=false 取消隐藏。
     /// 返回值：true 表示命中行被更新，false 表示 channel 不存在。
+    /// 这个 user 在本地**是否已经能算出显示名**。
+    ///
+    /// 定向补齐的完成判据必须是「目标实体到了」，不是「RPC 没报错」：服务端可能
+    /// 因为可见性遮蔽、实体尚未生成或分页边界返回空页，那时请求是成功的、
+    /// 依赖却仍然缺着。用返回码当完成信号，缺失的对端就再也不会被重试。
+    ///
+    /// 判据与 `list_channels` 解析 DM 标题的口径一致（alias / nickname / username
+    /// 三者取其一非空），否则会出现「查询说就绪、标题仍是空」。
+    pub fn has_displayable_user(&self, uid: &str, user_id: u64) -> Result<bool> {
+        let conn = self.conn_for_user(uid)?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM \"user\"
+                 WHERE user_id = ?1
+                   AND COALESCE(
+                         NULLIF(alias, ''),
+                         NULLIF(nickname, ''),
+                         NULLIF(username, '')
+                       ) IS NOT NULL
+                 LIMIT 1",
+                params![user_id as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("has_displayable_user: {e}")))?;
+        Ok(found.is_some())
+    }
+
     /// 会话行的投影依赖哪个 user —— 反查：这个 user 的实体一旦落库/更新，
     /// 哪些会话的标题、头像需要重算。
     ///
@@ -9082,6 +9110,68 @@ mod tests {
             .find(|c| c.channel_id == channel_id)
             .expect("dm row present");
         assert_eq!(row.channel_name, "Demo");
+    }
+
+    /// 定向补齐的完成判据必须看**目标实体**，不能看 RPC 返回码：服务端可能因为
+    /// 可见性遮蔽或实体尚未生成返回空页，那时请求成功、依赖仍然缺着。判成完成，
+    /// 这个对端就再也不会被重试。
+    ///
+    /// 判据也必须与 `list_channels` 解析标题的口径一致——有行但三个名字字段全空，
+    /// 标题依然算不出来，那就**不算**就绪。
+    #[test]
+    fn a_user_row_without_any_name_is_not_considered_resolved() {
+        let store = test_store();
+        let uid = "10104";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        assert!(
+            !store.has_displayable_user(uid, 55).expect("missing user"),
+            "本地没有这行 user 时不能算就绪"
+        );
+
+        // 有行、但 alias/nickname/username 全空 —— 标题仍然算不出来。
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 55,
+                    username: Some(String::new()),
+                    nickname: Some(String::new()),
+                    alias: None,
+                    avatar: String::new(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 1,
+                    updated_at: 1,
+                },
+            )
+            .expect("upsert empty user");
+        assert!(
+            !store.has_displayable_user(uid, 55).expect("empty names"),
+            "名字全空的 user 行不能算就绪，否则会话标题永远是空的却不再重试"
+        );
+
+        // 只要有一个名字字段就算就绪：**头像不参与判定**，
+        // 一张图片的网络故障不该让整条会话不可见。
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 55,
+                    username: Some("peer55".to_string()),
+                    nickname: None,
+                    alias: None,
+                    avatar: String::new(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 2,
+                    updated_at: 2,
+                },
+            )
+            .expect("upsert named user");
+        assert!(store.has_displayable_user(uid, 55).expect("named user"));
     }
 
     /// 存量兼容：老版本把对端 uid 写进了 `channel_name`。反查依赖必须与
