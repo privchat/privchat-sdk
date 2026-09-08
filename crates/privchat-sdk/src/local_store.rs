@@ -77,40 +77,50 @@ const ACCOUNT_TREE_AUTH: &str = "auth";
 const ACCOUNT_TREE_KV: &str = "kv";
 const PENDING_TIMELINE_MUTATION_PREFIX: &str = "__pending_timeline_mutation__:v1";
 
+/// 用户资料 upsert。
+///
+/// 两类写入方，语义不同：
+///
+/// * **带版本的权威快照**（`version > 0`，来自 user 实体同步或详情响应）——正常参与
+///   版本比较：只有不比本地旧才生效，生效后推进 `version`。详情响应因此必须带上
+///   服务端那次读取的 `sync_version`；否则晚到的旧响应会盖掉刚同步来的新资料，
+///   而本地版本还停在新数字上，形成「旧内容挂着新版本」，此后再也纠不回来。
+/// * **无版本的部分写入**（`version = 0`，如只知道账号名的频道成员行）——**只补空缺**：
+///   本地该字段为空时填上，非空一律不动，也不碰 `version`。它没有资格覆盖已确认的
+///   资料，也没有资格声称自己在序列里的位置。
+///
+/// 字段三态：NULL = 本次没有这个字段的信息；空串 = 权威说它是空的（清除）；其它 = 新值。
+/// `avatar` 列是 NOT NULL，用 ?11 标志位承载「是否提供」。
 const UPSERT_USER_SQL: &str = "INSERT INTO user (
         user_id, username, nickname, alias, avatar,
         user_type, is_deleted, channel_id, version, updated_at
      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
      ON CONFLICT(user_id) DO UPDATE SET
-        -- 三态：NULL = 本次写入没有这个字段的信息(保留库里的值)；
-        -- 空串 = 权威来源明确说它是空的(清除)；其它 = 新值。
-        -- 少了这个区分,一个只知道账号名的写入方就会把刚到的昵称/头像抹掉。
-        username=CASE WHEN excluded.username IS NULL THEN user.username
-                      ELSE excluded.username END,
-        nickname=CASE WHEN excluded.nickname IS NULL THEN user.nickname
-                      ELSE excluded.nickname END,
-        alias=CASE WHEN excluded.alias IS NULL THEN user.alias
-                   ELSE excluded.alias END,
-        -- avatar 列是 NOT NULL,没法靠 NULL 表达本次没带头像信息,所以用 ?11 这个
-        -- 标志位区分:0 = 未提供(保留),1 = 提供了(空串就是明确清除)。
-        avatar=CASE WHEN ?11 = 0 THEN user.avatar ELSE excluded.avatar END,
-        user_type=excluded.user_type,
-        is_deleted=excluded.is_deleted,
-        channel_id=excluded.channel_id,
-        -- version 记录的是**资料快照**在实体序列里的位置,所以只有带着资料快照的
-        -- 写入才能移动它。判据取 nickname:资料实体一定带这个字段(没有昵称时是空串),
-        -- 只知道账号名的部分写入方则是 NULL。
-        --
-        -- 这条规则同时挡住两种事故:
-        --  * 部分写入携带一个来自别的序列的大号码(好友关系版本、毫秒时间戳),把
-        --    version 抬到天上,之后所有正常的资料同步全被闸门挡死,该用户资料冻结;
-        --  * version=0 的权威点读(查看资料页的强制刷新)被闸门拒之门外。
-        version=CASE WHEN excluded.nickname IS NULL THEN user.version
-                     ELSE MAX(user.version, excluded.version) END,
+        username=CASE
+            WHEN excluded.username IS NULL THEN user.username
+            WHEN ?9 = 0 AND COALESCE(user.username, '') <> '' THEN user.username
+            ELSE excluded.username END,
+        nickname=CASE
+            WHEN excluded.nickname IS NULL THEN user.nickname
+            WHEN ?9 = 0 AND COALESCE(user.nickname, '') <> '' THEN user.nickname
+            ELSE excluded.nickname END,
+        alias=CASE
+            WHEN excluded.alias IS NULL THEN user.alias
+            WHEN ?9 = 0 AND COALESCE(user.alias, '') <> '' THEN user.alias
+            ELSE excluded.alias END,
+        avatar=CASE
+            WHEN ?11 = 0 THEN user.avatar
+            WHEN ?9 = 0 AND COALESCE(user.avatar, '') <> '' THEN user.avatar
+            ELSE excluded.avatar END,
+        user_type=CASE WHEN ?9 = 0 AND user.user_type <> 0 THEN user.user_type
+                       ELSE excluded.user_type END,
+        is_deleted=CASE WHEN ?9 = 0 THEN user.is_deleted ELSE excluded.is_deleted END,
+        channel_id=CASE
+            WHEN ?9 = 0 AND COALESCE(user.channel_id, '') <> '' THEN user.channel_id
+            ELSE excluded.channel_id END,
+        version=MAX(user.version, excluded.version),
         updated_at=excluded.updated_at
-     WHERE excluded.version = 0
-        OR excluded.nickname IS NULL
-        OR excluded.version >= user.version";
+     WHERE excluded.version = 0 OR excluded.version >= user.version";
 
 const K_SCHEMA_VERSION: &[u8] = b"schema_version";
 const K_DEVICE_ID: &[u8] = b"device_id";
@@ -599,6 +609,36 @@ impl LocalStore {
             );",
         )
         .map_err(|e| Error::Storage(format!("create auth_session: {e}")))?;
+
+        Self::repair_polluted_user_versions(&conn)?;
+        Ok(())
+    }
+
+    /// 把被写坏的 `user.version` 清回 0。
+    ///
+    /// 旧版本的 FFI 把 `updated_at`（毫秒时间戳）当成资料版本写进这一列。`user.version`
+    /// 是所有资料写入的闸门，一旦被顶到 1.7e12，之后每一次真实的 `sync_version`
+    /// （递增序列，量级在千以内）都比它小、全被挡下——那个用户的昵称和头像从此冻结，
+    /// 重装、重连、重新登录都救不回来，因为脏数据在本地库里。
+    ///
+    /// 光修产生源头不够：**已经装在用户手机上的那些行还坏着**。这里在开库时清一次。
+    /// 判据取一个不可能被真实序列达到的阈值：序列每改一次资料 +1，1e12 意味着一万亿次
+    /// 修改；而毫秒时间戳从 2001 年起就已经超过它了。清成 0 = 「位置未知」，下一条
+    /// 权威资料（任何版本）都能落地，随后版本重新跟上真实序列。
+    fn repair_polluted_user_versions(conn: &Connection) -> Result<()> {
+        const IMPLAUSIBLE_VERSION: i64 = 1_000_000_000_000;
+        let repaired = conn
+            .execute(
+                "UPDATE user SET version = 0 WHERE version >= ?1",
+                params![IMPLAUSIBLE_VERSION],
+            )
+            .map_err(|e| Error::Storage(format!("repair user versions: {e}")))?;
+        if repaired > 0 {
+            tracing::warn!(
+                repaired,
+                "reset user rows whose version had been overwritten with a timestamp"
+            );
+        }
         Ok(())
     }
 
@@ -9247,26 +9287,81 @@ mod tests {
         );
     }
 
-    /// GPT 评审要求的顺序验收：**权威 55 → 外来 99 的部分写入 → 权威 56**，
-    /// 最终必须是 56 的昵称。
+    /// 顺序验收：**权威 55 → 无版本部分写入 → 权威 56**，最终必须是 56 的昵称。
     ///
-    /// 只验证「99 没有立刻抹掉昵称」是不够的——如果那个 99 被写进了 `user.version`，
-    /// 后续每一次正常的实体同步(56、57…)都会被闸门挡住，这个用户的资料从此冻结。
-    /// 所以断言分两层：内容对，且**版本没有被无关来源抬高**。
+    /// 只验证「部分写入没有立刻抹掉昵称」是不够的：如果它顺手把 `user.version` 抬高，
+    /// 后续每一次正常的实体同步都会被闸门挡住，这个用户的资料从此冻结。所以断言分
+    /// 两层——内容对，且**版本没有被无关来源抬高**。
     #[test]
-    fn a_foreign_version_cannot_freeze_later_authoritative_updates() {
+    fn a_versionless_write_neither_overwrites_nor_raises_the_version() {
         let store = test_store();
         let uid = "10133";
         store.ensure_user_storage(uid).expect("ensure storage");
 
-        let write = |nickname: Option<&str>, version: i64| {
+        let write = |nickname: Option<&str>, username: Option<&str>, version: i64| {
             store
                 .upsert_user(
                     uid,
                     &UpsertUserInput {
                         user_id: 77,
-                        username: None,
+                        username: username.map(|s| s.to_string()),
                         nickname: nickname.map(|s| s.to_string()),
+                        alias: None,
+                        avatar: None,
+                        user_type: 0,
+                        is_deleted: false,
+                        channel_id: String::new(),
+                        version,
+                        updated_at: version,
+                    },
+                )
+                .expect("upsert")
+        };
+        let row = || {
+            store
+                .list_users_by_ids(uid, &[77])
+                .expect("read back")
+                .into_iter()
+                .next()
+                .expect("user row")
+        };
+
+        write(Some("v55"), None, 55);
+        assert_eq!(row().nickname.as_deref(), Some("v55"));
+
+        // 无版本的部分写入：只补它知道的空缺(username),不碰已有昵称,不碰版本。
+        write(Some("stale"), Some("acct"), 0);
+        assert_eq!(row().nickname.as_deref(), Some("v55"), "无版本写入不得覆盖已确认资料");
+        assert_eq!(row().username.as_deref(), Some("acct"), "但它该补上本地缺的字段");
+
+        // 下一版权威资料必须能落地——如果刚才那次把版本抬高了,这里就会被挡住。
+        write(Some("v56"), None, 56);
+        assert_eq!(
+            row().nickname.as_deref(),
+            Some("v56"),
+            "a versionless write must not lock out the next authoritative update",
+        );
+    }
+
+    /// 晚到的旧详情响应不得盖掉已经同步到的新资料。
+    ///
+    /// 竞态：详情请求先读到旧昵称 → 响应在路上；实体增量先落库了新昵称；旧响应才到。
+    /// 只要详情响应带着它那次读取的 `sync_version`，版本闸就能正确拒掉它。这也是为什么
+    /// 详情必须带版本——不带版本的写入即使内容是旧的也会被当成"补空缺"放行。
+    #[test]
+    fn a_late_stale_detail_response_loses_to_the_newer_entity_row() {
+        let store = test_store();
+        let uid = "10135";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        let write = |nickname: &str, version: i64| {
+            store
+                .upsert_user(
+                    uid,
+                    &UpsertUserInput {
+                        user_id: 88,
+                        username: Some("acct".to_string()),
+                        nickname: Some(nickname.to_string()),
                         alias: None,
                         avatar: None,
                         user_type: 0,
@@ -9280,7 +9375,7 @@ mod tests {
         };
         let nickname_now = || {
             store
-                .list_users_by_ids(uid, &[77])
+                .list_users_by_ids(uid, &[88])
                 .expect("read back")
                 .into_iter()
                 .next()
@@ -9288,20 +9383,99 @@ mod tests {
                 .nickname
         };
 
-        write(Some("v55"), 55);
-        assert_eq!(nickname_now().as_deref(), Some("v55"));
+        write("A", 60); // 详情请求读到的那一版
+        write("B", 61); // 实体增量先落库
+        assert_eq!(nickname_now().as_deref(), Some("B"));
 
-        // 一个来自别的实体序列的写入,号码碰巧更大。
-        write(None, 99);
-        assert_eq!(nickname_now().as_deref(), Some("v55"), "外来写入不该改内容");
-
-        // 真正的下一版权威资料。它的号(56)比那个外来的 99 小,但必须生效。
-        write(Some("v56"), 56);
+        write("A", 60); // 旧详情响应姗姗来迟
         assert_eq!(
             nickname_now().as_deref(),
-            Some("v56"),
-            "a foreign version must not lock out the next authoritative update",
+            Some("B"),
+            "a stale detail response must not overwrite a newer entity row",
         );
+    }
+
+    /// 已经装在用户手机上的脏行要被修回来：旧 FFI 把毫秒时间戳写进了 `user.version`，
+    /// 之后所有真实 sync_version 都比它小、永远进不来。开库时清一次。
+    #[test]
+    fn a_timestamp_left_in_the_version_column_is_repaired_on_open() {
+        let store = test_store();
+        let uid = "10136";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        // 直接造出旧版本产生的脏行:版本是一个毫秒时间戳。
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 99,
+                    username: Some("acct".to_string()),
+                    nickname: Some("frozen".to_string()),
+                    alias: None,
+                    avatar: None,
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 1_788_889_244_058,
+                    updated_at: 1_788_889_244_058,
+                },
+            )
+            .expect("seed polluted row");
+
+        // 修复前:正常的实体同步进不来。
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 99,
+                    username: None,
+                    nickname: Some("fresh".to_string()),
+                    alias: None,
+                    avatar: None,
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 61,
+                    updated_at: 61,
+                },
+            )
+            .expect("upsert");
+        let blocked = store
+            .list_users_by_ids(uid, &[99])
+            .expect("read")
+            .into_iter()
+            .next()
+            .expect("row")
+            .nickname;
+        assert_eq!(blocked.as_deref(), Some("frozen"), "前提:脏版本确实会挡住同步");
+
+        // 重开库 → 修复跑起来 → 同一条同步现在能落地。
+        store.ensure_user_storage(uid).expect("reopen runs repair");
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 99,
+                    username: None,
+                    nickname: Some("fresh".to_string()),
+                    alias: None,
+                    avatar: None,
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 61,
+                    updated_at: 61,
+                },
+            )
+            .expect("upsert after repair");
+        let row = store
+            .list_users_by_ids(uid, &[99])
+            .expect("read")
+            .into_iter()
+            .next()
+            .expect("row");
+        assert_eq!(row.nickname.as_deref(), Some("fresh"), "修复后增量必须能持续生效");
+        assert_eq!(row.version, 61, "版本回到真实序列上");
     }
 
     /// 头像的「明确清除」必须能落地：用户删掉头像后不能还显示旧的。

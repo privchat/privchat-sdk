@@ -391,6 +391,9 @@ pub struct AccountUserDetailView {
     pub source_id: String,
     /// 是否已关注（仅 user_type=2 Bot 有意义；非 bot 永远 false）
     pub is_follow: bool,
+    /// 这份资料在 user 实体序列里的位置，与字段同一次读取。宿主入库时原样带上，
+    /// 让详情响应和实体增量在同一条版本轴上比较；0 = 老 server 没下发。
+    pub sync_version: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1992,6 +1995,9 @@ pub struct UpsertUserInput {
     pub user_type: i32,
     pub is_deleted: bool,
     pub channel_id: String,
+    /// 这份内容在 user 实体序列里的位置。详情响应传服务端下发的 `sync_version`；
+    /// 只知道部分字段、无法声称位置的写入方传 0。**不要传时间戳**。
+    pub version: i64,
     pub updated_at: i64,
 }
 
@@ -3522,13 +3528,13 @@ fn map_upsert_user(v: UpsertUserInput) -> SdkUpsertUserInput {
         user_type: v.user_type,
         is_deleted: v.is_deleted,
         channel_id: v.channel_id,
-        // 宿主直写（查看资料页的强制刷新等）拿的是权威点读结果:内容最新,但它在
-        // 实体序列里的位置未知。所以**不声称版本**(0)。
+        // 版本由调用方传入,且必须是**服务端那次读取的 sync_version**——不是时间戳,
+        // 也不是自造的递增值。这里曾经写 `v.updated_at`（毫秒时间戳）:`user.version`
+        // 是所有资料写入的闸门,一旦被抬到 1.7e12,之后所有真实 sync_version 都比它小、
+        // 全被挡在门外,那个用户的资料再也刷不动。
         //
-        // 这里曾经写 `v.updated_at`——一个毫秒时间戳。`user.version` 是所有资料写入
-        // 的闸门,一旦被抬到 1.7e12,之后所有正常的 sync_version(几十几百)全被挡在
-        // 门外,那个用户的资料就再也刷不动了。
-        version: 0,
+        // 0 = 「没有版本」,本地库据此把这次写入当成只补空缺的部分写入,不覆盖已确认资料。
+        version: v.version,
         updated_at: v.updated_at,
     }
 }
@@ -5049,7 +5055,8 @@ impl PrivchatClient {
                 user_type: i32::from(detail.user_type),
                 is_deleted: false,
                 channel_id: String::new(),
-                version: 0,
+                // 服务端那次读取的位置,和字段同一份快照。
+                version: detail.sync_version as i64,
                 updated_at: now_ms,
             })
             .await
@@ -6540,6 +6547,7 @@ impl PrivchatClient {
             source_type: resp.source_type,
             source_id: resp.source_id,
             is_follow: resp.is_follow,
+            sync_version: resp.sync_version,
         })
     }
 
