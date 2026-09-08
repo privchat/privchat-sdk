@@ -2461,8 +2461,11 @@ impl LocalStore {
                                     NULLIF(gm.alias, ''),
                                     NULLIF(u.alias, ''),
                                     NULLIF(u.nickname, ''),
-                                    NULLIF(u.username, ''),
-                                    CAST(gm.user_id AS TEXT)
+                                    NULLIF(u.username, '')
+                                    -- 这里曾经兜底 `CAST(gm.user_id AS TEXT)`：一个成员
+                                    -- 资料没同步到，群名里就混进一串数字。缺资料的成员
+                                    -- 直接**跳过**（下面 WHERE 过滤掉 NULL），用其他成员
+                                    -- 的名字拼——一个陌生成员不该毁掉整个群的标题。
                                 ) AS name_part
                                 FROM group_member gm
                                 LEFT JOIN \"user\" u ON u.user_id = gm.user_id
@@ -2472,7 +2475,11 @@ impl LocalStore {
                                 LIMIT 3
                             )
                         ),
-                        CAST(c.channel_id AS TEXT)
+                        -- 全都拿不到 → **空串**，由 UI 渲染本地化的「群聊」。
+                        -- 曾经兜底 `CAST(c.channel_id AS TEXT)`，于是刚被拉进的群在
+                        -- group 实体到达前显示成一串 channel_id。群不用发布屏障：
+                        -- typed「群聊」是合理占位，藏掉整个群反而让用户没有入口。
+                        ''
                     )
                     ELSE c.channel_name
                 END AS resolved_channel_name,
@@ -2642,8 +2649,9 @@ impl LocalStore {
                                         NULLIF(gm.alias, ''),
                                         NULLIF(u.alias, ''),
                                         NULLIF(u.nickname, ''),
-                                        NULLIF(u.username, ''),
-                                        CAST(gm.user_id AS TEXT)
+                                        NULLIF(u.username, '')
+                                        -- 与 list_channels 同口径：缺资料的成员跳过，
+                                        -- 不拿 uid 充数（见那边的注释）。
                                     ) AS name_part
                                     FROM group_member gm
                                     LEFT JOIN \"user\" u ON u.user_id = gm.user_id
@@ -2653,7 +2661,13 @@ impl LocalStore {
                                     LIMIT 3
                                 )
                             ),
-                            CAST(c.channel_id AS TEXT)
+                            -- 全都拿不到 → **空串**，由 UI 渲染本地化的「群聊」。
+                            -- 这里曾经兜底 `CAST(c.channel_id AS TEXT)`，于是刚被拉进
+                            -- 的群在 group 实体到达前显示成一串 channel_id。
+                            -- 与 DM 不同，群不需要发布屏障：typed「群聊」是合理的占位，
+                            -- 藏掉整个群反而让用户没有入口（也不能因为某个成员资料缺失
+                            -- 就阻塞整个群）。
+                            ''
                         )
                         ELSE c.channel_name
                     END AS resolved_channel_name,
@@ -5611,7 +5625,8 @@ mod tests {
     use rusqlite::Connection;
     use crate::{
         LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
-        UpsertChannelInput, UpsertGroupInput, UpsertRemoteMessageInput, UpsertUserInput,
+        UpsertChannelInput, UpsertGroupInput, UpsertGroupMemberInput, UpsertRemoteMessageInput,
+        UpsertUserInput,
     };
     use rand::RngCore;
     use rusqlite::params;
@@ -8996,10 +9011,17 @@ mod tests {
         assert!(extra.is_pinned);
     }
 
-    /// P1-17 顺手根治：空名群（本地 upsert、group.name 为 NULL、无成员行）
-    /// 必须物化 fallback 标题（链路末端 CAST(channel_id AS TEXT)），不允许空标题。
+    /// 空名群（group.name 为 NULL、无成员行）：标题返回**空串**，由 UI 渲染
+    /// 本地化的「群聊」。
+    ///
+    /// 原来这里兜底 `CAST(channel_id AS TEXT)`，于是刚被拉进的群在 group 实体
+    /// 到达前显示成一串数字——与「绝不显示裸 id」的规则冲突，只是 DM 那边守住了、
+    /// 群这边漏了。裸 id 不是名字，占位文案也不能落进 SDK（切语言就成了硬编码），
+    /// 所以 SDK 给空、UI 给 typed 文案。
+    ///
+    /// 群**不套发布屏障**：typed「群聊」是合理占位，藏掉整个群反而让用户没有入口。
     #[test]
-    fn empty_name_group_falls_back_to_channel_id_title() {
+    fn empty_name_group_yields_no_title_and_lets_the_ui_localize_it() {
         let store = test_store();
         let uid = "10099";
         store
@@ -9044,13 +9066,97 @@ mod tests {
             .iter()
             .find(|c| c.channel_id == 9_900_000_001)
             .expect("synthetic group row present");
-        assert_eq!(row.channel_name, "9900000001");
+        assert_eq!(
+            row.channel_name, "",
+            "标题留空由 UI 渲染本地化的「群聊」，不能是裸 channel_id"
+        );
 
+        // 两个查询必须同口径，否则实时路径和冷启动会显示不同的标题。
         let single = store
             .get_channel_by_id(uid, 9_900_000_001)
             .expect("get channel")
             .expect("channel exists");
-        assert_eq!(single.channel_name, "9900000001");
+        assert_eq!(single.channel_name, "");
+    }
+
+    /// 群名由成员拼接兜底时，**缺资料的成员跳过**而不是拿 uid 充数。
+    /// 一个陌生成员没同步到，不该让整个群标题里混进一串数字。
+    #[test]
+    fn group_name_from_members_skips_members_without_a_profile() {
+        let store = test_store();
+        let uid = "10107";
+        store.ensure_user_storage(uid).expect("ensure storage");
+        let group_id: u64 = 9_900_000_777;
+
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id: group_id,
+                    channel_type: 2,
+                    channel_name: String::new(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 0,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 10,
+                    last_local_message_id: 0,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: None,
+                },
+            )
+            .expect("upsert group channel");
+
+        for (member, named) in [(8001u64, true), (8002u64, false)] {
+            if named {
+                store
+                    .upsert_user(
+                        uid,
+                        &UpsertUserInput {
+                            user_id: member,
+                            username: Some("alice".to_string()),
+                            nickname: Some("Alice".to_string()),
+                            alias: None,
+                            avatar: String::new(),
+                            user_type: 0,
+                            is_deleted: false,
+                            channel_id: String::new(),
+                            version: 1,
+                            updated_at: 1,
+                        },
+                    )
+                    .expect("upsert member user");
+            }
+            store
+                .upsert_group_member(
+                    uid,
+                    &UpsertGroupMemberInput {
+                        group_id,
+                        user_id: member,
+                        role: 2,
+                        status: 0,
+                        alias: None,
+                        is_muted: false,
+                        joined_at: 1,
+                        version: 1,
+                        updated_at: 1,
+                    },
+                )
+                .expect("upsert group member");
+        }
+
+        let rows = store.list_channels(uid, 20, 0).expect("list channels");
+        let row = rows
+            .iter()
+            .find(|c| c.channel_id == group_id)
+            .expect("group row present");
+        assert_eq!(
+            row.channel_name, "Alice",
+            "缺资料的成员应被跳过，而不是把 8002 拼进群名"
+        );
+        assert!(!row.channel_name.contains("8002"));
     }
 
     /// 邀请码注册回归（真机 2026-09-08）：新用户绑码 → 服务端自动加好友 + 发欢迎语，
