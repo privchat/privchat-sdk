@@ -79,18 +79,23 @@ const PENDING_TIMELINE_MUTATION_PREFIX: &str = "__pending_timeline_mutation__:v1
 
 /// 用户资料 upsert。
 ///
-/// 两类写入方，语义不同：
+/// 两类写入方，按**字段归属**区分权限（ENTITY_INVALIDATION_SYNC_SPEC §4.2）：
 ///
-/// * **带版本的权威快照**（`version > 0`，来自 user 实体同步或详情响应）——正常参与
-///   版本比较：只有不比本地旧才生效，生效后推进 `version`。详情响应因此必须带上
-///   服务端那次读取的 `sync_version`；否则晚到的旧响应会盖掉刚同步来的新资料，
-///   而本地版本还停在新数字上，形成「旧内容挂着新版本」，此后再也纠不回来。
-/// * **无版本的部分写入**（`version = 0`，如只知道账号名的频道成员行）——**只补空缺**：
-///   本地该字段为空时填上，非空一律不动，也不碰 `version`。它没有资格覆盖已确认的
-///   资料，也没有资格声称自己在序列里的位置。
+/// * **带版本的权威快照**（`version > 0`，user 实体同步或详情响应）——正常参与版本
+///   比较：不比本地旧才生效，生效后推进 `version`。详情响应因此必须带服务端那次读取的
+///   `sync_version`，否则晚到的旧响应会盖掉新资料却留下新版本号。
+/// * **无版本写入**（`version = 0`，如只知道账号名的频道成员行）——它不是"弱一点的
+///   版本"，而是**根本不拥有这个字段的序列**。所以对 user 实体拥有的字段
+///   （nickname / avatar / user_type）：本地还没有权威快照（`version = 0`）时可以填，
+///   一旦有了就完全不许碰，**包括权威写下的空值**。username / alias 归属别处
+///   （D5：别人的 username 由 friend 实体携带），本地缺就可以补。
+///
+/// 「本地是空的」不构成写入许可：权威清空也是一个值。user v61 把头像清了，一条带着
+/// 上周头像 URL 的频道成员行若把它填回去，本地就成了「v61 的版本号 + 复活的内容」，
+/// 而 61 已被记为见过，之后任何同步都纠不回来。
 ///
 /// 字段三态：NULL = 本次没有这个字段的信息；空串 = 权威说它是空的（清除）；其它 = 新值。
-/// `avatar` 列是 NOT NULL，用 ?11 标志位承载「是否提供」。
+/// `avatar` 列 NOT NULL，用 ?11 标志位承载「是否提供」。
 const UPSERT_USER_SQL: &str = "INSERT INTO user (
         user_id, username, nickname, alias, avatar,
         user_type, is_deleted, channel_id, version, updated_at
@@ -100,24 +105,35 @@ const UPSERT_USER_SQL: &str = "INSERT INTO user (
             WHEN excluded.username IS NULL THEN user.username
             WHEN ?9 = 0 AND COALESCE(user.username, '') <> '' THEN user.username
             ELSE excluded.username END,
-        nickname=CASE
-            WHEN excluded.nickname IS NULL THEN user.nickname
-            WHEN ?9 = 0 AND COALESCE(user.nickname, '') <> '' THEN user.nickname
-            ELSE excluded.nickname END,
         alias=CASE
             WHEN excluded.alias IS NULL THEN user.alias
             WHEN ?9 = 0 AND COALESCE(user.alias, '') <> '' THEN user.alias
             ELSE excluded.alias END,
-        avatar=CASE
-            WHEN ?11 = 0 THEN user.avatar
-            WHEN ?9 = 0 AND COALESCE(user.avatar, '') <> '' THEN user.avatar
-            ELSE excluded.avatar END,
-        user_type=CASE WHEN ?9 = 0 AND user.user_type <> 0 THEN user.user_type
-                       ELSE excluded.user_type END,
-        is_deleted=CASE WHEN ?9 = 0 THEN user.is_deleted ELSE excluded.is_deleted END,
         channel_id=CASE
             WHEN ?9 = 0 AND COALESCE(user.channel_id, '') <> '' THEN user.channel_id
             ELSE excluded.channel_id END,
+        -- 以下三列归 user 实体所有：无版本写入只在本地尚无权威快照时可填。
+        nickname=CASE
+            WHEN excluded.nickname IS NULL THEN user.nickname
+            WHEN ?9 = 0 AND user.version > 0 THEN user.nickname
+            ELSE excluded.nickname END,
+        avatar=CASE
+            WHEN ?11 = 0 THEN user.avatar
+            WHEN ?9 = 0 AND user.version > 0 THEN user.avatar
+            ELSE excluded.avatar END,
+        user_type=CASE
+            WHEN ?9 = 0 AND user.version > 0 THEN user.user_type
+            WHEN ?9 = 0 AND user.user_type <> 0 THEN user.user_type
+            ELSE excluded.user_type END,
+        -- 头像被权威清空 ⇒ 缓存引用一起归零（AVATAR_CACHE_SPEC §2.1）。
+        -- 留着 avatar_local_path 就是删了头像还继续显示上周下载的那张图。
+        avatar_cached_url=CASE
+            WHEN ?11 = 1 AND excluded.avatar = '' AND NOT (?9 = 0 AND user.version > 0)
+                THEN '' ELSE user.avatar_cached_url END,
+        avatar_local_path=CASE
+            WHEN ?11 = 1 AND excluded.avatar = '' AND NOT (?9 = 0 AND user.version > 0)
+                THEN '' ELSE user.avatar_local_path END,
+        is_deleted=CASE WHEN ?9 = 0 THEN user.is_deleted ELSE excluded.is_deleted END,
         version=MAX(user.version, excluded.version),
         updated_at=excluded.updated_at
      WHERE excluded.version = 0 OR excluded.version >= user.version";
@@ -9392,6 +9408,129 @@ mod tests {
             nickname_now().as_deref(),
             Some("B"),
             "a stale detail response must not overwrite a newer entity row",
+        );
+    }
+
+    /// 权威清除 → 无版本旧资料晚到 → **仍然保持清除**。
+    ///
+    /// 「本地是空的就可以填」是错的判据：权威写下的空值也是一个值。头像被 v61 清掉后，
+    /// 一条带着上周头像 URL 的频道成员行如果把它填回去，本地就变成「v61 的版本号 +
+    /// 复活的内容」——而 61 已被记为见过，之后任何同步都纠不回来。昵称同理。
+    ///
+    /// 归属规则（ENTITY_INVALIDATION_SYNC_SPEC §4.2）：nickname/avatar 归 user 实体，
+    /// 本地一旦有权威快照就不许无版本写入碰；username 归 friend 实体，缺就能补。
+    #[test]
+    fn a_versionless_write_cannot_resurrect_an_authoritative_clear() {
+        let store = test_store();
+        let uid = "10137";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        let put = |nickname: Option<&str>,
+                   avatar: Option<&str>,
+                   username: Option<&str>,
+                   version: i64| {
+            store
+                .upsert_user(
+                    uid,
+                    &UpsertUserInput {
+                        user_id: 55,
+                        username: username.map(|s| s.to_string()),
+                        nickname: nickname.map(|s| s.to_string()),
+                        alias: None,
+                        avatar: avatar.map(|s| s.to_string()),
+                        user_type: 0,
+                        is_deleted: false,
+                        channel_id: String::new(),
+                        version,
+                        updated_at: version,
+                    },
+                )
+                .expect("upsert")
+        };
+        let row = || {
+            store
+                .list_users_by_ids(uid, &[55])
+                .expect("read back")
+                .into_iter()
+                .next()
+                .expect("user row")
+        };
+
+        // 权威快照：有昵称有头像。
+        put(Some("Named"), Some("https://cdn/a.png"), None, 60);
+        assert_eq!(row().avatar, "https://cdn/a.png");
+
+        // 权威清除：这个人删掉了头像，也清空了昵称。
+        put(Some(""), Some(""), None, 61);
+        assert_eq!(row().nickname.as_deref(), Some(""));
+        assert_eq!(row().avatar, "");
+
+        // 一条无版本的旧资料晚到（频道成员行仍带着上周的值）。
+        put(Some("Named"), Some("https://cdn/a.png"), Some("acct"), 0);
+        assert_eq!(
+            row().avatar,
+            "",
+            "a versionless write must not resurrect a cleared avatar",
+        );
+        assert_eq!(
+            row().nickname.as_deref(),
+            Some(""),
+            "a versionless write must not resurrect a cleared nickname",
+        );
+        // 但它仍可以补自己拥有的、本地确实缺的字段。
+        assert_eq!(row().username.as_deref(), Some("acct"));
+    }
+
+    /// 权威清除头像时，缓存引用必须一起归零。
+    ///
+    /// `avatar_local_path` 是 AVATAR_CACHE_SPEC §4 定义的 **UI 唯一头像来源**。只把
+    /// `avatar` 清成空串、留着本地路径，等于删了头像还继续显示上周下载的那张图，
+    /// 而且重启也不会好——脏数据在本地库里。
+    #[test]
+    fn clearing_an_avatar_also_drops_the_cached_file_reference() {
+        let store = test_store();
+        let uid = "10138";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        let put = |avatar: Option<&str>, version: i64| {
+            store
+                .upsert_user(
+                    uid,
+                    &UpsertUserInput {
+                        user_id: 66,
+                        username: Some("acct".to_string()),
+                        nickname: Some("Named".to_string()),
+                        alias: None,
+                        avatar: avatar.map(|s| s.to_string()),
+                        user_type: 0,
+                        is_deleted: false,
+                        channel_id: String::new(),
+                        version,
+                        updated_at: version,
+                    },
+                )
+                .expect("upsert")
+        };
+
+        put(Some("https://cdn/a.png"), 70);
+        store
+            .set_user_avatar_cache(uid, 66, "https://cdn/a.png", "/tmp/a.img")
+            .expect("cache the download");
+        let cached = store
+            .get_user_avatar_cache(uid, 66)
+            .expect("read cache")
+            .expect("cache row");
+        assert_eq!(cached.avatar_local_path, "/tmp/a.img", "前提:确实缓存过文件");
+
+        put(Some(""), 71); // 权威清除
+        let after = store
+            .get_user_avatar_cache(uid, 66)
+            .expect("read cache")
+            .expect("cache row");
+        assert_eq!(after.avatar_cached_url, "", "cached url must be dropped");
+        assert_eq!(
+            after.avatar_local_path, "",
+            "the stale file must stop being the UI source",
         );
     }
 
