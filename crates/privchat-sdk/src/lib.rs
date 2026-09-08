@@ -6500,11 +6500,18 @@ impl State {
                                     .unwrap_or(0),
                                 is_deleted: false,
                                 channel_id: String::new(),
-                                version: item.version as i64,
+                                // The **user's own** entity version, never the
+                                // friendship's. `user.version` gates every later
+                                // profile write; stamping a friendship version on it
+                                // compares two unrelated sequences, so whichever
+                                // stream happens to number higher wins forever. A
+                                // server that does not send one yet → 0, i.e. "no
+                                // claim", which loses to any real user entity.
+                                version: embedded_user.version.unwrap_or(0),
                                 updated_at: embedded_user
                                     .updated_at
                                     .or(embedded_user.version)
-                                    .unwrap_or(item.version as i64),
+                                    .unwrap_or(0),
                             })
                             .await?;
                         if let Some(avatar_url) = embedded_user.avatar.as_deref() {
@@ -6942,17 +6949,22 @@ impl State {
                             .upsert_user(UpsertUserInput {
                                 user_id: member_uid,
                                 username: inferred_username.clone(),
-                                nickname: inferred_username,
+                                // A channel member row knows an account name, not a
+                                // display name. Copying username into nickname used to
+                                // manufacture a nickname nobody set, which then reads
+                                // as "this user has a nickname" everywhere downstream.
+                                // None = "no information"; the upsert preserves what is
+                                // already stored.
+                                nickname: None,
                                 alias: inferred_alias,
                                 avatar: inferred_avatar.clone(),
                                 user_type: 0,
                                 is_deleted: false,
                                 channel_id: String::new(),
-                                version: item.version as i64,
-                                updated_at: channel_member
-                                    .updated_at
-                                    .or(channel_member.version)
-                                    .unwrap_or(item.version as i64),
+                                // channel_member versions are their own sequence — not
+                                // comparable with user versions. 0 = no claim.
+                                version: 0,
+                                updated_at: channel_member.updated_at.unwrap_or(0),
                             })
                             .await;
                         self.ensure_avatar_cached(member_uid, &inferred_avatar);

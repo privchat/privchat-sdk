@@ -82,12 +82,24 @@ const UPSERT_USER_SQL: &str = "INSERT INTO user (
         user_type, is_deleted, channel_id, version, updated_at
      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
      ON CONFLICT(user_id) DO UPDATE SET
+        -- NULL means the writer has no information about that field, not clear it.
+        -- Several call sites write a partial identity (a friend row knows the username,
+        -- a channel member row knows neither name); before this, a partial write with a
+        -- NULL nickname erased a nickname the user entity had just delivered.
+        -- An explicit empty string still clears, which is how the server says this user
+        -- has no nickname (PROFILE_VISIBILITY D5).
         username=CASE
             WHEN excluded.username IS NULL OR excluded.username = ''
             THEN user.username ELSE excluded.username END,
-        nickname=excluded.nickname,
-        alias=excluded.alias,
-        avatar=excluded.avatar,
+        nickname=CASE
+            WHEN excluded.nickname IS NULL THEN user.nickname
+            ELSE excluded.nickname END,
+        alias=CASE
+            WHEN excluded.alias IS NULL THEN user.alias
+            ELSE excluded.alias END,
+        avatar=CASE
+            WHEN excluded.avatar = '' THEN user.avatar
+            ELSE excluded.avatar END,
         user_type=excluded.user_type,
         is_deleted=excluded.is_deleted,
         channel_id=excluded.channel_id,
@@ -9157,6 +9169,127 @@ mod tests {
             "缺资料的成员应被跳过，而不是把 8002 拼进群名"
         );
         assert!(!row.channel_name.contains("8002"));
+    }
+
+    /// 生产回归（2026-09-09）：绑邀请码时对端还没设昵称，几十秒后设了，
+    /// 而好友这边的会话标题永远停在用户名。
+    ///
+    /// 客户端这一半的成因是**版本号跨实体比较**：`user.version` 是所有资料写入的闸门，
+    /// 但当时 friend 分支往里写的是好友关系的 sync_version、channel_member 分支写的是
+    /// 它自己的 sync_version——三个互不相干的数列。谁碰巧号大谁就永久赢。
+    ///
+    /// 修复后 friend 内嵌资料带的是 user 自己的版本，channel_member 不再声称版本(0)。
+    #[test]
+    fn a_partial_writer_cannot_outrank_the_user_entity_with_a_foreign_version() {
+        let store = test_store();
+        let uid = "10131";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        // 权威 user 实体先到：昵称是用户刚设好的那个。
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 36,
+                    username: None, // D5：别人的 username 不由 user 实体下发
+                    nickname: Some("IOS17Pro".to_string()),
+                    alias: None,
+                    avatar: String::new(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 55,
+                    updated_at: 55,
+                },
+            )
+            .expect("user entity");
+
+        // 只知道账号名的写入方随后到达，并且**带着一个更大的外来版本号**——这正是
+        // 修复前的真实形态：好友关系/频道成员的 sync_version 来自另一条数列，凑巧
+        // 比 user 的大，于是它顺利通过版本闸，把刚到的昵称抹成空。
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: 36,
+                    username: Some("ios013739a".to_string()),
+                    nickname: None,
+                    alias: None,
+                    avatar: String::new(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 99,
+                    updated_at: 99,
+                },
+            )
+            .expect("partial write");
+
+        let user = store
+            .list_users_by_ids(uid, &[36])
+            .expect("read back")
+            .into_iter()
+            .next()
+            .expect("user row");
+        assert_eq!(
+            user.username.as_deref(), Some("ios013739a"),
+            "the partial write still contributes the field it does know",
+        );
+        assert_eq!(
+            user.nickname.as_deref(), Some("IOS17Pro"),
+            "a partial write must not erase the authoritative nickname, whatever version it claims",
+        );
+    }
+
+    /// 同一次回归的另一半：即便旧资料**带着更大的版本号**（历史脏数据，或者一个
+    /// 尚未升级的服务端仍在发好友关系版本），也不能让它把昵称抹成空。
+    ///
+    /// 这条锁的是 upsert 的字段语义：NULL = 没有这个字段的信息（保留原值），
+    /// 空串 = 服务端明确说「此人没有昵称」（清除）。以前 `nickname=excluded.nickname`
+    /// 一律照写，于是任何一个只知道账号名的写入方都会把昵称抹掉。
+    #[test]
+    fn a_null_field_preserves_what_is_stored_while_an_empty_string_clears_it() {
+        let store = test_store();
+        let uid = "10132";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        let write = |nickname: Option<&str>, version: i64| {
+            store
+                .upsert_user(
+                    uid,
+                    &UpsertUserInput {
+                        user_id: 41,
+                        username: Some("someone".to_string()),
+                        nickname: nickname.map(|s| s.to_string()),
+                        alias: None,
+                        avatar: String::new(),
+                        user_type: 0,
+                        is_deleted: false,
+                        channel_id: String::new(),
+                        version,
+                        updated_at: version,
+                    },
+                )
+                .expect("upsert")
+        };
+        let read = || {
+            store
+                .list_users_by_ids(uid, &[41])
+                .expect("read back")
+                .into_iter()
+                .next()
+                .expect("user row")
+                .nickname
+        };
+
+        write(Some("Nickname"), 10);
+        assert_eq!(read().as_deref(), Some("Nickname"));
+
+        write(None, 20); // 更高版本,但没有昵称信息 → 保留
+        assert_eq!(read().as_deref(), Some("Nickname"));
+
+        write(Some(""), 30); // 服务端明确说没有昵称 → 清除
+        assert_eq!(read().as_deref(), Some(""));
     }
 
     /// 邀请码注册回归（真机 2026-09-08）：新用户绑码 → 服务端自动加好友 + 发欢迎语，
