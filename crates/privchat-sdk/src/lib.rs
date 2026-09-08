@@ -14017,6 +14017,17 @@ impl State {
                     None
                 };
                 new_channel_peer_user_id = inferred_peer_user_id;
+                // 实时路径新建的 DM：对端 user 可能还没到，这一行现在发布不出去
+                // （发布屏障）。立刻排进定向补齐队列——这条路径不读会话列表，
+                // 不在这里排的话要等下一次 list_channels 才会被发现。
+                if let Some(peer) = inferred_peer_user_id {
+                    if !self.peer_hydration_seen.contains(&peer)
+                        && self.peer_hydration_queue.len() < PEER_HYDRATION_QUEUE_LIMIT
+                    {
+                        self.peer_hydration_seen.insert(peer);
+                        self.peer_hydration_queue.push_back(peer);
+                    }
+                }
                 (
                     String::new(),
                     String::new(),
