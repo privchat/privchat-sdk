@@ -2728,8 +2728,23 @@ impl LocalStore {
                  -- 下来，但服务端投影给了 last_msg_timestamp，那种会话必须留在列表里。
                  --
                  -- 群不适用：刚被拉进的群还没人说话，从列表里藏掉就等于没有入口。
+                 --
+                 -- 发布屏障（CONVERSATION_DEPENDENCY_READINESS_SPEC §4）：
+                 -- DM 的标题算不出来（本地还没有对端 user）时**不发布这一行**，
+                 -- 而不是给 UI 一个空壳让它显示「加载中」。定向补齐到位后
+                 -- 会话带着完整标题/头像/预览一次性出现。
+                 --
+                 -- 判据是「算出来的名字非空」而不是「user 行存在」，两个好处：
+                 --   * 曾经就绪过的会话，即使这次刷新失败，旧快照仍在 user 表里，
+                 --     名字照样算得出来 → **已展示的会话绝不会消失**；
+                 --   * 系统会话、存量 channel_name 有真名的行，都不受影响。
+                 -- 头像**不参与**判定：一张图片下载失败不该让整条会话不可见。
+                 --
+                 -- 过滤放在 WHERE（LIMIT 之前，§5.5）：请求 20 条就返回 20 条
+                 -- 可展示的，不会出现「要 20 条、19 条未就绪、只拿到 1 条」。
                  WHERE COALESCE(c.is_deleted, 0) = 0
                    AND (c.channel_type <> 1 OR resolved_last_msg_timestamp > 0)
+                   AND (c.channel_type <> 1 OR resolved_channel_name <> '')
                  ORDER BY c.top DESC, resolved_last_msg_timestamp DESC, c.channel_id DESC
                  LIMIT ?1 OFFSET ?2",
             )
@@ -2808,6 +2823,16 @@ impl LocalStore {
     /// 设置本地 channel 隐藏标记。纯本地操作，不触达服务端。
     /// hidden=true 对应 is_deleted=1（主页列表不再显示）；hidden=false 取消隐藏。
     /// 返回值：true 表示命中行被更新，false 表示 channel 不存在。
+    /// 因依赖未就绪而**暂未发布**的会话数量。
+    ///
+    /// spec §6：这些行不渲染成占位会话，但用户要能知道「还在同步」——
+    /// 数字为 0 时 UI 不显示任何提示，非 0 且持续一段时间才提示，
+    /// 避免正常情况下也闪一下横幅。
+    pub fn unresolved_conversation_count(&self, uid: &str) -> Result<u32> {
+        let peers = self.unresolved_dm_peers(uid, 1000)?;
+        Ok(peers.len() as u32)
+    }
+
     /// 这个 user 在本地**是否已经能算出显示名**。
     ///
     /// 定向补齐的完成判据必须是「目标实体到了」，不是「RPC 没报错」：服务端可能
@@ -5679,14 +5704,20 @@ mod tests {
             )
             .expect("upsert channel");
 
+        // 名字算不出来 → **这一行根本不发布**（发布屏障）。
+        // 原来是发布一个空名字行让 UI 显示「加载中」；现在等定向补齐到位后
+        // 带着完整标题一次性出现。无论哪种形态，对端 uid 都绝不会出现在标题里。
         let listed = store.list_channels(uid, 10, 0).expect("list channels");
-        let dm = listed.iter().find(|c| c.channel_id == 4381).expect("dm row");
-        assert_eq!(dm.channel_name, "", "名字未知时留空，绝不返回 uid");
         assert!(
-            !dm.channel_name.contains("100000007"),
-            "对端 uid 绝不能出现在标题里，实际='{}'",
-            dm.channel_name
+            listed.iter().all(|c| c.channel_id != 4381),
+            "对端未知的 DM 不该发布；曾经这里返回空壳行"
         );
+        assert!(
+            listed.iter().all(|c| !c.channel_name.contains("100000007")),
+            "对端 uid 绝不能出现在任何标题里"
+        );
+        // 未就绪的行要能被计数，UI 据此显示全局同步提示（spec §6）。
+        assert_eq!(store.unresolved_conversation_count(uid).expect("count"), 1);
     }
 
     /// 对端 user 实体一到，标题立刻是真名——不需要重启，也不需要额外的全量同步。
@@ -5765,9 +5796,13 @@ mod tests {
             )
             .expect("upsert channel");
 
+        // 存量 uid 名字当成「没有名字」——名字算不出来的 DM **不发布**
+        // （发布屏障，见 list_channels 的 WHERE），而不是给 UI 一个空壳行去显示「加载中」。
         let before = store.list_channels(uid, 10, 0).expect("list channels");
-        let dm = before.iter().find(|c| c.channel_id == 4382).expect("dm row");
-        assert_eq!(dm.channel_name, "", "存量 uid 名字当成「没有名字」");
+        assert!(
+            before.iter().all(|c| c.channel_id != 4382),
+            "标题算不出来的 DM 不该出现在列表里"
+        );
 
         // 但它仍然要能反推出对端，等 user 实体到了标题就对了。
         store
@@ -9055,15 +9090,12 @@ mod tests {
             )
             .expect("upsert dm channel");
 
-        // 对端 user 还没到：标题算不出来（**空串，绝不回退 uid**），且被识别为未就绪。
+        // 对端 user 还没到：标题算不出来 → **这一行不发布**（发布屏障），
+        // 并被识别为未就绪，交给定向补齐。
         let rows = store.list_channels(uid, 20, 0).expect("list channels");
-        let row = rows
-            .iter()
-            .find(|c| c.channel_id == channel_id)
-            .expect("dm row present");
-        assert_eq!(
-            row.channel_name, "",
-            "对端 user 缺失时标题必须留空由 UI 显示 typed loading，不能出现裸 uid"
+        assert!(
+            rows.iter().all(|c| c.channel_id != channel_id),
+            "对端未就绪的 DM 不该发布空壳行"
         );
         assert_eq!(
             store.unresolved_dm_peers(uid, 10).expect("unresolved"),
@@ -9172,6 +9204,137 @@ mod tests {
             )
             .expect("upsert named user");
         assert!(store.has_displayable_user(uid, 55).expect("named user"));
+    }
+
+    /// 🔴 发布屏障的另一半：**已经展示过的会话，绝不能因为一次刷新失败而消失**。
+    ///
+    /// 「新会话未就绪就不发布」和「已有会话保持可见」是两个场景，必须同时成立。
+    /// 判据选的是「名字算不算得出来」而不是「这次同步成没成功」——旧快照还在
+    /// user 表里，名字照样算得出来，所以刷新失败只是名字停留在上一版，
+    /// 会话、历史、未读一个都不会少。
+    #[test]
+    fn a_conversation_that_was_once_visible_survives_a_failed_refresh() {
+        let store = test_store();
+        let uid = "10105";
+        store.ensure_user_storage(uid).expect("ensure storage");
+        let peer_id: u64 = 66;
+        let channel_id: u64 = 7005;
+
+        store
+            .upsert_user(
+                uid,
+                &UpsertUserInput {
+                    user_id: peer_id,
+                    username: Some("peer66".to_string()),
+                    nickname: Some("旧昵称".to_string()),
+                    alias: None,
+                    avatar: String::new(),
+                    user_type: 0,
+                    is_deleted: false,
+                    channel_id: String::new(),
+                    version: 1,
+                    updated_at: 1,
+                },
+            )
+            .expect("upsert peer");
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id,
+                    channel_type: 1,
+                    channel_name: String::new(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 3,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 100,
+                    last_local_message_id: 0,
+                    last_msg_content: "hi".to_string(),
+                    version: 1,
+                    peer_user_id: Some(peer_id),
+                },
+            )
+            .expect("upsert dm");
+
+        let rows = store.list_channels(uid, 20, 0).expect("list");
+        let row = rows.iter().find(|c| c.channel_id == channel_id).expect("visible");
+        assert_eq!(row.channel_name, "旧昵称");
+        assert_eq!(row.unread_count, 3);
+
+        // 模拟「资料刷新失败」：什么都没写进来，本地仍是旧快照。
+        // 会话必须还在，名字仍是旧值，未读一条不少。
+        let rows = store.list_channels(uid, 20, 0).expect("list again");
+        let row = rows
+            .iter()
+            .find(|c| c.channel_id == channel_id)
+            .expect("已展示的会话不能因为刷新失败而消失");
+        assert_eq!(row.channel_name, "旧昵称");
+        assert_eq!(row.unread_count, 3);
+        // 也不该再被当成待补齐（本地有可用快照）。
+        assert!(store.unresolved_dm_peers(uid, 10).expect("unresolved").is_empty());
+    }
+
+    /// 分页：未就绪的行在 LIMIT **之前**被过滤掉，请求 N 条就给 N 条可展示的。
+    /// 放在 LIMIT 之后过滤会出现「要 3 条、前两条未就绪、只拿到 1 条」，
+    /// 用户以为没有更多会话了（spec §5.5）。
+    #[test]
+    fn unready_rows_do_not_eat_into_the_requested_page_size() {
+        let store = test_store();
+        let uid = "10106";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        // 交替插入：未就绪、就绪、未就绪、就绪…… 未就绪的排在更前面（时间戳更大）。
+        for i in 0..6u64 {
+            let peer = 700 + i;
+            let ready = i % 2 == 1;
+            if ready {
+                store
+                    .upsert_user(
+                        uid,
+                        &UpsertUserInput {
+                            user_id: peer,
+                            username: Some(format!("peer{peer}")),
+                            nickname: None,
+                            alias: None,
+                            avatar: String::new(),
+                            user_type: 0,
+                            is_deleted: false,
+                            channel_id: String::new(),
+                            version: 1,
+                            updated_at: 1,
+                        },
+                    )
+                    .expect("upsert peer");
+            }
+            store
+                .upsert_channel(
+                    uid,
+                    &UpsertChannelInput {
+                        channel_id: 7100 + i,
+                        channel_type: 1,
+                        channel_name: String::new(),
+                        channel_remark: String::new(),
+                        avatar: String::new(),
+                        unread_count: 0,
+                        top: 0,
+                        mute: 0,
+                        last_msg_timestamp: (100 - i) as i64,
+                        last_local_message_id: 0,
+                        last_msg_content: "x".to_string(),
+                        version: 1,
+                        peer_user_id: Some(peer),
+                    },
+                )
+                .expect("upsert dm");
+        }
+
+        // 三条就绪的会话，请求 3 条必须拿到 3 条——不能被未就绪的行挤掉名额。
+        let page = store.list_channels(uid, 3, 0).expect("page");
+        assert_eq!(page.len(), 3, "未就绪行必须在 LIMIT 之前过滤掉");
+        assert!(page.iter().all(|c| !c.channel_name.is_empty()));
+        assert_eq!(store.unresolved_conversation_count(uid).expect("count"), 3);
     }
 
     /// 存量兼容：老版本把对端 uid 写进了 `channel_name`。反查依赖必须与
