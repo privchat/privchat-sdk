@@ -82,30 +82,35 @@ const UPSERT_USER_SQL: &str = "INSERT INTO user (
         user_type, is_deleted, channel_id, version, updated_at
      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
      ON CONFLICT(user_id) DO UPDATE SET
-        -- NULL means the writer has no information about that field, not clear it.
-        -- Several call sites write a partial identity (a friend row knows the username,
-        -- a channel member row knows neither name); before this, a partial write with a
-        -- NULL nickname erased a nickname the user entity had just delivered.
-        -- An explicit empty string still clears, which is how the server says this user
-        -- has no nickname (PROFILE_VISIBILITY D5).
-        username=CASE
-            WHEN excluded.username IS NULL OR excluded.username = ''
-            THEN user.username ELSE excluded.username END,
-        nickname=CASE
-            WHEN excluded.nickname IS NULL THEN user.nickname
-            ELSE excluded.nickname END,
-        alias=CASE
-            WHEN excluded.alias IS NULL THEN user.alias
-            ELSE excluded.alias END,
-        avatar=CASE
-            WHEN excluded.avatar = '' THEN user.avatar
-            ELSE excluded.avatar END,
+        -- 三态：NULL = 本次写入没有这个字段的信息(保留库里的值)；
+        -- 空串 = 权威来源明确说它是空的(清除)；其它 = 新值。
+        -- 少了这个区分,一个只知道账号名的写入方就会把刚到的昵称/头像抹掉。
+        username=CASE WHEN excluded.username IS NULL THEN user.username
+                      ELSE excluded.username END,
+        nickname=CASE WHEN excluded.nickname IS NULL THEN user.nickname
+                      ELSE excluded.nickname END,
+        alias=CASE WHEN excluded.alias IS NULL THEN user.alias
+                   ELSE excluded.alias END,
+        -- avatar 列是 NOT NULL,没法靠 NULL 表达本次没带头像信息,所以用 ?11 这个
+        -- 标志位区分:0 = 未提供(保留),1 = 提供了(空串就是明确清除)。
+        avatar=CASE WHEN ?11 = 0 THEN user.avatar ELSE excluded.avatar END,
         user_type=excluded.user_type,
         is_deleted=excluded.is_deleted,
         channel_id=excluded.channel_id,
-        version=excluded.version,
+        -- version 记录的是**资料快照**在实体序列里的位置,所以只有带着资料快照的
+        -- 写入才能移动它。判据取 nickname:资料实体一定带这个字段(没有昵称时是空串),
+        -- 只知道账号名的部分写入方则是 NULL。
+        --
+        -- 这条规则同时挡住两种事故:
+        --  * 部分写入携带一个来自别的序列的大号码(好友关系版本、毫秒时间戳),把
+        --    version 抬到天上,之后所有正常的资料同步全被闸门挡死,该用户资料冻结;
+        --  * version=0 的权威点读(查看资料页的强制刷新)被闸门拒之门外。
+        version=CASE WHEN excluded.nickname IS NULL THEN user.version
+                     ELSE MAX(user.version, excluded.version) END,
         updated_at=excluded.updated_at
-     WHERE excluded.version >= user.version";
+     WHERE excluded.version = 0
+        OR excluded.nickname IS NULL
+        OR excluded.version >= user.version";
 
 const K_SCHEMA_VERSION: &[u8] = b"schema_version";
 const K_DEVICE_ID: &[u8] = b"device_id";
@@ -3271,12 +3276,13 @@ impl LocalStore {
                 input.username,
                 input.nickname,
                 input.alias,
-                input.avatar,
+                input.avatar.clone().unwrap_or_default(),
                 input.user_type,
                 if input.is_deleted { 1 } else { 0 },
                 input.channel_id,
                 input.version,
-                input.updated_at
+                input.updated_at,
+                if input.avatar.is_some() { 1 } else { 0 }
             ],
         )
         .map_err(|e| Error::Storage(format!("upsert user: {e}")))?;
@@ -5780,7 +5786,7 @@ mod tests {
                     username: Some("fujie95".to_string()),
                     nickname: Some("福姐九五".to_string()),
                     alias: None,
-                    avatar: String::new(),
+                    avatar: Some(String::new()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -5840,7 +5846,7 @@ mod tests {
                     username: Some("fujie95".to_string()),
                     nickname: Some("福姐九五".to_string()),
                     alias: None,
-                    avatar: String::new(),
+                    avatar: Some(String::new()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -5905,7 +5911,7 @@ mod tests {
                     username: Some("self".to_string()),
                     nickname: Some("Self".to_string()),
                     alias: None,
-                    avatar: "https://cdn/old.png".to_string(),
+                    avatar: Some("https://cdn/old.png".to_string()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: "c-self".to_string(),
@@ -8457,7 +8463,7 @@ mod tests {
                     username: Some("alice".to_string()),
                     nickname: Some("Alice".to_string()),
                     alias: Some("A".to_string()),
-                    avatar: "avatar://alice".to_string(),
+                    avatar: Some("avatar://alice".to_string()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: "c-alice".to_string(),
@@ -8480,7 +8486,7 @@ mod tests {
                     username: Some("stale-alice".to_string()),
                     nickname: Some("Stale Alice".to_string()),
                     alias: Some("stale".to_string()),
-                    avatar: "avatar://stale".to_string(),
+                    avatar: Some("avatar://stale".to_string()),
                     user_type: 9,
                     is_deleted: true,
                     channel_id: "stale-channel".to_string(),
@@ -8687,7 +8693,7 @@ mod tests {
                     username: Some("alice-2".to_string()),
                     nickname: Some("Alice 2".to_string()),
                     alias: Some("A2".to_string()),
-                    avatar: "avatar://alice-2".to_string(),
+                    avatar: Some("avatar://alice-2".to_string()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: "c-alice".to_string(),
@@ -8758,7 +8764,7 @@ mod tests {
                 username: Some(format!("user-{user_id}")),
                 nickname: Some(format!("User {user_id}")),
                 alias: None,
-                avatar: String::new(),
+                avatar: Some(String::new()),
                 user_type: 0,
                 is_deleted: false,
                 channel_id: String::new(),
@@ -9131,7 +9137,7 @@ mod tests {
                             username: Some("alice".to_string()),
                             nickname: Some("Alice".to_string()),
                             alias: None,
-                            avatar: String::new(),
+                            avatar: Some(String::new()),
                             user_type: 0,
                             is_deleted: false,
                             channel_id: String::new(),
@@ -9194,7 +9200,7 @@ mod tests {
                     username: None, // D5：别人的 username 不由 user 实体下发
                     nickname: Some("IOS17Pro".to_string()),
                     alias: None,
-                    avatar: String::new(),
+                    avatar: Some(String::new()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -9215,7 +9221,7 @@ mod tests {
                     username: Some("ios013739a".to_string()),
                     nickname: None,
                     alias: None,
-                    avatar: String::new(),
+                    avatar: Some(String::new()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -9241,6 +9247,110 @@ mod tests {
         );
     }
 
+    /// GPT 评审要求的顺序验收：**权威 55 → 外来 99 的部分写入 → 权威 56**，
+    /// 最终必须是 56 的昵称。
+    ///
+    /// 只验证「99 没有立刻抹掉昵称」是不够的——如果那个 99 被写进了 `user.version`，
+    /// 后续每一次正常的实体同步(56、57…)都会被闸门挡住，这个用户的资料从此冻结。
+    /// 所以断言分两层：内容对，且**版本没有被无关来源抬高**。
+    #[test]
+    fn a_foreign_version_cannot_freeze_later_authoritative_updates() {
+        let store = test_store();
+        let uid = "10133";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        let write = |nickname: Option<&str>, version: i64| {
+            store
+                .upsert_user(
+                    uid,
+                    &UpsertUserInput {
+                        user_id: 77,
+                        username: None,
+                        nickname: nickname.map(|s| s.to_string()),
+                        alias: None,
+                        avatar: None,
+                        user_type: 0,
+                        is_deleted: false,
+                        channel_id: String::new(),
+                        version,
+                        updated_at: version,
+                    },
+                )
+                .expect("upsert")
+        };
+        let nickname_now = || {
+            store
+                .list_users_by_ids(uid, &[77])
+                .expect("read back")
+                .into_iter()
+                .next()
+                .expect("user row")
+                .nickname
+        };
+
+        write(Some("v55"), 55);
+        assert_eq!(nickname_now().as_deref(), Some("v55"));
+
+        // 一个来自别的实体序列的写入,号码碰巧更大。
+        write(None, 99);
+        assert_eq!(nickname_now().as_deref(), Some("v55"), "外来写入不该改内容");
+
+        // 真正的下一版权威资料。它的号(56)比那个外来的 99 小,但必须生效。
+        write(Some("v56"), 56);
+        assert_eq!(
+            nickname_now().as_deref(),
+            Some("v56"),
+            "a foreign version must not lock out the next authoritative update",
+        );
+    }
+
+    /// 头像的「明确清除」必须能落地：用户删掉头像后不能还显示旧的。
+    /// 与之相对，一个不带头像信息的部分写入(None)不得清空已有头像。
+    #[test]
+    fn an_explicit_empty_avatar_clears_while_an_absent_one_preserves() {
+        let store = test_store();
+        let uid = "10134";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        let write = |avatar: Option<&str>, version: i64| {
+            store
+                .upsert_user(
+                    uid,
+                    &UpsertUserInput {
+                        user_id: 78,
+                        username: Some("someone".to_string()),
+                        nickname: Some("Someone".to_string()),
+                        alias: None,
+                        avatar: avatar.map(|s| s.to_string()),
+                        user_type: 0,
+                        is_deleted: false,
+                        channel_id: String::new(),
+                        version,
+                        updated_at: version,
+                    },
+                )
+                .expect("upsert")
+        };
+        let avatar_now = || {
+            store
+                .list_users_by_ids(uid, &[78])
+                .expect("read back")
+                .into_iter()
+                .next()
+                .expect("user row")
+                .avatar
+        };
+
+        write(Some("https://cdn/a.png"), 10);
+        assert_eq!(avatar_now(), "https://cdn/a.png");
+
+        write(None, 20); // 没带头像信息 → 保留
+        assert_eq!(avatar_now(), "https://cdn/a.png");
+
+        write(Some(""), 30); // 权威说没有头像 → 清除
+        assert_eq!(avatar_now(), "", "an explicit empty avatar must clear the stored one");
+    }
+
     /// 同一次回归的另一半：即便旧资料**带着更大的版本号**（历史脏数据，或者一个
     /// 尚未升级的服务端仍在发好友关系版本），也不能让它把昵称抹成空。
     ///
@@ -9262,7 +9372,7 @@ mod tests {
                         username: Some("someone".to_string()),
                         nickname: nickname.map(|s| s.to_string()),
                         alias: None,
-                        avatar: String::new(),
+                        avatar: Some(String::new()),
                         user_type: 0,
                         is_deleted: false,
                         channel_id: String::new(),
@@ -9351,7 +9461,7 @@ mod tests {
                     username: Some("demo".to_string()),
                     nickname: Some("Demo".to_string()),
                     alias: None,
-                    avatar: String::new(),
+                    avatar: Some(String::new()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -9409,7 +9519,7 @@ mod tests {
                     username: Some(String::new()),
                     nickname: Some(String::new()),
                     alias: None,
-                    avatar: String::new(),
+                    avatar: Some(String::new()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -9433,7 +9543,7 @@ mod tests {
                     username: Some("peer55".to_string()),
                     nickname: None,
                     alias: None,
-                    avatar: String::new(),
+                    avatar: Some(String::new()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -9467,7 +9577,7 @@ mod tests {
                     username: Some("peer66".to_string()),
                     nickname: Some("旧昵称".to_string()),
                     alias: None,
-                    avatar: String::new(),
+                    avatar: Some(String::new()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -9537,7 +9647,7 @@ mod tests {
                             username: Some(format!("peer{peer}")),
                             nickname: None,
                             alias: None,
-                            avatar: String::new(),
+                            avatar: Some(String::new()),
                             user_type: 0,
                             is_deleted: false,
                             channel_id: String::new(),

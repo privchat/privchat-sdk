@@ -1983,10 +1983,12 @@ pub struct StoredMessageExtra {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UpsertUserInput {
     pub user_id: u64,
+    /// `None` = 本次写入没有这个字段的信息（保留本地已有值）；
+    /// `Some("")` = 权威来源明确说它是空的（清除）；`Some(v)` = 新值。
     pub username: Option<String>,
     pub nickname: Option<String>,
     pub alias: Option<String>,
-    pub avatar: String,
+    pub avatar: Option<String>,
     pub user_type: i32,
     pub is_deleted: bool,
     pub channel_id: String,
@@ -3520,7 +3522,13 @@ fn map_upsert_user(v: UpsertUserInput) -> SdkUpsertUserInput {
         user_type: v.user_type,
         is_deleted: v.is_deleted,
         channel_id: v.channel_id,
-        version: v.updated_at.max(0),
+        // 宿主直写（查看资料页的强制刷新等）拿的是权威点读结果:内容最新,但它在
+        // 实体序列里的位置未知。所以**不声称版本**(0)。
+        //
+        // 这里曾经写 `v.updated_at`——一个毫秒时间戳。`user.version` 是所有资料写入
+        // 的闸门,一旦被抬到 1.7e12,之后所有正常的 sync_version(几十几百)全被挡在
+        // 门外,那个用户的资料就再也刷不动了。
+        version: 0,
         updated_at: v.updated_at,
     }
 }
@@ -5035,7 +5043,9 @@ impl PrivchatClient {
                 username: Some(detail.username),
                 nickname: Some(detail.nickname),
                 alias: None,
-                avatar: detail.avatar_url.unwrap_or_default(),
+                // 权威点读一定带全字段:服务端说 None 就是"这人没头像",按清除处理,
+                // 而不是"这次没查到头像"。
+                avatar: Some(detail.avatar_url.unwrap_or_default()),
                 user_type: i32::from(detail.user_type),
                 is_deleted: false,
                 channel_id: String::new(),

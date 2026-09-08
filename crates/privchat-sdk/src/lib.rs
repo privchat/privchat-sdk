@@ -2480,10 +2480,14 @@ pub struct StoredMessageExtra {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpsertUserInput {
     pub user_id: u64,
+    /// 三态语义（本地库 upsert 依赖它区分"没这条信息"和"确实为空"）：
+    /// `None` = 本次写入不知道这个字段，保留库里的值；
+    /// `Some("")` = 权威来源明确说这个字段是空的，清除；
+    /// `Some(v)` = 新值。
     pub username: Option<String>,
     pub nickname: Option<String>,
     pub alias: Option<String>,
-    pub avatar: String,
+    pub avatar: Option<String>,
     pub user_type: i32,
     pub is_deleted: bool,
     pub channel_id: String,
@@ -6493,7 +6497,7 @@ impl State {
                                     .clone()
                                     .or(embedded_user.name.clone()),
                                 alias: embedded_user.alias.clone(),
-                                avatar: embedded_user.avatar.clone().unwrap_or_default(),
+                                avatar: embedded_user.avatar.clone(),
                                 user_type: embedded_user
                                     .user_type
                                     .or(embedded_user.type_field)
@@ -6590,7 +6594,7 @@ impl State {
                     if user_id == 0 {
                         continue;
                     }
-                    let avatar = Self::json_get_string(&payload, &["avatar"]).unwrap_or_default();
+                    let avatar = Self::json_get_string(&payload, &["avatar"]);
                     user_inputs.push(UpsertUserInput {
                         user_id,
                         username: Self::json_get_string(&payload, &["username"]),
@@ -6957,7 +6961,7 @@ impl State {
                                 // already stored.
                                 nickname: None,
                                 alias: inferred_alias,
-                                avatar: inferred_avatar.clone(),
+                                avatar: Some(inferred_avatar.clone()),
                                 user_type: 0,
                                 is_deleted: false,
                                 channel_id: String::new(),
@@ -17122,7 +17126,11 @@ impl PrivchatSdk {
                                 let r = state.storage.upsert_user(input).await;
                                 if r.is_ok() {
                                     // FFI 直写路径（profile fetch 等）也触发头像缓存。
-                                    state.ensure_avatar_cached(user_id, &avatar);
+                                    // avatar 为 None = 本次写入没带头像信息,不动缓存;
+                                    // Some("") = 权威说没有头像,交给下游按"清除"处理。
+                                    if let Some(avatar) = avatar.as_deref() {
+                                        state.ensure_avatar_cached(user_id, avatar);
+                                    }
                                 }
                                 r
                             }
@@ -18714,7 +18722,7 @@ impl PrivchatSdk {
                     username: Some(item.user.username),
                     nickname: Some(item.user.nickname),
                     alias: None,
-                    avatar: item.user.avatar_url.unwrap_or_default(),
+                    avatar: item.user.avatar_url,
                     user_type: item.user.user_type as i32,
                     is_deleted: false,
                     channel_id: String::new(),
@@ -23702,7 +23710,7 @@ mod tests {
                 username: Some("bob".to_string()),
                 nickname: Some("Bob".to_string()),
                 alias: Some("B".to_string()),
-                avatar: "avatar://bob".to_string(),
+                avatar: Some("avatar://bob".to_string()),
                 user_type: 0,
                 is_deleted: false,
                 channel_id: String::new(),
@@ -25032,7 +25040,7 @@ mod tests {
                     username: Some("alice".to_string()),
                     nickname: Some("Alice".to_string()),
                     alias: Some("A".to_string()),
-                    avatar: "avatar://alice".to_string(),
+                    avatar: Some("avatar://alice".to_string()),
                     user_type: 0,
                     is_deleted: false,
                     channel_id: "friend-88001".to_string(),
@@ -25159,7 +25167,7 @@ mod tests {
             username: Some("u-one".to_string()),
             nickname: Some("User One".to_string()),
             alias: Some("UNO".to_string()),
-            avatar: "avatar://u-one".to_string(),
+            avatar: Some("avatar://u-one".to_string()),
             user_type: 0,
             is_deleted: false,
             channel_id: "friend-88101".to_string(),
@@ -25173,7 +25181,7 @@ mod tests {
             username: Some("u-two".to_string()),
             nickname: Some("User Two".to_string()),
             alias: None,
-            avatar: "avatar://u-two".to_string(),
+            avatar: Some("avatar://u-two".to_string()),
             user_type: 0,
             is_deleted: false,
             channel_id: "friend-88102".to_string(),
