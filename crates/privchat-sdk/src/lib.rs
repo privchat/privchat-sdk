@@ -4179,6 +4179,33 @@ impl State {
     ///
     /// 同步快速路径（空 URL / 进程内已验证 / 下载中）直接返回，未命中才 spawn
     /// 后台任务——sync 循环批量灌用户时不会形成 task 洪峰。不阻塞调用方。
+    /// 头像被权威清空后的收尾：删掉磁盘上那张旧图，并通知 UI 重读。
+    ///
+    /// 本地行的三列已在 upsert 里归零，所以渲染层这时读到的就是"没有头像"；缺的是
+    /// 让它**知道该重读**。文件删除放在事件之前——先让来源消失，再叫醒观察者，
+    /// 避免观察者抢在删除之前又把旧路径读回去。
+    async fn remove_cached_avatar_file(&mut self, user_id: u64) {
+        let Some(uid) = self.current_uid.as_deref() else {
+            return;
+        };
+        if let Ok(paths) = self
+            .storage
+            .get_storage_paths_for_uid(uid.to_string())
+            .await
+        {
+            let path = avatar_cache::avatar_cache_path(
+                std::path::Path::new(&paths.user_root),
+                user_id,
+            );
+            let _ = std::fs::remove_file(path);
+        }
+        self.pending_events.push(SdkEvent::SyncEntityChanged {
+            entity_type: "user".to_string(),
+            entity_id: user_id.to_string(),
+            deleted: false,
+        });
+    }
+
     fn ensure_avatar_cached(&self, user_id: u64, avatar_url: &str) {
         let Some(uid) = self.current_uid.as_deref() else {
             return;
@@ -6583,6 +6610,7 @@ impl State {
             }
             "user" => {
                 let mut user_inputs = Vec::with_capacity(items.len());
+                let mut cleared_avatar_user_ids: Vec<u64> = Vec::new();
                 for item in items {
                     let payload = item
                         .payload
@@ -6595,6 +6623,11 @@ impl State {
                         continue;
                     }
                     let avatar = Self::json_get_string(&payload, &["avatar"]);
+                    // 权威说这个人没有头像 ⇒ 本轮结束后要让缓存层忘掉它,否则
+                    // 进程内的 verified 记忆会让下一次 ensure 直接跳过。
+                    if avatar.as_deref() == Some("") {
+                        cleared_avatar_user_ids.push(user_id);
+                    }
                     user_inputs.push(UpsertUserInput {
                         user_id,
                         username: Self::json_get_string(&payload, &["username"]),
@@ -6619,6 +6652,16 @@ impl State {
                     hydrated_user_ids.push(user_id);
                 }
                 self.storage.batch_upsert_users(user_inputs).await?;
+                // 头像被权威清空的那些行:落库时 avatar / avatar_cached_url /
+                // avatar_local_path 已经一起归零(AVATAR_CACHE_SPEC §2.1),磁盘上那张
+                // 旧图也要删掉——它是 §4 定义的 UI 唯一头像来源,留着就是"删了头像还
+                // 显示旧图",而且重启也不会好,因为脏数据在本地。
+                //
+                // 下载成功那条路径会发 SyncEntityChanged 让各处重读;清除必须做对称的
+                // 事,否则界面要等下一次冷启动才跟上(2026-09-09 真机实测)。
+                for user_id in cleared_avatar_user_ids {
+                    self.remove_cached_avatar_file(user_id).await;
+                }
                 // A global user page can contain thousands of identities. Their metadata is a
                 // readiness dependency; downloading every avatar is not. Eager cache jobs flood
                 // the single storage actor and can trap an opened conversation behind minutes of

@@ -98,8 +98,8 @@ const PENDING_TIMELINE_MUTATION_PREFIX: &str = "__pending_timeline_mutation__:v1
 /// `avatar` 列 NOT NULL，用 ?11 标志位承载「是否提供」。
 const UPSERT_USER_SQL: &str = "INSERT INTO user (
         user_id, username, nickname, alias, avatar,
-        user_type, is_deleted, channel_id, version, updated_at
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        user_type, is_deleted, channel_id, version, updated_at, profile_snapshot
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CASE WHEN ?9 > 0 THEN 1 ELSE 0 END)
      ON CONFLICT(user_id) DO UPDATE SET
         username=CASE
             WHEN excluded.username IS NULL THEN user.username
@@ -113,25 +113,33 @@ const UPSERT_USER_SQL: &str = "INSERT INTO user (
             WHEN ?9 = 0 AND COALESCE(user.channel_id, '') <> '' THEN user.channel_id
             ELSE excluded.channel_id END,
         -- 以下三列归 user 实体所有：无版本写入只在本地尚无权威快照时可填。
+        --
+        -- 判据是 profile_snapshot 而不是 version。version 只表示快照在序列里的位置,
+        -- 被写坏时要能安全归零;有没有快照是另一件事,必须单独记 —— 否则修版本号就等于
+        -- 把这行降级成从没同步过,一条只知道账号名的部分写入又能把昵称头像填回去。
         nickname=CASE
             WHEN excluded.nickname IS NULL THEN user.nickname
-            WHEN ?9 = 0 AND user.version > 0 THEN user.nickname
+            WHEN ?9 = 0 AND user.profile_snapshot = 1 THEN user.nickname
             ELSE excluded.nickname END,
         avatar=CASE
             WHEN ?11 = 0 THEN user.avatar
-            WHEN ?9 = 0 AND user.version > 0 THEN user.avatar
+            WHEN ?9 = 0 AND user.profile_snapshot = 1 THEN user.avatar
             ELSE excluded.avatar END,
         user_type=CASE
-            WHEN ?9 = 0 AND user.version > 0 THEN user.user_type
+            WHEN ?9 = 0 AND user.profile_snapshot = 1 THEN user.user_type
             WHEN ?9 = 0 AND user.user_type <> 0 THEN user.user_type
             ELSE excluded.user_type END,
+        -- 带版本的权威写入落地即置位；无版本写入不改变它。
+        profile_snapshot=CASE WHEN ?9 > 0 THEN 1 ELSE user.profile_snapshot END,
         -- 头像被权威清空 ⇒ 缓存引用一起归零（AVATAR_CACHE_SPEC §2.1）。
         -- 留着 avatar_local_path 就是删了头像还继续显示上周下载的那张图。
         avatar_cached_url=CASE
-            WHEN ?11 = 1 AND excluded.avatar = '' AND NOT (?9 = 0 AND user.version > 0)
+            WHEN ?11 = 1 AND excluded.avatar = ''
+                 AND NOT (?9 = 0 AND user.profile_snapshot = 1)
                 THEN '' ELSE user.avatar_cached_url END,
         avatar_local_path=CASE
-            WHEN ?11 = 1 AND excluded.avatar = '' AND NOT (?9 = 0 AND user.version > 0)
+            WHEN ?11 = 1 AND excluded.avatar = ''
+                 AND NOT (?9 = 0 AND user.profile_snapshot = 1)
                 THEN '' ELSE user.avatar_local_path END,
         is_deleted=CASE WHEN ?9 = 0 THEN user.is_deleted ELSE excluded.is_deleted END,
         version=MAX(user.version, excluded.version),
@@ -630,28 +638,47 @@ impl LocalStore {
         Ok(())
     }
 
-    /// 把被写坏的 `user.version` 清回 0。
+    /// 修复被写坏的 `user.version`，并补上 `profile_snapshot` 列。
     ///
-    /// 旧版本的 FFI 把 `updated_at`（毫秒时间戳）当成资料版本写进这一列。`user.version`
-    /// 是所有资料写入的闸门，一旦被顶到 1.7e12，之后每一次真实的 `sync_version`
-    /// （递增序列，量级在千以内）都比它小、全被挡下——那个用户的昵称和头像从此冻结，
-    /// 重装、重连、重新登录都救不回来，因为脏数据在本地库里。
+    /// `user.version` 一列同时承担了两件事：**有没有权威快照**（决定无版本写入能不能
+    /// 填 nickname/avatar）和**快照在实体序列里的位置**（决定新写入能不能覆盖）。
+    /// 两件事绑在一起，就没法安全地修一个被写坏的版本号——归零会让它变成"从没同步过"，
+    /// 于是一条只知道账号名的部分写入又能把昵称头像填回去。
     ///
-    /// 光修产生源头不够：**已经装在用户手机上的那些行还坏着**。这里在开库时清一次。
-    /// 判据取一个不可能被真实序列达到的阈值：序列每改一次资料 +1，1e12 意味着一万亿次
-    /// 修改；而毫秒时间戳从 2001 年起就已经超过它了。清成 0 = 「位置未知」，下一条
-    /// 权威资料（任何版本）都能落地，随后版本重新跟上真实序列。
+    /// 拆开之后修复才成立：`profile_snapshot=1` 记住"这行有过权威资料"，`version` 只
+    /// 表示位置，归零 = "位置未知"，下一条权威资料照样能落地。
+    ///
+    /// 两类脏数据：
+    /// * **时间戳量级**（旧 FFI 把 `updated_at` 当版本写进来）——`>= 1e12` 一眼可辨。
+    /// * **同量级**（好友关系版本 / 成员版本写进了 user 序列）——数值和真实
+    ///   `sync_version` 一样是几十几百，**无法从数值上区分**。对这类只能整体归零：
+    ///   位置信息本来就已经不可信，留着它反而会挡住真正的更新。内容不动。
     fn repair_polluted_user_versions(conn: &Connection) -> Result<()> {
+        // 加列：老库没有这一列，ALTER 失败 = 已经加过。
+        let _ = conn.execute(
+            "ALTER TABLE \"user\" ADD COLUMN profile_snapshot INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // 首次升级：已经有名字或头像的行，其资料只可能来自权威来源，标记之。
+        // 这一步幂等（后续再跑时这些行已经是 1）。
+        conn.execute(
+            "UPDATE \"user\" SET profile_snapshot = 1
+             WHERE profile_snapshot = 0
+               AND (COALESCE(nickname, '') <> '' OR COALESCE(avatar, '') <> '')",
+            [],
+        )
+        .map_err(|e| Error::Storage(format!("mark profile snapshots: {e}")))?;
+
         const IMPLAUSIBLE_VERSION: i64 = 1_000_000_000_000;
-        let repaired = conn
+        let stamped = conn
             .execute(
-                "UPDATE user SET version = 0 WHERE version >= ?1",
+                "UPDATE \"user\" SET version = 0 WHERE version >= ?1",
                 params![IMPLAUSIBLE_VERSION],
             )
             .map_err(|e| Error::Storage(format!("repair user versions: {e}")))?;
-        if repaired > 0 {
+        if stamped > 0 {
             tracing::warn!(
-                repaired,
+                repaired = stamped,
                 "reset user rows whose version had been overwritten with a timestamp"
             );
         }
@@ -9531,6 +9558,77 @@ mod tests {
         assert_eq!(
             after.avatar_local_path, "",
             "the stale file must stop being the UI source",
+        );
+    }
+
+    /// 同量级的版本污染（好友关系版本 / 成员版本写进了 user 序列）没法靠数值认出来，
+    /// 只能整体归零位置信息。这条钉住归零之后**两个性质同时成立**：
+    ///
+    /// 1. 权威更新能落地（否则那个用户的资料就永久冻结）；
+    /// 2. 无版本写入仍然不能复活已清除的字段（否则修污染就等于开了另一个洞）。
+    ///
+    /// 之所以能同时成立，是因为「有没有权威快照」被拆到了 `profile_snapshot`，
+    /// 不再借 `version > 0` 表达。
+    #[test]
+    fn zeroing_a_polluted_version_keeps_the_row_protected() {
+        let store = test_store();
+        let uid = "10139";
+        store.ensure_user_storage(uid).expect("ensure storage");
+
+        let put = |nickname: Option<&str>, avatar: Option<&str>, version: i64| {
+            store
+                .upsert_user(
+                    uid,
+                    &UpsertUserInput {
+                        user_id: 44,
+                        username: Some("acct".to_string()),
+                        nickname: nickname.map(|s| s.to_string()),
+                        alias: None,
+                        avatar: avatar.map(|s| s.to_string()),
+                        user_type: 0,
+                        is_deleted: false,
+                        channel_id: String::new(),
+                        version,
+                        updated_at: version,
+                    },
+                )
+                .expect("upsert")
+        };
+        let row = || {
+            store
+                .list_users_by_ids(uid, &[44])
+                .expect("read")
+                .into_iter()
+                .next()
+                .expect("row")
+        };
+
+        // 权威资料到位,然后被权威清空头像。
+        put(Some("Named"), Some("https://cdn/a.png"), 40);
+        put(Some("Named"), Some(""), 41);
+        assert_eq!(row().avatar, "");
+
+        // 模拟同量级污染:一个来自别的序列的号码占住了 version。
+        put(Some("Named"), None, 500);
+
+        // 修复：位置归零（真实修复里由开库时统一做，这里直接改库等价）。
+        {
+            let conn = store.conn_for_user(uid).expect("conn");
+            conn.execute("UPDATE \"user\" SET version = 0 WHERE user_id = 44", [])
+                .expect("zero the polluted version");
+        }
+
+        // 1) 无版本写入仍然不能复活被清除的头像 —— profile_snapshot 还记着。
+        put(Some("Resurrected"), Some("https://cdn/a.png"), 0);
+        assert_eq!(row().avatar, "", "归零位置不得重开复活的口子");
+        assert_eq!(row().nickname.as_deref(), Some("Named"));
+
+        // 2) 真正的权威更新能落地 —— 这正是修复要解决的"资料冻结"。
+        put(Some("Unfrozen"), None, 42);
+        assert_eq!(
+            row().nickname.as_deref(),
+            Some("Unfrozen"),
+            "归零之后权威更新必须能进来,否则这行永远冻着",
         );
     }
 
