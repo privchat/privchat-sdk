@@ -318,13 +318,33 @@ fn scan_entities(text: &str, mentions: &[u64]) -> Vec<MessageTextEntity> {
         }
     }
     let mention_re = Regex::new(r"@[\p{L}\p{N}_-]+").expect("static regex");
-    for (index, m) in mention_re.find_iter(text).enumerate() {
+    // 与 url/email 重叠的 `@xxx` 不是提及（`hi@example.com` 里的 `@example`）。
+    // 它们在下面的去重里本来就会被丢掉，但**计数必须先把它们排除**，否则一条带邮箱的
+    // 消息就会让下面的数量判定失衡。
+    let spans: Vec<_> = mention_re
+        .find_iter(text)
+        .filter(|m| !out.iter().any(|e: &MessageTextEntity| {
+            let (s, e2) = (utf16_len(text, m.start()), utf16_len(text, m.end()));
+            s < e.end && e2 > e.start
+        }))
+        .collect();
+    // 🔴 位置配对只在「真提及的个数和 id 的个数一致」时才成立。
+    //
+    // 这里原来无条件按 `mentions[i]` 配第 i 个 `@`。可文本里任何一个长得像提及的东西
+    // （`@here`、用户手打的 `@某人`）都会占掉一个位置，把后面每一个真提及都往后挪一格
+    // —— 结果是 **@张三 打开李四的资料**。这比认不出来更糟：它看起来是对的，
+    // 用户不会怀疑。
+    //
+    // 数量对不上时宁可全部留空，让上层按名字在成员名单里解析（privchat-ui 已这么做）。
+    // 「不知道」是可恢复的，「配错人」不是。
+    let positional_ok = spans.len() == mentions.len();
+    for (index, m) in spans.iter().enumerate() {
         out.push(entity(
             "mention",
             text,
             m.start(),
             m.end(),
-            mentions.get(index).copied(),
+            if positional_ok { mentions.get(index).copied() } else { None },
         ));
     }
     out.sort_by_key(|e| e.start);
@@ -375,6 +395,12 @@ fn has_adjacent_digit(text: &str, start: usize, end: usize) -> bool {
             .next()
             .is_some_and(|c| c.is_ascii_digit())
 }
+/// 字节偏移 → UTF-16 偏移。实体的 start/end 用的是 UTF-16（与 Kotlin/Swift 的 String
+/// 索引一致），重叠判定必须在同一坐标系里做。
+fn utf16_len(text: &str, byte_offset: usize) -> u32 {
+    text[..byte_offset].encode_utf16().count() as u32
+}
+
 fn entity(
     kind: &str,
     text: &str,
@@ -412,6 +438,27 @@ mod tests {
         assert_eq!(body.entities.len(), 4);
         assert_eq!(body.entities[2].kind, "email");
         assert_eq!(body.entities[3].value, "13800138000");
+    }
+
+    /// 位置配对只在数量一致时可信。数量对不上就全部留空，交给上层按名字解析——
+    /// 「不知道」可恢复，「配到别人身上」不可恢复，而且看起来是对的。
+    #[test]
+    fn mention_ids_are_dropped_when_the_counts_disagree() {
+        // 两个 @ 一个 id：`@here` 不是提及，却会占掉第 0 位，把 9 配给它，
+        // 真正的 `@客服` 反而落空——旧实现正是这个结果。
+        let mixed = scan_entities("@here 麻烦 @客服 看下", &[9]);
+        let mentions: Vec<_> = mixed.iter().filter(|e| e.kind == "mention").collect();
+        assert_eq!(mentions.len(), 2);
+        assert!(mentions.iter().all(|e| e.user_id.is_none()));
+
+        // 数量一致时仍然按位置配，顺序与文本出现顺序一致。
+        let matched = scan_entities("@张三 @李四", &[11, 22]);
+        let ids: Vec<_> = matched
+            .iter()
+            .filter(|e| e.kind == "mention")
+            .map(|e| e.user_id)
+            .collect();
+        assert_eq!(ids, vec![Some(11), Some(22)]);
     }
 
     #[test]
