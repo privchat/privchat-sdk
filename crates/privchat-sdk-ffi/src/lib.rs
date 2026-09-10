@@ -342,12 +342,6 @@ pub struct AvatarCacheResult {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct SeenByEntry {
-    pub user_id: u64,
-    pub read_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
 pub struct ProfileView {
     pub status: String,
     pub action: String,
@@ -1111,7 +1105,15 @@ fn history_item_view(
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MessageReadListView {
     pub readers: Vec<MessageReadUserView>,
-    pub total: u64,
+    /// 发送时有权接收的人数（不含发送者）。不是当前群成员数：
+    /// 退群的人当时确实收到了，后加入的人当时并不在。
+    pub recipient_count: u32,
+    pub read_count: u32,
+    /// 下一页游标；None = 到底了。键集分页，不要换成 offset。
+    pub next_after_user_id: Option<u64>,
+    pub has_more: bool,
+    /// 明细可查截止时间（毫秒）。到点后服务端直接拒绝，UI 显示"已读详情已过期"。
+    pub detail_expires_at: i64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1120,13 +1122,17 @@ pub struct MessageReadUserView {
     pub username: Option<String>,
     pub nickname: Option<String>,
     pub avatar_url: Option<String>,
-    pub read_at: Option<u64>,
+    /// 资料没取到时仍然在名单里，UI 显示占位而不是把人丢掉。
+    pub profile_loaded: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MessageReadStatsView {
     pub read_count: u32,
-    pub total_count: u32,
+    /// 发送时有权接收的人数（不含发送者）。
+    pub recipient_count: u32,
+    pub unread_count: u32,
+    pub detail_expires_at: i64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -6172,10 +6178,15 @@ impl PrivchatClient {
         })
     }
 
+    /// 群消息已读名单，按 user_id 键集分页（READ_STATUS_SPEC §6.5.7）。
+    ///
+    /// `after_user_id` 传上一页的 `next_after_user_id`，首页传 0。
     pub async fn message_read_list(
         &self,
         server_message_id: u64,
         channel_id: u64,
+        after_user_id: u64,
+        limit: Option<u32>,
     ) -> Result<MessageReadListView, PrivchatFfiError> {
         let resp: MessageReadListResponse = rpc_call_typed(
             &self.inner,
@@ -6183,6 +6194,8 @@ impl PrivchatClient {
             &MessageReadListRequest {
                 message_id: server_message_id,
                 channel_id,
+                after_user_id,
+                limit,
             },
         )
         .await?;
@@ -6195,10 +6208,14 @@ impl PrivchatClient {
                     username: r.username,
                     nickname: r.nickname,
                     avatar_url: r.avatar_url,
-                    read_at: r.read_at,
+                    profile_loaded: r.profile_loaded,
                 })
                 .collect(),
-            total: resp.total as u64,
+            recipient_count: resp.recipient_count,
+            read_count: resp.read_count,
+            next_after_user_id: resp.next_after_user_id,
+            has_more: resp.has_more,
+            detail_expires_at: resp.detail_expires_at,
         })
     }
 
@@ -6218,7 +6235,9 @@ impl PrivchatClient {
         .await?;
         Ok(MessageReadStatsView {
             read_count: resp.read_count,
-            total_count: resp.total_count,
+            recipient_count: resp.recipient_count,
+            unread_count: resp.unread_count,
+            detail_expires_at: resp.detail_expires_at,
         })
     }
 
@@ -8848,56 +8867,6 @@ impl PrivchatClient {
             .filter_map(|m| m.server_message_id)
             .max()
             .unwrap_or(0))
-    }
-
-    pub async fn is_event_read_by(
-        &self,
-        server_message_id: u64,
-        user_id: u64,
-    ) -> Result<bool, PrivchatFfiError> {
-        let channel_id = self
-            .resolve_channel_id_by_server_message_id(server_message_id)
-            .await?;
-        let resp: MessageReadListResponse = rpc_call_typed(
-            &self.inner,
-            routes::message_status::READ_LIST,
-            &MessageReadListRequest {
-                message_id: server_message_id,
-                channel_id,
-            },
-        )
-        .await?;
-        Ok(resp
-            .readers
-            .into_iter()
-            .any(|entry| entry.user_id == user_id))
-    }
-
-    pub async fn seen_by_for_event(
-        &self,
-        server_message_id: u64,
-    ) -> Result<Vec<SeenByEntry>, PrivchatFfiError> {
-        let channel_id = self
-            .resolve_channel_id_by_server_message_id(server_message_id)
-            .await?;
-        let resp: MessageReadListResponse = rpc_call_typed(
-            &self.inner,
-            routes::message_status::READ_LIST,
-            &MessageReadListRequest {
-                message_id: server_message_id,
-                channel_id,
-            },
-        )
-        .await?;
-        Ok(resp
-            .readers
-            .into_iter()
-            .filter_map(|entry| {
-                let user_id = entry.user_id;
-                let read_at = entry.read_at;
-                Some(SeenByEntry { user_id, read_at })
-            })
-            .collect())
     }
 
     pub async fn paginate_back(

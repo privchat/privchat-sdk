@@ -6112,6 +6112,10 @@ impl State {
             "self_read_pts_updated"
             | "peer_read_pts_updated"
             | "user_read_pts"
+            // 群聚合已读（READ_STATUS_SPEC §6.5.8）：与对端已读同构，只是 reader_id 恒为 0
+            // ——它是「除你之外的最大水位」，不指向任何具体阅读者。漏掉这一支的后果是
+            // 群消息的气泡永远停在「已发送」：服务端推了，SDK 认不出来就直接丢了。
+            | "group_read_aggregate_updated"
             | "channel_read_cursor_updated" => {
                 let channel_id =
                     Self::json_field_u64(&payload_json, &["metadata", "channel_id"]).unwrap_or(0);
