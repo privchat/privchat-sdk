@@ -6316,6 +6316,190 @@ source={} sealed_cache={} extra={}",
             metrics,
         })
     }
+
+    /// 群已读：聚合投影 + 名单授权 + 键集分页（READ_STATUS_SPEC §6.5）。
+    ///
+    /// 覆盖的是「所有群消息都停在已发送」这个 bug 的整条链路：
+    /// 别人读了 → 服务端推**匿名聚合** → SDK 认出来 → 本地 peer_read_pts 前进
+    /// （气泡据此显示已读）→ 发送者能查人数和名单，别人查不了。
+    pub async fn phase47_group_read_receipts(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let alice_uid = manager.user_id("alice")?;
+        let bob_uid = manager.user_id("bob")?;
+        let charlie_uid = manager.user_id("charlie")?;
+
+        // 自己建一个组，不蹭别的 phase 的群：那些群里已经有被读过的消息，
+        // 人数断言会跟着别的 phase 的执行顺序漂。
+        let group = manager
+            .create_group("alice", "group_read_smoke", vec![bob_uid, charlie_uid])
+            .await?;
+        let channel_id = group.group_id;
+        metrics.rpc_calls += 1;
+        if channel_id == 0 {
+            return Err(boxed_err("create group_read_smoke failed"));
+        }
+        metrics.rpc_successes += 1;
+
+        let sent = manager
+            .send_text("alice", channel_id, GROUP_SYNC_CHANNEL_TYPE, "read me")
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.messages_sent += 1;
+        let message_pts = sent.pts.ok_or_else(|| boxed_err("submit returned no pts"))?;
+        let server_message_id = sent
+            .server_msg_id
+            .ok_or_else(|| boxed_err("submit returned no server_msg_id"))?;
+        metrics.rpc_successes += 1;
+
+        // ① 没人读之前：0 人已读，收件人是**发送时**的另外两人（不含发送者）。
+        let stats0 = manager
+            .message_read_stats("alice", channel_id, server_message_id)
+            .await?;
+        metrics.rpc_calls += 1;
+        if stats0.read_count != 0 || stats0.recipient_count != 2 {
+            metrics.errors.push(format!(
+                "before anyone reads: read_count={} recipient_count={} (want 0/2)",
+                stats0.read_count, stats0.recipient_count
+            ));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+
+        // ② bob 读到这条消息。
+        manager.mark_read("bob", channel_id, message_pts).await?;
+        metrics.rpc_calls += 1;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        manager.refresh_all_local_views().await?;
+
+        // ③ 聚合必须落到 alice 本地：气泡的「已读」就是从这个水位算的。
+        //    这一条挡的正是原来的 bug——服务端只给 Direct 推，群消息永远停在已发送。
+        let extra = manager
+            .get_local_channel_extra("alice", channel_id, GROUP_SYNC_CHANNEL_TYPE as i32)
+            .await?;
+        let peer_read_pts = extra.map(|e| e.peer_read_pts).unwrap_or(0);
+        if peer_read_pts < message_pts {
+            metrics.errors.push(format!(
+                "alice local peer_read_pts={peer_read_pts} < message pts={message_pts}: \
+                 群聚合没有到达客户端，气泡会一直停在「已发送」"
+            ));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+
+        // ④ 人数与名单。
+        let stats1 = manager
+            .message_read_stats("alice", channel_id, server_message_id)
+            .await?;
+        metrics.rpc_calls += 1;
+        if stats1.read_count != 1 || stats1.unread_count != 1 {
+            metrics.errors.push(format!(
+                "after bob reads: read_count={} unread_count={} (want 1/1)",
+                stats1.read_count, stats1.unread_count
+            ));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+        if stats1.detail_expires_at <= 0 {
+            metrics
+                .errors
+                .push("read_stats 没有回 detail_expires_at".to_string());
+        }
+
+        let list1 = manager
+            .read_list("alice", channel_id, server_message_id)
+            .await?;
+        metrics.rpc_calls += 1;
+        let ids1: Vec<u64> = list1.readers.iter().map(|r| r.user_id).collect();
+        if ids1 != vec![bob_uid] {
+            metrics
+                .errors
+                .push(format!("read_list={ids1:?} (want [{bob_uid}])"));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+
+        // ⑤ 只有发送者能查。bob 是收件人，不是发送者。
+        match manager
+            .message_read_stats("bob", channel_id, server_message_id)
+            .await
+        {
+            Ok(_) => metrics
+                .errors
+                .push("bob（非发送者）竟然查到了已读统计".to_string()),
+            Err(_) => metrics.rpc_successes += 1,
+        }
+        metrics.rpc_calls += 1;
+
+        // ⑥ charlie 也读 → 2 人；键集分页每页 1 条，两页应当**不重不漏**。
+        manager
+            .mark_read("charlie", channel_id, message_pts)
+            .await?;
+        metrics.rpc_calls += 1;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let stats2 = manager
+            .message_read_stats("alice", channel_id, server_message_id)
+            .await?;
+        metrics.rpc_calls += 1;
+        if stats2.read_count != 2 || stats2.unread_count != 0 {
+            metrics.errors.push(format!(
+                "after charlie reads: read_count={} unread_count={} (want 2/0)",
+                stats2.read_count, stats2.unread_count
+            ));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+
+        let page1 = manager
+            .read_list_page("alice", channel_id, server_message_id, 0, Some(1))
+            .await?;
+        metrics.rpc_calls += 1;
+        let cursor = page1
+            .next_after_user_id
+            .ok_or_else(|| boxed_err("第一页没有回 next_after_user_id"))?;
+        let page2 = manager
+            .read_list_page("alice", channel_id, server_message_id, cursor, Some(1))
+            .await?;
+        metrics.rpc_calls += 1;
+        let mut paged: Vec<u64> = page1
+            .readers
+            .iter()
+            .chain(page2.readers.iter())
+            .map(|r| r.user_id)
+            .collect();
+        paged.sort_unstable();
+        let mut want = vec![bob_uid, charlie_uid];
+        want.sort_unstable();
+        if paged != want {
+            metrics.errors.push(format!(
+                "keyset 分页结果={paged:?} (want {want:?})：重复或漏项"
+            ));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+        if !page1.has_more {
+            metrics
+                .errors
+                .push("第一页 has_more=false，但还有第二页".to_string());
+        }
+
+        Ok(PhaseResult {
+            phase_name: "group-read-receipts".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: format!(
+                "group={channel_id} msg={server_message_id} pts={message_pts} \
+                 alice={alice_uid} peer_read_pts={peer_read_pts} \
+                 read_count 0→{}→{}",
+                stats1.read_count, stats2.read_count
+            ),
+            metrics,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

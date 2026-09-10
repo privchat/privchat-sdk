@@ -173,6 +173,9 @@ impl MultiAccountManager {
         let tcp_port = parse_env_u16("PRIVCHAT_TCP_PORT", 9001);
         let quic_port = parse_env_u16("PRIVCHAT_QUIC_PORT", 9001);
         let ws_port = parse_env_u16("PRIVCHAT_WS_PORT", 9080);
+        // 网关的 WS 路径是配置项（本地 config.toml 用 /gate），路径不对是 404，
+        // 报出来像「连不上」而不是「路径写错」。
+        let ws_path = std::env::var("PRIVCHAT_WS_PATH").unwrap_or_else(|_| "/".to_string());
 
         let endpoints = vec![
             ServerEndpoint {
@@ -193,7 +196,7 @@ impl MultiAccountManager {
                 protocol: TransportProtocol::WebSocket,
                 host,
                 port: ws_port,
-                path: Some("/".to_string()),
+                path: Some(ws_path),
                 use_tls: false,
             },
         ];
@@ -707,6 +710,28 @@ impl MultiAccountManager {
         .await
     }
 
+    /// 键集分页版：`after_user_id` 传上一页的 `next_after_user_id`。
+    pub async fn read_list_page(
+        &self,
+        key: &str,
+        channel_id: u64,
+        server_message_id: u64,
+        after_user_id: u64,
+        limit: Option<u32>,
+    ) -> BoxResult<MessageReadListResponse> {
+        self.rpc_typed(
+            key,
+            routes::message_status::READ_LIST,
+            &MessageReadListRequest {
+                message_id: server_message_id,
+                channel_id,
+                after_user_id,
+                limit,
+            },
+        )
+        .await
+    }
+
     pub async fn read_list(
         &self,
         key: &str,
@@ -719,6 +744,8 @@ impl MultiAccountManager {
             &MessageReadListRequest {
                 message_id: server_message_id,
                 channel_id,
+                after_user_id: 0,
+                limit: None,
             },
         )
         .await
