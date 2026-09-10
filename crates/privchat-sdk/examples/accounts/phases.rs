@@ -6523,6 +6523,94 @@ source={} sealed_cache={} extra={}",
             metrics,
         })
     }
+
+    /// 明细过期之后，**已读状态本身仍然工作**（READ_STATUS_SPEC §6.5.1 / §6.5.4）。
+    ///
+    /// 两层是分开的：聚合水位永久保留，过期的只是「谁读的」这份名单。
+    /// 如果哪天有人把聚合推送也挂到窗口上，第 8 天的群消息就再也不会显示已读了，
+    /// 而这种退化不会有任何报错——所以要有一条断言钉住它。
+    ///
+    /// 需要服务端配 `[message] read_detail_retention_days = 0` 才有意义（窗口当场过期），
+    /// 所以由 `PRIVCHAT_EXPECT_READ_DETAIL_EXPIRED=1` 显式打开；没开就跳过，
+    /// 但**说明自己跳过了**，不会伪装成通过。
+    pub async fn phase48_group_read_survives_detail_expiry(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+        let armed = std::env::var("PRIVCHAT_EXPECT_READ_DETAIL_EXPIRED")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !armed {
+            return Ok(PhaseResult {
+                phase_name: "group-read-survives-expiry".to_string(),
+                success: true,
+                duration: start.elapsed(),
+                details: "skipped: 需服务端 read_detail_retention_days=0 并设 \
+                          PRIVCHAT_EXPECT_READ_DETAIL_EXPIRED=1"
+                    .to_string(),
+                metrics,
+            });
+        }
+
+        let bob_uid = manager.user_id("bob")?;
+        let charlie_uid = manager.user_id("charlie")?;
+        let group = manager
+            .create_group("alice", "group_read_expired", vec![bob_uid, charlie_uid])
+            .await?;
+        let channel_id = group.group_id;
+        metrics.rpc_calls += 1;
+        let sent = manager
+            .send_text("alice", channel_id, GROUP_SYNC_CHANNEL_TYPE, "expired soon")
+            .await?;
+        metrics.rpc_calls += 1;
+        metrics.messages_sent += 1;
+        let message_pts = sent.pts.ok_or_else(|| boxed_err("submit returned no pts"))?;
+        let server_message_id = sent
+            .server_msg_id
+            .ok_or_else(|| boxed_err("submit returned no server_msg_id"))?;
+
+        manager.mark_read("bob", channel_id, message_pts).await?;
+        metrics.rpc_calls += 1;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        manager.refresh_all_local_views().await?;
+
+        // 明细必须被拒。
+        match manager
+            .message_read_stats("alice", channel_id, server_message_id)
+            .await
+        {
+            Ok(_) => metrics
+                .errors
+                .push("窗口为 0 时仍然查到了已读明细".to_string()),
+            Err(_) => metrics.rpc_successes += 1,
+        }
+        metrics.rpc_calls += 1;
+
+        // 但气泡的「已读」要照常：聚合水位不受窗口影响。
+        let extra = manager
+            .get_local_channel_extra("alice", channel_id, GROUP_SYNC_CHANNEL_TYPE as i32)
+            .await?;
+        let peer_read_pts = extra.map(|e| e.peer_read_pts).unwrap_or(0);
+        if peer_read_pts < message_pts {
+            metrics.errors.push(format!(
+                "明细过期后聚合也没了：peer_read_pts={peer_read_pts} < pts={message_pts}，\
+                 群消息会退回「已发送」"
+            ));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+
+        Ok(PhaseResult {
+            phase_name: "group-read-survives-expiry".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: format!(
+                "group={channel_id} msg={server_message_id} 明细被拒、聚合 pts={peer_read_pts} 保留"
+            ),
+            metrics,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
