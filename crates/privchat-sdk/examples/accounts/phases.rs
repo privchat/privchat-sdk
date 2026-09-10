@@ -6454,6 +6454,29 @@ source={} sealed_cache={} extra={}",
             metrics.rpc_successes += 1;
         }
 
+        // ⑥b 同一个人重复上报、以及乱序回退的上报，都不得改变人数（§6.5.9）。
+        //
+        // 多端同时在线时重复上报是常态，而人数一旦按"上报次数"算，
+        // 群里两台设备的人就会被数成两个人。
+        manager
+            .mark_read("charlie", channel_id, message_pts)
+            .await?;
+        manager.mark_read("bob", channel_id, 1).await?; // 回退的水位
+        metrics.rpc_calls += 2;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let stats_dup = manager
+            .message_read_stats("alice", channel_id, server_message_id)
+            .await?;
+        metrics.rpc_calls += 1;
+        if stats_dup.read_count != 2 {
+            metrics.errors.push(format!(
+                "重复/乱序上报后 read_count={}（应仍为 2）",
+                stats_dup.read_count
+            ));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+
         let page1 = manager
             .read_list_page("alice", channel_id, server_message_id, 0, Some(1))
             .await?;
