@@ -6107,15 +6107,19 @@ impl State {
         let notification_type =
             Self::json_field_string(&payload_json, &["metadata", "notification_type"])?;
 
+        // 🔴 这里匹配的是 `notification_type`，而**区分 self / peer / 群聚合的是
+        // `metadata.visibility`**。notification_type 对这三者恒为
+        // "channel_read_cursor_updated"（见 protocol 的 ChannelReadCursorNotification::new）。
+        //
+        // 群聚合（READ_STATUS_SPEC §6.5.8）因此走的就是下面这一支：它带 reader_id = 0，
+        // 落到下游 `channel_read_cursor` 的 apply 时，reader_id != current_uid 走对端分支、
+        // 写进 peer_read_pts —— 气泡的「已读」正是从这个水位算出来的。
+        // 想按 visibility 再加一支的话，先确认这里读的是 visibility，否则那一支永远命中不了。
         match notification_type.as_str() {
             // 已读游标同步通知：走 channel_read_cursor 实体
             "self_read_pts_updated"
             | "peer_read_pts_updated"
             | "user_read_pts"
-            // 群聚合已读（READ_STATUS_SPEC §6.5.8）：与对端已读同构，只是 reader_id 恒为 0
-            // ——它是「除你之外的最大水位」，不指向任何具体阅读者。漏掉这一支的后果是
-            // 群消息的气泡永远停在「已发送」：服务端推了，SDK 认不出来就直接丢了。
-            | "group_read_aggregate_updated"
             | "channel_read_cursor_updated" => {
                 let channel_id =
                     Self::json_field_u64(&payload_json, &["metadata", "channel_id"]).unwrap_or(0);
