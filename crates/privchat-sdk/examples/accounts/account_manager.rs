@@ -463,6 +463,18 @@ impl MultiAccountManager {
         self.direct_channels.get(&direct_key(a, b)).copied()
     }
 
+    /// 本地 user 表里的一条记录（entity sync 落下来的那份）。
+    ///
+    /// 「我」页与好友列表读的都是它，不是每次去查服务器——所以断言"页面能显示出
+    /// 名字"要看的就是这一份。
+    pub async fn local_user(
+        &self,
+        key: &str,
+        user_id: u64,
+    ) -> BoxResult<Option<privchat_sdk::StoredUser>> {
+        Ok(self.account(key)?.sdk.get_user_by_id(user_id).await?)
+    }
+
     pub async fn list_local_friends(
         &self,
         key: &str,

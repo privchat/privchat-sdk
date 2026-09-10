@@ -248,6 +248,10 @@ impl TestCoordinator {
             self.run_phase("phase47_group_read_receipts", TestPhases::phase47_group_read_receipts(manager).await)
                 .await;
         }
+        if self.enabled("phase49_self_profile_update") {
+            self.run_phase("phase49_self_profile_update", TestPhases::phase49_self_profile_update(manager).await)
+                .await;
+        }
         if self.enabled("phase48_group_read_survives_detail_expiry") {
             self.run_phase("phase48_group_read_survives_detail_expiry", TestPhases::phase48_group_read_survives_detail_expiry(manager).await)
                 .await;

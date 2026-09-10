@@ -6524,6 +6524,114 @@ source={} sealed_cache={} extra={}",
         })
     }
 
+    /// BUILTIN 部署下用户能改自己的昵称，并且改完别人查得到（`account/profile/update`）。
+    ///
+    /// 这条路由此前整个模块被注释掉：handler 是「返回 success 但什么都不写」的桩。
+    /// 于是本地版 / 独立部署的「我」页一边显示「未设置」，一边把用户送进一个
+    /// 只会报错的昵称页。桩的危险在于**纯函数测试照样全绿**，所以这里必须
+    /// 真的发一次 RPC，再从别人的视角把新昵称读回来。
+    pub async fn phase49_self_profile_update(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let mut metrics = PhaseMetrics::default();
+
+        let alice = manager.account_config("alice")?;
+        let nickname = format!("昵称{}", alice.user_id % 10_000);
+
+        #[derive(serde::Serialize)]
+        struct UpdateReq<'a> {
+            display_name: &'a str,
+        }
+        let resp: serde_json::Value = manager
+            .rpc_typed(
+                "alice",
+                "account/profile/update",
+                &UpdateReq {
+                    display_name: &nickname,
+                },
+            )
+            .await?;
+        metrics.rpc_calls += 1;
+        if resp.get("display_name").and_then(|v| v.as_str()) != Some(nickname.as_str()) {
+            metrics
+                .errors
+                .push(format!("更新响应里的昵称不对: {resp}"));
+        } else {
+            metrics.rpc_successes += 1;
+        }
+
+        // 别人看得到才算写进去了：桩接口能把响应编得很好看，但改不了别人读到的数据。
+        let seen = manager
+            .search_users("bob", &alice.username)
+            .await?
+            .users
+            .into_iter()
+            .find(|u| u.user_id == alice.user_id);
+        metrics.rpc_calls += 1;
+        match seen {
+            Some(u) if u.nickname == nickname => metrics.rpc_successes += 1,
+            Some(u) => metrics.errors.push(format!(
+                "bob 搜到的昵称是 {:?}，期望 {nickname}",
+                u.nickname
+            )),
+            None => metrics
+                .errors
+                .push("bob 搜不到 alice，无法验证昵称".to_string()),
+        }
+
+        // 空请求必须被拒：什么都不改却回 success，正是桩接口的行为。
+        #[derive(serde::Serialize)]
+        struct EmptyReq {}
+        match manager
+            .rpc_typed::<_, serde_json::Value>("alice", "account/profile/update", &EmptyReq {})
+            .await
+        {
+            Ok(v) => metrics
+                .errors
+                .push(format!("空请求竟然成功了: {v}")),
+            Err(_) => metrics.rpc_successes += 1,
+        }
+        metrics.rpc_calls += 1;
+
+        // 「我」页读的是**本地** user 记录（entity sync 落下来的那份），
+        // 而不是每次去查服务器。所以要断言本地这份同时有 username 和新昵称：
+        // 少了 username，页面就只能显示 uid —— spec 反复要求少外露的正是它。
+        manager.refresh_all_local_views().await?;
+        let local_self = manager.local_user("alice", alice.user_id).await?;
+        match local_self {
+            Some(u) => {
+                if u.username.as_deref() != Some(alice.username.as_str()) {
+                    metrics.errors.push(format!(
+                        "本地 self 记录缺 username: {:?}（「我」页会退回显示 uid）",
+                        u.username
+                    ));
+                } else {
+                    metrics.rpc_successes += 1;
+                }
+                if u.nickname.as_deref() != Some(nickname.as_str()) {
+                    metrics.errors.push(format!(
+                        "本地 self 记录的昵称是 {:?}，期望 {nickname}",
+                        u.nickname
+                    ));
+                } else {
+                    metrics.rpc_successes += 1;
+                }
+            }
+            None => metrics
+                .errors
+                .push("本地没有 self 的 user 记录：「我」页拿不到任何名字".to_string()),
+        }
+
+        Ok(PhaseResult {
+            phase_name: "self-profile-update".to_string(),
+            success: metrics.errors.is_empty(),
+            duration: start.elapsed(),
+            details: format!("alice={} nickname={nickname}", alice.user_id),
+            metrics,
+        })
+    }
+
     /// 明细过期之后，**已读状态本身仍然工作**（READ_STATUS_SPEC §6.5.1 / §6.5.4）。
     ///
     /// 两层是分开的：聚合水位永久保留，过期的只是「谁读的」这份名单。
