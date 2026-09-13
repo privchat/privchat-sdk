@@ -176,6 +176,19 @@ struct InstallState {
     install_secret: [u8; 32],
 }
 
+/// 撤回一条消息时，判断"它该不该从未读角标里扣掉"所需要的全部事实。
+///
+/// 单独拎成一个结构是因为它们必须在消息被改写成「消息已撤回」**之前**读出来——
+/// 那条 UPDATE 会把 `type` 置 0，事后再查就分不出原本是不是系统消息了。
+#[derive(Debug, Clone, Copy)]
+struct RevokedMessageFacts {
+    channel_id: i64,
+    channel_type: i32,
+    from_uid: i64,
+    pts: i64,
+    message_type: i32,
+}
+
 #[derive(Debug, Clone)]
 struct EncryptedBlob {
     ciphertext: Vec<u8>,
@@ -2063,30 +2076,37 @@ impl LocalStore {
     ) -> Result<Option<StoredMessage>> {
         let conn = self.conn_for_user(uid)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let updated = if revoked {
-            conn.execute(
-                "UPDATE message
-                 SET type = 0, content = ?1, searchable_word = ?1, updated_at = ?2
-                 WHERE server_message_id = ?3",
-                params!["消息已撤回", now_ms, server_message_id as i64],
-            )
-            .map_err(|e| Error::Storage(format!("update revoked message by server id: {e}")))?
-        } else {
-            0
-        };
-        if updated == 0 {
+        if !revoked {
             return Ok(None);
         }
-        let (message_id, channel_id, channel_type): (i64, i64, i32) = conn
+        // 先定位 + 取事实，再改写。原来是「先 UPDATE，再按 server_message_id 回查」，
+        // 那样等拿到行时 `type` 已被置 0，分不出这条原本是不是系统消息。
+        let message_id: i64 = match conn
             .query_row(
-                "SELECT id, channel_id, channel_type
-                 FROM message
-                 WHERE server_message_id = ?1
-                 LIMIT 1",
+                "SELECT id FROM message WHERE server_message_id = ?1 LIMIT 1",
                 params![server_message_id as i64],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
-            .map_err(|e| Error::Storage(format!("query revoked message by server id: {e}")))?;
+            .optional()
+            .map_err(|e| Error::Storage(format!("query revoked message by server id: {e}")))?
+        {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let facts = Self::load_revoked_message_facts(&conn, message_id)?;
+        // 扣角标只能发生一次，所以要在写 message_extra **之前**取撤回旧值。
+        let was_revoked = Self::is_message_already_revoked(&conn, message_id)?;
+        let (channel_id, channel_type) = match facts {
+            Some(f) => (f.channel_id, f.channel_type),
+            None => return Ok(None),
+        };
+        conn.execute(
+            "UPDATE message
+             SET type = 0, content = ?1, searchable_word = ?1, updated_at = ?2
+             WHERE id = ?3",
+            params!["消息已撤回", now_ms, message_id],
+        )
+        .map_err(|e| Error::Storage(format!("update revoked message by server id: {e}")))?;
         conn.execute(
             "INSERT INTO message_extra (
                 message_id, channel_id, channel_type, revoke, revoker, extra_version
@@ -2105,6 +2125,16 @@ impl LocalStore {
             ],
         )
         .map_err(|e| Error::Storage(format!("set message revoke by server id: {e}")))?;
+        if !was_revoked {
+            // 撤回的消息不再占未读角标。收口在存储层而不是各个调用点：撤回有三条落地
+            // 路径（sync 的 deleted 实体、message_extra 实体、extra 的实时投递），
+            // 挂在调用点上迟早漏一条。
+            if let Some(facts) = facts.as_ref() {
+                let uid_i64 = uid.parse::<i64>().unwrap_or_default();
+                Self::discount_unread_for_revoked_message(&conn, uid_i64, facts)?;
+            }
+        }
+        drop(conn);
         self.get_message_by_id(uid, message_id as u64)
     }
 
@@ -3216,6 +3246,110 @@ impl LocalStore {
         }
 
         Ok(exact_unread)
+    }
+
+    /// 一条消息被撤回后，把它从该会话的未读角标里扣掉。
+    ///
+    /// 撤回的消息不该继续占着角标：用户点进去只会看到「消息已撤回」，没有任何东西可读，
+    /// 而角标还在催他。
+    ///
+    /// **精确扣减，不是整体重算。** 重算（按本地 message 表数一遍未读）看着更"自愈"，
+    /// 实际会把角标错误清零：本地 message 表未必含有构成未读的那些消息——新设备冷同步
+    /// 时 channel 实体带着 unread=4 先到，消息还没拉下来，这时重算得 0，角标就没了。
+    /// 扣减只依赖"这一条该不该减"，不依赖本地历史是否完整。
+    ///
+    /// 判定口径与入站时 `should_bump_unread` 严格对齐：别人发的、非系统消息、在读水位
+    /// 之后的，才曾经被计入过。`channel_extra` 没有行时读水位视为 0——**没有读水位行就是
+    /// 一次都没读过**，那这条必然是未读，正好也是角标亮着的那种情况。
+    ///
+    /// ⚠️ 调用方必须保证幂等：只在"这条消息此前未被标记撤回"时调用。
+    /// [`Self::set_message_revoke`] 那条 UPDATE 没有"已撤回就跳过"的守卫，重放同一条
+    /// 撤回事件照样报告更新成功，无脑扣减会把本该保留的未读一路啃到 0。
+    fn discount_unread_for_revoked_message(
+        conn: &Connection,
+        uid_i64: i64,
+        facts: &RevokedMessageFacts,
+    ) -> Result<()> {
+        let RevokedMessageFacts {
+            channel_id,
+            channel_type,
+            from_uid,
+            pts,
+            message_type,
+        } = *facts;
+
+        // 自己发的从来没进过角标；系统消息同理（SYSTEM_MESSAGE_SPEC §6）。
+        let system_type = privchat_protocol::message::ContentMessageType::System as i32;
+        if from_uid == uid_i64 || message_type == system_type {
+            return Ok(());
+        }
+
+        let keep_pts: i64 = conn
+            .query_row(
+                "SELECT keep_pts
+                 FROM channel_extra
+                 WHERE channel_id = ?1 AND channel_type = ?2
+                 LIMIT 1",
+                params![channel_id, channel_type],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("discount unread query keep_pts: {e}")))?
+            .unwrap_or(0);
+        // 已经读过它了，它不在角标里，减了就会误伤别的未读消息。
+        if pts <= keep_pts {
+            return Ok(());
+        }
+
+        conn.execute(
+            "UPDATE channel
+                SET unread_count = MAX(0, unread_count - 1), updated_at = ?2
+              WHERE channel_id = ?1 AND unread_count > 0",
+            params![channel_id, chrono::Utc::now().timestamp_millis()],
+        )
+        .map_err(|e| Error::Storage(format!("discount unread update channel: {e}")))?;
+        Ok(())
+    }
+
+    /// 在把消息改写成「消息已撤回」**之前**，把扣角标要用到的事实抓下来。
+    ///
+    /// 必须提前抓：撤回那条 UPDATE 会把 `type` 置 0，事后再读就分不出这条原本是不是
+    /// 系统消息了。
+    fn load_revoked_message_facts(
+        conn: &Connection,
+        message_id: i64,
+    ) -> Result<Option<RevokedMessageFacts>> {
+        conn.query_row(
+            "SELECT channel_id, channel_type, from_uid, COALESCE(pts, 0), type
+             FROM message
+             WHERE id = ?1
+             LIMIT 1",
+            params![message_id],
+            |r| {
+                Ok(RevokedMessageFacts {
+                    channel_id: r.get(0)?,
+                    channel_type: r.get(1)?,
+                    from_uid: r.get(2)?,
+                    pts: r.get(3)?,
+                    message_type: r.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| Error::Storage(format!("load revoked message facts: {e}")))
+    }
+
+    /// 这条消息此前是否已被标记撤回。用于让撤回的副作用（扣角标）只发生一次。
+    fn is_message_already_revoked(conn: &Connection, message_id: i64) -> Result<bool> {
+        let revoked: Option<i64> = conn
+            .query_row(
+                "SELECT revoke FROM message_extra WHERE message_id = ?1 LIMIT 1",
+                params![message_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(format!("query message revoked flag: {e}")))?;
+        Ok(revoked.unwrap_or(0) != 0)
     }
 
     pub fn upsert_channel_extra(&self, uid: &str, input: &UpsertChannelExtraInput) -> Result<()> {
@@ -4944,6 +5078,9 @@ impl LocalStore {
             Err(e) => return Err(Error::Storage(format!("query message for revoke: {e}"))),
         };
         let now_ms = chrono::Utc::now().timestamp_millis();
+        // 事实与"此前是否已撤回"都要在改写之前取：下面那条 UPDATE 会把 type 置 0。
+        let facts = Self::load_revoked_message_facts(&conn, message_id as i64)?;
+        let was_revoked = Self::is_message_already_revoked(&conn, message_id as i64)?;
         conn.execute(
             "INSERT INTO message_extra (
                 message_id, channel_id, channel_type, revoke, revoker, extra_version
@@ -4976,6 +5113,15 @@ impl LocalStore {
                     "set message revoke failed: message.id={} not found",
                     message_id
                 )));
+            }
+            // 撤回的消息不再占未读角标。放在存储层而不是各个调用点：撤回有三条落地路径
+            // （sync 的 deleted 实体、message_extra 实体、以及 extra 的实时投递），
+            // 挂在调用点上迟早漏一条。
+            if !was_revoked {
+                if let Some(facts) = facts.as_ref() {
+                    let uid_i64 = uid.parse::<i64>().unwrap_or_default();
+                    Self::discount_unread_for_revoked_message(&conn, uid_i64, facts)?;
+                }
             }
         }
         Ok(())
@@ -8301,6 +8447,155 @@ mod tests {
         let page = store.list_channels(uid, 20, 0).expect("list channels");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].channel_id, 9001);
+    }
+
+    /// 撤回一条未读消息后，角标要跟着少一。
+    ///
+    /// 会话里两条别人发的未读消息，撤回其中一条 → 角标必须从 2 变 1。撤回后的消息
+    /// 点进去只剩「消息已撤回」，没有任何东西可读，角标却还在催人。
+    #[test]
+    fn revoking_an_unread_message_drops_it_from_the_badge() {
+        let store = test_store();
+        let uid = "10101";
+        let channel_id = 610_u64;
+        let channel_type = 1_i32;
+
+        for (server_id, pts) in [(960001_u64, 100_i64), (960002, 101)] {
+            store
+                .upsert_remote_message_with_result(
+                    uid,
+                    &UpsertRemoteMessageInput {
+                        server_message_id: server_id,
+                        local_message_id: 0,
+                        channel_id,
+                        channel_type,
+                        timestamp: 1_700_000_000_000 + pts,
+                        from_uid: 200,
+                        message_type: 1,
+                        content: format!("peer-{server_id}"),
+                        status: 2,
+                        searchable_word: String::new(),
+                        setting: 0,
+                        pts,
+                        order_seq: pts,
+                        extra: "{}".to_string(),
+                        timestamp_precision:
+                            crate::canonical_inbound::TimePrecision::Milliseconds,
+                        mime_type: None,
+                        revoked: false,
+                    },
+                )
+                .expect("insert peer message");
+        }
+
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id,
+                    channel_type,
+                    channel_name: "peer".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 2,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 0,
+                    last_local_message_id: 0,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: Some(200),
+                },
+            )
+            .expect("upsert channel");
+
+        store
+            .set_message_revoke_by_server_message_id(uid, 960002, true, Some(200))
+            .expect("revoke message");
+
+        let unread = store
+            .get_channel_unread_count(uid, channel_id, channel_type)
+            .expect("unread after revoke");
+        assert_eq!(
+            unread, 1,
+            "撤回了一条未读消息，角标却没减——用户点进去只会看到「消息已撤回」，没有东西可读"
+        );
+    }
+
+    /// 同一条撤回事件重放，角标不能越减越少。
+    ///
+    /// `set_message_revoke_by_server_message_id` 的 UPDATE 没有「已撤回就跳过」的守卫，
+    /// 重放时照样报告更新成功。所以这里必须是重算而不是减一——减一会在每次重放时
+    /// 再扣一次，把本该保留的未读一路啃到 0。
+    #[test]
+    fn replaying_the_same_revoke_does_not_keep_eating_the_badge() {
+        let store = test_store();
+        let uid = "10102";
+        let channel_id = 611_u64;
+        let channel_type = 1_i32;
+
+        for (server_id, pts) in [(970001_u64, 100_i64), (970002, 101), (970003, 102)] {
+            store
+                .upsert_remote_message_with_result(
+                    uid,
+                    &UpsertRemoteMessageInput {
+                        server_message_id: server_id,
+                        local_message_id: 0,
+                        channel_id,
+                        channel_type,
+                        timestamp: 1_700_000_000_000 + pts,
+                        from_uid: 200,
+                        message_type: 1,
+                        content: format!("peer-{server_id}"),
+                        status: 2,
+                        searchable_word: String::new(),
+                        setting: 0,
+                        pts,
+                        order_seq: pts,
+                        extra: "{}".to_string(),
+                        timestamp_precision:
+                            crate::canonical_inbound::TimePrecision::Milliseconds,
+                        mime_type: None,
+                        revoked: false,
+                    },
+                )
+                .expect("insert peer message");
+        }
+
+        store
+            .upsert_channel(
+                uid,
+                &UpsertChannelInput {
+                    channel_id,
+                    channel_type,
+                    channel_name: "peer".to_string(),
+                    channel_remark: String::new(),
+                    avatar: String::new(),
+                    unread_count: 3,
+                    top: 0,
+                    mute: 0,
+                    last_msg_timestamp: 0,
+                    last_local_message_id: 0,
+                    last_msg_content: String::new(),
+                    version: 1,
+                    peer_user_id: Some(200),
+                },
+            )
+            .expect("upsert channel");
+
+        for _ in 0..4 {
+            store
+                .set_message_revoke_by_server_message_id(uid, 970003, true, Some(200))
+                .expect("revoke message");
+        }
+
+        let unread = store
+            .get_channel_unread_count(uid, channel_id, channel_type)
+            .expect("unread after repeated revoke");
+        assert_eq!(
+            unread, 2,
+            "同一条撤回被重放了 4 次，角标被多扣了——剩下两条没读的消息不该因此消失"
+        );
     }
 
     #[test]

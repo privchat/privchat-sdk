@@ -24133,7 +24133,12 @@ mod tests {
             .expect("read channel")
             .expect("channel exists");
         assert_eq!(channel.channel_name, "resume-room");
-        assert_eq!(channel.unread_count, 4);
+        // 实体带来 unread=4，随后 70001 被撤回。它是别人发的、在读水位之后，本来就占着
+        // 角标里的一格，撤回后要还回来 → 3。
+        //
+        // 这里也顺带证明了扣减优于整体重算：本地只落了 1 条消息，而服务端说有 4 条未读
+        // （其余几条还没拉下来）。重算会数出 1、甚至把角标抹成 0；扣减只动该动的那一格。
+        assert_eq!(channel.unread_count, 3);
         assert_eq!(channel.top, 1);
         assert_eq!(channel.version, 12);
 
