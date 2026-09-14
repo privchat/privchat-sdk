@@ -3134,6 +3134,16 @@ enum Command {
         channel_type: i32,
         resp: oneshot::Sender<Result<usize>>,
     },
+    /// 只对**单个**频道按水位追一次增量（`get_difference`），不带实体族同步。
+    ///
+    /// 与 [`Command::SyncChannel`] 的区别是请求数：那个还会同步 channel 实体、
+    /// read cursor、群成员，一次打四五个 RPC；打开会话是高频动作，只需要
+    /// 「我本地这条时间线落后了吗」这一个问题。没有新消息时它是 1 个 RPC。
+    ResumeChannelDifference {
+        channel_id: u64,
+        channel_type: i32,
+        resp: oneshot::Sender<Result<usize>>,
+    },
     SyncAllChannels {
         resp: oneshot::Sender<Result<usize>>,
     },
@@ -15693,6 +15703,29 @@ impl PrivchatSdk {
                             let _ = resp.send(result);
                         }
                     }
+                    Command::ResumeChannelDifference {
+                        channel_id,
+                        channel_type,
+                        resp,
+                    } => {
+                        // 超时取 8s：这是用户已经盯着会话页在等的那次请求，
+                        // 卡住就该尽快让位给本地内容，而不是按后台同步的 30s 去熬。
+                        let result = match state.require_authenticated() {
+                            Ok(()) => match timeout(
+                                Duration::from_secs(8),
+                                state.resume_channel_difference(channel_id, channel_type),
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => Err(Error::Transport(
+                                    "resume_channel_difference timeout".to_string(),
+                                )),
+                            },
+                            Err(e) => Err(e),
+                        };
+                        let _ = resp.send(result);
+                    }
                     Command::SyncChannel {
                         channel_id,
                         channel_type,
@@ -18519,6 +18552,25 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    /// 对单个频道按水位追一次增量。见 [`Command::ResumeChannelDifference`]。
+    pub async fn resume_channel_difference(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+    ) -> Result<usize> {
+        self.ensure_running()?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::ResumeChannelDifference {
+                channel_id,
+                channel_type,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| self.actor_channel_error())?;
+        resp_rx.await.map_err(|_| self.actor_channel_error())?
+    }
+
     pub async fn sync_channel(&self, channel_id: u64, channel_type: i32) -> Result<usize> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -19578,10 +19630,32 @@ impl PrivchatSdk {
             .map(|s| s.hydrated)
             .unwrap_or(false);
         if !should_hydrate_latest_window(hydrated, local.len()) {
+            // 补过窗口了，但**不等于时间线是齐的**。
+            //
+            // 这里原来直接返回本地就结束了，于是点推送进来看到的永远是本地快照：
+            // 那条刚推送过来的消息要等 Phase 3 后台收敛才落库。实测从连上到消息出现
+            // 10 秒——Phase 2 完成后先等 5s 宽限，再批量比对 pts，才轮到这个频道。
+            // 而用户正盯着的就是这一个会话。
+            //
+            // 所以按水位追一次增量：`get_difference(本地 pts)`，没有新消息时是 1 个
+            // 空响应，有新消息时顺带补齐。不走 `sync_channel`——那个还要同步频道实体、
+            // read cursor、群成员，一次四五个 RPC，打开会话是高频动作扛不住。
+            //
+            // 🔴 失败不影响这次打开：本地内容照常返回。追齐是锦上添花，Phase 3 仍是兜底。
+            let caught_up = self
+                .resume_channel_difference(channel_id, channel_type)
+                .await
+                .unwrap_or(0);
+            let messages = if caught_up > 0 {
+                self.list_messages(channel_id, channel_type, limit as usize, 0)
+                    .await?
+            } else {
+                local
+            };
             return Ok(OpenConversationPage {
-                messages: local,
+                messages,
                 has_more_before: read_has_more(self.kv_get_local(gap_key).await?),
-                fetched_from_server: false,
+                fetched_from_server: caught_up > 0,
             });
         }
 
@@ -21770,6 +21844,23 @@ mod tests {
         );
         assert!(!should_hydrate_latest_window(true, 0));
         assert!(!should_hydrate_latest_window(true, 50));
+    }
+
+    /// 「补过窗口」只决定要不要拉整页历史，**不代表时间线是齐的**。
+    ///
+    /// 这条用来钉住语义边界：hydrated=true 时 open_conversation 不再拉整页，但必须
+    /// 另外按水位追一次增量。少了那一步，点推送进来看到的永远是本地快照——实测要等
+    /// Phase 3 后台收敛（5s 宽限 + 批量比对 pts）才补上，从连上到消息出现 10 秒。
+    #[test]
+    fn hydrated_does_not_mean_the_timeline_is_caught_up() {
+        // 已 hydrated：不拉整页。
+        assert!(!should_hydrate_latest_window(true, 50));
+        // 但这个判据只回答「要不要整页」，回答不了「有没有更新的消息」——
+        // 后者只有服务端的 pts 知道，所以 open_conversation 在这个分支里
+        // 仍然要走 resume_channel_difference。
+        //
+        // 反过来，从没补过时整页拉取本身就带来了最新窗口，不必再追增量。
+        assert!(should_hydrate_latest_window(false, 0));
     }
 
     #[test]
