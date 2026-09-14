@@ -19646,10 +19646,23 @@ impl PrivchatSdk {
             // read cursor、群成员，一次四五个 RPC，打开会话是高频动作扛不住。
             //
             // 🔴 失败不影响这次打开：本地内容照常返回。追齐是锦上添花，Phase 3 仍是兜底。
-            let caught_up = self
+            // 失败只记不抛：本地内容照常返回，Phase 3 仍是兜底。但必须**打出来**——
+            // 冷启动点推送时，会话页会在连上后约 1 秒就打开，那时 authenticate 未必
+            // 走完，追齐会以 NotAuthenticated 失败。静默吞掉的话，线上表现就是
+            // 「有时快有时慢」而日志里什么都看不到。
+            let caught_up = match self
                 .resume_channel_difference(channel_id, channel_type)
                 .await
-                .unwrap_or(0);
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!(
+                        "[SDK.open_conversation] catch-up skipped channel_id={channel_id} \
+                         channel_type={channel_type}: {e}"
+                    );
+                    0
+                }
+            };
             let messages = if caught_up > 0 {
                 self.list_messages(channel_id, channel_type, limit as usize, 0)
                     .await?
