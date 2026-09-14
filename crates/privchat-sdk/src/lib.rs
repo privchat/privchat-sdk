@@ -18559,6 +18559,10 @@ impl PrivchatSdk {
         channel_type: i32,
     ) -> Result<usize> {
         self.ensure_running()?;
+        // 这是前台工作：用户已经打开了这个会话在等它。唤醒前台即抢占 Phase 3 的后台
+        // 收敛（`run_preemptible_background` 是 biased select，前台一响就放弃本轮后台
+        // 工作），否则这条命令要排在一轮收敛后面，而收敛正是我们要绕开的那个延迟。
+        self.foreground_wakeup.notify_one();
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::ResumeChannelDifference {
