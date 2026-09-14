@@ -8939,9 +8939,9 @@ impl State {
         // 所以那套清理必须在这里也做一遍。
         self.reset_if_owner_changed(&uid, chrono::Utc::now().timestamp_millis());
         // authenticate() 的职责只是用当前 access_token 握手；不应覆盖 login/register 写入的
-        // refresh_token 或过期时间。若该用户已有会话，只原子刷新 access_token；否则才走
+        // refresh_token 或过期时间。若该用户已有会话，原子更新 access_token 与设备绑定；否则才走
         // save_login（用于外部认证首次 handshake，无 refresh_token）。
-        let existing_session = self.storage.load_session(uid.clone()).await.ok().flatten();
+        let existing_session = self.storage.load_session(uid.clone()).await?;
         if let Some(existing) = existing_session.as_ref() {
             // 冷启动 restore：从持久化 snapshot 恢复 bootstrap_completed，与自动重连路径
             // （restore_persisted_session）保持一致。否则每次冷启动 bootstrap_completed 停留在
@@ -8961,9 +8961,9 @@ impl State {
         }
         if existing_session.is_some() {
             self.storage
-                .update_access_token(uid.clone(), token_for_persist, None)
+                .update_authenticated_session(uid.clone(), token_for_persist, device_id_for_persist, None)
                 .await?;
-            // update_access_token 不写 K_CUR_UID；与 save_login 分支保持一致，确保磁盘 current_uid
+            // Credential updates do not write K_CUR_UID. Keep the active account pointer
             // 与本次 authenticate 的 uid 对齐，避免后续 with_uid! 命令读到 None。
             self.storage.save_current_uid(uid.clone()).await?;
         } else {

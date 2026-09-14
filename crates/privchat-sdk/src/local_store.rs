@@ -950,10 +950,11 @@ impl LocalStore {
 
     /// 原子更新 access token；不动 refresh_token / device_id。
     /// `expires_at = None` 表示保持原值不变（Command::Authenticate 外部 token 流程用不到新的过期时间）。
-    pub fn update_access_token(
+    pub fn update_authenticated_session(
         &self,
         uid: &str,
         access_token: &str,
+        device_id: &str,
         expires_at: Option<u64>,
     ) -> Result<()> {
         let master_key = self.load_master_key(uid)?;
@@ -961,6 +962,9 @@ impl LocalStore {
             self.encrypt_user_blob(uid, "access_token", &master_key, access_token.as_bytes())?;
         let auth = self.account_tree(uid, ACCOUNT_TREE_AUTH)?;
         let mut batch = sled::Batch::default();
+        // The token and the device accepted by ConnAuth are one credential.
+        // Persist both in the same batch, including when this account already exists.
+        batch.insert(K_DEVICE_ID_CURRENT, device_id.as_bytes());
         batch.insert(K_ACCESS_TOKEN_ALG, TOKEN_ALG.as_bytes());
         batch.insert(K_ACCESS_TOKEN_ENC, blob.ciphertext);
         batch.insert(K_ACCESS_TOKEN_NONCE, blob.nonce);
@@ -6217,6 +6221,26 @@ mod tests {
         );
         assert!(out.db_path.exists());
         assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn authenticated_device_binding_survives_reopen() {
+        let store = test_store();
+        let path = store.base_dir.as_ref().clone();
+        let uid = "20002";
+        store.save_login(uid, &LoginResult {
+            user_id: 20002, token: "old-access".into(), device_id: "old-device".into(),
+            refresh_token: None, expires_at: 0,
+        }).unwrap();
+        store.set_bootstrap_completed(uid, true).unwrap();
+        store.update_authenticated_session(uid, "new-access", "new-device", None).unwrap();
+        store.flush_user(uid).unwrap();
+        drop(store);
+        let reopened = LocalStore::open_at(path).unwrap();
+        let session = reopened.load_session(uid).unwrap().unwrap();
+        assert_eq!(session.token, "new-access");
+        assert_eq!(session.device_id, "new-device");
+        assert!(session.bootstrap_completed);
     }
 
     #[test]

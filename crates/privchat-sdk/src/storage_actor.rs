@@ -54,9 +54,10 @@ enum StorageCmd {
         uid: String,
         resp: oneshot::Sender<Result<bool>>,
     },
-    UpdateAccessToken {
+    UpdateAuthenticatedSession {
         uid: String,
         access_token: String,
+        device_id: String,
         expires_at: Option<u64>,
         resp: oneshot::Sender<Result<()>>,
     },
@@ -649,17 +650,19 @@ impl StorageHandle {
         resp_rx.await.map_err(|_| Error::ActorClosed)?
     }
 
-    pub async fn update_access_token(
+    pub async fn update_authenticated_session(
         &self,
         uid: String,
         access_token: String,
+        device_id: String,
         expires_at: Option<u64>,
     ) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(StorageCmd::UpdateAccessToken {
+            .send(StorageCmd::UpdateAuthenticatedSession {
                 uid,
                 access_token,
+                device_id,
                 expires_at,
                 resp: resp_tx,
             })
@@ -2183,13 +2186,14 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
         StorageCmd::LoadBootstrapCompleted { uid, resp } => {
             let _ = resp.send(store.load_bootstrap_completed(&uid));
         }
-        StorageCmd::UpdateAccessToken {
+        StorageCmd::UpdateAuthenticatedSession {
             uid,
             access_token,
+            device_id,
             expires_at,
             resp,
         } => {
-            let _ = resp.send(store.update_access_token(&uid, &access_token, expires_at));
+            let _ = resp.send(store.update_authenticated_session(&uid, &access_token, &device_id, expires_at));
         }
         StorageCmd::LoadAccessToken { uid, resp } => {
             let _ = resp.send(store.load_access_token(&uid));
