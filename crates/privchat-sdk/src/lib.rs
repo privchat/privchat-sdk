@@ -97,6 +97,7 @@ mod avatar_cache;
 pub mod canonical_inbound;
 pub mod error_codes;
 mod local_store;
+pub mod local_reader;
 pub mod media_download;
 pub mod media_store;
 mod receive_pipeline;
@@ -3051,6 +3052,8 @@ enum ThumbnailDownloadOutcome {
 const OUTBOUND_DRAIN_BATCH_SIZE: usize = 20;
 
 enum Command {
+    #[cfg(test)]
+    HoldActorForLocalReadTest { entered: oneshot::Sender<()>, release: oneshot::Receiver<()> },
     Connect {
         resp: oneshot::Sender<Result<()>>,
     },
@@ -14328,6 +14331,7 @@ pub struct AttachmentTransferStats {
 
 #[derive(Clone)]
 pub struct PrivchatSdk {
+    local_storage: tokio::sync::watch::Receiver<Option<StorageHandle>>,
     /// 附件正文的传输计数：秒传命中一次 +1 claim，真传字节一次 +1 upload。
     ///
     /// 这是唯一能回答「这次转发到底传没传字节」的地方——服务端也按内容哈希复用
@@ -14415,6 +14419,7 @@ impl PrivchatSdk {
     }
 
     pub fn with_runtime(config: PrivchatConfig, runtime_provider: RuntimeProvider) -> Self {
+        let (local_storage_tx, local_storage)=tokio::sync::watch::channel(None);
         let configured_data_dir = config.data_dir.clone();
         let data_dir_for_self = configured_data_dir.clone();
         // 附件 file queue 的路由键在构造期固化：首发与重试必须落到同一条有序队列。
@@ -14491,6 +14496,7 @@ impl PrivchatSdk {
                 }
             };
             let snowflake = actor_snowflake;
+            let _=local_storage_tx.send(Some(storage.clone()));
             let current_uid = storage.load_current_uid().await.ok().flatten();
             let saved = if let Some(uid) = &current_uid {
                 storage.load_session(uid.clone()).await.ok().flatten()
@@ -15079,6 +15085,11 @@ impl PrivchatSdk {
                     cmd = rx.recv() => {
                         let Some(cmd) = cmd else { break; };
                         match cmd {
+                    #[cfg(test)]
+                    Command::HoldActorForLocalReadTest {entered,release} => {
+                        let _=entered.send(());
+                        let _=release.await;
+                    }
                     Command::Connect { resp } => {
                         if actor_logs_enabled() {
                             eprintln!("[SDK.actor] loop: cmd connect");
@@ -18048,6 +18059,7 @@ impl PrivchatSdk {
             switch_wakeup: switch_wakeup_sdk,
             foreground_wakeup: foreground_wakeup_sdk,
             startup_error,
+            local_storage,
             snowflake,
             presence_cache,
             typing_throttle: Arc::new(StdMutex::new(HashMap::new())),

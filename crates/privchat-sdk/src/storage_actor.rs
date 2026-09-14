@@ -32,6 +32,7 @@ use crate::{
 };
 
 enum StorageCmd {
+    LocalRead(Box<dyn FnOnce(&LocalStore) + Send>),
     SaveLogin {
         uid: String,
         login: LoginResult,
@@ -581,6 +582,21 @@ pub struct StorageHandle {
 }
 
 impl StorageHandle {
+    pub(crate) async fn read_scoped<T: Send + 'static>(
+        &self, owner_uid: String,
+        read: impl FnOnce(&LocalStore, &str) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let (tx, rx)=oneshot::channel();
+        self.tx.send(StorageCmd::LocalRead(Box::new(move |store| {
+            let result=match store.load_current_uid() {
+                Ok(Some(uid)) if uid==owner_uid => read(store,&uid),
+                Ok(_) => Err(Error::InvalidState("local reader account changed".into())),
+                Err(e) => Err(e),
+            };
+            let _=tx.send(result);
+        }))).map_err(|_|Error::ActorClosed)?;
+        rx.await.map_err(|_|Error::ActorClosed)?
+    }
     pub fn start() -> Result<Self> {
         let store = LocalStore::open_default()?;
         let (tx, rx) = mpsc::channel::<StorageCmd>();
@@ -2167,6 +2183,7 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
     }
 
     match cmd {
+        StorageCmd::LocalRead(read) => read(store),
         StorageCmd::SaveLogin { uid, login, resp } => {
             let _ = resp.send(store.save_login(&uid, &login));
         }
