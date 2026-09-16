@@ -31,18 +31,61 @@ pub(crate) struct AvatarEventSinks {
     pub event_history_limit: usize,
 }
 
-/// 头像缓存文件路径（spec §3，按主键命名）：
-/// `{user_root}/avatars/users/{targetUid}.img`。
+/// 头像缓存文件路径（spec §3）：`{user_root}/avatars/users/{targetUid}-{tag}.img`，
+/// `tag` 是源 URL 的短指纹。
 ///
-/// 路径完全由 `target_uid` 决定，与 URL 无关——渲染时不需查库、直接
-/// `exists()` 即可判定；换头像时原地覆盖同一文件，不堆积孤儿、无需目录清扫。
-/// 「文件是否过期」不看文件名，看 user 行 `avatar_cached_url != avatar`。
+/// 🔴 **文件名必须随内容变**。这里曾经只按 `target_uid` 命名、换头像原地覆盖同一文件，
+/// 理由是"渲染时不查库、直接 exists() 即可判定，不堆积孤儿"。代价是客户端换完头像
+/// 界面不刷新：图片加载器按 URL 缓存，文件名不变就一直给旧位图，要杀进程重进才看得到
+/// 新头像。也别想用 `?v=` / `#v=` 去骗缓存——两者都会被当成路径的一部分，文件直接打不开
+/// （真机实测头像掉回字母占位）。
+///
+/// 带指纹之后旧文件会成为孤儿，所以 [`purge_stale_avatar_files`] 在写入新文件后删掉同一
+/// uid 的其它版本。这与生成式头像（initials/九宫格）早就在用的"带指纹文件名"是同一套做法。
+///
 /// 扩展名固定 `.img`（解码器按内容嗅探，无需真实后缀；iOS 已验证可渲染）。
-pub(crate) fn avatar_cache_path(user_root: &Path, target_uid: u64) -> PathBuf {
+pub(crate) fn avatar_cache_path(user_root: &Path, target_uid: u64, source_url: &str) -> PathBuf {
     user_root
         .join("avatars")
         .join("users")
-        .join(format!("{target_uid}.img"))
+        .join(format!("{target_uid}-{}.img", url_tag(source_url)))
+}
+
+/// 源 URL 的短指纹（8 位十六进制）。只用来区分版本，不做安全用途。
+fn url_tag(source_url: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source_url.hash(&mut h);
+    format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
+}
+
+/// 删掉同一 uid 的其它版本头像文件，只保留 `keep`。
+///
+/// 带指纹的文件名意味着换一次头像多一个文件；不清理的话，一个常换头像的账号会在
+/// 目录里堆满历史版本。失败只当没清理过——留着孤儿文件远好过让换头像这件事失败。
+/// 删掉某个 uid 的**全部**头像缓存文件（头像被清空时用）。
+pub(crate) fn remove_cached_avatar_files(user_root: &Path, target_uid: u64) {
+    let dir = user_root.join("avatars").join("users");
+    // keep 指向一个不存在的名字 ⇒ 同 uid 的都会被删。
+    purge_stale_avatar_files(&dir, target_uid, &dir.join(""));
+}
+
+fn purge_stale_avatar_files(dir: &Path, target_uid: u64, keep: &Path) {
+    let prefix = format!("{target_uid}-");
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        // 旧布局 `{uid}.img`（带指纹之前装机的）在这里一并回收：写入新版本后它已经是孤儿，
+        // 留着只会让老用户的目录里永远躺一张废图。生成式头像 `{uid}.gen-*.img` 不匹配，安全。
+        let legacy = format!("{target_uid}.img");
+        if (name.starts_with(&prefix) || name == legacy) && name.ends_with(".img") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// 下载 URL 到 dest：先写 `.part` 临时文件再 rename（原子换入）。
@@ -303,9 +346,9 @@ async fn run_ensure(
             return false;
         }
     };
-    let dest = avatar_cache_path(&paths.user_root, user_id);
-    // 走到这里说明本地缺失或已过期（换头像 ⇒ cached_url != url）：下载并原子覆盖
-    // 同一路径（download_to_file 内部 `.part` → rename 覆盖）。
+    let dest = avatar_cache_path(&paths.user_root, user_id, url);
+    // 走到这里说明本地缺失或已过期（换头像 ⇒ cached_url != url）：下载到带指纹的新
+    // 文件名，成功后再删掉同 uid 的旧版本。
     if let Err(e) = download_to_file(url, &dest).await {
         eprintln!("[SDK.avatar] download failed user_id={user_id} url={url}: {e}");
         return false;
@@ -321,8 +364,11 @@ async fn run_ensure(
         .await
     {
         Ok(true) => {
-            // 同一路径原地覆盖，不产生孤儿。历史 hash 布局（旧版本装机）的文件路径
-            // 与新路径不同，单独兜底删除一次以免残留。
+            // 文件名带指纹 ⇒ 换头像会留下旧文件，写成功后清掉同 uid 的其它版本
+            // （也顺带清掉历史 uid-only / hash 布局的残留）。
+            if let Some(dir) = dest.parent() {
+                purge_stale_avatar_files(dir, user_id, &dest);
+            }
             if !row.avatar_local_path.is_empty() && row.avatar_local_path != dest_str {
                 let _ = std::fs::remove_file(&row.avatar_local_path);
             }
@@ -369,10 +415,13 @@ pub(crate) async fn recache_user_avatar(
         )));
     }
     let paths = storage.get_storage_paths().await?;
-    let dest = avatar_cache_path(&paths.user_root, user_id);
+    let dest = avatar_cache_path(&paths.user_root, user_id, url);
     download_to_file(url, &dest)
         .await
         .map_err(|e| crate::Error::Storage(format!("recache download failed: {e}")))?;
+    if let Some(dir) = dest.parent() {
+        purge_stale_avatar_files(dir, user_id, &dest);
+    }
     let dest_str = dest.to_string_lossy().to_string();
     // 只有下载 + 落盘成功才 force-set；上面任一步 Err 都不会走到这里 ⇒ 旧缓存不被覆盖。
     storage
@@ -405,13 +454,47 @@ mod tests {
     }
 
     #[test]
-    fn cache_path_keyed_by_target_uid() {
+    fn cache_path_keyed_by_uid_and_url() {
         let root = Path::new("/data/users/1001");
-        let p = avatar_cache_path(root, 42);
-        assert_eq!(p.to_string_lossy(), "/data/users/1001/avatars/users/42.img");
-        // 路径只由 uid 决定，与 URL 无关 ⇒ 换头像原地覆盖同一文件；不同 uid 不同文件。
-        assert_eq!(p, avatar_cache_path(root, 42));
-        assert_ne!(p, avatar_cache_path(root, 43));
+        let a = avatar_cache_path(root, 42, "https://cdn/a.jpg");
+        assert!(a.starts_with("/data/users/1001/avatars/users"));
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("42-"));
+        // 同 uid 同 url ⇒ 同一文件（命中缓存，不重复下载）。
+        assert_eq!(a, avatar_cache_path(root, 42, "https://cdn/a.jpg"));
+        // 🔴 换头像必须换文件名：文件名不变，图片加载器就一直给旧位图，界面要杀进程才刷新。
+        assert_ne!(a, avatar_cache_path(root, 42, "https://cdn/b.jpg"));
+        assert_ne!(a, avatar_cache_path(root, 43, "https://cdn/a.jpg"));
+    }
+
+    #[test]
+    fn purge_removes_other_versions_of_the_same_uid_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "privchat-avatar-purge-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = dir.join("42-aaaaaaaa.img");
+        let stale = dir.join("42-bbbbbbbb.img");
+        let other_uid = dir.join("43-aaaaaaaa.img");
+        let unrelated = dir.join("42.jpg");
+        let legacy = dir.join("42.img");
+        let generated = dir.join("42.gen-abcd.img");
+        for f in [&keep, &stale, &other_uid, &unrelated, &legacy, &generated] {
+            std::fs::write(f, b"x").unwrap();
+        }
+
+        purge_stale_avatar_files(&dir, 42, &keep);
+
+        assert!(keep.exists(), "当前版本被误删");
+        assert!(!stale.exists(), "旧版本没被清掉，换几次头像目录就堆满了");
+        assert!(other_uid.exists(), "误删了别人的头像");
+        assert!(unrelated.exists(), "误删了非 .img 文件");
+        assert!(!legacy.exists(), "旧布局 42.img 没被回收");
+        assert!(generated.exists(), "误删了生成的字母头像");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -4207,11 +4207,10 @@ impl State {
             .get_storage_paths_for_uid(uid.to_string())
             .await
         {
-            let path = avatar_cache::avatar_cache_path(
+            avatar_cache::remove_cached_avatar_files(
                 std::path::Path::new(&paths.user_root),
                 user_id,
             );
-            let _ = std::fs::remove_file(path);
         }
         self.pending_events.push(SdkEvent::SyncEntityChanged {
             entity_type: "user".to_string(),
