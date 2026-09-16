@@ -94,6 +94,7 @@ const REPAIR_BACKOFF_BASE_MS: u64 = 2_000;
 const REPAIR_BACKOFF_MAX_SHIFT: u32 = 6;
 
 mod avatar_cache;
+pub use avatar_cache::AvatarCrop;
 pub mod canonical_inbound;
 pub mod error_codes;
 mod local_store;
@@ -18812,17 +18813,23 @@ impl PrivchatSdk {
     /// AVATAR_CACHE_SPEC §8: 头像上传前客户端预处理。
     ///
     /// decode（白名单 jpeg/png/webp，gif/损坏格式直接 Err，不消耗上传流量）→
-    /// 中心裁剪正方形 → 边长 >480 缩放到 480x480（≤480 不放大）→ 编码 PNG
-    /// 写临时文件，返回处理后路径。App 选图后先过它再走上传管道。
-    pub async fn prepare_avatar_image(&self, src_path: String) -> Result<String> {
+    /// 按 `crop` 裁出正方形（`None` = 中心裁剪）→ 缩放到 720x720 → 白底合成 →
+    /// 编码 JPEG 写临时文件，返回处理后路径。App 选图 + 裁剪后先过它再走上传管道。
+    ///
+    /// 裁剪坐标系是 **EXIF 方向校正之后**的图像像素，见 AVATAR_CACHE_SPEC §8.1。
+    pub async fn prepare_avatar_image(
+        &self,
+        src_path: String,
+        crop: Option<avatar_cache::AvatarCrop>,
+    ) -> Result<String> {
         // 直接同步调用:uniffi 的 async 桥在自己的 foreign executor 上 poll 本 future,
         // 没有 Tokio runtime 上下文,spawn_blocking 会 panic「no reactor running」。
-        // 头像预处理是一次性 CPU 工作(≤480 图,数十 ms),App 已在协程里调用,
+        // 头像预处理是一次性 CPU 工作(720 图,数十 ms),App 已在协程里调用,
         // 短暂阻塞该协程线程可接受。
         // 输出写 data_dir/tmp（app 沙箱内保证可写）；Android 上 std temp_dir =
         // /data/local/tmp 无写权限，不能用（见 prepare_avatar_image_sync doc）。
         let out_dir = std::path::Path::new(self.data_dir()).join("tmp");
-        avatar_cache::prepare_avatar_image_sync(std::path::Path::new(&src_path), &out_dir)
+        avatar_cache::prepare_avatar_image_sync(std::path::Path::new(&src_path), &out_dir, crop)
             .map(|p| p.to_string_lossy().to_string())
     }
 

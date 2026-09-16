@@ -8268,11 +8268,31 @@ impl PrivchatClient {
     /// AVATAR_CACHE_SPEC §8: 头像上传前客户端预处理。
     ///
     /// decode（白名单 jpeg/png/webp，gif/损坏格式直接 Err，不消耗上传流量）→
-    /// 中心裁剪正方形 → 边长 >480 缩放到 480x480（≤480 不放大）→ 编码 PNG
-    /// 写临时文件。返回处理后文件路径，App 选图后先过它再走上传管道。
-    pub async fn prepare_avatar_image(&self, src_path: String) -> Result<String, PrivchatFfiError> {
+    /// 按裁剪矩形裁正方形 → 缩到 720x720 → 白底合成 → 编码 JPEG 写临时文件。
+    /// 返回处理后文件路径，App 选图 + 裁剪后先过它再走上传管道。
+    ///
+    /// `crop_x` / `crop_y` / `crop_size` 三者要么全给要么全不给；全不给 = 中心裁剪
+    /// （兼容没有裁剪界面的调用方）。**归一化到 0..1**，相对 EXIF 方向校正之后的图像；
+    /// x/y 相对宽高，size 相对短边。见 AVATAR_CACHE_SPEC §8.1。
+    ///
+    /// 用归一化而不是像素：像素要求 UI 先知道源图尺寸，而那又要求 UI 自己读 EXIF
+    /// 判断宽高是否交换。归一化把方向这件事整个留在 Rust。
+    ///
+    /// 用三个独立可空参数而不是一个结构体：uniffi 的绑定是手工维护的，多一个 record
+    /// 类型就要同步三个平台的绑定文件，而这里只是三个整数。
+    pub async fn prepare_avatar_image(
+        &self,
+        src_path: String,
+        crop_x: Option<f32>,
+        crop_y: Option<f32>,
+        crop_size: Option<f32>,
+    ) -> Result<String, PrivchatFfiError> {
+        let crop = match (crop_x, crop_y, crop_size) {
+            (Some(x), Some(y), Some(size)) => Some(privchat_sdk::AvatarCrop { x, y, size }),
+            _ => None,
+        };
         self.inner
-            .prepare_avatar_image(src_path)
+            .prepare_avatar_image(src_path, crop)
             .await
             .map_err(PrivchatFfiError::from)
     }

@@ -71,21 +71,46 @@ pub(crate) async fn download_to_file(
 }
 
 /// AVATAR_CACHE_SPEC §8: 头像上传目标边长（server ImagePolicy targetSize 对齐）。
-pub(crate) const AVATAR_UPLOAD_EDGE: u32 = 480;
+///
+/// 🔴 这个数字镜像在三处，改一处就要三处一起改：这里、Web 端 canvas 实现、
+/// server `ImagePolicy`。spec §8 的表头写明了这条。
+pub(crate) const AVATAR_UPLOAD_EDGE: u32 = 720;
+
+/// JPEG 质量。720x720 q85 约 60~100KB —— 比原先 480 PNG（约 500KB）还小而清晰度翻倍。
+const AVATAR_JPEG_QUALITY: u8 = 85;
+
+/// 用户在裁剪界面选定的区域，**归一化**到 0..1，相对 **EXIF 方向校正之后**的图像。
+///
+/// 为什么用归一化而不是像素：像素坐标要求 UI 先知道源图尺寸，而那又要求 UI 自己读
+/// EXIF 判断宽高是否交换——源图带旋转时，UI 显示的是校正后的样子，拿原始像素尺寸
+/// 换算会算到完全不相干的区域。归一化把这件事整个留在 Rust：UI 只说"我框的是这张图
+/// 的哪一块比例"，方向校正后的实际像素由 decode 之后的尺寸决定。
+#[derive(Debug, Clone, Copy)]
+pub struct AvatarCrop {
+    /// 裁剪区左上角 x，占图像宽度的比例。
+    pub x: f32,
+    /// 裁剪区左上角 y，占图像高度的比例。
+    pub y: f32,
+    /// 裁剪区边长，占图像**短边**的比例（正方形，所以只要一个值）。
+    pub size: f32,
+}
 
 /// AVATAR_CACHE_SPEC §8: 头像上传前客户端预处理。
 ///
 /// 1. decode（image crate 仅编译 jpeg/png/webp 特性，gif/损坏格式天然解码失败
 ///    即拒，上传前报错不消耗流量）；EXIF orientation 已应用；
-/// 2. 中心裁剪为正方形；
-/// 3. 边长 >480 缩放到 480x480（≤480 保持原尺寸，不放大）；
-/// 4. 编码 PNG 写 `out_dir`（调用方传 SDK data_dir 下的 tmp 子目录），返回处理后
-///    文件路径（交上传管道）。
+/// 2. 按 `crop` 裁出正方形；`None` 时退回中心裁剪（兼容没有裁剪界面的调用方）；
+/// 3. 缩放到 720x720（小于 720 也放大——产出规格恒定，下游不必处理"任意边长"）；
+/// 4. 合成白底后编码 JPEG 写 `out_dir`，返回处理后文件路径（交上传管道）。
 ///
 /// `out_dir` 不得用 `std::env::temp_dir()`：Android 上它是 `/data/local/tmp`，
 /// 普通 app 进程无写权限（EACCES, os error 13）——真机头像上传曾因此 100% 失败。
 /// app 沙箱内唯一保证可写的是宿主传入的 data_dir。
-pub(crate) fn prepare_avatar_image_sync(src_path: &Path, out_dir: &Path) -> crate::Result<PathBuf> {
+pub(crate) fn prepare_avatar_image_sync(
+    src_path: &Path,
+    out_dir: &Path,
+    crop: Option<AvatarCrop>,
+) -> crate::Result<PathBuf> {
     // 复用消息缩略图同一 decode（EXIF orientation 已应用）；actor `State` 上的
     // 无状态 helper，直接静态调用。
     let img = crate::State::decode_image_oriented(src_path)?;
@@ -95,19 +120,41 @@ pub(crate) fn prepare_avatar_image_sync(src_path: &Path, out_dir: &Path) -> crat
             "prepare avatar: empty image".to_string(),
         ));
     }
-    let side = w.min(h);
-    let x = (w - side) / 2;
-    let y = (h - side) / 2;
-    let mut square = img.crop_imm(x, y, side, side);
-    if side > AVATAR_UPLOAD_EDGE {
-        square = square.resize_exact(
-            AVATAR_UPLOAD_EDGE,
-            AVATAR_UPLOAD_EDGE,
-            image::imageops::FilterType::Triangle,
-        );
+
+    let (x, y, side) = match crop {
+        // 越界**钳制**而不是报错：UI 的浮点换算与 decode 后的整数像素之间总会差一两个
+        // 像素，为此让用户重新裁一次是荒唐的（spec §8.1）。
+        Some(c) => {
+            let short = w.min(h) as f32;
+            let side = ((c.size.clamp(0.0, 1.0) * short).round() as u32).clamp(1, w.min(h));
+            let x = ((c.x.max(0.0) * w as f32).round() as u32).min(w.saturating_sub(side));
+            let y = ((c.y.max(0.0) * h as f32).round() as u32).min(h.saturating_sub(side));
+            (x, y, side)
+        }
+        None => {
+            let side = w.min(h);
+            ((w - side) / 2, (h - side) / 2, side)
+        }
+    };
+
+    let square = img.crop_imm(x, y, side, side).resize_exact(
+        AVATAR_UPLOAD_EDGE,
+        AVATAR_UPLOAD_EDGE,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    // 🔴 JPEG 没有透明通道：带 alpha 的源图必须先合成到白底。少了这一步，透明区域
+    // 会被编码成黑色——一张透明背景的 PNG 头像上传完变成黑块。
+    let rgba = square.to_rgba8();
+    let mut rgb = image::RgbImage::new(AVATAR_UPLOAD_EDGE, AVATAR_UPLOAD_EDGE);
+    for (x, y, px) in rgba.enumerate_pixels() {
+        let [r, g, b, a] = px.0;
+        let a = a as u32;
+        // 源色按 alpha 与白底做直线混合。
+        let blend = |c: u8| -> u8 { (((c as u32) * a + 255 * (255 - a)) / 255) as u8 };
+        rgb.put_pixel(x, y, image::Rgb([blend(r), blend(g), blend(b)]));
     }
-    // PNG 编码统一走 RGBA8，避免个别源色型（如 16bit）编码分歧。
-    let square = image::DynamicImage::ImageRgba8(square.to_rgba8());
+
     std::fs::create_dir_all(out_dir).map_err(|e| {
         crate::Error::Storage(format!(
             "prepare avatar: create out dir {} failed: {e}",
@@ -115,15 +162,18 @@ pub(crate) fn prepare_avatar_image_sync(src_path: &Path, out_dir: &Path) -> crat
         ))
     })?;
     let out = out_dir.join(format!(
-        "privchat-avatar-{}-{}.png",
+        "privchat-avatar-{}-{}.jpg",
         std::process::id(),
         chrono::Utc::now()
             .timestamp_nanos_opt()
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
     ));
-    square
-        .save_with_format(&out, image::ImageFormat::Png)
-        .map_err(|e| crate::Error::Storage(format!("prepare avatar: encode png failed: {e}")))?;
+    let mut file = std::fs::File::create(&out).map_err(|e| {
+        crate::Error::Storage(format!("prepare avatar: create {} failed: {e}", out.display()))
+    })?;
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, AVATAR_JPEG_QUALITY)
+        .encode_image(&image::DynamicImage::ImageRgb8(rgb))
+        .map_err(|e| crate::Error::Storage(format!("prepare avatar: encode jpeg failed: {e}")))?;
     Ok(out)
 }
 
@@ -365,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_avatar_center_crops_and_caps_at_480() {
+    fn prepare_avatar_center_crops_and_always_outputs_720() {
         let dir = std::env::temp_dir();
         // 大图：800x600 → 中心裁 600x600 → 缩到 480x480
         let src = dir.join(format!(
@@ -379,13 +429,13 @@ mod tests {
         ))
         .save_with_format(&src, image::ImageFormat::Png)
         .unwrap();
-        let out = prepare_avatar_image_sync(&src, &dir).unwrap();
+        let out = prepare_avatar_image_sync(&src, &dir, None).unwrap();
         let processed = image::open(&out).unwrap();
-        assert_eq!((processed.width(), processed.height()), (480, 480));
+        assert_eq!((processed.width(), processed.height()), (720, 720));
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&out);
 
-        // 小图：100x50 → 50x50，不放大
+        // 小图同样产出 720x720：规格恒定，下游不必处理"头像可能是任意边长"。
         let src2 = dir.join(format!(
             "privchat-avatar-test-small-{}.png",
             std::process::id()
@@ -397,9 +447,9 @@ mod tests {
         ))
         .save_with_format(&src2, image::ImageFormat::Png)
         .unwrap();
-        let out2 = prepare_avatar_image_sync(&src2, &dir).unwrap();
+        let out2 = prepare_avatar_image_sync(&src2, &dir, None).unwrap();
         let processed2 = image::open(&out2).unwrap();
-        assert_eq!((processed2.width(), processed2.height()), (50, 50));
+        assert_eq!((processed2.width(), processed2.height()), (720, 720));
         let _ = std::fs::remove_file(&src2);
         let _ = std::fs::remove_file(&out2);
 
@@ -409,7 +459,100 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&bad, b"definitely not an image").unwrap();
-        assert!(prepare_avatar_image_sync(&bad, &dir).is_err());
+        assert!(prepare_avatar_image_sync(&bad, &dir, None).is_err());
         let _ = std::fs::remove_file(&bad);
+    }
+
+    /// 裁剪矩形要真的被采用，而不是被忽略后仍走中心裁剪。
+    ///
+    /// 造一张左右分色的图：左半红、右半蓝。框住最左边那一块，产出应当整幅是红的；
+    /// 若裁剪参数被忽略，中心裁剪会同时取到红蓝交界，中心像素就不是纯红。
+    #[test]
+    fn crop_rect_selects_the_requested_region() {
+        let dir = std::env::current_dir().unwrap().join("target/avatar-crop-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join(format!("crop-src-{}.png", std::process::id()));
+        let mut img = image::RgbaImage::new(400, 200);
+        for (x, _y, px) in img.enumerate_pixels_mut() {
+            *px = if x < 200 {
+                image::Rgba([255u8, 0, 0, 255])
+            } else {
+                image::Rgba([0u8, 0, 255, 255])
+            };
+        }
+        image::DynamicImage::ImageRgba8(img)
+            .save_with_format(&src, image::ImageFormat::Png)
+            .unwrap();
+
+        let out = prepare_avatar_image_sync(
+            &src,
+            &dir,
+            Some(AvatarCrop { x: 0.0, y: 0.0, size: 1.0 }),
+        )
+        .unwrap();
+        let processed = image::open(&out).unwrap().to_rgb8();
+        assert_eq!((processed.width(), processed.height()), (720, 720));
+        let c = processed.get_pixel(360, 360).0;
+        assert!(
+            c[0] > 200 && c[2] < 60,
+            "裁剪矩形被忽略了，中心像素不是纯红: {c:?}"
+        );
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// 越界的裁剪矩形按钳制处理，不报错。
+    ///
+    /// UI 的浮点换算与 decode 后的整数像素之间总会差一两个像素，为此让用户重裁一次
+    /// 是荒唐的（spec §8.1）。
+    #[test]
+    fn an_out_of_bounds_crop_is_clamped_not_rejected() {
+        let dir = std::env::current_dir().unwrap().join("target/avatar-crop-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join(format!("clamp-src-{}.png", std::process::id()));
+        image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            100,
+            100,
+            image::Rgba([7u8, 7, 7, 255]),
+        ))
+        .save_with_format(&src, image::ImageFormat::Png)
+        .unwrap();
+
+        // 整个矩形都在图外，且边长超过图像。
+        let out = prepare_avatar_image_sync(
+            &src,
+            &dir,
+            Some(AvatarCrop { x: 9.0, y: 9.0, size: 9.0 }),
+        )
+        .expect("越界矩形应当被钳制而不是报错");
+        assert_eq!(image::open(&out).unwrap().width(), 720);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// 透明像素合成到白底，而不是变成黑色。
+    ///
+    /// JPEG 没有透明通道。少了白底合成，一张透明背景的 PNG 头像上传完就是个黑块。
+    #[test]
+    fn transparent_pixels_become_white_not_black() {
+        let dir = std::env::current_dir().unwrap().join("target/avatar-crop-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join(format!("alpha-src-{}.png", std::process::id()));
+        image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            120,
+            120,
+            image::Rgba([0u8, 0, 0, 0]), // 全透明
+        ))
+        .save_with_format(&src, image::ImageFormat::Png)
+        .unwrap();
+
+        let out = prepare_avatar_image_sync(&src, &dir, None).unwrap();
+        let c = image::open(&out).unwrap().to_rgb8().get_pixel(360, 360).0;
+        assert!(
+            c[0] > 240 && c[1] > 240 && c[2] > 240,
+            "透明像素没有合成到白底，编码成了深色: {c:?}"
+        );
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&out);
     }
 }
