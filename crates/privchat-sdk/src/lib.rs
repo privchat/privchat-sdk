@@ -10457,7 +10457,11 @@ impl State {
                 MessageType::SendMessageRequest
                 | MessageType::PushMessageRequest
                 | MessageType::PushBatchRequest
-                | MessageType::PublishRequest => {
+                | MessageType::PublishRequest
+                // app→user 定向 transfer(SdkEvent::TransferReceived)同样是服务端推送:
+                // 登录到 authenticate 之间到达的那几帧(比如刚进战斗就发的 slots_offered)
+                // 不缓冲就永久丢失,而且没有任何 sync 路径能补回来。
+                | MessageType::TransferRequest => {
                     if self.pending_prelogin_inbound_frames.len() >= 256 {
                         let _ = self.pending_prelogin_inbound_frames.remove(0);
                     }
