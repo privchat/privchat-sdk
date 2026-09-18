@@ -32,6 +32,7 @@ use msgtrans::RequestOptions;
 use msgtrans::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig};
 use msgtrans::{TransportClient, TransportClientBuilder};
 use privchat_protocol::message::LocalMessagePayloadEnvelope;
+pub use privchat_protocol::protocol::ChannelType;
 use privchat_protocol::presence::{
     PresenceBatchStatusRequest, PresenceBatchStatusResponse, PresenceChangedNotification,
     TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
@@ -9341,7 +9342,7 @@ impl State {
     ) -> UpsertRemoteMessageInput {
         let canonical = crate::canonical_inbound::CanonicalInboundMessage::from_history_item(
             item,
-            if channel_type == 0 { 1 } else { channel_type },
+            normalize_legacy_channel_type(channel_type),
             Self::wire_message_type_to_i32,
         );
         let mime_type = Self::extract_mime_type_from_json(&canonical.content, &canonical.extra);
@@ -9383,7 +9384,7 @@ impl State {
         let resp: MessageHistoryResponse = self
             .rpc_call_typed(routes::message_history::GET, &req)
             .await?;
-        let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        let normalized_channel_type = normalize_legacy_channel_type(channel_type);
         self.store_history_items(resp.messages.iter(), normalized_channel_type)
             .await?;
         Ok(resp)
@@ -9408,7 +9409,7 @@ impl State {
         let resp: MessageHistoryAroundResponse = self
             .rpc_call_typed(routes::message_history::AROUND, &req)
             .await?;
-        let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        let normalized_channel_type = normalize_legacy_channel_type(channel_type);
         self.store_history_items(
             resp.before_messages
                 .iter()
@@ -9806,7 +9807,7 @@ impl State {
         channel_type: i32,
         server_message_id: u64,
     ) -> Result<Option<u64>> {
-        let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        let normalized_channel_type = normalize_legacy_channel_type(channel_type);
         let resp = self
             .fetch_and_store_messages_around(
                 channel_id,
@@ -9855,7 +9856,7 @@ impl State {
             return Ok(0);
         }
 
-        let normalized_channel_type = if channel_type == 0 { 1 } else { channel_type };
+        let normalized_channel_type = normalize_legacy_channel_type(channel_type);
         let message_ids = self
             .store_history_items(resp.messages.iter(), normalized_channel_type)
             .await?;
@@ -11121,11 +11122,7 @@ impl State {
             if channel.channel_type != 1 && channel.channel_type != 0 {
                 continue;
             }
-            let normalized_channel_type = if channel.channel_type == 0 {
-                1
-            } else {
-                channel.channel_type
-            };
+            let normalized_channel_type = normalize_legacy_channel_type(channel.channel_type);
             let is_system_channel = channel.channel_name == "1"
                 || channel.channel_remark == "1"
                 || channel.channel_name == "__system_1__";
@@ -11221,7 +11218,7 @@ impl State {
         total += self
             .resume_channel_difference(channel_id, channel_type)
             .await?;
-        if channel_type == 2 {
+        if channel_type == ChannelType::Group.as_wire() as i32 {
             match self
                 .sync_entities("group_member".to_string(), Some(channel_id.to_string()))
                 .await
@@ -14080,7 +14077,7 @@ impl State {
                 // 频道实体随后同步到会修正这一行，但期间已经渲染出去的会话对象
                 // （聊天页在导航时抓的快照）会一直顶着「系统消息」的标题。
                 // 推断本来就只是兜底，宁可留空等实体，也不能把 DM 永久贴错人。
-                let inferred_peer_user_id = if channel_type == 1 {
+                let inferred_peer_user_id = if channel_type == ChannelType::Direct.as_wire() as i32 {
                     match from_uid {
                         Some(uid)
                             if uid > 0 && uid != current_uid && uid != SYSTEM_ACCOUNT_UID =>
@@ -18695,7 +18692,7 @@ impl PrivchatSdk {
     }
 
     /// 订阅频道事件（进入聊天页面时调用，接收 typing / presence 等状态事件）
-    /// channel_type: 0=Private, 1=Group, 2=Room
+    /// channel_type: wire 编号，见 [`ChannelType`]：1=Direct, 2=Group, 3=Room（0 非法）
     /// token: 可选，Room 类型订阅时传入业务 API 签发的 ticket（JWT）
     pub async fn subscribe_channel(
         &self,
@@ -18718,7 +18715,7 @@ impl PrivchatSdk {
     }
 
     /// 取消订阅频道事件（离开聊天页面时调用）
-    /// channel_type: 0=Private, 1=Group, 2=Room
+    /// channel_type: wire 编号，见 [`ChannelType`]：1=Direct, 2=Group, 3=Room
     pub async fn unsubscribe_channel(&self, channel_id: u64, channel_type: u8) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -21078,6 +21075,12 @@ fn test_attachment_key() -> privchat_protocol::rpc::file::upload::AttachmentKey 
 
 #[cfg(test)]
 const TEST_CHUNK_PLAIN_SIZE: u32 = privchat_protocol::attachment_crypto::DEFAULT_CHUNK_PLAIN_SIZE;
+
+/// 本地库里早期把单聊存成 0；wire 上 0 非法（[`ChannelType`]），一律归一为 Direct(1)。
+/// 只处理 0；其它值原样保留，交给调用方按 wire 编号解释。
+pub(crate) fn normalize_legacy_channel_type(channel_type: i32) -> i32 {
+    if channel_type == 0 { ChannelType::Direct.as_wire() as i32 } else { channel_type }
+}
 
 #[cfg(test)]
 mod tests {

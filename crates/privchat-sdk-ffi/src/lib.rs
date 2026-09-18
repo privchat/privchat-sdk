@@ -4782,7 +4782,7 @@ impl PrivchatClient {
     }
 
     /// 订阅频道事件（进入聊天页面时调用，接收 typing / presence 等状态事件）
-    /// channel_type: 0=Private, 1=Group, 2=Room
+    /// channel_type: wire 编号 1=Direct, 2=Group, 3=Room（0 非法；见 privchat_protocol::protocol::ChannelType）
     /// token: 可选，Room 类型订阅时传入业务 API 签发的 ticket（JWT）
     pub async fn subscribe_channel(
         &self,
@@ -4797,7 +4797,7 @@ impl PrivchatClient {
     }
 
     /// 取消订阅频道事件（离开聊天页面时调用）
-    /// channel_type: 0=Private, 1=Group, 2=Room
+    /// channel_type: wire 编号 1=Direct, 2=Group, 3=Room（0 非法；见 privchat_protocol::protocol::ChannelType）
     pub async fn unsubscribe_channel(
         &self,
         channel_id: u64,

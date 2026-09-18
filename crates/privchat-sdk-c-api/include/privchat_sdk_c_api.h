@@ -55,7 +55,7 @@ char* privchat_capi_session_snapshot(PrivchatCapiClient* client, uint64_t timeou
 
 // --- channels ----------------------------------------------------------------
 
-// channel_type: 0=Private, 1=Group, 2=Room. token may be NULL.
+// channel_type: wire value 1=Direct, 2=Group, 3=Room (0 is invalid; see privchat_protocol::protocol::ChannelType). token may be NULL.
 int32_t privchat_capi_subscribe_channel(PrivchatCapiClient* client, uint64_t channel_id,
                                         uint8_t channel_type, const char* token,
                                         uint64_t timeout_ms);
