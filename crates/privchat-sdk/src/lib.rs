@@ -699,6 +699,9 @@ pub enum SdkEvent {
         message_id: u64,
         status: i32,
         server_message_id: Option<u64>,
+        /// Why a terminal failure (status 3) happened: the server's refusal code, so the
+        /// host can say "you are not their friend" instead of a bare red mark. None otherwise.
+        error_code: Option<u32>,
     },
     TypingSent {
         channel_id: u64,
@@ -7341,6 +7344,7 @@ impl State {
                             message_id,
                             status,
                             server_message_id: Some(server_message_id),
+                            error_code: None,
                         });
                     } else if upserted.inserted_new && from_self {
                         if inbound_logs_enabled() {
@@ -7666,6 +7670,7 @@ impl State {
                             message_id,
                             status,
                             server_message_id: Some(raw_message_id),
+                            error_code: None,
                         });
                     }
                     emitted.push(SdkEvent::SyncEntityChanged {
@@ -8008,6 +8013,7 @@ impl State {
                             message_id,
                             status: 2,
                             server_message_id: Some(resp.server_message_id),
+                            error_code: None,
                         });
                     processed += 1;
                 }
@@ -8045,6 +8051,7 @@ impl State {
                                 message_id,
                                 status: 2,
                                 server_message_id: Some(server_message_id),
+                                error_code: None,
                             });
                         processed += 1;
                         continue;
@@ -8100,6 +8107,7 @@ impl State {
                             message_id,
                             status: 3,
                             server_message_id: None,
+                            error_code: Some(e.protocol_code()),
                         });
                     // 命令行已在 outbox_reject 的同一事务里删掉了，这里只报事件。
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
@@ -8235,6 +8243,7 @@ impl State {
                             message_id,
                             status: 2,
                             server_message_id: Some(resp.server_message_id),
+                            error_code: None,
                         });
                     processed += 1;
                 }
@@ -8268,6 +8277,7 @@ impl State {
                                 message_id,
                                 status: 2,
                                 server_message_id: Some(server_message_id),
+                                error_code: None,
                             });
                         processed += 1;
                         continue;
@@ -8330,6 +8340,7 @@ impl State {
                             message_id,
                             status: 3,
                             server_message_id: None,
+                            error_code: Some(e.protocol_code()),
                         });
                     self.pending_events.push(SdkEvent::OutboundQueueUpdated {
                         kind: "file".to_string(),
@@ -16126,6 +16137,7 @@ impl PrivchatSdk {
                                     message_id,
                                     status: 1,
                                     server_message_id: None,
+                                    error_code: None,
                                 },
                             );
                             let _ = actor_cmd_tx.try_send(Command::KickOutboundDrain);
@@ -16208,6 +16220,7 @@ impl PrivchatSdk {
                                     message_id,
                                     status: 1,
                                     server_message_id: None,
+                                    error_code: None,
                                 },
                             );
                             let _ = actor_cmd_tx.try_send(Command::KickOutboundDrain);
@@ -16316,6 +16329,7 @@ impl PrivchatSdk {
                                     message_id,
                                     status: 1,
                                     server_message_id: None,
+                                    error_code: None,
                                 },
                             );
                             let _ = actor_cmd_tx.try_send(Command::KickOutboundDrain);
@@ -16370,6 +16384,7 @@ impl PrivchatSdk {
                                     message_id,
                                     status: 0,
                                     server_message_id: None,
+                                    error_code: None,
                                 },
                             );
                             let _ = resp.send(Ok(message_id));
@@ -16618,6 +16633,7 @@ impl PrivchatSdk {
                                     message_id,
                                     status: 2,
                                     server_message_id: Some(server_message_id),
+                                    error_code: None,
                                 },
                             );
                         }
@@ -16741,6 +16757,7 @@ impl PrivchatSdk {
                                     message_id,
                                     status,
                                     server_message_id: None,
+                                    error_code: None,
                                 },
                             );
                         }
@@ -16911,6 +16928,7 @@ impl PrivchatSdk {
                                         message_id,
                                         status: 1,
                                         server_message_id: None,
+                                        error_code: None,
                                     },
                                 );
                                 let _ = actor_cmd_tx.try_send(Command::KickOutboundDrain);

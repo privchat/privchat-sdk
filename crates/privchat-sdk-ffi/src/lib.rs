@@ -1569,6 +1569,8 @@ pub enum SdkEvent {
         message_id: u64,
         status: i32,
         server_message_id: Option<u64>,
+        /// Server refusal code when status is 3 (failed); None otherwise.
+        error_code: Option<u32>,
     },
     TypingSent {
         channel_id: u64,
@@ -2658,10 +2660,12 @@ fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
             message_id,
             status,
             server_message_id,
+            error_code,
         } => SdkEvent::MessageSendStatusChanged {
             message_id,
             status,
             server_message_id,
+            error_code,
         },
         privchat_sdk::SdkEvent::TypingSent {
             channel_id,
@@ -2988,11 +2992,13 @@ fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
             message_id,
             status,
             server_message_id,
+            error_code,
         } => json!({
             "type": "message_send_status_changed",
             "message_id": message_id,
             "status": status,
-            "server_message_id": server_message_id
+            "server_message_id": server_message_id,
+            "error_code": error_code
         }),
         SdkEvent::TypingSent {
             channel_id,
