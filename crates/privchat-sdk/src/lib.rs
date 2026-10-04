@@ -4086,6 +4086,12 @@ struct State {
     /// 双入口、重连多入口）直接跳过，避免 resume sync 全家桶连跑多轮放大重连风暴。
     /// 失败不记录（下一个触发点自然重试）；换代（重连）后必然重新执行。
     last_resume_synced: Option<(u64, Instant)>,
+    /// A conversation the user opened before the session finished authenticating — the
+    /// typical cold start from a notification tap. Its catch-up failed with
+    /// SessionNotReady; it is the first thing done once the session is authenticated,
+    /// ahead of the rest of resume sync, so the pushed message shows without waiting for
+    /// background convergence.
+    pending_focus_catchup: Option<(u64, i32)>,
     /// Last bounded anti-entropy scan. Realtime push is the fast path; this
     /// periodic batch-PTS comparison repairs missed pushes without scanning
     /// every channel on every tick.
@@ -10262,6 +10268,50 @@ impl State {
         })
     }
 
+    async fn catch_up_pending_focus(&mut self) {
+        let Some((channel_id, channel_type)) = self.pending_focus_catchup.take() else {
+            return;
+        };
+        match timeout(
+            Duration::from_secs(8),
+            self.resume_channel_difference(channel_id, channel_type),
+        )
+        .await
+        {
+            Ok(Ok(applied)) => {
+                eprintln!(
+                    "[SDK.actor] focus catch-up done channel_id={channel_id} \
+                     channel_type={channel_type} applied={applied}"
+                );
+                // The open page and the list re-read the store on this. Sent now, not via
+                // pending_events: those drain only when the whole resume round ends, and the
+                // point of going first is not to wait for it.
+                let event = SdkEvent::TimelineUpdated {
+                    channel_id,
+                    channel_type,
+                    message_id: 0,
+                    reason: "history_hydrated".to_string(),
+                };
+                if let (Some(tx), Some(history), Some(seq)) =
+                    (&self.event_tx, &self.event_history, &self.event_seq)
+                {
+                    emit_sequenced_event(tx, history, seq, self.event_history_limit, event);
+                } else {
+                    self.pending_events.push(event);
+                }
+            }
+            // Background convergence still covers it; never fail the resume round over it.
+            Ok(Err(e)) => eprintln!(
+                "[SDK.actor] focus catch-up failed channel_id={channel_id} \
+                 channel_type={channel_type}: {e}"
+            ),
+            Err(_) => eprintln!(
+                "[SDK.actor] focus catch-up timed out channel_id={channel_id} \
+                 channel_type={channel_type}"
+            ),
+        }
+    }
+
     async fn execute_resume_sync(&mut self) -> Result<()> {
         if self.session_state != SessionState::Authenticated {
             let err =
@@ -10271,6 +10321,11 @@ impl State {
                 .await;
             return Err(err);
         }
+        // The conversation the user is looking at goes first: it is the one a notification
+        // tap opened before authentication finished. Entity syncs, presence and channel pts
+        // carry nothing the user is waiting for. Runs even when the rest of this round is
+        // debounced below.
+        self.catch_up_pending_focus().await;
         if !self.bootstrap_completed {
             return Ok(());
         }
@@ -14536,6 +14591,7 @@ impl PrivchatSdk {
                 auth_terminal_fired: false,
                 inbound_epoch: 0,
                 last_resume_synced: None,
+                pending_focus_catchup: None,
                 last_anti_entropy_at: Instant::now(),
                 convergence_run: None,
                 resume_run_id: 0,
@@ -15741,7 +15797,15 @@ impl PrivchatSdk {
                                     "resume_channel_difference timeout".to_string(),
                                 )),
                             },
-                            Err(e) => Err(e),
+                            Err(e) => {
+                                // Not authenticated yet: the conversation was opened during
+                                // connect (cold start from a notification tap). Keep it as the
+                                // focus so the session catches it up first once it is ready.
+                                if matches!(e, Error::SessionNotReady { .. }) {
+                                    state.pending_focus_catchup = Some((channel_id, channel_type));
+                                }
+                                Err(e)
+                            }
                         };
                         let _ = resp.send(result);
                     }
@@ -21859,6 +21923,7 @@ mod tests {
             auth_terminal_fired: false,
             inbound_epoch: 0,
             last_resume_synced: None,
+            pending_focus_catchup: None,
             last_anti_entropy_at: Instant::now(),
             convergence_run: None,
             resume_run_id: 0,
