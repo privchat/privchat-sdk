@@ -19702,6 +19702,9 @@ impl PrivchatSdk {
             } else {
                 local
             };
+            if caught_up > 0 {
+                self.emit_history_hydrated(channel_id, channel_type);
+            }
             return Ok(OpenConversationPage {
                 messages,
                 has_more_before: read_has_more(self.kv_get_local(gap_key).await?),
@@ -19750,6 +19753,7 @@ impl PrivchatSdk {
         let messages = self
             .list_messages(channel_id, channel_type, limit as usize, 0)
             .await?;
+        self.emit_history_hydrated(channel_id, channel_type);
         Ok(OpenConversationPage {
             messages,
             has_more_before: resp.has_more,
@@ -19758,6 +19762,21 @@ impl PrivchatSdk {
     }
 
     /// 这个会话补过首屏了吗（KV，重启后仍然有效）。
+    /// Tell the host that history fetched from the server landed in the local store.
+    ///
+    /// The conversation list preview is projected from the latest local message, and the
+    /// server no longer sends preview content. Without this event a first-screen sweep (or
+    /// opening a conversation) fills the store while the list keeps showing blank rows,
+    /// because nothing asks the host to re-query its channels.
+    fn emit_history_hydrated(&self, channel_id: u64, channel_type: i32) {
+        self.emit_event(SdkEvent::TimelineUpdated {
+            channel_id,
+            channel_type,
+            message_id: 0,
+            reason: "history_hydrated".to_string(),
+        });
+    }
+
     async fn is_first_screen_hydrated(&self, channel_id: u64, channel_type: i32) -> bool {
         self.kv_get_local(format!("__hist_hydrated__:{channel_type}:{channel_id}"))
             .await
