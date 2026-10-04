@@ -75,6 +75,19 @@ const ACCOUNT_TREE_PROFILE: &str = "profile";
 const ACCOUNT_TREE_WRAP: &str = "wrap";
 const ACCOUNT_TREE_AUTH: &str = "auth";
 const ACCOUNT_TREE_KV: &str = "kv";
+/// Same period sled uses for its own flusher on the platforms where it runs one.
+const SLED_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+/// The platforms sled 0.34 starts a periodic flusher on (`Db::start_inner`); see
+/// [`LocalStore::spawn_periodic_flusher`].
+const SLED_RUNS_OWN_FLUSHER: bool = cfg!(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+));
 const PENDING_TIMELINE_MUTATION_PREFIX: &str = "__pending_timeline_mutation__:v1";
 
 /// 用户资料 upsert。
@@ -406,13 +419,60 @@ impl LocalStore {
     pub fn open_at(base: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base)
             .map_err(|e| Error::Storage(format!("create data dir: {e}")))?;
-        Ok(Self {
+        let store = Self {
             base_dir: Arc::new(base),
             account_dbs: Arc::new(Mutex::new(HashMap::new())),
             global_db: Arc::new(Mutex::new(None)),
             sqlite_conns: Arc::new(Mutex::new(HashMap::new())),
             queues_migrated: Arc::new(Mutex::new(HashSet::new())),
-        })
+        };
+        if !SLED_RUNS_OWN_FLUSHER {
+            store.spawn_periodic_flusher(SLED_FLUSH_EVERY)?;
+        }
+        Ok(store)
+    }
+
+    /// Flush every open sled database on a timer.
+    ///
+    /// 🔴 sled 0.34 starts its own periodic flusher only on windows / linux / macos / BSD
+    /// (`Db::start_inner`). iOS and Android are not on that list, so there a write sits in
+    /// memory until something calls `flush()` explicitly, and the OS killing the app — the
+    /// normal way a mobile app ends — loses it. Sync versions, channel pts, the
+    /// first-screen hydration marks and group settings all went that way: every cold start
+    /// re-synced and re-fetched as if the device were new. This restores sled's desktop
+    /// behaviour (same 500ms period) for every write, rather than flushing at each call site.
+    ///
+    /// Holds only weak references: the thread ends when the store is dropped, and an account
+    /// database removed from the map (logout) is no longer touched.
+    fn spawn_periodic_flusher(&self, every: std::time::Duration) -> Result<()> {
+        let account_dbs = Arc::downgrade(&self.account_dbs);
+        let global_db = Arc::downgrade(&self.global_db);
+        std::thread::Builder::new()
+            .name("privchat-sled-flusher".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(every);
+                let (Some(account_dbs), Some(global_db)) =
+                    (account_dbs.upgrade(), global_db.upgrade())
+                else {
+                    return;
+                };
+                // Clone the handles out so no lock is held across the fsync.
+                let mut dbs: Vec<sled::Db> = match account_dbs.lock() {
+                    Ok(guard) => guard.values().cloned().collect(),
+                    Err(_) => return,
+                };
+                if let Ok(guard) = global_db.lock() {
+                    dbs.extend(guard.iter().cloned());
+                }
+                drop((account_dbs, global_db));
+                for db in dbs {
+                    if let Err(e) = db.flush() {
+                        tracing::warn!(error = %e, "periodic sled flush failed");
+                    }
+                }
+            })
+            .map(|_| ())
+            .map_err(|e| Error::Storage(format!("spawn sled flusher: {e}")))
     }
 
     pub fn open_default() -> Result<Self> {
@@ -5892,6 +5952,35 @@ mod tests {
             hex::encode(rand_bytes)
         ));
         LocalStore::open_at(dir).expect("open test store")
+    }
+
+    /// 移动端 sled 不自己刷盘：没有这条线程，写进去的数据在 App 被杀时全丢
+    /// （同步水位、频道 pts、首屏 hydrated 标记——每次冷启动都当新设备重来）。
+    /// 用关掉自动刷盘的库模拟 iOS/Android：不手动 flush，等一个周期后应已无积压。
+    #[test]
+    fn periodic_flusher_persists_writes_sled_would_not_flush() {
+        let store = test_store();
+        let db = sled::Config::new()
+            .path(store.base_dir().join("no-auto-flush.kv"))
+            .flush_every_ms(None)
+            .open()
+            .expect("open sled without auto flush");
+        store
+            .account_dbs
+            .lock()
+            .unwrap()
+            .insert("u1".to_string(), db.clone());
+        store
+            .spawn_periodic_flusher(std::time::Duration::from_millis(20))
+            .expect("spawn flusher");
+
+        db.open_tree("kv")
+            .unwrap()
+            .insert(b"__hist_hydrated__:1:75", b"{\"hydrated\":true}".to_vec())
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert_eq!(db.flush().unwrap(), 0, "write still pending after the flush period");
     }
 
     /// 退出登录不是注销账号：凭证清掉了，bootstrap 水位必须还读得出来。
