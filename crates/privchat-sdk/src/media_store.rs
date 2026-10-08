@@ -239,7 +239,11 @@ pub fn resolve_downloaded_file_name(
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(64)
         .collect();
-    let base = if base.is_empty() { "attachment".to_string() } else { base };
+    let base = if base.is_empty() {
+        "attachment".to_string()
+    } else {
+        base
+    };
 
     let ext = ext_from_known_mime(server_mime)
         .or_else(|| safe_extension_of(server_filename))
@@ -327,7 +331,8 @@ pub(crate) fn find_primary_file(dir: &Path) -> Option<PathBuf> {
                 }
                 // 临时后缀是**追加**上去的（`payload.png.part`、`payload.png.decrypted.part`、
                 // `合同.pdf.sealed.tmp`），去掉之后仍带扩展名；用户自己那份去掉后只剩 `payload`。
-                if p.extension().map_or(false, |ext| ext == "part" || ext == "tmp")
+                if p.extension()
+                    .map_or(false, |ext| ext == "part" || ext == "tmp")
                     && stem.contains('.')
                 {
                     return false;
@@ -374,7 +379,6 @@ pub(crate) fn find_primary_file(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-
 #[cfg(test)]
 mod reanchor_tests {
     use super::*;
@@ -386,7 +390,8 @@ mod reanchor_tests {
     /// 认死那条绝对路径 = 用户看到「视频没了」，其实一个字节都没少。
     #[test]
     fn a_stale_container_prefix_is_remapped_onto_the_current_root() {
-        let user_root = Path::new("/C/Application/47AD7B80/Documents/privchat_data/users/100000003");
+        let user_root =
+            Path::new("/C/Application/47AD7B80/Documents/privchat_data/users/100000003");
         let stale = Path::new(
             "/C/Application/854ED157/Documents/privchat_data/users/100000003/files/202608/24/payload.mov",
         );
@@ -511,7 +516,6 @@ mod primary_file_tests {
     }
 }
 
-
 #[cfg(test)]
 mod downloaded_file_name_tests {
     use super::*;
@@ -526,7 +530,6 @@ mod downloaded_file_name_tests {
             "25865.png"
         );
     }
-
 
     /// 🔴 物理名必须带 `file_id`：两个人各发一张 `photo.png`，
     /// 用展示名当磁盘名就会互相覆盖——第二条消息点开是第一张图。
@@ -562,7 +565,10 @@ mod downloaded_file_name_tests {
             display_file_name("report\u{202e}gpj.exe", None).as_deref(),
             Some("reportgpj.exe")
         );
-        assert_eq!(display_file_name("", Some("local.png")).as_deref(), Some("local.png"));
+        assert_eq!(
+            display_file_name("", Some("local.png")).as_deref(),
+            Some("local.png")
+        );
         assert_eq!(display_file_name("", None), None);
     }
 
@@ -593,14 +599,23 @@ mod downloaded_file_name_tests {
         );
         // 服务端 MIME 认不出时，才轮到原文件名的扩展名。
         assert_eq!(
-            resolve_downloaded_file_name("10b", "report.HEIC", "application/octet-stream", None, None),
+            resolve_downloaded_file_name(
+                "10b",
+                "report.HEIC",
+                "application/octet-stream",
+                None,
+                None
+            ),
             "10b.heic"
         );
         assert_eq!(
             resolve_downloaded_file_name("11", "", "", None, Some("audio/mp4")),
             "11.m4a"
         );
-        assert_eq!(resolve_downloaded_file_name("12", "", "", None, None), "12.bin");
+        assert_eq!(
+            resolve_downloaded_file_name("12", "", "", None, None),
+            "12.bin"
+        );
     }
 
     /// 🔴 文件名来自别人的消息。拼进缓存路径之前必须清洗，
@@ -615,7 +630,10 @@ mod downloaded_file_name_tests {
             "trailing.",
         ] {
             let name = resolve_downloaded_file_name("13", hostile, "", None, None);
-            assert!(!name.contains('/') && !name.contains('\\'), "{hostile} -> {name}");
+            assert!(
+                !name.contains('/') && !name.contains('\\'),
+                "{hostile} -> {name}"
+            );
             assert!(!name.contains(".."), "{hostile} -> {name}");
         }
         // 合法扩展名照常保留（上面那条 exe 是合法字符，但目录部分必须被丢掉）。
@@ -632,6 +650,9 @@ mod downloaded_file_name_tests {
             resolve_downloaded_file_name("../7", "x.png", "", None, None),
             "7.png"
         );
-        assert_eq!(resolve_downloaded_file_name("", "x.png", "", None, None), "attachment.png");
+        assert_eq!(
+            resolve_downloaded_file_name("", "x.png", "", None, None),
+            "attachment.png"
+        );
     }
 }

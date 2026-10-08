@@ -52,11 +52,7 @@ type BoxResult<T> = Result<T, BoxError>;
 /// 账号由 platform 侧签发。所以这里允许直接喂一组已有凭据：
 ///   PRIVCHAT_UID_A / PRIVCHAT_TOKEN_A / PRIVCHAT_DEVICE_A（第二个用户用 _B）
 /// 三个都给了就跳过注册，否则走 server 内置注册（BUILTIN 本地环境）。
-async fn sign_in(
-    sdk: &PrivchatSdk,
-    suffix: &str,
-    fallback_username: String,
-) -> BoxResult<u64> {
+async fn sign_in(sdk: &PrivchatSdk, suffix: &str, fallback_username: String) -> BoxResult<u64> {
     let uid = std::env::var(format!("PRIVCHAT_UID_{suffix}")).ok();
     let token = std::env::var(format!("PRIVCHAT_TOKEN_{suffix}")).ok();
     let device = std::env::var(format!("PRIVCHAT_DEVICE_{suffix}")).ok();
@@ -117,7 +113,10 @@ async fn main() -> BoxResult<()> {
         "🔴 内容已经在服务端，预检必须命中"
     );
     assert!(
-        token_probe["file_id"].as_str().unwrap_or_default().is_empty(),
+        token_probe["file_id"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
         "🔴 预检不许泄露别人的 file_id，它只回答「在不在」；实际={}",
         token_probe["file_id"]
     );
@@ -323,10 +322,7 @@ fn seal_with_token(token: &Value, plaintext: &[u8]) -> BoxResult<Vec<u8>> {
     let chunk = token["chunk_plain_size"]
         .as_u64()
         .ok_or("token response missing chunk_plain_size")? as u32;
-    let key = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        key_b64,
-    )?;
+    let key = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key_b64)?;
     let sealed = privchat_protocol::attachment_crypto::encrypt_attachment_with_chunk_size(
         plaintext, &key, key_id, chunk,
     )?;
@@ -349,7 +345,9 @@ async fn upload_blob(token: &Value, blob: &[u8]) -> BoxResult<Value> {
     let upload_url = token["upload_url"]
         .as_str()
         .ok_or("token response missing upload_url")?;
-    let upload_token = token["token"].as_str().ok_or("token response missing token")?;
+    let upload_token = token["token"]
+        .as_str()
+        .ok_or("token response missing token")?;
     let part = reqwest::multipart::Part::bytes(blob.to_vec())
         .file_name("dedup-probe.bin")
         .mime_str("application/octet-stream")?;
@@ -398,7 +396,9 @@ fn random_blob(seed: u128) -> Vec<u8> {
     let mut state = seed as u64 | 1;
     (0..4096)
         .map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u8
         })
         .collect()

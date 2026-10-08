@@ -72,13 +72,17 @@ pub(crate) fn remove_cached_avatar_files(user_root: &Path, target_uid: u64) {
 
 fn purge_stale_avatar_files(dir: &Path, target_uid: u64, keep: &Path) {
     let prefix = format!("{target_uid}-");
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path == keep {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         // 旧布局 `{uid}.img`（带指纹之前装机的）在这里一并回收：写入新版本后它已经是孤儿，
         // 留着只会让老用户的目录里永远躺一张废图。生成式头像 `{uid}.gen-*.img` 不匹配，安全。
         let legacy = format!("{target_uid}.img");
@@ -212,7 +216,10 @@ pub(crate) fn prepare_avatar_image_sync(
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
     ));
     let mut file = std::fs::File::create(&out).map_err(|e| {
-        crate::Error::Storage(format!("prepare avatar: create {} failed: {e}", out.display()))
+        crate::Error::Storage(format!(
+            "prepare avatar: create {} failed: {e}",
+            out.display()
+        ))
     })?;
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, AVATAR_JPEG_QUALITY)
         .encode_image(&image::DynamicImage::ImageRgb8(rgb))
@@ -552,7 +559,9 @@ mod tests {
     /// 若裁剪参数被忽略，中心裁剪会同时取到红蓝交界，中心像素就不是纯红。
     #[test]
     fn crop_rect_selects_the_requested_region() {
-        let dir = std::env::current_dir().unwrap().join("target/avatar-crop-test");
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target/avatar-crop-test");
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join(format!("crop-src-{}.png", std::process::id()));
         let mut img = image::RgbaImage::new(400, 200);
@@ -570,7 +579,11 @@ mod tests {
         let out = prepare_avatar_image_sync(
             &src,
             &dir,
-            Some(AvatarCrop { x: 0.0, y: 0.0, size: 1.0 }),
+            Some(AvatarCrop {
+                x: 0.0,
+                y: 0.0,
+                size: 1.0,
+            }),
         )
         .unwrap();
         let processed = image::open(&out).unwrap().to_rgb8();
@@ -590,7 +603,9 @@ mod tests {
     /// 是荒唐的（spec §8.1）。
     #[test]
     fn an_out_of_bounds_crop_is_clamped_not_rejected() {
-        let dir = std::env::current_dir().unwrap().join("target/avatar-crop-test");
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target/avatar-crop-test");
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join(format!("clamp-src-{}.png", std::process::id()));
         image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
@@ -605,7 +620,11 @@ mod tests {
         let out = prepare_avatar_image_sync(
             &src,
             &dir,
-            Some(AvatarCrop { x: 9.0, y: 9.0, size: 9.0 }),
+            Some(AvatarCrop {
+                x: 9.0,
+                y: 9.0,
+                size: 9.0,
+            }),
         )
         .expect("越界矩形应当被钳制而不是报错");
         assert_eq!(image::open(&out).unwrap().width(), 720);
@@ -618,7 +637,9 @@ mod tests {
     /// JPEG 没有透明通道。少了白底合成，一张透明背景的 PNG 头像上传完就是个黑块。
     #[test]
     fn transparent_pixels_become_white_not_black() {
-        let dir = std::env::current_dir().unwrap().join("target/avatar-crop-test");
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target/avatar-crop-test");
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join(format!("alpha-src-{}.png", std::process::id()));
         image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(

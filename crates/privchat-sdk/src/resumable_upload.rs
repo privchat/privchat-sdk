@@ -231,9 +231,9 @@ pub fn chunk_verdict(code: Option<u32>, is_server_error: bool) -> ChunkVerdict {
     match code {
         Some(0) | Some(20614) => ChunkVerdict::Ok, // 20614=已完成，拿 file_id 即可
         Some(20611) | Some(20612) => ChunkVerdict::RetryChunk, // 摘要不符 / 会话忙
-        Some(20610) | Some(20615) => ChunkVerdict::Resync,     // 区间对不上 / 缺区间
-        Some(20613) => ChunkVerdict::StartOver,                // 会话没了
-        Some(20618) => ChunkVerdict::RestartUpload,            // 完成后校验失败，从零重来
+        Some(20610) | Some(20615) => ChunkVerdict::Resync, // 区间对不上 / 缺区间
+        Some(20613) => ChunkVerdict::StartOver,    // 会话没了
+        Some(20618) => ChunkVerdict::RestartUpload, // 完成后校验失败，从零重来
         _ => {
             if is_server_error {
                 ChunkVerdict::RetryChunk
@@ -664,7 +664,10 @@ mod tests {
     #[test]
     fn complete_restart_codes_are_exactly_20613_and_20618() {
         assert!(complete_code_means_restart(20613), "会话没了要重来");
-        assert!(complete_code_means_restart(20618), "完成后校验失败要从零重来");
+        assert!(
+            complete_code_means_restart(20618),
+            "完成后校验失败要从零重来"
+        );
         assert!(!complete_code_means_restart(0));
         assert!(!complete_code_means_restart(20611));
         assert!(!complete_code_means_restart(20615));
@@ -827,7 +830,8 @@ impl UploadSessionRecord {
         if self.server_identity != server_identity {
             return ReuseVerdict::DifferentServer;
         }
-        if !self.sealed_sha256.eq_ignore_ascii_case(sealed_sha256) || self.sealed_size != sealed_size
+        if !self.sealed_sha256.eq_ignore_ascii_case(sealed_sha256)
+            || self.sealed_size != sealed_size
         {
             return ReuseVerdict::DifferentPayload;
         }
@@ -899,7 +903,6 @@ impl UploadSessionRecord {
     }
 }
 
-
 #[cfg(test)]
 mod s3_part_mapping_tests {
     use super::*;
@@ -925,8 +928,14 @@ mod s3_part_mapping_tests {
             vec![1, 3]
         );
         // 空区间不产片；越界片号被丢弃（服务端不该给，给了也不炸）。
-        assert_eq!(parts_from_missing(&[(0, 0)], part, total_parts), Vec::<u32>::new());
-        assert_eq!(parts_from_missing(&[(99 * part, part)], part, total_parts), Vec::<u32>::new());
+        assert_eq!(
+            parts_from_missing(&[(0, 0)], part, total_parts),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            parts_from_missing(&[(99 * part, part)], part, total_parts),
+            Vec::<u32>::new()
+        );
     }
 
     /// 末片按余数截断，不能按整片长度去读盘（会越界或多传）。

@@ -71,11 +71,11 @@ use privchat_protocol::rpc::{
     ChannelPinResponse,
     ClientSubmitRequest,
     ClientSubmitResponse,
-    DevicePushStatusRequest,
-    DevicePushStatusResponse,
     DevicePushPreferenceGetRequest,
     DevicePushPreferenceResponse,
     DevicePushPreferenceUpdateRequest,
+    DevicePushStatusRequest,
+    DevicePushStatusResponse,
     DevicePushUpdateRequest,
     DevicePushUpdateResponse,
     FileGetUrlRequest,
@@ -186,19 +186,20 @@ use privchat_sdk::{
     ConnectionState as SdkConnectionState, ContactCardMessageInput as SdkContactCardMessageInput,
     Error as SdkError, LinkMessageInput as SdkLinkMessageInput,
     LocalAccountSummary as SdkLocalAccountSummary, LocationMessageInput as SdkLocationMessageInput,
-    LoginResult as SdkLoginResult,     MentionInput as SdkMentionInput, NetworkHint as SdkNetworkHint, NewMessage as SdkNewMessage,
-    PresenceStatus as SdkPresenceStatus, PrivchatConfig as SdkConfig, PrivchatSdk as InnerSdk,
-    QueueMessage as SdkQueueMessage, SequencedSdkEvent as SdkSequencedSdkEvent,
-    ServerEndpoint as SdkServerEndpoint, SessionSnapshot as SdkSessionSnapshot,
-    StoredBlacklistEntry as SdkStoredBlacklistEntry, StoredChannel as SdkStoredChannel,
-    StoredChannelExtra as SdkStoredChannelExtra, StoredChannelMember as SdkStoredChannelMember,
-    StoredFriend as SdkStoredFriend, StoredGroup as SdkStoredGroup,
-    StoredGroupMember as SdkStoredGroupMember, StoredMessage as SdkStoredMessage,
-    StoredMessageExtra as SdkStoredMessageExtra, StoredMessageReaction as SdkStoredMessageReaction,
-    StoredReminder as SdkStoredReminder, StoredUser as SdkStoredUser,
-    StructuredSendOptions as SdkStructuredSendOptions, TerminalReason as SdkTerminalReason,
-    TransportProtocol as SdkProtocol, TypingActionType as SdkTypingActionType,
-    UnreadMentionCount as SdkUnreadMentionCount, UpsertBlacklistInput as SdkUpsertBlacklistInput,
+    LoginResult as SdkLoginResult, MentionInput as SdkMentionInput, NetworkHint as SdkNetworkHint,
+    NewMessage as SdkNewMessage, PresenceStatus as SdkPresenceStatus, PrivchatConfig as SdkConfig,
+    PrivchatSdk as InnerSdk, QueueMessage as SdkQueueMessage,
+    SequencedSdkEvent as SdkSequencedSdkEvent, ServerEndpoint as SdkServerEndpoint,
+    SessionSnapshot as SdkSessionSnapshot, StoredBlacklistEntry as SdkStoredBlacklistEntry,
+    StoredChannel as SdkStoredChannel, StoredChannelExtra as SdkStoredChannelExtra,
+    StoredChannelMember as SdkStoredChannelMember, StoredFriend as SdkStoredFriend,
+    StoredGroup as SdkStoredGroup, StoredGroupMember as SdkStoredGroupMember,
+    StoredMessage as SdkStoredMessage, StoredMessageExtra as SdkStoredMessageExtra,
+    StoredMessageReaction as SdkStoredMessageReaction, StoredReminder as SdkStoredReminder,
+    StoredUser as SdkStoredUser, StructuredSendOptions as SdkStructuredSendOptions,
+    TerminalReason as SdkTerminalReason, TransportProtocol as SdkProtocol,
+    TypingActionType as SdkTypingActionType, UnreadMentionCount as SdkUnreadMentionCount,
+    UpsertBlacklistInput as SdkUpsertBlacklistInput,
     UpsertChannelExtraInput as SdkUpsertChannelExtraInput,
     UpsertChannelInput as SdkUpsertChannelInput,
     UpsertChannelMemberInput as SdkUpsertChannelMemberInput,
@@ -206,7 +207,7 @@ use privchat_sdk::{
     UpsertGroupMemberInput as SdkUpsertGroupMemberInput,
     UpsertMessageReactionInput as SdkUpsertMessageReactionInput,
     UpsertReminderInput as SdkUpsertReminderInput, UpsertUserInput as SdkUpsertUserInput,
-    UserStoragePaths as SdkUserStoragePaths, 
+    UserStoragePaths as SdkUserStoragePaths,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -6011,8 +6012,12 @@ impl PrivchatClient {
                 device_id,
                 apns_armed,
                 push_token,
-                vendor: vendor.map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty()),
-                locale: locale.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+                vendor: vendor
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| !v.is_empty()),
+                locale: locale
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
                 push_sound,
             },
         )
@@ -7926,6 +7931,25 @@ impl PrivchatClient {
             .await
     }
 
+    /// 本地优先首读（绕开网络 actor，不发网络）。
+    ///
+    /// `get_messages` / `open_conversation` 的本地读都排在网络 actor 的命令队列里，首屏预取
+    /// 扫补正打网络时会把它们顶在后面，表现为「有些会话点进去要等一会儿才出历史」。本方法走
+    /// 独立存储 actor，点开会话时先用它从 SQLite 瞬读渲染，再调 `open_conversation` 追增量。
+    pub async fn get_local_timeline(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        limit: u64,
+    ) -> Result<Vec<StoredMessage>, PrivchatFfiError> {
+        let out = self
+            .inner
+            .local_timeline(channel_id, channel_type, limit as u32)
+            .await
+            .map_err(PrivchatFfiError::from)?;
+        Ok(out.into_iter().map(map_stored_message).collect())
+    }
+
     pub async fn upsert_channel(&self, input: UpsertChannelInput) -> Result<(), PrivchatFfiError> {
         self.inner
             .upsert_channel(map_upsert_channel(input))
@@ -8976,9 +9000,15 @@ impl PrivchatClient {
         let (data, sealed, meta) = self
             .resolve_attachment_bytes_with_meta(&source_path)
             .await?;
-        let server_name = meta.as_ref().map(|m| m.original_filename.as_str()).unwrap_or("");
+        let server_name = meta
+            .as_ref()
+            .map(|m| m.original_filename.as_str())
+            .unwrap_or("");
         let server_mime = meta.as_ref().map(|m| m.mime_type.as_str()).unwrap_or("");
-        let file_type = meta.as_ref().map(|m| m.file_type.clone()).unwrap_or_default();
+        let file_type = meta
+            .as_ref()
+            .map(|m| m.file_type.clone())
+            .unwrap_or_default();
 
         let file_name = privchat_sdk::media_store::resolve_downloaded_file_name(
             source_path.trim(),
@@ -8987,11 +9017,9 @@ impl PrivchatClient {
             message_file_name.as_deref(),
             message_mime_type.as_deref(),
         );
-        let display = privchat_sdk::media_store::display_file_name(
-            server_name,
-            message_file_name.as_deref(),
-        )
-        .unwrap_or_default();
+        let display =
+            privchat_sdk::media_store::display_file_name(server_name, message_file_name.as_deref())
+                .unwrap_or_default();
 
         let dir = std::path::Path::new(&target_dir);
         std::fs::create_dir_all(dir).map_err(|e| PrivchatFfiError::SdkError {
@@ -9063,9 +9091,7 @@ impl PrivchatClient {
 
         // 把原始密文留在文件旁边：这份内容再发一次时原样上传，服务端按摘要认出
         // 「已经有了」，正文一个字节都不用传。
-        if let (Some(blob), Some(dir), Some(name)) =
-            (sealed, target.parent(), target.file_name())
-        {
+        if let (Some(blob), Some(dir), Some(name)) = (sealed, target.parent(), target.file_name()) {
             privchat_sdk::media_download::write_sealed_cache(
                 dir,
                 &format!("{}.sealed", name.to_string_lossy()),
@@ -9135,7 +9161,6 @@ impl PrivchatClient {
                 detail: format!("ensure attachment dir failed: {e}"),
             })
     }
-
 
     /// Start a streaming download for an attachment-encrypted (v1) message by
     /// `file_id`. The SDK resolves the signed URL + cek via `file/get_url` and
@@ -9250,7 +9275,6 @@ impl PrivchatClient {
         None
     }
 
-
     /// Plan 2：宿主处理完 `SdkEvent::MediaJobRequested` 后回传结果。
     pub fn submit_media_job_result(
         &self,
@@ -9268,7 +9292,6 @@ impl PrivchatClient {
             .submit_media_job_result(job_id, inner)
             .map_err(PrivchatFfiError::from)
     }
-
 
     pub fn to_client_endpoint(&self) -> Option<String> {
         self.config().endpoints.first().map(|v| {
@@ -9517,7 +9540,7 @@ mod tests {
             }],
             connection_timeout_secs: 1,
             data_dir: String::new(),
-        spki_pins: vec![],
+            spki_pins: vec![],
         }
     }
 
@@ -9678,10 +9701,7 @@ impl PrivchatClient {
     async fn resolve_attachment_bytes_with_meta(
         &self,
         source_path: &str,
-    ) -> Result<
-        (Vec<u8>, Option<Vec<u8>>, Option<FileGetUrlResponse>),
-        PrivchatFfiError,
-    > {
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>, Option<FileGetUrlResponse>), PrivchatFfiError> {
         let source = source_path.trim();
         if source.is_empty() {
             return Err(PrivchatFfiError::SdkError {
@@ -9771,19 +9791,20 @@ impl PrivchatClient {
         // 分流由票据说了算（有没有密钥），不由字节的 magic 说了算。
         let (plain, sealed) = match attachment_key.as_deref() {
             Some(encoded) => {
-                let site_key = privchat_sdk::attachment_crypto::decode_site_key(encoded)
-                    .map_err(|e| PrivchatFfiError::SdkError {
-                        code: privchat_protocol::ErrorCode::InternalError as u32,
-                        detail: format!("attachment key unusable: {e}"),
+                let site_key =
+                    privchat_sdk::attachment_crypto::decode_site_key(encoded).map_err(|e| {
+                        PrivchatFfiError::SdkError {
+                            code: privchat_protocol::ErrorCode::InternalError as u32,
+                            detail: format!("attachment key unusable: {e}"),
+                        }
                     })?;
-                let plain =
-                    privchat_sdk::attachment_crypto::decrypt_downloaded_attachment_bytes(
-                        &site_key, &blob,
-                    )
-                    .map_err(|e| PrivchatFfiError::SdkError {
-                        code: privchat_protocol::ErrorCode::InternalError as u32,
-                        detail: format!("decrypt attachment failed: {e}"),
-                    })?;
+                let plain = privchat_sdk::attachment_crypto::decrypt_downloaded_attachment_bytes(
+                    &site_key, &blob,
+                )
+                .map_err(|e| PrivchatFfiError::SdkError {
+                    code: privchat_protocol::ErrorCode::InternalError as u32,
+                    detail: format!("decrypt attachment failed: {e}"),
+                })?;
                 // 密文留一份：再发这份内容时可以直接复用，不必重新封装。
                 (plain, Some(blob))
             }

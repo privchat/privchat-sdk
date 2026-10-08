@@ -408,7 +408,11 @@ impl<'a> Drop for ConnGuard<'a> {
 /// 搜 "Test" 命中一条 system.friend_request 的原始 JSON）。服务端索引同规则
 /// （message_repo `AND m.message_type = 0`），两层必须一致。
 fn searchable_word_gate(message_type: i32, searchable_word: &str) -> String {
-    if message_type == 0 { searchable_word.to_string() } else { String::new() }
+    if message_type == 0 {
+        searchable_word.to_string()
+    } else {
+        String::new()
+    }
 }
 
 impl LocalStore {
@@ -679,10 +683,14 @@ impl LocalStore {
         // 代价说清楚：**还没发出去的 outbox 消息会跟着没**。这是 beta1 一次性的
         // 断代成本，换的是不用把 22 条迁移的修复逻辑永远背下去。
         if Self::has_pre_baseline_ledger(&conn)? {
-            tracing::warn!(uid, "本地库来自 1.0.0 beta1 之前的版本，重建：未发送的消息会丢失");
+            tracing::warn!(
+                uid,
+                "本地库来自 1.0.0 beta1 之前的版本，重建：未发送的消息会丢失"
+            );
             drop(conn);
             Self::remove_db_files(db_path)?;
-            conn = Connection::open(db_path).map_err(|e| Error::Storage(format!("open db: {e}")))?;
+            conn =
+                Connection::open(db_path).map_err(|e| Error::Storage(format!("open db: {e}")))?;
             conn.pragma_update(None, "key", &key)
                 .map_err(|e| Error::Storage(format!("set db key: {e}")))?;
             conn.pragma_update(None, "journal_mode", "WAL")
@@ -3099,7 +3107,9 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("dm_channels_for_peer query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| Error::Storage(format!("dm_channels_for_peer row: {e}")))? as u64);
+            out.push(
+                row.map_err(|e| Error::Storage(format!("dm_channels_for_peer row: {e}")))? as u64,
+            );
         }
         Ok(out)
     }
@@ -3142,7 +3152,9 @@ impl LocalStore {
             .map_err(|e| Error::Storage(format!("unresolved_dm_peers query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| Error::Storage(format!("unresolved_dm_peers row: {e}")))? as u64);
+            out.push(
+                row.map_err(|e| Error::Storage(format!("unresolved_dm_peers row: {e}")))? as u64,
+            );
         }
         Ok(out)
     }
@@ -5933,7 +5945,6 @@ mod tests {
         get_string, resolve_group_member_display_name, LegacyQueueKind, LocalStore,
         GLOBAL_TREE_ACCOUNTS, K_ACTIVE_UID,
     };
-    use rusqlite::Connection;
     use crate::{
         LoginResult, NewMessage, PendingTimelineMutation, UpsertChannelExtraInput,
         UpsertChannelInput, UpsertGroupInput, UpsertGroupMemberInput, UpsertRemoteMessageInput,
@@ -5941,6 +5952,7 @@ mod tests {
     };
     use rand::RngCore;
     use rusqlite::params;
+    use rusqlite::Connection;
     use std::path::PathBuf;
 
     fn test_store() -> LocalStore {
@@ -6119,7 +6131,10 @@ mod tests {
             .expect("upsert user");
 
         let listed = store.list_channels(uid, 10, 0).expect("list channels");
-        let dm = listed.iter().find(|c| c.channel_id == 4381).expect("dm row");
+        let dm = listed
+            .iter()
+            .find(|c| c.channel_id == 4381)
+            .expect("dm row");
         assert_eq!(dm.channel_name, "福姐九五");
     }
 
@@ -6317,12 +6332,22 @@ mod tests {
         let store = test_store();
         let path = store.base_dir.as_ref().clone();
         let uid = "20002";
-        store.save_login(uid, &LoginResult {
-            user_id: 20002, token: "old-access".into(), device_id: "old-device".into(),
-            refresh_token: None, expires_at: 0,
-        }).unwrap();
+        store
+            .save_login(
+                uid,
+                &LoginResult {
+                    user_id: 20002,
+                    token: "old-access".into(),
+                    device_id: "old-device".into(),
+                    refresh_token: None,
+                    expires_at: 0,
+                },
+            )
+            .unwrap();
         store.set_bootstrap_completed(uid, true).unwrap();
-        store.update_authenticated_session(uid, "new-access", "new-device", None).unwrap();
+        store
+            .update_authenticated_session(uid, "new-access", "new-device", None)
+            .unwrap();
         store.flush_user(uid).unwrap();
         drop(store);
         let reopened = LocalStore::open_at(path).unwrap();
@@ -6977,7 +7002,10 @@ mod tests {
 
         // 早上的一条已确认消息。
         store
-            .upsert_remote_message_with_result(uid, &remote(900001, 5, 1_700_000_000_000, "早上的消息"))
+            .upsert_remote_message_with_result(
+                uid,
+                &remote(900001, 5, 1_700_000_000_000, "早上的消息"),
+            )
             .expect("morning");
 
         // 紧接着发一条，失败了：拿不到 server_message_id，但锚住了当时的水位 pts=5。
@@ -7003,7 +7031,10 @@ mod tests {
 
         // 晚上又收到一条，pts 更大。
         store
-            .upsert_remote_message_with_result(uid, &remote(900002, 9, 1_700_000_600_000, "晚上的图片"))
+            .upsert_remote_message_with_result(
+                uid,
+                &remote(900002, 9, 1_700_000_600_000, "晚上的图片"),
+            )
             .expect("evening");
 
         let page = store.list_messages(uid, cid, ctype, 10, 0).expect("list");
@@ -7048,7 +7079,10 @@ mod tests {
         };
 
         store
-            .upsert_remote_message_with_result(uid, &remote(900001, 5, 1_700_000_000_000, "早上的消息"))
+            .upsert_remote_message_with_result(
+                uid,
+                &remote(900001, 5, 1_700_000_000_000, "早上的消息"),
+            )
             .expect("morning");
         let legacy = store
             .create_local_message(
@@ -7070,7 +7104,10 @@ mod tests {
             )
             .expect("legacy local row");
         store
-            .upsert_remote_message_with_result(uid, &remote(900002, 9, 1_700_000_600_000, "晚上的图片"))
+            .upsert_remote_message_with_result(
+                uid,
+                &remote(900002, 9, 1_700_000_600_000, "晚上的图片"),
+            )
             .expect("evening");
 
         let conn = store.conn_for_user(uid).expect("conn");
@@ -8459,7 +8496,11 @@ mod tests {
                         mute: 0,
                         last_msg_timestamp: ts,
                         last_local_message_id: 0,
-                        last_msg_content: if ts > 0 { "hi".to_string() } else { String::new() },
+                        last_msg_content: if ts > 0 {
+                            "hi".to_string()
+                        } else {
+                            String::new()
+                        },
                         version: 1,
                         peer_user_id: None,
                     },
@@ -8592,8 +8633,7 @@ mod tests {
                         pts,
                         order_seq: pts,
                         extra: "{}".to_string(),
-                        timestamp_precision:
-                            crate::canonical_inbound::TimePrecision::Milliseconds,
+                        timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                         mime_type: None,
                         revoked: false,
                     },
@@ -8666,8 +8706,7 @@ mod tests {
                         pts,
                         order_seq: pts,
                         extra: "{}".to_string(),
-                        timestamp_precision:
-                            crate::canonical_inbound::TimePrecision::Milliseconds,
+                        timestamp_precision: crate::canonical_inbound::TimePrecision::Milliseconds,
                         mime_type: None,
                         revoked: false,
                     },
@@ -9729,11 +9768,13 @@ mod tests {
             .next()
             .expect("user row");
         assert_eq!(
-            user.username.as_deref(), Some("ios013739a"),
+            user.username.as_deref(),
+            Some("ios013739a"),
             "the partial write still contributes the field it does know",
         );
         assert_eq!(
-            user.nickname.as_deref(), Some("IOS17Pro"),
+            user.nickname.as_deref(),
+            Some("IOS17Pro"),
             "a partial write must not erase the authoritative nickname, whatever version it claims",
         );
     }
@@ -9782,8 +9823,16 @@ mod tests {
 
         // 无版本的部分写入：只补它知道的空缺(username),不碰已有昵称,不碰版本。
         write(Some("stale"), Some("acct"), 0);
-        assert_eq!(row().nickname.as_deref(), Some("v55"), "无版本写入不得覆盖已确认资料");
-        assert_eq!(row().username.as_deref(), Some("acct"), "但它该补上本地缺的字段");
+        assert_eq!(
+            row().nickname.as_deref(),
+            Some("v55"),
+            "无版本写入不得覆盖已确认资料"
+        );
+        assert_eq!(
+            row().username.as_deref(),
+            Some("acct"),
+            "但它该补上本地缺的字段"
+        );
 
         // 下一版权威资料必须能落地——如果刚才那次把版本抬高了,这里就会被挡住。
         write(Some("v56"), None, 56);
@@ -9860,28 +9909,26 @@ mod tests {
         let uid = "10137";
         store.ensure_user_storage(uid).expect("ensure storage");
 
-        let put = |nickname: Option<&str>,
-                   avatar: Option<&str>,
-                   username: Option<&str>,
-                   version: i64| {
-            store
-                .upsert_user(
-                    uid,
-                    &UpsertUserInput {
-                        user_id: 55,
-                        username: username.map(|s| s.to_string()),
-                        nickname: nickname.map(|s| s.to_string()),
-                        alias: None,
-                        avatar: avatar.map(|s| s.to_string()),
-                        user_type: 0,
-                        is_deleted: false,
-                        channel_id: String::new(),
-                        version,
-                        updated_at: version,
-                    },
-                )
-                .expect("upsert")
-        };
+        let put =
+            |nickname: Option<&str>, avatar: Option<&str>, username: Option<&str>, version: i64| {
+                store
+                    .upsert_user(
+                        uid,
+                        &UpsertUserInput {
+                            user_id: 55,
+                            username: username.map(|s| s.to_string()),
+                            nickname: nickname.map(|s| s.to_string()),
+                            alias: None,
+                            avatar: avatar.map(|s| s.to_string()),
+                            user_type: 0,
+                            is_deleted: false,
+                            channel_id: String::new(),
+                            version,
+                            updated_at: version,
+                        },
+                    )
+                    .expect("upsert")
+            };
         let row = || {
             store
                 .list_users_by_ids(uid, &[55])
@@ -9955,7 +10002,10 @@ mod tests {
             .get_user_avatar_cache(uid, 66)
             .expect("read cache")
             .expect("cache row");
-        assert_eq!(cached.avatar_local_path, "/tmp/a.img", "前提:确实缓存过文件");
+        assert_eq!(
+            cached.avatar_local_path, "/tmp/a.img",
+            "前提:确实缓存过文件"
+        );
 
         put(Some(""), 71); // 权威清除
         let after = store
@@ -10092,7 +10142,11 @@ mod tests {
             .next()
             .expect("row")
             .nickname;
-        assert_eq!(blocked.as_deref(), Some("frozen"), "前提:脏版本确实会挡住同步");
+        assert_eq!(
+            blocked.as_deref(),
+            Some("frozen"),
+            "前提:脏版本确实会挡住同步"
+        );
 
         // 重开库 → 修复跑起来 → 同一条同步现在能落地。
         store.ensure_user_storage(uid).expect("reopen runs repair");
@@ -10119,7 +10173,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("row");
-        assert_eq!(row.nickname.as_deref(), Some("fresh"), "修复后增量必须能持续生效");
+        assert_eq!(
+            row.nickname.as_deref(),
+            Some("fresh"),
+            "修复后增量必须能持续生效"
+        );
         assert_eq!(row.version, 61, "版本回到真实序列上");
     }
 
@@ -10167,7 +10225,11 @@ mod tests {
         assert_eq!(avatar_now(), "https://cdn/a.png");
 
         write(Some(""), 30); // 权威说没有头像 → 清除
-        assert_eq!(avatar_now(), "", "an explicit empty avatar must clear the stored one");
+        assert_eq!(
+            avatar_now(),
+            "",
+            "an explicit empty avatar must clear the stored one"
+        );
     }
 
     /// 同一次回归的另一半：即便旧资料**带着更大的版本号**（历史脏数据，或者一个
@@ -10304,7 +10366,9 @@ mod tests {
                 .is_empty(),
             "user 已就位，不该再排队补齐"
         );
-        let rows = store.list_channels(uid, 20, 0).expect("list channels again");
+        let rows = store
+            .list_channels(uid, 20, 0)
+            .expect("list channels again");
         let row = rows
             .iter()
             .find(|c| c.channel_id == channel_id)
@@ -10427,7 +10491,10 @@ mod tests {
             .expect("upsert dm");
 
         let rows = store.list_channels(uid, 20, 0).expect("list");
-        let row = rows.iter().find(|c| c.channel_id == channel_id).expect("visible");
+        let row = rows
+            .iter()
+            .find(|c| c.channel_id == channel_id)
+            .expect("visible");
         assert_eq!(row.channel_name, "旧昵称");
         assert_eq!(row.unread_count, 3);
 
@@ -10441,7 +10508,10 @@ mod tests {
         assert_eq!(row.channel_name, "旧昵称");
         assert_eq!(row.unread_count, 3);
         // 也不该再被当成待补齐（本地有可用快照）。
-        assert!(store.unresolved_dm_peers(uid, 10).expect("unresolved").is_empty());
+        assert!(store
+            .unresolved_dm_peers(uid, 10)
+            .expect("unresolved")
+            .is_empty());
     }
 
     /// 分页：未就绪的行在 LIMIT **之前**被过滤掉，请求 N 条就给 N 条可展示的。

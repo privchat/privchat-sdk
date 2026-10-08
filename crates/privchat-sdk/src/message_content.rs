@@ -323,10 +323,12 @@ fn scan_entities(text: &str, mentions: &[u64]) -> Vec<MessageTextEntity> {
     // 消息就会让下面的数量判定失衡。
     let spans: Vec<_> = mention_re
         .find_iter(text)
-        .filter(|m| !out.iter().any(|e: &MessageTextEntity| {
-            let (s, e2) = (utf16_len(text, m.start()), utf16_len(text, m.end()));
-            s < e.end && e2 > e.start
-        }))
+        .filter(|m| {
+            !out.iter().any(|e: &MessageTextEntity| {
+                let (s, e2) = (utf16_len(text, m.start()), utf16_len(text, m.end()));
+                s < e.end && e2 > e.start
+            })
+        })
         .collect();
     // 🔴 位置配对只在「真提及的个数和 id 的个数一致」时才成立。
     //
@@ -344,7 +346,11 @@ fn scan_entities(text: &str, mentions: &[u64]) -> Vec<MessageTextEntity> {
             text,
             m.start(),
             m.end(),
-            if positional_ok { mentions.get(index).copied() } else { None },
+            if positional_ok {
+                mentions.get(index).copied()
+            } else {
+                None
+            },
         ));
     }
     out.sort_by_key(|e| e.start);
@@ -560,9 +566,8 @@ mod caption_projection_tests {
     /// 🔴 附件的说明文字要跟图片一起显示；以前这一支一律清空 text，配的话就没了。
     #[test]
     fn a_caption_is_projected_as_the_message_text() {
-        let body = project_stored_message(&attachment(
-            r#"{"file_name":"a.jpg","caption":"周末爬山"}"#,
-        ));
+        let body =
+            project_stored_message(&attachment(r#"{"file_name":"a.jpg","caption":"周末爬山"}"#));
         assert_eq!(body.text, "周末爬山");
     }
 

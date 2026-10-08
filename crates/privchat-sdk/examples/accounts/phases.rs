@@ -4375,7 +4375,9 @@ impl TestPhases {
         }
 
         // ---- 场景 3：recall ----
-        let _ = manager.search_then_apply_friend("fsync_c", "charlie").await?;
+        let _ = manager
+            .search_then_apply_friend("fsync_c", "charlie")
+            .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4935,9 +4937,9 @@ impl TestPhases {
         // 发送成功后 content 必须已经从本地路径换成服务端附件描述：
         // 还留着 file:// / 绝对路径 = 对端拿到的是一条打不开的消息。
         if sent.content.contains(&source_path.display().to_string()) {
-            metrics.errors.push(
-                "sent attachment content still points at the local source path".to_string(),
-            );
+            metrics
+                .errors
+                .push("sent attachment content still points at the local source path".to_string());
         }
 
         let leftovers = alice.peek_outbound_files(100).await?;
@@ -5286,15 +5288,26 @@ impl TestPhases {
         let bob_uid = manager.user_id("bob")?;
 
         // 真 PNG：接收端要解码它做缩略图。
-        let img = image::RgbImage::from_fn(64, 48, |x, y| image::Rgb([(x * 3) as u8, 40, (y * 5) as u8]));
+        let img = image::RgbImage::from_fn(64, 48, |x, y| {
+            image::Rgb([(x * 3) as u8, 40, (y * 5) as u8])
+        });
         let mut buf = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(img).write_to(&mut buf, image::ImageFormat::Png)?;
         let png = buf.into_inner();
 
         let Some(alice_sent) = Self::send_one_fidelity_attachment(
-            manager, "alice", ab, channel_type, alice_uid, "原图.png", "image/png",
+            manager,
+            "alice",
+            ab,
+            channel_type,
+            alice_uid,
+            "原图.png",
+            "image/png",
             privchat_protocol::message::ContentMessageType::Image as i32,
-            Some("原始说明"), &png, None, &mut metrics,
+            Some("原始说明"),
+            &png,
+            None,
+            &mut metrics,
         )
         .await?
         else {
@@ -5306,15 +5319,30 @@ impl TestPhases {
             ));
         };
         let alice_wire = Self::sent_attachment_wire(&alice_sent);
-        let alice_file_url = alice_wire.get("file_url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let alice_file_id = alice_wire.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let alice_file_url = alice_wire
+            .get("file_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let alice_file_id = alice_wire
+            .get("file_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let alice_server_id = alice_sent.server_message_id.unwrap_or(0);
 
         // bob 收到并把主文件下载到本地托管目录——这一步产生的密文缓存正是秒传的本钱。
         let bob_root = manager.base_dir.join("bob");
         let Some(bob_row) = Self::wait_for_downloaded_attachment(
-            manager, "bob", ab, channel_type, alice_server_id, &bob_root, bob_uid,
-            "payload.png", "image/png", &mut metrics,
+            manager,
+            "bob",
+            ab,
+            channel_type,
+            alice_server_id,
+            &bob_root,
+            bob_uid,
+            "payload.png",
+            "image/png",
+            &mut metrics,
         )
         .await?
         else {
@@ -5347,9 +5375,18 @@ impl TestPhases {
 
         // bob 重新发一次：普通附件发送，源就是他自己那份托管文件。
         let Some(bob_sent) = Self::send_one_fidelity_attachment(
-            manager, "bob", target, channel_type, bob_uid, "原图.png", "image/png",
+            manager,
+            "bob",
+            target,
+            channel_type,
+            bob_uid,
+            "原图.png",
+            "image/png",
             privchat_protocol::message::ContentMessageType::Image as i32,
-            Some("原始说明"), &[], Some(bob_local.as_path()), &mut metrics,
+            Some("原始说明"),
+            &[],
+            Some(bob_local.as_path()),
+            &mut metrics,
         )
         .await?
         else {
@@ -5361,8 +5398,15 @@ impl TestPhases {
             ));
         };
         let bob_wire = Self::sent_attachment_wire(&bob_sent);
-        let bob_file_url = bob_wire.get("file_url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let bob_file_id = bob_wire.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let bob_file_url = bob_wire
+            .get("file_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let bob_file_id = bob_wire
+            .get("file_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         if bob_file_id == 0 || bob_file_id == alice_file_id {
             metrics.errors.push(format!(
@@ -5397,20 +5441,33 @@ impl TestPhases {
             ));
         }
         if bob_sent.message_type != alice_sent.message_type {
-            metrics.errors.push("resend changed the message type".to_string());
-        }
-        if Self::wire_display_name(&bob_wire) != "原图.png" {
             metrics
                 .errors
-                .push(format!("resend lost the name: {:?}", Self::wire_display_name(&bob_wire)));
+                .push("resend changed the message type".to_string());
+        }
+        if Self::wire_display_name(&bob_wire) != "原图.png" {
+            metrics.errors.push(format!(
+                "resend lost the name: {:?}",
+                Self::wire_display_name(&bob_wire)
+            ));
         }
 
         // 缓存没了 → 换一串密文 → 服务端没见过 → 必须退回整传，而且照样发得出去。
-        let removed = Self::drop_sealed_caches_under(&bob_root.join("users").join(bob_uid.to_string()));
+        let removed =
+            Self::drop_sealed_caches_under(&bob_root.join("users").join(bob_uid.to_string()));
         let Some(fallback_sent) = Self::send_one_fidelity_attachment(
-            manager, "bob", target, channel_type, bob_uid, "原图.png", "image/png",
+            manager,
+            "bob",
+            target,
+            channel_type,
+            bob_uid,
+            "原图.png",
+            "image/png",
             privchat_protocol::message::ContentMessageType::Image as i32,
-            None, &[], Some(bob_local.as_path()), &mut metrics,
+            None,
+            &[],
+            Some(bob_local.as_path()),
+            &mut metrics,
         )
         .await?
         else {
@@ -5425,7 +5482,10 @@ impl TestPhases {
         // 🔴 判据是 file_id，不是 file_url：本地行的 wire 描述按类型落在 content 或
         // extra 两处，file_url 只在其中一处出现，读得早了还可能没回写完
         // （这正是这条 phase 早先偶发失败的原因，不是产品问题）。
-        let fallback_file_id = fallback_wire.get("file_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let fallback_file_id = fallback_wire
+            .get("file_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         if fallback_file_id == 0 {
             metrics.errors.push(format!(
                 "fallback upload produced no file reference: wire={fallback_wire}"
@@ -5610,8 +5670,18 @@ started={started} expected={payload_filename} dir={:?} contents=[{listing}] extr
 
         let video_type = privchat_protocol::message::ContentMessageType::Video as i32;
         let Some(alice_sent) = Self::send_one_fidelity_attachment(
-            manager, "alice", ab, channel_type, alice_uid, "假期.mp4", "video/mp4",
-            video_type, Some("海边"), &video, None, &mut metrics,
+            manager,
+            "alice",
+            ab,
+            channel_type,
+            alice_uid,
+            "假期.mp4",
+            "video/mp4",
+            video_type,
+            Some("海边"),
+            &video,
+            None,
+            &mut metrics,
         )
         .await?
         else {
@@ -5625,8 +5695,16 @@ started={started} expected={payload_filename} dir={:?} contents=[{listing}] extr
         let alice_server_id = alice_sent.server_message_id.unwrap_or(0);
         let bob_root = manager.base_dir.join("bob");
         let Some(bob_row) = Self::wait_for_downloaded_attachment(
-            manager, "bob", ab, channel_type, alice_server_id, &bob_root, bob_uid,
-            "payload.mp4", "video/mp4", &mut metrics,
+            manager,
+            "bob",
+            ab,
+            channel_type,
+            alice_server_id,
+            &bob_root,
+            bob_uid,
+            "payload.mp4",
+            "video/mp4",
+            &mut metrics,
         )
         .await?
         else {
@@ -5649,8 +5727,18 @@ started={started} expected={payload_filename} dir={:?} contents=[{listing}] extr
         let before_bytes = std::fs::read(&bob_local)?;
         let before = manager.sdk("bob")?.attachment_transfer_stats();
         let Some(bob_sent) = Self::send_one_fidelity_attachment(
-            manager, "bob", ab, channel_type, bob_uid, "假期.mp4", "video/mp4",
-            video_type, Some("海边"), &[], Some(bob_local.as_path()), &mut metrics,
+            manager,
+            "bob",
+            ab,
+            channel_type,
+            bob_uid,
+            "假期.mp4",
+            "video/mp4",
+            video_type,
+            Some("海边"),
+            &[],
+            Some(bob_local.as_path()),
+            &mut metrics,
         )
         .await?
         else {
@@ -5678,7 +5766,9 @@ started={started} expected={payload_filename} dir={:?} contents=[{listing}] extr
             ));
         }
         if after.claims <= before.claims {
-            metrics.errors.push("the resent video should have claimed the existing content".to_string());
+            metrics
+                .errors
+                .push("the resent video should have claimed the existing content".to_string());
         }
         if bob_sent.message_type != video_type {
             metrics.errors.push(format!(
@@ -6095,9 +6185,9 @@ source={} sealed_cache={} extra={}",
             .filter(|id| message_ids.contains(id))
             .collect();
         if !leaked.is_empty() {
-            metrics
-                .errors
-                .push(format!("outbox still holds sent messages after restart: {leaked:?}"));
+            metrics.errors.push(format!(
+                "outbox still holds sent messages after restart: {leaked:?}"
+            ));
         }
 
         // ---- B. ACK 窗口：同一条命令被重放 ----
@@ -6113,7 +6203,9 @@ source={} sealed_cache={} extra={}",
                 .errors
                 .push("cannot exercise the ack window without a server id".to_string());
         } else {
-            second.enqueue_outbound_message(replay_id, Vec::new()).await?;
+            second
+                .enqueue_outbound_message(replay_id, Vec::new())
+                .await?;
             metrics.rpc_calls += 1;
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             loop {
@@ -6349,7 +6441,9 @@ source={} sealed_cache={} extra={}",
             .await?;
         metrics.rpc_calls += 1;
         metrics.messages_sent += 1;
-        let message_pts = sent.pts.ok_or_else(|| boxed_err("submit returned no pts"))?;
+        let message_pts = sent
+            .pts
+            .ok_or_else(|| boxed_err("submit returned no pts"))?;
         let server_message_id = sent
             .server_msg_id
             .ok_or_else(|| boxed_err("submit returned no server_msg_id"))?;
@@ -6554,9 +6648,7 @@ source={} sealed_cache={} extra={}",
             .await?;
         metrics.rpc_calls += 1;
         if resp.get("display_name").and_then(|v| v.as_str()) != Some(nickname.as_str()) {
-            metrics
-                .errors
-                .push(format!("更新响应里的昵称不对: {resp}"));
+            metrics.errors.push(format!("更新响应里的昵称不对: {resp}"));
         } else {
             metrics.rpc_successes += 1;
         }
@@ -6587,9 +6679,7 @@ source={} sealed_cache={} extra={}",
             .rpc_typed::<_, serde_json::Value>("alice", "account/profile/update", &EmptyReq {})
             .await
         {
-            Ok(v) => metrics
-                .errors
-                .push(format!("空请求竟然成功了: {v}")),
+            Ok(v) => metrics.errors.push(format!("空请求竟然成功了: {v}")),
             Err(_) => metrics.rpc_successes += 1,
         }
         metrics.rpc_calls += 1;
@@ -6673,7 +6763,9 @@ source={} sealed_cache={} extra={}",
             .await?;
         metrics.rpc_calls += 1;
         metrics.messages_sent += 1;
-        let message_pts = sent.pts.ok_or_else(|| boxed_err("submit returned no pts"))?;
+        let message_pts = sent
+            .pts
+            .ok_or_else(|| boxed_err("submit returned no pts"))?;
         let server_message_id = sent
             .server_msg_id
             .ok_or_else(|| boxed_err("submit returned no server_msg_id"))?;

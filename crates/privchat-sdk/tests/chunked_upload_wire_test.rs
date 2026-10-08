@@ -57,7 +57,10 @@ impl MockServer {
                     let missing = if confirmed >= total {
                         "[]".to_string()
                     } else {
-                        format!(r#"[{{"offset":{confirmed},"length":{}}}]"#, total - confirmed)
+                        format!(
+                            r#"[{{"offset":{confirmed},"length":{}}}]"#,
+                            total - confirmed
+                        )
                     };
                     format!(
                         r#"{{"code":0,"message":"OK","data":{{"received":{received},"missing":{missing},"received_bytes":{confirmed},"total_size":{total},"completed":false}}}}"#
@@ -162,7 +165,10 @@ fn the_chunk_endpoints_are_siblings_of_the_upload_endpoint() {
     for (upload_url, want) in [
         ("http://h/api/app/files/upload", "http://h/api/app/files"),
         ("http://h/api/app/files/upload/", "http://h/api/app/files"),
-        ("https://cdn.example.com/files/upload", "https://cdn.example.com/files"),
+        (
+            "https://cdn.example.com/files/upload",
+            "https://cdn.example.com/files",
+        ),
     ] {
         let base = upload_url.trim_end_matches('/').trim_end_matches("/upload");
         assert_eq!(base, want, "从 {upload_url} 推出来的 base 不对");
@@ -212,7 +218,8 @@ async fn a_chunked_upload_speaks_the_documented_protocol() {
         session_threshold: 64 * 1024,
         max_parallel_parts: 1,
     };
-    let mut up = privchat_sdk::resumable_upload::ResumableUpload::from_missing(total as u64, plan, &missing);
+    let mut up =
+        privchat_sdk::resumable_upload::ResumableUpload::from_missing(total as u64, plan, &missing);
     while let Some(chunk) = up.next_chunk() {
         let piece = &blob[chunk.offset as usize..(chunk.offset + chunk.len) as usize];
         let resp = client
@@ -311,7 +318,8 @@ async fn a_chunked_upload_speaks_the_documented_protocol() {
     );
 
     assert!(
-        reqs.iter().any(|r| r.path.starts_with("/api/app/files/complete") && r.method == "POST"),
+        reqs.iter()
+            .any(|r| r.path.starts_with("/api/app/files/complete") && r.method == "POST"),
         "最后要调 complete"
     );
 }

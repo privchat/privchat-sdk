@@ -108,7 +108,11 @@ async fn either_pin_works_during_rotation() {
     for (cert, key) in [(cert_a, key_a), (cert_b, key_b)] {
         let url = spawn_tls_server(cert, key).await;
         let client = file_plane_http::control_client(&url, &pins).expect("client builds");
-        let response = client.get(&url).send().await.expect("either key is accepted");
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .expect("either key is accepted");
         assert!(response.status().is_success());
     }
 }

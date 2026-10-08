@@ -82,7 +82,10 @@ pub struct PrivchatCapiBuffer {
 
 impl PrivchatCapiBuffer {
     fn empty() -> Self {
-        Self { data: ptr::null_mut(), len: 0 }
+        Self {
+            data: ptr::null_mut(),
+            len: 0,
+        }
     }
 
     fn from_vec(mut v: Vec<u8>) -> Self {
@@ -160,7 +163,11 @@ fn resolve_timeout(timeout_ms: u64) -> Duration {
 
 /// Run an SDK future on the client's runtime with a hard timeout.
 /// Never panics across the FFI boundary.
-fn block_on_timeout<F, T>(client: &PrivchatCapiClient, timeout_ms: u64, fut: F) -> Result<T, (i32, String)>
+fn block_on_timeout<F, T>(
+    client: &PrivchatCapiClient,
+    timeout_ms: u64,
+    fut: F,
+) -> Result<T, (i32, String)>
 where
     F: Future<Output = Result<T, privchat_sdk::Error>> + Send + 'static,
     T: Send + 'static,
@@ -181,10 +188,7 @@ where
             format!("timeout after {} ms", timeout.as_millis()),
         )),
         Ok(Err(e)) => Err((PRIVCHAT_CAPI_ERR_SDK, e.to_string())),
-        Err(_) => Err((
-            PRIVCHAT_CAPI_ERR_SDK,
-            "panic inside SDK call".to_string(),
-        )),
+        Err(_) => Err((PRIVCHAT_CAPI_ERR_SDK, "panic inside SDK call".to_string())),
     }
 }
 
@@ -343,9 +347,11 @@ pub unsafe extern "C" fn privchat_capi_run_bootstrap_sync(
 ) -> i32 {
     let client = guard_client!(handle, PRIVCHAT_CAPI_ERR_INVALID_ARG);
     let sdk = client.sdk.clone();
-    match block_on_timeout(client, timeout_ms, async move {
-        sdk.run_bootstrap_sync().await
-    }) {
+    match block_on_timeout(
+        client,
+        timeout_ms,
+        async move { sdk.run_bootstrap_sync().await },
+    ) {
         Ok(()) => PRIVCHAT_CAPI_OK,
         Err((code, msg)) => {
             set_last_error(msg);
@@ -382,9 +388,11 @@ pub unsafe extern "C" fn privchat_capi_connection_state(
 ) -> *mut c_char {
     let client = guard_client!(handle, ptr::null_mut());
     let sdk = client.sdk.clone();
-    match block_on_timeout(client, timeout_ms, async move {
-        sdk.connection_state().await
-    }) {
+    match block_on_timeout(
+        client,
+        timeout_ms,
+        async move { sdk.connection_state().await },
+    ) {
         Ok(state) => json_to_c_string(&state),
         Err((_, msg)) => {
             set_last_error(msg);
@@ -401,9 +409,11 @@ pub unsafe extern "C" fn privchat_capi_session_snapshot(
 ) -> *mut c_char {
     let client = guard_client!(handle, ptr::null_mut());
     let sdk = client.sdk.clone();
-    match block_on_timeout(client, timeout_ms, async move {
-        sdk.session_snapshot().await
-    }) {
+    match block_on_timeout(
+        client,
+        timeout_ms,
+        async move { sdk.session_snapshot().await },
+    ) {
         Ok(snapshot) => json_to_c_string(&snapshot),
         Err((_, msg)) => {
             set_last_error(msg);
@@ -596,9 +606,7 @@ pub unsafe extern "C" fn privchat_capi_events_since(
 ) -> *mut c_char {
     let client = guard_client!(handle, ptr::null_mut());
     let out = catch_unwind(AssertUnwindSafe(|| {
-        let events = client
-            .sdk
-            .events_since(from_sequence_id, limit as usize);
+        let events = client.sdk.events_since(from_sequence_id, limit as usize);
         json_to_c_string(&events)
     }));
     match out {
@@ -709,7 +717,8 @@ pub unsafe extern "C" fn privchat_capi_transfer(
     // the outer bridge timeout instead of receiving a literal 0.
     let effective_ms = resolve_timeout(timeout_ms).as_millis() as u64;
     match block_on_timeout(client, effective_ms, async move {
-        sdk.transfer(channel_id, route, body_bytes, effective_ms).await
+        sdk.transfer(channel_id, route, body_bytes, effective_ms)
+            .await
     }) {
         Ok(reply) => into_c_string(transfer_reply_json(&reply)),
         Err((_, msg)) => {
@@ -763,7 +772,8 @@ pub unsafe extern "C" fn privchat_capi_transfer_bytes(
     let sdk = client.sdk.clone();
     let effective_ms = resolve_timeout(timeout_ms).as_millis() as u64;
     match block_on_timeout(client, timeout_ms, async move {
-        sdk.transfer(channel_id, route, body_bytes, effective_ms).await
+        sdk.transfer(channel_id, route, body_bytes, effective_ms)
+            .await
     }) {
         Ok(reply) => {
             write_transfer_bytes_out(reply, out_code, out_reply);
@@ -955,7 +965,9 @@ pub unsafe extern "C" fn privchat_capi_mark_read_to_pts(
         let v: serde_json::Value = serde_json::from_str(&resp)
             .map_err(|e| privchat_sdk::Error::Serialization(format!("read_pts resp: {e}")))?;
         let last_read_pts = v["last_read_pts"].as_u64().ok_or_else(|| {
-            privchat_sdk::Error::Serialization(format!("read_pts resp missing last_read_pts: {resp}"))
+            privchat_sdk::Error::Serialization(format!(
+                "read_pts resp missing last_read_pts: {resp}"
+            ))
         })?;
         // Same fallback as the FFI's resolve_channel_type: unknown -> direct.
         let channel_type = match sdk.get_channel_by_id(channel_id).await {
@@ -1098,7 +1110,8 @@ mod tests {
             if code != 0 {
                 assert!(
                     last_error_string().contains(&format!("biz {code}")),
-                    "非零码的 message 未进入 last_error");
+                    "非零码的 message 未进入 last_error"
+                );
             }
             unsafe { privchat_capi_free_buffer(&mut out_reply) };
         }
@@ -1116,10 +1129,8 @@ mod tests {
     /// Unique throwaway data_dir so parallel tests never share sqlite files.
     fn test_config_json() -> CString {
         let n = DIR_SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "privchat-capi-test-{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("privchat-capi-test-{}-{n}", std::process::id()));
         cstr(&format!(
             "{{\"endpoints\":[{{\"protocol\":\"Tcp\",\"host\":\"127.0.0.1\",\
              \"port\":1,\"path\":null,\"use_tls\":false}}],\
@@ -1163,13 +1174,22 @@ mod tests {
                 privchat_capi_authenticate(null, 1, tok.as_ptr(), dev.as_ptr(), 10),
                 PRIVCHAT_CAPI_ERR_INVALID_ARG
             );
-            assert_eq!(privchat_capi_connect(null, 10), PRIVCHAT_CAPI_ERR_INVALID_ARG);
-            assert_eq!(privchat_capi_disconnect(null, 10), PRIVCHAT_CAPI_ERR_INVALID_ARG);
+            assert_eq!(
+                privchat_capi_connect(null, 10),
+                PRIVCHAT_CAPI_ERR_INVALID_ARG
+            );
+            assert_eq!(
+                privchat_capi_disconnect(null, 10),
+                PRIVCHAT_CAPI_ERR_INVALID_ARG
+            );
             assert_eq!(
                 privchat_capi_run_bootstrap_sync(null, 10),
                 PRIVCHAT_CAPI_ERR_INVALID_ARG
             );
-            assert_eq!(privchat_capi_shutdown(null, 10), PRIVCHAT_CAPI_ERR_INVALID_ARG);
+            assert_eq!(
+                privchat_capi_shutdown(null, 10),
+                PRIVCHAT_CAPI_ERR_INVALID_ARG
+            );
             assert_eq!(
                 privchat_capi_subscribe_channel(null, 1, 0, ptr::null(), 10),
                 PRIVCHAT_CAPI_ERR_INVALID_ARG
@@ -1184,7 +1204,13 @@ mod tests {
             );
             assert_eq!(
                 privchat_capi_send_text_message(
-                    null, 1, 0, 1, content.as_ptr(), 10, ptr::null_mut()
+                    null,
+                    1,
+                    0,
+                    1,
+                    content.as_ptr(),
+                    10,
+                    ptr::null_mut()
                 ),
                 PRIVCHAT_CAPI_ERR_INVALID_ARG
             );
@@ -1296,26 +1322,52 @@ mod tests {
 
             // NULL body + 非零长度 = 调用方 bug
             assert_eq!(
-                privchat_capi_transfer_bytes(h, 1, route.as_ptr(), ptr::null(), 4, 10,
-                        &mut code, &mut out),
+                privchat_capi_transfer_bytes(
+                    h,
+                    1,
+                    route.as_ptr(),
+                    ptr::null(),
+                    4,
+                    10,
+                    &mut code,
+                    &mut out
+                ),
                 PRIVCHAT_CAPI_ERR_INVALID_ARG
             );
             // NULL route
             assert_eq!(
-                privchat_capi_transfer_bytes(h, 1, ptr::null(), ptr::null(), 0, 10,
-                        &mut code, &mut out),
+                privchat_capi_transfer_bytes(
+                    h,
+                    1,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    10,
+                    &mut code,
+                    &mut out
+                ),
                 PRIVCHAT_CAPI_ERR_INVALID_ARG
             );
             // 含 NUL 与 0xFF 的二进制 body:离线必然超时/失败,但不得因为
             // 内容不是 UTF-8 就在参数校验阶段被拒(那才是字符串接口的毛病)。
             let binary: [u8; 6] = [0x00, 0xFF, 0x41, 0x00, 0xFE, 0x42];
-            let rc = privchat_capi_transfer_bytes(h, 1, route.as_ptr(),
-                    binary.as_ptr(), binary.len(), 200, &mut code, &mut out);
-            assert_ne!(rc, PRIVCHAT_CAPI_ERR_INVALID_ARG,
-                    "binary body must not be rejected as an invalid argument");
+            let rc = privchat_capi_transfer_bytes(
+                h,
+                1,
+                route.as_ptr(),
+                binary.as_ptr(),
+                binary.len(),
+                200,
+                &mut code,
+                &mut out,
+            );
+            assert_ne!(
+                rc, PRIVCHAT_CAPI_ERR_INVALID_ARG,
+                "binary body must not be rejected as an invalid argument"
+            );
 
             privchat_capi_free_buffer(&mut out);
-            privchat_capi_free_buffer(&mut out);   // 二次释放必须是 no-op
+            privchat_capi_free_buffer(&mut out); // 二次释放必须是 no-op
             privchat_capi_client_destroy(h);
         }
     }
@@ -1417,9 +1469,8 @@ mod tests {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let src = format!("{manifest}/tests/c_smoke.c");
         let include = format!("{manifest}/include");
-        let mut cmd = host_cc().expect(
-            "no C compiler found (cc/clang/gcc); install Xcode command line tools",
-        );
+        let mut cmd = host_cc()
+            .expect("no C compiler found (cc/clang/gcc); install Xcode command line tools");
         cmd.args(["-fsyntax-only", "-Wall", "-Werror", "-I", &include, &src]);
         let o = cmd.output().expect("failed to invoke cc");
         assert!(
@@ -1437,8 +1488,7 @@ mod tests {
             return std::path::PathBuf::from(dir).join("debug");
         }
         // Workspace layout: crates/privchat-sdk-c-api -> privchat-sdk/target.
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/debug")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug")
     }
 
     /// Real ABI proof: link the C smoke test against the built cdylib and
@@ -1463,10 +1513,8 @@ mod tests {
         }
         assert!(dylib.exists(), "cdylib missing at {}", dylib.display());
 
-        let bin = std::env::temp_dir().join(format!(
-            "privchat-capi-c-smoke-{}",
-            std::process::id()
-        ));
+        let bin =
+            std::env::temp_dir().join(format!("privchat-capi-c-smoke-{}", std::process::id()));
         let mut cc = host_cc().expect("no C compiler found (cc/clang/gcc)");
         let rpath = format!("-Wl,-rpath,{}", lib_dir.display());
         let lib_dir_str = lib_dir.display().to_string();

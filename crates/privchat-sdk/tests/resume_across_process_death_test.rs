@@ -88,7 +88,11 @@ impl MockServer {
                             let missing = if s.confirmed >= TOTAL as u64 {
                                 "[]".to_string()
                             } else {
-                                format!(r#"[{{"offset":{},"length":{}}}]"#, s.confirmed, TOTAL as u64 - s.confirmed)
+                                format!(
+                                    r#"[{{"offset":{},"length":{}}}]"#,
+                                    s.confirmed,
+                                    TOTAL as u64 - s.confirmed
+                                )
                             };
                             format!(
                                 r#"{{"code":0,"message":"OK","data":{{"received":{received},"missing":{missing},"received_bytes":{},"total_size":{TOTAL},"completed":false}}}}"#,

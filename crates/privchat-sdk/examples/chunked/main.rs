@@ -164,7 +164,10 @@ async fn main() -> BoxResult<()> {
             Some(digest.as_str()),
             "🔴 get_url 回的明文摘要必须就是申请时冻结的那个"
         );
-        let url = payload(&detail)["file_url"].as_str().unwrap_or_default().to_string();
+        let url = payload(&detail)["file_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         println!("   get_url ok，明文摘要一致");
         // 真正下载回来解密，证明读地址可用（path-style 会 403）。
         let fetched = reqwest::Client::new().get(&url).send().await?;
@@ -173,10 +176,8 @@ async fn main() -> BoxResult<()> {
         assert!(st.is_success(), "🔴 下载附件失败 status={st}");
         assert_eq!(body.len(), sealed.len(), "🔴 下载回来的密文长度不对");
         let key_b64 = token["attachment_key"]["key"].as_str().unwrap();
-        let key = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            key_b64,
-        )?;
+        let key =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key_b64)?;
         let plain = privchat_protocol::attachment_crypto::decrypt_attachment(&body, &key)
             .map_err(|e| format!("解密失败: {e}"))?;
         assert_eq!(sha256_hex(&plain), digest, "🔴 解密后明文摘要对不上");
@@ -200,7 +201,10 @@ async fn main() -> BoxResult<()> {
         "🔴 服务端认下的字节数({confirmed})与实际传出去的({offset})对不上——\
          断点续传会从错误的位置接着传"
     );
-    println!("   已传 {offset} / {}，status 确认 {confirmed}", sealed.len());
+    println!(
+        "   已传 {offset} / {}，status 确认 {confirmed}",
+        sealed.len()
+    );
 
     // ---------------------------------------------------------------- 场景 4
     println!("\n5) 传完剩下的 → complete 落库，get_url 能取回");
@@ -237,7 +241,10 @@ async fn main() -> BoxResult<()> {
         "🔴 分片路径也必须吃秒传：判重键是明文摘要，与走哪条数据面无关"
     );
     assert!(
-        again["upload_token"].as_str().unwrap_or_default().is_empty()
+        again["upload_token"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
             || again["upload_token"].is_null(),
         "🔴 命中时不该再发上传凭据；实际={}",
         again["upload_token"]
@@ -278,7 +285,12 @@ fn sdk_config(host: &str, tcp_port: u16, data_dir: &std::path::Path) -> Privchat
 fn control_http(url: &str) -> BoxResult<reqwest::Client> {
     let pins: Vec<String> = std::env::var("PRIVCHAT_SPKI_PINS")
         .ok()
-        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     Ok(privchat_sdk::file_plane_http::control_client(url, &pins)?)
 }
@@ -321,10 +333,7 @@ fn seal_with_token(token: &Value, plaintext: &[u8]) -> BoxResult<Vec<u8>> {
     let chunk = token["chunk_plain_size"]
         .as_u64()
         .ok_or("token response missing chunk_plain_size")? as u32;
-    let key = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        key_b64,
-    )?;
+    let key = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key_b64)?;
     Ok(
         privchat_protocol::attachment_crypto::encrypt_attachment_with_chunk_size(
             plaintext, &key, key_id, chunk,
@@ -390,7 +399,12 @@ async fn put_parts_via_s3(
         let resp = req.send().await?;
         if !resp.status().is_success() {
             let st = resp.status();
-            return Err(format!("S3 part {} failed: {st} {}", i + 1, resp.text().await.unwrap_or_default()).into());
+            return Err(format!(
+                "S3 part {} failed: {st} {}",
+                i + 1,
+                resp.text().await.unwrap_or_default()
+            )
+            .into());
         }
     }
     Ok(())
@@ -468,7 +482,10 @@ async fn get_url(sdk: &PrivchatSdk, file_id: u64) -> BoxResult<Value> {
 }
 
 fn payload(envelope: &Value) -> &Value {
-    envelope.get("data").filter(|v| !v.is_null()).unwrap_or(envelope)
+    envelope
+        .get("data")
+        .filter(|v| !v.is_null())
+        .unwrap_or(envelope)
 }
 
 fn sha256_hex(data: &[u8]) -> String {

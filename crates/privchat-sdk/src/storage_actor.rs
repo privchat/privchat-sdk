@@ -583,19 +583,22 @@ pub struct StorageHandle {
 
 impl StorageHandle {
     pub(crate) async fn read_scoped<T: Send + 'static>(
-        &self, owner_uid: String,
+        &self,
+        owner_uid: String,
         read: impl FnOnce(&LocalStore, &str) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let (tx, rx)=oneshot::channel();
-        self.tx.send(StorageCmd::LocalRead(Box::new(move |store| {
-            let result=match store.load_current_uid() {
-                Ok(Some(uid)) if uid==owner_uid => read(store,&uid),
-                Ok(_) => Err(Error::InvalidState("local reader account changed".into())),
-                Err(e) => Err(e),
-            };
-            let _=tx.send(result);
-        }))).map_err(|_|Error::ActorClosed)?;
-        rx.await.map_err(|_|Error::ActorClosed)?
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(StorageCmd::LocalRead(Box::new(move |store| {
+                let result = match store.load_current_uid() {
+                    Ok(Some(uid)) if uid == owner_uid => read(store, &uid),
+                    Ok(_) => Err(Error::InvalidState("local reader account changed".into())),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(result);
+            })))
+            .map_err(|_| Error::ActorClosed)?;
+        rx.await.map_err(|_| Error::ActorClosed)?
     }
     pub fn start() -> Result<Self> {
         let store = LocalStore::open_default()?;
@@ -2210,7 +2213,12 @@ fn handle_single_cmd(store: &LocalStore, cmd: StorageCmd) {
             expires_at,
             resp,
         } => {
-            let _ = resp.send(store.update_authenticated_session(&uid, &access_token, &device_id, expires_at));
+            let _ = resp.send(store.update_authenticated_session(
+                &uid,
+                &access_token,
+                &device_id,
+                expires_at,
+            ));
         }
         StorageCmd::LoadAccessToken { uid, resp } => {
             let _ = resp.send(store.load_access_token(&uid));

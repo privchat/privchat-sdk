@@ -32,17 +32,17 @@ use msgtrans::RequestOptions;
 use msgtrans::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig};
 use msgtrans::{TransportClient, TransportClientBuilder};
 use privchat_protocol::message::LocalMessagePayloadEnvelope;
-pub use privchat_protocol::protocol::ChannelType;
 use privchat_protocol::presence::{
     PresenceBatchStatusRequest, PresenceBatchStatusResponse, PresenceChangedNotification,
     TypingActionType as ProtoTypingActionType, TypingIndicatorRequest,
 };
+pub use privchat_protocol::protocol::ChannelType;
 use privchat_protocol::rpc::auth::{AuthLoginRequest, AuthResponse, UserRegisterRequest};
 use privchat_protocol::rpc::contact::friend::FriendPendingResponse;
 use privchat_protocol::rpc::file::upload::{
-    FileGetUrlRequest, FileGetUrlResponse, FileRequestUploadTokenRequest,
+    FileGetUrlRequest, FileGetUrlResponse, FileRequestChunkedUploadTokenRequest,
+    FileRequestChunkedUploadTokenResponse, FileRequestUploadTokenRequest,
     FileRequestUploadTokenResponse,
-    FileRequestChunkedUploadTokenRequest, FileRequestChunkedUploadTokenResponse,
 };
 use privchat_protocol::rpc::message::history::{
     MessageHistoryAroundRequest, MessageHistoryAroundResponse, MessageHistoryGetRequest,
@@ -98,8 +98,8 @@ mod avatar_cache;
 pub use avatar_cache::AvatarCrop;
 pub mod canonical_inbound;
 pub mod error_codes;
-mod local_store;
 pub mod local_reader;
+mod local_store;
 pub mod media_download;
 pub mod media_store;
 mod receive_pipeline;
@@ -142,7 +142,6 @@ pub struct ResolvedFileDownload {
     /// **绝不进日志。**
     pub attachment_key: Option<String>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransportProtocol {
@@ -886,7 +885,6 @@ pub enum ResumeEscalationScope {
     FullRebuild,
 }
 
-
 /// Plan 2 媒体作业结果。Kotlin/iOS 宿主完成工作后，通过
 /// [`PrivchatSdk::submit_media_job_result`] 回传。`ok=true` 时 `output_path`
 /// 必须指向已写入的文件（由发布方保证路径存在）。
@@ -1065,25 +1063,35 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
             .await?;
 
         if response.already_exists {
-            let claim_token = response.claim_token.filter(|t| !t.trim().is_empty()).ok_or_else(|| {
-                Error::Serialization(
+            let claim_token = response
+                .claim_token
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Serialization(
                     "decode file/request_chunked_upload_token: already_exists 却没有 claim_token"
                         .to_string(),
                 )
-            })?;
+                })?;
             return Ok(ChunkedPrepared::Claim { claim_token });
         }
         let session = ChunkedSession {
-            upload_token: response.upload_token.filter(|t| !t.trim().is_empty()).ok_or_else(|| {
-                Error::Serialization(
-                    "decode file/request_chunked_upload_token: missing upload_token".to_string(),
-                )
-            })?,
-            upload_url: response.upload_url.filter(|t| !t.trim().is_empty()).ok_or_else(|| {
-                Error::Serialization(
-                    "decode file/request_chunked_upload_token: missing upload_url".to_string(),
-                )
-            })?,
+            upload_token: response
+                .upload_token
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Serialization(
+                        "decode file/request_chunked_upload_token: missing upload_token"
+                            .to_string(),
+                    )
+                })?,
+            upload_url: response
+                .upload_url
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Serialization(
+                        "decode file/request_chunked_upload_token: missing upload_url".to_string(),
+                    )
+                })?,
             base_unit: response.base_unit.filter(|b| *b > 0).unwrap_or(64 * 1024),
             expires_at: response.expires_at.unwrap_or(0),
             // 不下发 = 旧服务端 = 内置面。
@@ -1195,9 +1203,9 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
         session: &ChunkedSession,
         plaintext: &[u8],
     ) -> Result<SealedPayload> {
-        let chunk = session.chunk_plain_size.ok_or_else(|| {
-            Error::Serialization("分片会话未下发块大小，拒绝上传".to_string())
-        })?;
+        let chunk = session
+            .chunk_plain_size
+            .ok_or_else(|| Error::Serialization("分片会话未下发块大小，拒绝上传".to_string()))?;
         let (blob, sha256) = match session.attachment_key.as_ref() {
             // 刚签发的会话：密钥在手，正常封装（命中缓存就直接复用）。
             Some(key) => State::seal_once(self.sealed_cache, plaintext, key, chunk)?,
@@ -1208,9 +1216,8 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                 let key_id = session.encryption_key_id.ok_or_else(|| {
                     Error::Serialization("恢复的分片会话缺少 key_id，无法认出密文缓存".to_string())
                 })?;
-                State::load_sealed_cache(self.sealed_cache, key_id, chunk).ok_or(
-                    Error::UploadSessionGone,
-                )?
+                State::load_sealed_cache(self.sealed_cache, key_id, chunk)
+                    .ok_or(Error::UploadSessionGone)?
             }
         };
         Self::check_sealed_len(&blob, session.total_size)?;
@@ -1233,7 +1240,6 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
             .await
     }
 }
-
 
 /// 一个分片会话：申请 token 拿到的、四个端点要用的全部。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1319,8 +1325,11 @@ trait AttachmentUploadIo {
     /// 默认空实现——测试用的假 Io 不需要关心。
     fn on_upload_finished(&mut self) {}
 
-    async fn prepare(&mut self, digest: Option<&str>, size: usize)
-        -> Result<FileRequestUploadTokenResponse>;
+    async fn prepare(
+        &mut self,
+        digest: Option<&str>,
+        size: usize,
+    ) -> Result<FileRequestUploadTokenResponse>;
     /// 秒传取用：换一个属于自己的 file_id，不传正文。
     async fn claim(&mut self, token: &str, digest: &str) -> Result<UploadedFileInfo>;
 
@@ -1362,7 +1371,9 @@ trait AttachmentUploadIo {
         _size: usize,
         _force_upload: bool,
     ) -> Result<ChunkedPrepared> {
-        Err(Error::Transport("chunked upload not supported by this Io".to_string()))
+        Err(Error::Transport(
+            "chunked upload not supported by this Io".to_string(),
+        ))
     }
     /// 分片传字节。
     async fn upload_chunked(
@@ -1370,7 +1381,9 @@ trait AttachmentUploadIo {
         _session: &ChunkedSession,
         _payload: &SealedPayload,
     ) -> Result<UploadedFileInfo> {
-        Err(Error::Transport("chunked upload not supported by this Io".to_string()))
+        Err(Error::Transport(
+            "chunked upload not supported by this Io".to_string(),
+        ))
     }
 }
 
@@ -1484,7 +1497,6 @@ fn emit_sequenced_event(
     }
     let _ = event_tx.send(event);
 }
-
 
 /// 线上角色 → 本地 `group_member.role`。
 ///
@@ -3058,7 +3070,10 @@ const OUTBOUND_DRAIN_BATCH_SIZE: usize = 20;
 
 enum Command {
     #[cfg(test)]
-    HoldActorForLocalReadTest { entered: oneshot::Sender<()>, release: oneshot::Receiver<()> },
+    HoldActorForLocalReadTest {
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
     Connect {
         resp: oneshot::Sender<Result<()>>,
     },
@@ -4929,7 +4944,6 @@ impl State {
             .collect::<Vec<_>>()
             .join(",")
     }
-
 
     fn emit_sync_page_progress(&self, entity_type: &str, page: usize) {
         let event = SdkEvent::SyncEntityPageApplied {
@@ -7795,11 +7809,7 @@ impl State {
                     Ok(channel_ids) => invalidated.extend(channel_ids),
                     Err(e) => {
                         // 查不到就少发一次刷新，不影响已经落库的数据；下次同步/冷启动仍会收敛。
-                        tracing::warn!(
-                            "dm_channels_for_peer failed for user {}: {}",
-                            user_id,
-                            e
-                        );
+                        tracing::warn!("dm_channels_for_peer failed for user {}: {}", user_id, e);
                     }
                 }
             }
@@ -8982,7 +8992,12 @@ impl State {
         }
         if existing_session.is_some() {
             self.storage
-                .update_authenticated_session(uid.clone(), token_for_persist, device_id_for_persist, None)
+                .update_authenticated_session(
+                    uid.clone(),
+                    token_for_persist,
+                    device_id_for_persist,
+                    None,
+                )
                 .await?;
             // Credential updates do not write K_CUR_UID. Keep the active account pointer
             // 与本次 authenticate 的 uid 对齐，避免后续 with_uid! 命令读到 None。
@@ -11738,7 +11753,6 @@ impl State {
         None
     }
 
-
     /// 从消息内容 JSON 解析缩略图的协议权威 `thumbnail_file_id`（envelope `metadata` 或 flat）。
     /// Scheme B：接收端按此 file_id 走 `file/get_url` 拿 signed_url + cek 下载解密。
     fn extract_thumbnail_file_id(content: &str) -> Option<u64> {
@@ -11816,44 +11830,44 @@ impl State {
             // 现在只剩一条路：有 id 就走 get_url 换票据；换不到就按下面的规则区分
             // "服务端明确说没有" 与 "这次没拿到"，后者保持待重试。
             _ => {
-                    // thumb_status=3 是**终态**：写下去之后永不重试，UI 从此渲染
-                    // 静态占位符。所以它只能表示「已经看清楚了,这条消息确实没有
-                    // 缩略图」,不能表示「我没看到缩略图字段」。
-                    //
-                    // 这两者的区别就是上一次事故:history 回填丢了 metadata,extra
-                    // 是空串,于是这里判定「没有缩略图」并永久标记——整段历史的图片
-                    // 从此是灰块,重开 App 也不会好。
-                    //
-                    // 现在的规则:metadata 解析不出来时停在 0(未知/待重试),留给下
-                    // 一次投影或定向 repair 去补;只有确实解析出了 metadata 而其中
-                    // 没有缩略图字段,才允许进终态。
-                    // 许可条件是「服务端明确说了没有缩略图」,不是「metadata 能解析」。
-                    // 后者会漏掉最要命的一种:metadata 里有 thumbnail_file_id,只是这次
-                    // file/get_url 因网络/token/服务端抖动没拿到票据——那是可重试失败,
-                    // 写成终态就等于一次抖动永久毁掉一张图。
-                    let explicit_absence =
-                        crate::canonical_inbound::CanonicalInboundMessage::from_sync_entity(
-                            0,
-                            0,
-                            channel_id,
-                            channel_type,
-                            0,
-                            0,
-                            String::new(),
-                            content.to_string(),
-                            0,
-                            0,
-                        )
-                        .server_says_no_thumbnail();
-                    if explicit_absence {
-                        return Some(ThumbnailDownloadOutcome::ConfirmedAbsent);
-                    } else {
-                        tracing::warn!(
-                            message_id,
-                            channel_id,
-                            "拿不到缩略图票据,但服务端未明确表示没有缩略图:保持待重试,不写终态"
-                        );
-                    }
+                // thumb_status=3 是**终态**：写下去之后永不重试，UI 从此渲染
+                // 静态占位符。所以它只能表示「已经看清楚了,这条消息确实没有
+                // 缩略图」,不能表示「我没看到缩略图字段」。
+                //
+                // 这两者的区别就是上一次事故:history 回填丢了 metadata,extra
+                // 是空串,于是这里判定「没有缩略图」并永久标记——整段历史的图片
+                // 从此是灰块,重开 App 也不会好。
+                //
+                // 现在的规则:metadata 解析不出来时停在 0(未知/待重试),留给下
+                // 一次投影或定向 repair 去补;只有确实解析出了 metadata 而其中
+                // 没有缩略图字段,才允许进终态。
+                // 许可条件是「服务端明确说了没有缩略图」,不是「metadata 能解析」。
+                // 后者会漏掉最要命的一种:metadata 里有 thumbnail_file_id,只是这次
+                // file/get_url 因网络/token/服务端抖动没拿到票据——那是可重试失败,
+                // 写成终态就等于一次抖动永久毁掉一张图。
+                let explicit_absence =
+                    crate::canonical_inbound::CanonicalInboundMessage::from_sync_entity(
+                        0,
+                        0,
+                        channel_id,
+                        channel_type,
+                        0,
+                        0,
+                        String::new(),
+                        content.to_string(),
+                        0,
+                        0,
+                    )
+                    .server_says_no_thumbnail();
+                if explicit_absence {
+                    return Some(ThumbnailDownloadOutcome::ConfirmedAbsent);
+                } else {
+                    tracing::warn!(
+                        message_id,
+                        channel_id,
+                        "拿不到缩略图票据,但服务端未明确表示没有缩略图:保持待重试,不写终态"
+                    );
+                }
                 return None;
             }
         };
@@ -11866,13 +11880,8 @@ impl State {
         }
         let mut downloaded = None;
         for attempt in 0..3u64 {
-            match Self::do_download_thumbnail(
-                &thumb_url,
-                &dir,
-                &thumb_path,
-                thumb_key.as_deref(),
-            )
-            .await
+            match Self::do_download_thumbnail(&thumb_url, &dir, &thumb_path, thumb_key.as_deref())
+                .await
             {
                 Ok(()) => {
                     downloaded = Some(Ok(()));
@@ -12320,7 +12329,6 @@ impl State {
         // 明文摘要 = 判重键。
         sha256: &str,
     ) -> Result<(UploadedFileInfo, String)> {
-
         // 🔴 任何大小都走分片编排（RESUMABLE §2.4 第三十轮修订）。
         //
         // 旧版按 `file_size` 阈值在「整包 token」和「分片 token」之间二选一。那等于
@@ -12560,7 +12568,9 @@ impl State {
         // 先问一次：可能是续传（上次断在半路），也可能一片都还没传，也可能已经完成。
         let status = self.fetch_upload_status(&client, &base, token).await?;
         let (missing, completed) = match status {
-            UploadStatusOutcome::Status { missing, completed, .. } => (missing, completed),
+            UploadStatusOutcome::Status {
+                missing, completed, ..
+            } => (missing, completed),
             UploadStatusOutcome::SessionGone => return Err(Error::UploadSessionGone),
         };
         if completed {
@@ -12582,7 +12592,9 @@ impl State {
             let start = offset as usize;
             let end = start + len as usize;
             if end > blob.len() {
-                return Err(Error::Storage("sealed blob shorter than the session total".to_string()));
+                return Err(Error::Storage(
+                    "sealed blob shorter than the session total".to_string(),
+                ));
             }
             Ok(blob[start..end].to_vec())
         };
@@ -12626,7 +12638,11 @@ impl State {
                         ));
                     }
                     match self.fetch_upload_status(&client, &base, token).await? {
-                        UploadStatusOutcome::Status { missing, completed: true, .. } if missing.is_empty() => {
+                        UploadStatusOutcome::Status {
+                            missing,
+                            completed: true,
+                            ..
+                        } if missing.is_empty() => {
                             break;
                         }
                         UploadStatusOutcome::Status { missing, .. } => up.resync_missing(&missing),
@@ -12647,7 +12663,9 @@ impl State {
             }
         }
 
-        let info = self.complete_upload(&client, &base, token, mime_type).await?;
+        let info = self
+            .complete_upload(&client, &base, token, mime_type)
+            .await?;
         self.attachment_transfers
             .body_uploads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12685,16 +12703,18 @@ impl State {
         let client = control.clone();
         let total = blob.len() as u64;
         // 会话建成时已校验过这两个字段，这里再兜一次底，绝不用默认值瞎算片号。
-        let part_size = session.part_size.ok_or_else(|| {
-            Error::Storage("s3_multipart_v1 会话缺 part_size".to_string())
-        })?;
-        let total_parts = session.total_parts.ok_or_else(|| {
-            Error::Storage("s3_multipart_v1 会话缺 total_parts".to_string())
-        })?;
+        let part_size = session
+            .part_size
+            .ok_or_else(|| Error::Storage("s3_multipart_v1 会话缺 part_size".to_string()))?;
+        let total_parts = session
+            .total_parts
+            .ok_or_else(|| Error::Storage("s3_multipart_v1 会话缺 total_parts".to_string()))?;
 
         let status = self.fetch_upload_status(&client, &base, token).await?;
         let (missing, completed) = match status {
-            UploadStatusOutcome::Status { missing, completed, .. } => (missing, completed),
+            UploadStatusOutcome::Status {
+                missing, completed, ..
+            } => (missing, completed),
             UploadStatusOutcome::SessionGone => return Err(Error::UploadSessionGone),
         };
         if completed {
@@ -12732,7 +12752,10 @@ impl State {
         };
         self.emit_upload_progress(
             local_message_id,
-            UploadProgress { uploaded: done_bytes(&todo), total },
+            UploadProgress {
+                uploaded: done_bytes(&todo),
+                total,
+            },
         );
 
         // 🔴 失败预算与 proxy 面一致：算「自上次有进展以来」，不是每片各算一份。
@@ -12743,7 +12766,15 @@ impl State {
             let digest = crate::resumable_upload::chunk_digest(&bytes);
 
             match self
-                .put_part_direct(&control, &object_store, &base, token, part_number, bytes, &digest)
+                .put_part_direct(
+                    &control,
+                    &object_store,
+                    &base,
+                    token,
+                    part_number,
+                    bytes,
+                    &digest,
+                )
                 .await
             {
                 PartOutcome::Ok => {
@@ -12751,7 +12782,10 @@ impl State {
                     failures_since_progress = 0;
                     self.emit_upload_progress(
                         local_message_id,
-                        UploadProgress { uploaded: done_bytes(&todo), total },
+                        UploadProgress {
+                            uploaded: done_bytes(&todo),
+                            total,
+                        },
                     );
                 }
                 PartOutcome::Retry => {
@@ -12878,7 +12912,9 @@ impl State {
             return Ok(UploadStatusOutcome::SessionGone);
         }
         if status.is_server_error() {
-            return Err(Error::Transport(format!("上传进度查询服务端错误: {status}")));
+            return Err(Error::Transport(format!(
+                "上传进度查询服务端错误: {status}"
+            )));
         }
         if code != 0 {
             return Err(Error::Transport(format!(
@@ -12891,11 +12927,11 @@ impl State {
                 return Err(Error::Serialization(format!("上传进度响应缺少 {key}")));
             };
             arr.iter()
-                .map(|r| {
-                    match (r["offset"].as_u64(), r["length"].as_u64()) {
-                        (Some(o), Some(l)) => Ok((o, l)),
-                        _ => Err(Error::Serialization("上传进度响应里的区间格式不对".to_string())),
-                    }
+                .map(|r| match (r["offset"].as_u64(), r["length"].as_u64()) {
+                    (Some(o), Some(l)) => Ok((o, l)),
+                    _ => Err(Error::Serialization(
+                        "上传进度响应里的区间格式不对".to_string(),
+                    )),
                 })
                 .collect()
         };
@@ -12999,8 +13035,7 @@ impl State {
             .map_err(|e| Error::Serialization(format!("invalid mime_type for upload part: {e}")))?;
         let form = reqwest::multipart::Form::new()
             .part("file", part)
-            .text("encryption_version", "1")
-            ;
+            .text("encryption_version", "1");
         // 整文件上传打的也是我们自己的服务器（不是对象存储），走控制面 pin。
         let response = file_plane_http::control_client(upload_url, &self.config.spki_pins)?
             .post(upload_url)
@@ -13053,7 +13088,10 @@ impl State {
                 "upload failed: code={code} message={message}"
             )));
         }
-        let value = envelope.get("data").cloned().unwrap_or_else(|| envelope.clone());
+        let value = envelope
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| envelope.clone());
         let file_id = value
             .get("file_id")
             .and_then(|v| {
@@ -13345,7 +13383,10 @@ impl State {
     /// 路径可能带着**已经失效的沙盒前缀**（iOS 容器 UUID 重装/迁移后会变），这时
     /// 重挂到当前 root 再判——文件还在托管树里，坏的只是 content 里那串前缀。
     /// 重挂后要求文件真的存在：挂不实的路径不能算「接手后的成品」。
-    fn managed_source_path(content: &str, user_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn managed_source_path(
+        content: &str,
+        user_root: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
         let path = content.strip_prefix("file://").unwrap_or(content);
         let path = std::path::Path::new(path);
         if path.starts_with(user_root.join("files")) {
@@ -13541,7 +13582,11 @@ impl State {
             }
             let canonical_thumb = files_dir.join(media_store::THUMB_FILENAME);
             let managed_thumb = Self::managed_source_path(&message.content, &user_root)
-                .and_then(|source| source.parent().map(|dir| dir.join(media_store::THUMB_FILENAME)))
+                .and_then(|source| {
+                    source
+                        .parent()
+                        .map(|dir| dir.join(media_store::THUMB_FILENAME))
+                })
                 .filter(|path| path.exists());
             // 🔴 **同一个路径不能拷给自己**。
             //
@@ -13659,10 +13704,14 @@ impl State {
                     .map(|dir| dir.join(media_store::THUMB_FILENAME))
                     .filter(|path| path.exists())
                 {
-                    std::fs::copy(&source_thumb, &canonical_thumb)
-                        .map_err(|e| Error::Storage(format!("copy managed video thumbnail failed: {e}")))?;
+                    std::fs::copy(&source_thumb, &canonical_thumb).map_err(|e| {
+                        Error::Storage(format!("copy managed video thumbnail failed: {e}"))
+                    })?;
                     hook_used = true;
-                    let _ = self.storage.update_thumb_status(message.message_id, 1).await;
+                    let _ = self
+                        .storage
+                        .update_thumb_status(message.message_id, 1)
+                        .await;
                     thumb_upload = Some((
                         canonical_thumb.clone(),
                         "image/webp".to_string(),
@@ -13725,12 +13774,7 @@ impl State {
                                 }
                             }
                         }
-                        match Self::generate_image_thumbnail_sync(
-                            &out,
-                            &canonical_thumb,
-                            320,
-                            85,
-                        ) {
+                        match Self::generate_image_thumbnail_sync(&out, &canonical_thumb, 320, 85) {
                             Ok(_) => {
                                 hook_used = true;
                                 let _ = self
@@ -14101,85 +14145,84 @@ impl State {
         // 只有「这条消息就地建出新会话行」时才由这里定对端；已存在的行不碰
         // （upsert SQL 用 COALESCE 保留已存值）。
         let mut new_channel_peer_user_id: Option<u64> = None;
-        let (channel_name, channel_remark, avatar, top, mute, unread_count) =
-            if let Some(c) = existing {
-                (
-                    c.channel_name,
-                    c.channel_remark,
-                    c.avatar,
-                    c.top,
-                    c.mute,
-                    if bump_unread {
-                        c.unread_count.saturating_add(1)
-                    } else {
-                        c.unread_count
-                    },
-                )
-            } else {
-                let current_uid = self
-                    .current_uid
-                    .as_ref()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or_default();
-                // channel_type 客户端约定：1=DM，2=群，其它=房间。
-                //
-                // **名字一律留空**，DM 和群一样。名字的真源是 user / group 实体，
-                // 这里知道的只有 uid——把 uid 写进 channel_name 就是把一串数字写成了
-                // 「名字」：列表查询看到非空的 channel_name 就直接拿去显示，用户看到的
-                // 是 `100000007`。邀请码注册的新用户第一眼看到的就是这个（欢迎消息
-                // 先于对端 user 实体到达，本地会话行由这条消息就地建出来）。
-                //
-                // 群那条分支早就踩过同一个坑（见下方保留的注释），DM 这条一直没跟上。
-                // 服务端也是这个约定：`channel_service` 的自包含投影在名字缺失时发空串，
-                // 注释写着「宁可显示加载中也不显示一串数字」。
-                //
-                // 对端身份改存到 `peer_user_id` 结构化字段——那才是它该待的地方，
-                // 列表查询据此 JOIN user 表拿真名，user 实体一到名字自然就对了。
-                //
-                // 🔴 系统账号（uid=1）不算数：它会往**普通 DM** 里注入系统消息
-                // （加好友成功后的「我们已经是好友了」就是它发的，type=5）。新 DM 的
-                // 第一条消息往往正是这条，于是会话行被就地建出来、对端被推断成 1，
-                // 列表 JOIN user 表拿到的名字就成了「系统消息」、user_type=1。
-                // 频道实体随后同步到会修正这一行，但期间已经渲染出去的会话对象
-                // （聊天页在导航时抓的快照）会一直顶着「系统消息」的标题。
-                // 推断本来就只是兜底，宁可留空等实体，也不能把 DM 永久贴错人。
-                let inferred_peer_user_id = if channel_type == ChannelType::Direct.as_wire() as i32 {
-                    match from_uid {
-                        Some(uid)
-                            if uid > 0 && uid != current_uid && uid != SYSTEM_ACCOUNT_UID =>
-                        {
-                            Some(uid)
-                        }
-                        _ => None,
-                    }
+        let (channel_name, channel_remark, avatar, top, mute, unread_count) = if let Some(c) =
+            existing
+        {
+            (
+                c.channel_name,
+                c.channel_remark,
+                c.avatar,
+                c.top,
+                c.mute,
+                if bump_unread {
+                    c.unread_count.saturating_add(1)
                 } else {
-                    // 群/房间的名字来自 group 实体（entity sync），这里绝不能拿 channel_id
-                    // 当名字：它会被写进 channel.channel_name，而频道列表查询对群会优先取
-                    // channel_name，于是真正的群名（即便随后同步到）被永久盖住，标题卡在裸 id。
-                    // 留空，交给查询回落到 group.name / 成员名。
-                    None
-                };
-                new_channel_peer_user_id = inferred_peer_user_id;
-                // 实时路径新建的 DM：对端 user 可能还没到，这一行现在发布不出去
-                // （发布屏障）。立刻排进定向补齐队列——这条路径不读会话列表，
-                // 不在这里排的话要等下一次 list_channels 才会被发现。
-                if let Some(peer) = inferred_peer_user_id {
-                    if !self.peer_hydration_seen.contains(&peer)
-                        && self.peer_hydration_queue.len() < PEER_HYDRATION_QUEUE_LIMIT
-                    {
-                        self.peer_hydration_seen.insert(peer);
-                        self.peer_hydration_queue.push_back(peer);
+                    c.unread_count
+                },
+            )
+        } else {
+            let current_uid = self
+                .current_uid
+                .as_ref()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or_default();
+            // channel_type 客户端约定：1=DM，2=群，其它=房间。
+            //
+            // **名字一律留空**，DM 和群一样。名字的真源是 user / group 实体，
+            // 这里知道的只有 uid——把 uid 写进 channel_name 就是把一串数字写成了
+            // 「名字」：列表查询看到非空的 channel_name 就直接拿去显示，用户看到的
+            // 是 `100000007`。邀请码注册的新用户第一眼看到的就是这个（欢迎消息
+            // 先于对端 user 实体到达，本地会话行由这条消息就地建出来）。
+            //
+            // 群那条分支早就踩过同一个坑（见下方保留的注释），DM 这条一直没跟上。
+            // 服务端也是这个约定：`channel_service` 的自包含投影在名字缺失时发空串，
+            // 注释写着「宁可显示加载中也不显示一串数字」。
+            //
+            // 对端身份改存到 `peer_user_id` 结构化字段——那才是它该待的地方，
+            // 列表查询据此 JOIN user 表拿真名，user 实体一到名字自然就对了。
+            //
+            // 🔴 系统账号（uid=1）不算数：它会往**普通 DM** 里注入系统消息
+            // （加好友成功后的「我们已经是好友了」就是它发的，type=5）。新 DM 的
+            // 第一条消息往往正是这条，于是会话行被就地建出来、对端被推断成 1，
+            // 列表 JOIN user 表拿到的名字就成了「系统消息」、user_type=1。
+            // 频道实体随后同步到会修正这一行，但期间已经渲染出去的会话对象
+            // （聊天页在导航时抓的快照）会一直顶着「系统消息」的标题。
+            // 推断本来就只是兜底，宁可留空等实体，也不能把 DM 永久贴错人。
+            let inferred_peer_user_id = if channel_type == ChannelType::Direct.as_wire() as i32 {
+                match from_uid {
+                    Some(uid) if uid > 0 && uid != current_uid && uid != SYSTEM_ACCOUNT_UID => {
+                        Some(uid)
                     }
+                    _ => None,
                 }
-                (
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    0,
-                    0,
-                    if bump_unread { 1 } else { 0 },
-                )
+            } else {
+                // 群/房间的名字来自 group 实体（entity sync），这里绝不能拿 channel_id
+                // 当名字：它会被写进 channel.channel_name，而频道列表查询对群会优先取
+                // channel_name，于是真正的群名（即便随后同步到）被永久盖住，标题卡在裸 id。
+                // 留空，交给查询回落到 group.name / 成员名。
+                None
             };
+            new_channel_peer_user_id = inferred_peer_user_id;
+            // 实时路径新建的 DM：对端 user 可能还没到，这一行现在发布不出去
+            // （发布屏障）。立刻排进定向补齐队列——这条路径不读会话列表，
+            // 不在这里排的话要等下一次 list_channels 才会被发现。
+            if let Some(peer) = inferred_peer_user_id {
+                if !self.peer_hydration_seen.contains(&peer)
+                    && self.peer_hydration_queue.len() < PEER_HYDRATION_QUEUE_LIMIT
+                {
+                    self.peer_hydration_seen.insert(peer);
+                    self.peer_hydration_queue.push_back(peer);
+                }
+            }
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                0,
+                0,
+                if bump_unread { 1 } else { 0 },
+            )
+        };
         if inbound_logs_enabled() {
             eprintln!(
                 "[SDK.unread] update_channel_last_message: channel_id={} channel_type={} bump_unread={} unread_before={} unread_after={} message_id={} from_uid={:?}",
@@ -14303,11 +14346,11 @@ mod business_code_passthrough_tests {
         ] {
             // default 传 FatalProtocolError:未识别时应原样返回它,
             // 而不是被改写成任何 *ResyncRequired。
-            let got = State::classify_resume_message(
-                msg, ResumeFailureClass::FatalProtocolError);
+            let got = State::classify_resume_message(msg, ResumeFailureClass::FatalProtocolError);
             assert!(
                 matches!(got, ResumeFailureClass::FatalProtocolError),
-                "{msg} 被误判为 {got:?};业务码不该触发重分类");
+                "{msg} 被误判为 {got:?};业务码不该触发重分类"
+            );
         }
     }
 
@@ -14322,12 +14365,12 @@ mod business_code_passthrough_tests {
             ("code=20901", ResumeFailureClass::EntityResyncRequired),
             ("code=20902", ResumeFailureClass::FullRebuildRequired),
         ] {
-            let got = State::classify_resume_message(
-                msg, ResumeFailureClass::FatalProtocolError);
+            let got = State::classify_resume_message(msg, ResumeFailureClass::FatalProtocolError);
             assert_eq!(
                 std::mem::discriminant(&got),
                 std::mem::discriminant(&want),
-                "{msg} 应分类为 {want:?},实际 {got:?}");
+                "{msg} 应分类为 {want:?},实际 {got:?}"
+            );
         }
     }
 
@@ -14349,7 +14392,10 @@ mod business_code_passthrough_tests {
             let decoded: TransferResponse =
                 decode_message(&bytes).expect("decode TransferResponse");
             let reply = TransferReply::from_wire(decoded);
-            assert_eq!(reply.code, code, "code 在 wire → TransferReply 这一跳被改写");
+            assert_eq!(
+                reply.code, code,
+                "code 在 wire → TransferReply 这一跳被改写"
+            );
             assert_eq!(reply.message, format!("biz {code}"));
             assert_eq!(reply.data, vec![1, 2, 3]);
         }
@@ -14366,7 +14412,8 @@ mod business_code_passthrough_tests {
             let text = err.to_string();
             assert!(
                 text.contains(&format!("code={code}")),
-                "码 {code} 未出现在拒绝文本中: {text}");
+                "码 {code} 未出现在拒绝文本中: {text}"
+            );
         }
     }
 }
@@ -14482,7 +14529,7 @@ impl PrivchatSdk {
     }
 
     pub fn with_runtime(config: PrivchatConfig, runtime_provider: RuntimeProvider) -> Self {
-        let (local_storage_tx, local_storage)=tokio::sync::watch::channel(None);
+        let (local_storage_tx, local_storage) = tokio::sync::watch::channel(None);
         let configured_data_dir = config.data_dir.clone();
         let data_dir_for_self = configured_data_dir.clone();
         // 附件 file queue 的路由键在构造期固化：首发与重试必须落到同一条有序队列。
@@ -18511,7 +18558,6 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
-
     /// Plan 2 媒体作业回传。宿主（Kotlin/iOS）收到 `SdkEvent::MediaJobRequested`
     /// 处理完成后调用此接口。直接操作共享 `pending_media_jobs` 表、不经 actor
     /// 命令通道——此时 actor 正阻塞在同一 oneshot rx 上。
@@ -19360,13 +19406,9 @@ impl PrivchatSdk {
 
         if is_attachment_message_type(msg.message_type) {
             let user_root = PathBuf::from(self.user_storage_paths().await?.user_root);
-            let path = attachment_local_path(
-                &msg.content,
-                &user_root,
-                msg.message_id,
-                msg.created_at,
-            )
-            .ok_or(Error::AttachmentSourceMissing { message_id })?;
+            let path =
+                attachment_local_path(&msg.content, &user_root, msg.message_id, msg.created_at)
+                    .ok_or(Error::AttachmentSourceMissing { message_id })?;
             // 只证明源文件此刻可读，**不把字节读进来**：drain 会在真正发送时
             // 从这条托管路径读盘（payload 为空即走该分支）。把几十上百 MB 复制
             // 进 outbox 的 BLOB 列，等于同一份数据存两遍，还要跟着事务一起写。
@@ -19687,6 +19729,34 @@ impl PrivchatSdk {
             messages: older,
             has_more_before: resp.has_more,
         })
+    }
+
+    /// 本地优先首读：打开会话时**绕开网络 actor**、直接从存储 actor（[`LocalReader`]）
+    /// 读 SQLite 缓存,保证点开即出内容。
+    ///
+    /// 为什么需要它:`list_messages` / `open_conversation` 的本地读都走网络 actor 的命令
+    /// 队列,而首屏预取扫补(`start_first_screen_hydration`)会在同一个 actor 循环里逐个
+    /// 内联 `.await` 网络拉历史。扫补正打网络时,用户点开一个会话、哪怕消息早已在本地库,
+    /// 那次本地读也排在扫补的网络 RPC 后面 → 表现为「有些会话点进去要等一会儿才出历史」。
+    /// `LocalReader` 走的是独立的存储 actor(只做本地 IO,不碰网络),不受此阻塞。
+    ///
+    /// 排序/投影与 `list_messages` 同源(底层都是 `storage.list_messages`),所以这次快读与
+    /// 随后 `open_conversation` 追增量后的重渲染不会跳动。**不发任何网络**;未登录返回空。
+    /// 用法:UI 先用它瞬渲染,再调 `open_conversation` 做增量追齐(push-tap 正确性不变)。
+    pub async fn local_timeline(
+        &self,
+        channel_id: u64,
+        channel_type: i32,
+        limit: u32,
+    ) -> Result<Vec<StoredMessage>> {
+        match self.local_reader().await? {
+            Some(reader) => {
+                reader
+                    .messages(channel_id, channel_type, limit as usize, 0)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     /// 打开会话（SDK-HISTORY-7）：本地为渲染真源，本地为空时补一次**最新**窗口。
@@ -21122,8 +21192,6 @@ impl PrivchatSdk {
     }
 }
 
-
-
 /// 断言这串密文确实是"用这把密钥封的这份明文"。
 ///
 /// 🔴 不能拿字节做相等断言：每块都用新的随机 nonce，同一份明文封两次必然不同。
@@ -21180,7 +21248,11 @@ const TEST_CHUNK_PLAIN_SIZE: u32 = privchat_protocol::attachment_crypto::DEFAULT
 /// 本地库里早期把单聊存成 0；wire 上 0 非法（[`ChannelType`]），一律归一为 Direct(1)。
 /// 只处理 0；其它值原样保留，交给调用方按 wire 编号解释。
 pub(crate) fn normalize_legacy_channel_type(channel_type: i32) -> i32 {
-    if channel_type == 0 { ChannelType::Direct.as_wire() as i32 } else { channel_type }
+    if channel_type == 0 {
+        ChannelType::Direct.as_wire() as i32
+    } else {
+        channel_type
+    }
 }
 
 #[cfg(test)]
@@ -21198,7 +21270,9 @@ mod tests {
         state.peer_hydration_queue.push_back(4242);
         state.peer_hydration_seen.insert(4242);
 
-        let peer = state.next_peer_to_hydrate().expect("peer is due immediately");
+        let peer = state
+            .next_peer_to_hydrate()
+            .expect("peer is due immediately");
         assert_eq!(peer, 4242);
 
         // 失败一次 → 退避，同一 tick 不该再被取出来。
@@ -21489,13 +21563,12 @@ mod tests {
         plan_authenticate_transport, plan_connect, Action, AuthErrorKind, AuthenticateRetryDriver,
         AuthenticateRetryFuture, AuthenticateRetryOperation, AuthenticateTransportPlan,
         CanonicalTimelineEvent, Command, ConnectPlan, ConnectionState, ContentMessageType, Error,
-        HistHydratedState,
-        ErrorCode, LoginResult, MessageCachePolicy, NetworkHint, NewMessage, PresenceStatus,
-        PrivchatConfig, PrivchatSdk, Result, ResumeEscalationScope, ResumeFailureClass,
-        ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State, SyncCoordinator,
-        UpsertChannelInput, UpsertFriendInput, UpsertGroupInput, UpsertGroupMemberInput,
-        UpsertMessageReactionInput, UpsertRemoteMessageInput, UpsertUserInput,
-        NETWORK_DISCONNECTED_MESSAGE,
+        ErrorCode, HistHydratedState, LoginResult, MessageCachePolicy, NetworkHint, NewMessage,
+        PresenceStatus, PrivchatConfig, PrivchatSdk, Result, ResumeEscalationScope,
+        ResumeFailureClass, ResumeFailureTarget, SdkEvent, ServerCommit, SessionState, State,
+        SyncCoordinator, UpsertChannelInput, UpsertFriendInput, UpsertGroupInput,
+        UpsertGroupMemberInput, UpsertMessageReactionInput, UpsertRemoteMessageInput,
+        UpsertUserInput, NETWORK_DISCONNECTED_MESSAGE,
     };
     use crate::local_store::LocalStore;
     use crate::receive_pipeline::ReceivePipeline;
@@ -22193,7 +22266,10 @@ mod tests {
     async fn authenticating_as_someone_else_drops_the_previous_owners_session_state() {
         let (mut state, _dir) = new_seeded_state("auth-owner-change").await;
         // 上一个账号已经同步完成，协调器停在 Ready。
-        state.sync_coordinator.begin(SyncRunKind::Bootstrap, 0).unwrap();
+        state
+            .sync_coordinator
+            .begin(SyncRunKind::Bootstrap, 0)
+            .unwrap();
         state.sync_coordinator.complete(SyncRunKind::Bootstrap, 0);
         assert_eq!(
             state.sync_coordinator.snapshot().readiness,
@@ -22234,7 +22310,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn re_authenticating_as_the_same_user_keeps_the_session_state() {
         let (mut state, _dir) = new_seeded_state("auth-same-owner").await;
-        state.sync_coordinator.begin(SyncRunKind::Bootstrap, 0).unwrap();
+        state
+            .sync_coordinator
+            .begin(SyncRunKind::Bootstrap, 0)
+            .unwrap();
         state.sync_coordinator.complete(SyncRunKind::Bootstrap, 0);
 
         let cleaned = state.reset_if_owner_changed("10001", 1_000);
@@ -23404,10 +23483,7 @@ mod tests {
             2,
             "Ok 与 unsupported 两条分支都要上报进度"
         );
-        assert!(
-            !body.contains("if count > 0"),
-            "不能只在有增量时上报"
-        );
+        assert!(!body.contains("if count > 0"), "不能只在有增量时上报");
     }
 
     #[test]
@@ -23864,7 +23940,6 @@ mod tests {
         assert!(State::should_apply_entity_version(Some(5), 6));
         assert!(!State::should_apply_entity_version(Some(5), 4));
     }
-
 
     // 旧测试 conversation_preview_is_rendered_in_sdk_layer 已删除——
     // SDK 不再渲染会话预览（架构归正：preview 是 UI 层职责，参见 SYSTEM_MESSAGE_SPEC）。
@@ -26307,8 +26382,12 @@ mod ack_before_cache_release_tests {
     /// 本地库是 SQLCipher 加密的，外部连接得先给 key，否则连表都看不见。
     fn open_encrypted(db_path: &std::path::Path, uid: &str) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open(db_path).expect("open db");
-        conn.pragma_update(None, "key", &crate::local_store::LocalStore::derive_encryption_key(uid))
-            .expect("set db key");
+        conn.pragma_update(
+            None,
+            "key",
+            &crate::local_store::LocalStore::derive_encryption_key(uid),
+        )
+        .expect("set db key");
         conn
     }
 
@@ -26383,8 +26462,13 @@ mod ack_before_cache_release_tests {
         );
         std::fs::create_dir_all(&dir).expect("create message dir");
         let cache = dir.join("body.sealed");
-        let (first_blob, first_sha) =
-            State::seal_once(&cache, b"the picture bytes", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("seal");
+        let (first_blob, first_sha) = State::seal_once(
+            &cache,
+            b"the picture bytes",
+            &test_attachment_key(),
+            TEST_CHUNK_PLAIN_SIZE,
+        )
+        .expect("seal");
 
         // ---- ack 失败 ----
         arm_ack_failure(&paths.db_path, &uid.to_string());
@@ -26406,8 +26490,13 @@ mod ack_before_cache_release_tests {
         );
 
         // ---- 重试：必须是同一串密文 ----
-        let (retry_blob, retry_sha) =
-            State::seal_once(&cache, b"the picture bytes", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("reseal");
+        let (retry_blob, retry_sha) = State::seal_once(
+            &cache,
+            b"the picture bytes",
+            &test_attachment_key(),
+            TEST_CHUNK_PLAIN_SIZE,
+        )
+        .expect("reseal");
         assert_eq!(retry_blob, first_blob, "🔴 重试必须上传同一串字节");
         assert_eq!(retry_sha, first_sha);
 
@@ -26446,14 +26535,22 @@ mod upload_progress_fold_tests {
         let span = Some((0u64, 100u64));
         assert_eq!(fold_upload_progress(span, 0, 20), (0, 100));
         assert_eq!(fold_upload_progress(span, 10, 20), (10, 100));
-        assert_eq!(fold_upload_progress(span, 20, 20), (20, 100), "缩略图传完 = 20%，不是 100%");
+        assert_eq!(
+            fold_upload_progress(span, 20, 20),
+            (20, 100),
+            "缩略图传完 = 20%，不是 100%"
+        );
     }
 
     /// 正文从缩略图的末尾接着走，不从 0 重来。
     #[test]
     fn the_body_resumes_where_the_thumbnail_ended() {
         let span = Some((20u64, 100u64));
-        assert_eq!(fold_upload_progress(span, 0, 80), (20, 100), "正文起点是 20% 不是 0%");
+        assert_eq!(
+            fold_upload_progress(span, 0, 80),
+            (20, 100),
+            "正文起点是 20% 不是 0%"
+        );
         assert_eq!(fold_upload_progress(span, 40, 80), (60, 100));
         assert_eq!(fold_upload_progress(span, 80, 80), (100, 100));
     }
@@ -26809,7 +26906,6 @@ mod attachment_upload_plan_tests {
             Ok(token(&format!("token-{}", self.prepares.len()), hit))
         }
 
-
         /// 🔴 门禁：封装只能拿 token 里的东西。
         ///
         /// 假实现照样从 `token.attachment_key` 取密钥——取不到就报错。这样"prepare
@@ -26854,14 +26950,11 @@ mod attachment_upload_plan_tests {
             token: &FileRequestUploadTokenResponse,
             payload: &SealedPayload,
         ) -> Result<UploadedFileInfo> {
-            self.uploads.push((
-                token.token.clone(),
-                payload.blob.clone(),
-            ));
+            self.uploads
+                .push((token.token.clone(), payload.blob.clone()));
             Ok(uploaded())
         }
     }
-
 
     /// 测试用明文；SHA 是它的**明文**摘要——判重键就是这个。
     const PLAINTEXT: &[u8] = b"a picture";
@@ -27027,7 +27120,11 @@ mod chunked_upload_plan_tests {
         fn on_upload_finished(&mut self) {
             self.finished += 1;
         }
-        async fn prepare(&mut self, _d: Option<&str>, _s: usize) -> Result<FileRequestUploadTokenResponse> {
+        async fn prepare(
+            &mut self,
+            _d: Option<&str>,
+            _s: usize,
+        ) -> Result<FileRequestUploadTokenResponse> {
             panic!("大文件不该走整包 prepare");
         }
 
@@ -27069,23 +27166,38 @@ mod chunked_upload_plan_tests {
                 None => Ok(uploaded()),
             }
         }
-        async fn upload(&mut self, _t: &FileRequestUploadTokenResponse, _p: &SealedPayload) -> Result<UploadedFileInfo> {
+        async fn upload(
+            &mut self,
+            _t: &FileRequestUploadTokenResponse,
+            _p: &SealedPayload,
+        ) -> Result<UploadedFileInfo> {
             panic!("大文件不该走整包 upload");
         }
         fn uses_chunked_orchestration(&self) -> bool {
             true
         }
-        async fn prepare_chunked(&mut self, digest: &str, size: usize, force: bool) -> Result<ChunkedPrepared> {
+        async fn prepare_chunked(
+            &mut self,
+            digest: &str,
+            size: usize,
+            force: bool,
+        ) -> Result<ChunkedPrepared> {
             let n = self.prepares.len();
             self.prepares.push((digest.to_string(), size, force));
             let hit = !force && self.hits.get(n).copied().unwrap_or(false);
             Ok(if hit {
-                ChunkedPrepared::Claim { claim_token: format!("claim-{n}") }
+                ChunkedPrepared::Claim {
+                    claim_token: format!("claim-{n}"),
+                }
             } else {
                 ChunkedPrepared::Session(session(n))
             })
         }
-        async fn upload_chunked(&mut self, s: &ChunkedSession, _p: &SealedPayload) -> Result<UploadedFileInfo> {
+        async fn upload_chunked(
+            &mut self,
+            s: &ChunkedSession,
+            _p: &SealedPayload,
+        ) -> Result<UploadedFileInfo> {
             self.uploads.push(s.upload_token.clone());
             if let Some(e) = self.first_upload_error.take() {
                 return Err(e);
@@ -27097,7 +27209,9 @@ mod chunked_upload_plan_tests {
     #[tokio::test]
     async fn a_large_payload_takes_the_chunked_path_and_uploads_once() {
         let mut io = Recorder::default();
-        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
+        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha())
+            .await
+            .unwrap();
         assert_eq!(io.prepares, vec![(plaintext_sha(), PLAINTEXT.len(), false)]);
         assert_eq!(io.uploads.len(), 1);
         assert_eq!(io.claims, 0);
@@ -27107,8 +27221,13 @@ mod chunked_upload_plan_tests {
 
     #[tokio::test]
     async fn a_hit_claims_and_uploads_nothing() {
-        let mut io = Recorder { hits: vec![true], ..Default::default() };
-        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
+        let mut io = Recorder {
+            hits: vec![true],
+            ..Default::default()
+        };
+        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha())
+            .await
+            .unwrap();
         assert_eq!(io.claims, 1);
         assert!(io.uploads.is_empty());
         assert_eq!(token, "claim-0");
@@ -27125,10 +27244,15 @@ mod chunked_upload_plan_tests {
             }),
             ..Default::default()
         };
-        State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
+        State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha())
+            .await
+            .unwrap();
         assert_eq!(
             io.prepares,
-            vec![(plaintext_sha(), PLAINTEXT.len(), false), (plaintext_sha(), PLAINTEXT.len(), true)]
+            vec![
+                (plaintext_sha(), PLAINTEXT.len(), false),
+                (plaintext_sha(), PLAINTEXT.len(), true)
+            ]
         );
         assert_eq!(io.claims, 1);
         assert_eq!(io.uploads, vec![session(1).upload_token]);
@@ -27142,7 +27266,9 @@ mod chunked_upload_plan_tests {
             first_upload_error: Some(Error::UploadSessionGone),
             ..Default::default()
         };
-        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
+        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha())
+            .await
+            .unwrap();
         assert_eq!(io.prepares.len(), 2);
         assert_eq!(io.uploads.len(), 1);
         assert_eq!(io.claims, 1);
@@ -27160,10 +27286,21 @@ mod chunked_upload_plan_tests {
             first_upload_error: Some(Error::UploadSessionGone),
             ..Default::default()
         };
-        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.unwrap();
+        let (_, token) = State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha())
+            .await
+            .unwrap();
         // 两次 prepare 都不带 force：这不是 claim miss，没有理由跳过预检。
-        assert_eq!(io.prepares, vec![(plaintext_sha(), PLAINTEXT.len(), false), (plaintext_sha(), PLAINTEXT.len(), false)]);
-        assert_eq!(io.uploads, vec![session(0).upload_token, session(1).upload_token]);
+        assert_eq!(
+            io.prepares,
+            vec![
+                (plaintext_sha(), PLAINTEXT.len(), false),
+                (plaintext_sha(), PLAINTEXT.len(), false)
+            ]
+        );
+        assert_eq!(
+            io.uploads,
+            vec![session(0).upload_token, session(1).upload_token]
+        );
         assert_eq!(io.claims, 0);
         assert_eq!(token, session(1).upload_token, "回调用新会话的 token");
         assert!(io.finished >= 2, "旧会话记录要先丢掉再重来");
@@ -27175,7 +27312,11 @@ mod chunked_upload_plan_tests {
             first_upload_error: Some(Error::Transport("boom".into())),
             ..Default::default()
         };
-        assert!(State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha()).await.is_err());
+        assert!(
+            State::plan_attachment_upload(&mut io, PLAINTEXT, &plaintext_sha())
+                .await
+                .is_err()
+        );
         assert_eq!(io.prepares.len(), 1, "不该再申请");
     }
 }
@@ -27267,10 +27408,20 @@ mod seal_once_tests {
         let plaintext = b"the same picture, sent twice".to_vec();
 
         let key = test_attachment_key();
-        let (_, sha_a) = State::seal_once(&dir.join("a.sealed"), &plaintext, &key, TEST_CHUNK_PLAIN_SIZE)
-            .expect("seal a");
-        let (_, sha_b) = State::seal_once(&dir.join("b.sealed"), &plaintext, &key, TEST_CHUNK_PLAIN_SIZE)
-            .expect("seal b");
+        let (_, sha_a) = State::seal_once(
+            &dir.join("a.sealed"),
+            &plaintext,
+            &key,
+            TEST_CHUNK_PLAIN_SIZE,
+        )
+        .expect("seal a");
+        let (_, sha_b) = State::seal_once(
+            &dir.join("b.sealed"),
+            &plaintext,
+            &key,
+            TEST_CHUNK_PLAIN_SIZE,
+        )
+        .expect("seal b");
 
         assert_ne!(
             sha_a, sha_b,
@@ -27321,15 +27472,33 @@ mod seal_once_tests {
         let cache = dir.join("body.sealed");
         let meta_path = cache.with_extension("sealed.json");
 
-        let (_, first_sha) = State::seal_once(&cache, b"first", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("first seal");
+        let (_, first_sha) = State::seal_once(
+            &cache,
+            b"first",
+            &test_attachment_key(),
+            TEST_CHUNK_PLAIN_SIZE,
+        )
+        .expect("first seal");
         let stale_meta = std::fs::read_to_string(&meta_path).expect("read meta");
         // 换了 blob，metadata 留在上一轮。
         State::drop_sealed_cache(&cache);
-        let (_, second_sha) = State::seal_once(&cache, b"second", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("second seal");
+        let (_, second_sha) = State::seal_once(
+            &cache,
+            b"second",
+            &test_attachment_key(),
+            TEST_CHUNK_PLAIN_SIZE,
+        )
+        .expect("second seal");
         assert_ne!(first_sha, second_sha);
         std::fs::write(&meta_path, &stale_meta).expect("restore stale meta");
 
-        let (blob, sha) = State::seal_once(&cache, b"second", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("reseal");
+        let (blob, sha) = State::seal_once(
+            &cache,
+            b"second",
+            &test_attachment_key(),
+            TEST_CHUNK_PLAIN_SIZE,
+        )
+        .expect("reseal");
         assert_eq!(sha, State::sha256_hex(&blob), "🔴 摘要必须对应真实字节");
         assert_ne!(sha, first_sha, "🔴 不能沿用那份对不上的旧 metadata");
     }
@@ -27347,8 +27516,8 @@ mod seal_once_tests {
         let plaintext = b"a payload sealed under one key".to_vec();
 
         let old_key = test_attachment_key();
-        let (_, old_sha) =
-            State::seal_once(&cache, &plaintext, &old_key, TEST_CHUNK_PLAIN_SIZE).expect("first seal");
+        let (_, old_sha) = State::seal_once(&cache, &plaintext, &old_key, TEST_CHUNK_PLAIN_SIZE)
+            .expect("first seal");
 
         // 密钥轮换：同样的明文、同样的块大小，但 key_id 换了。
         let new_key = privchat_protocol::rpc::file::upload::AttachmentKey {
@@ -27361,13 +27530,9 @@ mod seal_once_tests {
         assert_eq!(sha, State::sha256_hex(&blob), "摘要必须对应真实字节");
 
         // 块大小变了同理。
-        let (_, sha_other_chunk) = State::seal_once(
-            &cache,
-            &plaintext,
-            &new_key,
-            TEST_CHUNK_PLAIN_SIZE * 2,
-        )
-        .expect("reseal with another chunk size");
+        let (_, sha_other_chunk) =
+            State::seal_once(&cache, &plaintext, &new_key, TEST_CHUNK_PLAIN_SIZE * 2)
+                .expect("reseal with another chunk size");
         assert_ne!(sha_other_chunk, sha, "🔴 块大小变了封出来就是另一串字节");
     }
 
@@ -27396,7 +27561,13 @@ mod seal_once_tests {
     fn the_cache_is_dropped_once_the_send_completes() {
         let dir = tmp_dir();
         let cache = dir.join("body.sealed");
-        State::seal_once(&cache, b"payload", &test_attachment_key(), TEST_CHUNK_PLAIN_SIZE).expect("seal");
+        State::seal_once(
+            &cache,
+            b"payload",
+            &test_attachment_key(),
+            TEST_CHUNK_PLAIN_SIZE,
+        )
+        .expect("seal");
         assert!(cache.exists() && cache.with_extension("sealed.json").exists());
 
         State::drop_sealed_cache(&cache);
@@ -27477,7 +27648,11 @@ mod attachment_wire_caption_tests {
     #[tokio::test]
     async fn whitespace_reaches_the_wire_untouched() {
         assert_eq!(
-            wire_content("whitespace", r#"{"file_name":"a.jpg","caption":"  周末爬山  "}"#).await,
+            wire_content(
+                "whitespace",
+                r#"{"file_name":"a.jpg","caption":"  周末爬山  "}"#
+            )
+            .await,
             "  周末爬山  "
         );
     }
@@ -27502,7 +27677,10 @@ mod attachment_caption_tests {
     #[test]
     fn a_caption_becomes_the_message_text() {
         let extra = r#"{"file_name":"a.jpg","mime_type":"image/jpeg","caption":"周末爬山"}"#;
-        assert_eq!(State::attachment_caption(extra).as_deref(), Some("周末爬山"));
+        assert_eq!(
+            State::attachment_caption(extra).as_deref(),
+            Some("周末爬山")
+        );
     }
 
     /// 没写就是没写：wire 层据此发空正文，占位文案由展示层现取。
@@ -27547,8 +27725,14 @@ mod wire_display_filename_tests {
 
     #[test]
     fn without_one_the_upload_name_is_used() {
-        assert_eq!(State::wire_display_filename("{}", "payload.pdf"), "payload.pdf");
-        assert_eq!(State::wire_display_filename("", "payload.pdf"), "payload.pdf");
+        assert_eq!(
+            State::wire_display_filename("{}", "payload.pdf"),
+            "payload.pdf"
+        );
+        assert_eq!(
+            State::wire_display_filename("", "payload.pdf"),
+            "payload.pdf"
+        );
         assert_eq!(
             State::wire_display_filename(r#"{"file_name":"  "}"#, "payload.pdf"),
             "payload.pdf"
@@ -27697,7 +27881,10 @@ mod attachment_wire_contract_tests {
                 "消息内容里出现了下载地址（它会过期）：{found:?}"
             );
             // 明确点名这两个曾经存在的键，报错信息才指得出是哪一步回退了。
-            assert!(content.get("file_url").is_none(), "{file_type}: file_url 不该进消息");
+            assert!(
+                content.get("file_url").is_none(),
+                "{file_type}: file_url 不该进消息"
+            );
             assert!(
                 content.get("thumbnail_url").is_none(),
                 "{file_type}: thumbnail_url 不该进消息"
@@ -27776,12 +27963,9 @@ mod transport_pin_scope_tests {
     fn tcp_has_no_insecure_escape_hatch() {
         assert!(validate_transport_pins(&TransportProtocol::Tcp, &[], false).is_err());
         assert!(validate_transport_pins(&TransportProtocol::Tcp, &[], true).is_err());
-        assert!(validate_transport_pins(
-            &TransportProtocol::Tcp,
-            &["pin".to_string()],
-            false
-        )
-        .is_ok());
+        assert!(
+            validate_transport_pins(&TransportProtocol::Tcp, &["pin".to_string()], false).is_ok()
+        );
     }
 }
 
@@ -27877,8 +28061,12 @@ without server identity verification"
             return true;
         }
         match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_unspecified(),
-            Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local() || ip.is_unspecified(),
+            Ok(std::net::IpAddr::V4(ip)) => {
+                ip.is_loopback() || ip.is_private() || ip.is_unspecified()
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unspecified()
+            }
             Err(_) => false,
         }
     }
@@ -27922,12 +28110,13 @@ without server identity verification"
 
         #[test]
         fn object_store_requires_https_outside_local_development() {
-            assert!(validate_object_store_url("https://bucket.cos.example/part?signature=x").is_ok());
+            assert!(
+                validate_object_store_url("https://bucket.cos.example/part?signature=x").is_ok()
+            );
             assert!(validate_object_store_url("http://127.0.0.1:9000/part?signature=x").is_ok());
-            let err = validate_object_store_url("http://bucket.example/part?signature=x")
-                .unwrap_err();
+            let err =
+                validate_object_store_url("http://bucket.example/part?signature=x").unwrap_err();
             assert!(format!("{err}").contains("plaintext object-store"), "{err}");
         }
     }
-
 }

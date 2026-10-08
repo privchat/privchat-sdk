@@ -32,7 +32,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[tokio::main]
 async fn main() {
     let host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let storage_root = std::env::var("PRIVCHAT_STORAGE_ROOT").ok().map(PathBuf::from);
+    let storage_root = std::env::var("PRIVCHAT_STORAGE_ROOT")
+        .ok()
+        .map(PathBuf::from);
     let size: usize = std::env::var("PRIVCHAT_LIVE_SIZE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -40,24 +42,33 @@ async fn main() {
 
     let data_dir = std::env::temp_dir().join(format!("privchat-chunked-live-{}", now_ms()));
     std::fs::create_dir_all(&data_dir).unwrap();
-    let client = std::sync::Arc::new(PrivchatClient::new(PrivchatConfig {
-        endpoints: vec![ServerEndpoint {
-            protocol: TransportProtocol::Tcp,
-            host: host.clone(),
-            port: 9001,
-            path: None,
-            use_tls: false,
-        }],
-        connection_timeout_secs: 30,
-        data_dir: data_dir.to_string_lossy().to_string(),
-        spki_pins: vec![],
-    })
-    .expect("client"));
+    let client = std::sync::Arc::new(
+        PrivchatClient::new(PrivchatConfig {
+            endpoints: vec![ServerEndpoint {
+                protocol: TransportProtocol::Tcp,
+                host: host.clone(),
+                port: 9001,
+                path: None,
+                use_tls: false,
+            }],
+            connection_timeout_secs: 30,
+            data_dir: data_dir.to_string_lossy().to_string(),
+            spki_pins: vec![],
+        })
+        .expect("client"),
+    );
 
     client.connect().await.expect("connect");
     let suffix = format!("{}", now_ms() % 10_000_000);
     let username = format!("chunk_{suffix}");
-    let device_id = format!("{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}", now_ms() as u32, (now_ms() >> 8) as u16, (now_ms() & 0xfff) as u16, (now_ms() >> 4 & 0xfff) as u16, now_ms() & 0xffff_ffff_ffff);
+    let device_id = format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        now_ms() as u32,
+        (now_ms() >> 8) as u16,
+        (now_ms() & 0xfff) as u16,
+        (now_ms() >> 4 & 0xfff) as u16,
+        now_ms() & 0xffff_ffff_ffff
+    );
     let login = client
         .register(username.clone(), "password123".into(), device_id.clone())
         .await
@@ -76,7 +87,9 @@ async fn main() {
     println!("✅ 建群 group_id={}", group.group_id);
 
     // ---- 造一份 > 1MiB 的「文件」并按 App 的三步入队 ----
-    let payload: Vec<u8> = (0..size).map(|i| ((i as u32).wrapping_mul(2654435761) >> 11) as u8).collect();
+    let payload: Vec<u8> = (0..size)
+        .map(|i| ((i as u32).wrapping_mul(2654435761) >> 11) as u8)
+        .collect();
     let file_name = "big.bin".to_string();
     let mime = "application/octet-stream".to_string();
     let local_message_id = client.generate_local_message_id().expect("lmid");
@@ -144,7 +157,12 @@ async fn main() {
                 match client.next_event(200).await {
                     Ok(Some(ev)) => {
                         total_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if let privchat_sdk_ffi::SdkEvent::AttachmentUploadProgress { local_message_id, uploaded, total } = ev {
+                        if let privchat_sdk_ffi::SdkEvent::AttachmentUploadProgress {
+                            local_message_id,
+                            uploaded,
+                            total,
+                        } = ev
+                        {
                             if local_message_id == want {
                                 progress.lock().unwrap().push((uploaded, total));
                             }
@@ -163,7 +181,11 @@ async fn main() {
             if let Ok(rd) = std::fs::read_dir(root) {
                 for e in rd.flatten() {
                     let parts = e.path().join("parts");
-                    if parts.is_dir() && std::fs::read_dir(&parts).map(|r| r.count() > 0).unwrap_or(false) {
+                    if parts.is_dir()
+                        && std::fs::read_dir(&parts)
+                            .map(|r| r.count() > 0)
+                            .unwrap_or(false)
+                    {
                         saw_parts = true;
                     }
                 }
@@ -183,20 +205,36 @@ async fn main() {
     let progress = progress.lock().unwrap().clone();
     let progress_seen = progress.len();
     let last_progress = progress.last().copied().unwrap_or((0, 0));
-    println!("🔎 events_seen={} progress={:?}", total_events.load(std::sync::atomic::Ordering::Relaxed), progress);
+    println!(
+        "🔎 events_seen={} progress={:?}",
+        total_events.load(std::sync::atomic::Ordering::Relaxed),
+        progress
+    );
     println!(
         "📊 status={status} progress_events={progress_seen} last={:?} elapsed={:?} saw_parts={saw_parts}",
         last_progress,
         started.elapsed()
     );
     assert!(status == 2, "消息没有到 Sent（status={status}）");
-    assert!(progress_seen >= 2, "分片路径应报多次进度（实际 {progress_seen}）");
-    assert_eq!(last_progress.1, last_progress.0, "最后一次进度应是 total/total");
+    assert!(
+        progress_seen >= 2,
+        "分片路径应报多次进度（实际 {progress_seen}）"
+    );
+    assert_eq!(
+        last_progress.1, last_progress.0,
+        "最后一次进度应是 total/total"
+    );
     if let Some(root) = storage_root.as_ref() {
         // 走了分片：chunked/ 根被建出来；没走整包：整包会话目录 tmp/uploads/{uid} 不存在。
-        assert!(root.join("tmp/uploads/chunked").is_dir(), "chunked/ 根不存在——没有走分片路径");
         assert!(
-            !root.join("tmp/uploads").join(login.user_id.to_string()).exists(),
+            root.join("tmp/uploads/chunked").is_dir(),
+            "chunked/ 根不存在——没有走分片路径"
+        );
+        assert!(
+            !root
+                .join("tmp/uploads")
+                .join(login.user_id.to_string())
+                .exists(),
             "出现了整包会话目录 tmp/uploads/{}——走的是整包而不是分片",
             login.user_id
         );
@@ -217,15 +255,34 @@ async fn main() {
     if let Some(root) = storage_root.as_ref() {
         let obj = root.join("files").join(format!("{file_id}.bin"));
         let stored = std::fs::read(&obj).unwrap_or_else(|e| panic!("读正式对象 {obj:?} 失败: {e}"));
-        assert_eq!(stored.len() as u64, last_progress.1, "正式对象大小 ≠ 上传总字节");
+        assert_eq!(
+            stored.len() as u64,
+            last_progress.1,
+            "正式对象大小 ≠ 上传总字节"
+        );
         assert!(stored.len() > size, "密文应大于明文（nonce+tag）");
-        println!("✅ 正式对象 {} 字节 = 上传总字节，sha256={}", stored.len(), &sha256_hex(&stored)[..16]);
+        println!(
+            "✅ 正式对象 {} 字节 = 上传总字节，sha256={}",
+            stored.len(),
+            &sha256_hex(&stored)[..16]
+        );
         let leftover = std::fs::read_dir(root.join("tmp/uploads/chunked"))
-            .map(|r| r.flatten().filter(|e| e.path().join("parts").is_dir()).count())
+            .map(|r| {
+                r.flatten()
+                    .filter(|e| e.path().join("parts").is_dir())
+                    .count()
+            })
             .unwrap_or(0);
         println!("🧹 仍带 parts 的会话数: {leftover}");
         assert!(
-            !root.join("tmp/uploads/chunked").read_dir().map(|mut r| r.any(|e| e.ok().map(|e| e.file_name().to_string_lossy().starts_with(&file_id)).unwrap_or(false))).unwrap_or(false),
+            !root
+                .join("tmp/uploads/chunked")
+                .read_dir()
+                .map(|mut r| r.any(|e| e
+                    .ok()
+                    .map(|e| e.file_name().to_string_lossy().starts_with(&file_id))
+                    .unwrap_or(false)))
+                .unwrap_or(false),
             "callback 之后会话目录应已删除"
         );
     }

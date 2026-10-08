@@ -238,7 +238,7 @@ impl MultiAccountManager {
             endpoints: self.endpoints.clone(),
             connection_timeout_secs: 30,
             data_dir: data_dir.to_string_lossy().to_string(),
-        spki_pins: vec![],
+            spki_pins: vec![],
         }));
 
         sdk.connect().await?;
@@ -1417,7 +1417,7 @@ impl MultiAccountManager {
             endpoints: self.endpoints.clone(),
             connection_timeout_secs: 30,
             data_dir: data_dir.to_string_lossy().to_string(),
-        spki_pins: vec![],
+            spki_pins: vec![],
         });
         sdk.connect().await?;
         let login = sdk
@@ -1484,7 +1484,7 @@ impl MultiAccountManager {
             endpoints: self.endpoints.clone(),
             connection_timeout_secs: 30,
             data_dir: data_dir.to_string_lossy().to_string(),
-        spki_pins: vec![],
+            spki_pins: vec![],
         }));
         sdk.connect().await?;
         let login = sdk
@@ -1513,7 +1513,7 @@ impl MultiAccountManager {
             endpoints: self.endpoints.clone(),
             connection_timeout_secs: 30,
             data_dir: data_dir.to_string_lossy().to_string(),
-        spki_pins: vec![],
+            spki_pins: vec![],
         });
 
         let mut details = String::new();

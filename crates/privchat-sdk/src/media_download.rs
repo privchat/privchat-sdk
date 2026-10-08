@@ -234,7 +234,6 @@ impl DownloadManager {
             .len()
     }
 
-
     /// Start (or no-op restart if already Downloading/Paused) a download from a
     /// resolved ticket (`url` + `encryption_version` + optional `cek`).
     /// - `target_dir` must already exist.
@@ -678,24 +677,22 @@ async fn run_download(
                 return;
             }
         };
-        let plaintext = match crate::attachment_crypto::decrypt_downloaded_attachment_bytes(
-            &site_key,
-            &blob,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = fs::remove_file(&part_path);
-                fail(
-                    &sdk,
-                    &manager,
-                    &key,
-                    ErrorCode::InternalError as u32,
-                    format!("decrypt attachment: {e}"),
-                )
-                .await;
-                return;
-            }
-        };
+        let plaintext =
+            match crate::attachment_crypto::decrypt_downloaded_attachment_bytes(&site_key, &blob) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = fs::remove_file(&part_path);
+                    fail(
+                        &sdk,
+                        &manager,
+                        &key,
+                        ErrorCode::InternalError as u32,
+                        format!("decrypt attachment: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
         let decrypted_part = final_path.with_extension("decrypted.part");
         let write_result = (|| -> std::io::Result<()> {
             let mut output = OpenOptions::new()
@@ -1028,7 +1025,10 @@ mod sealed_cache_tests {
         let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
         hasher.update(&blob);
         assert_eq!(meta["sha256"], hex::encode(hasher.finalize()));
-        assert_eq!(fs::read(dir.join("thumb.sealed")).expect("thumb blob"), b"thumb-blob");
+        assert_eq!(
+            fs::read(dir.join("thumb.sealed")).expect("thumb blob"),
+            b"thumb-blob"
+        );
         assert!(dir.join("thumb.sealed.json").exists());
     }
 
