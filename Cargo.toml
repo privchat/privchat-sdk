@@ -34,7 +34,7 @@ base64 = "0.22"
 
 msgtrans = { version = "2.0.0-beta.3", path = "../msgtrans/crates/msgtrans" }
 privchat-protocol = { version = "0.2", path = "../privchat-protocol" }
-uniffi = { version = "0.31.0", features = ["cli"] }
+uniffi = { version = "0.32.2", features = ["cli"] }
 
 [profile.release]
 opt-level = "s"
