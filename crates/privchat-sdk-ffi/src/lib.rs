@@ -1641,6 +1641,10 @@ pub enum SdkEvent {
     },
     ShutdownStarted,
     ShutdownCompleted,
+    RpcNotificationReceived {
+        route: String,
+        body: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1840,6 +1844,7 @@ pub struct MessageContentBody {
     pub reply_to_message_id: Option<String>,
     pub mentioned_user_ids: Vec<u64>,
     pub attachment_url: Option<String>,
+    pub sticker_id: Option<String>,
     pub attachment_file_id: Option<u64>,
     pub thumbnail_url: Option<String>,
     pub thumbnail_file_id: Option<u64>,
@@ -2504,6 +2509,9 @@ fn parse_read_list_user_ids(raw: &str) -> Vec<u64> {
 
 fn map_sdk_event(v: privchat_sdk::SdkEvent) -> SdkEvent {
     match v {
+        privchat_sdk::SdkEvent::RpcNotificationReceived { route, body } => {
+            SdkEvent::RpcNotificationReceived { route, body }
+        }
         privchat_sdk::SdkEvent::ConnectionStateChanged { from, to } => {
             SdkEvent::ConnectionStateChanged {
                 from: map_connection_state(from),
@@ -2814,6 +2822,9 @@ fn map_sequenced_sdk_event(v: SdkSequencedSdkEvent) -> SequencedSdkEvent {
 fn sdk_event_to_json_value(event: &SdkEvent) -> serde_json::Value {
     use serde_json::json;
     match event {
+        SdkEvent::RpcNotificationReceived { route, body } => json!({
+            "type": "rpc_notification_received", "route": route, "body": body
+        }),
         SdkEvent::ConnectionStateChanged { from, to } => json!({
             "type": "connection_state_changed",
             "from_state": format!("{from:?}"),
@@ -3364,6 +3375,7 @@ fn map_message_content(
         reply_to_message_id: v.reply_to_message_id,
         mentioned_user_ids: v.mentioned_user_ids,
         attachment_url: v.attachment_url,
+        sticker_id: v.sticker_id,
         attachment_file_id: v.attachment_file_id,
         thumbnail_url: v.thumbnail_url,
         thumbnail_file_id: v.thumbnail_file_id,
@@ -9463,6 +9475,62 @@ mod tests {
         PrivchatClient, PrivchatConfig, SdkEvent, ServerEndpoint, SyncPhase, SyncRunKind,
         TransportProtocol,
     };
+
+    #[test]
+    fn rpc_notification_event_ffi_json_preserves_route_and_bytes() {
+        let body = br#"{"call_id":"42","state":"ringing"}"#.to_vec();
+        let event = map_sdk_event(privchat_sdk::SdkEvent::RpcNotificationReceived {
+            route: "call/state".into(), body: body.clone(),
+        });
+        let value = super::sdk_event_to_json_value(&event);
+        assert_eq!(value, serde_json::json!({
+            "type": "rpc_notification_received", "route": "call/state", "body": body,
+        }));
+    }
+
+    #[test]
+    fn rpc_notification_typed_envelope_roundtrip() {
+        let envelope = Some(super::SequencedSdkEvent {
+            sequence_id: 7,
+            timestamp_ms: 42,
+            event: SdkEvent::RpcNotificationReceived {
+                route: "call/state".into(), body: b"{}".to_vec(),
+            },
+        });
+        let buffer = <Option<super::SequencedSdkEvent> as uniffi::Lower<super::UniFfiTag>>::lower(envelope);
+        // Optional flag + sequence ID + timestamp, followed by the appended enum variant.
+        let bytes = buffer.destroy_into_vec();
+        assert_eq!(&bytes[17..21], &33_i32.to_be_bytes());
+        let buffer = uniffi::RustBuffer::from_vec(bytes);
+        let decoded = <Option<super::SequencedSdkEvent> as uniffi::Lift<super::UniFfiTag>>::try_lift(buffer)
+            .unwrap().unwrap();
+        assert_eq!(decoded.sequence_id, 7);
+        assert_eq!(super::sdk_event_to_json_value(&decoded.event), serde_json::json!({
+            "type": "rpc_notification_received", "route": "call/state", "body": [123, 125],
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rpc_notification_polling_typed_and_json() {
+        let client = PrivchatClient::new(test_config()).unwrap();
+        client.inner.emit_event(privchat_sdk::SdkEvent::RpcNotificationReceived {
+            route: "call/state".into(), body: b"{}".to_vec(),
+        });
+        let mut found = false;
+        for _ in 0..32 {
+            let Some(event) = client.next_event_envelope(100).await.unwrap() else { break };
+            let buffer = <super::SequencedSdkEvent as uniffi::Lower<super::UniFfiTag>>::lower(event);
+            let decoded = <super::SequencedSdkEvent as uniffi::Lift<super::UniFfiTag>>::try_lift(buffer).unwrap();
+            let json = super::sequenced_event_to_json_value(&decoded);
+            if json["event"]["type"] == "rpc_notification_received" {
+                assert_eq!(json["event"]["route"], "call/state");
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+        client.shutdown().await.unwrap();
+    }
 
     #[test]
     fn attachment_extension_requires_an_object() {

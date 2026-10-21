@@ -30,6 +30,7 @@ pub struct MessageContentProjection {
     pub reply_to_message_id: Option<String>,
     pub mentioned_user_ids: Vec<u64>,
     pub attachment_url: Option<String>,
+    pub sticker_id: Option<String>,
     pub attachment_file_id: Option<u64>,
     pub thumbnail_url: Option<String>,
     pub thumbnail_file_id: Option<u64>,
@@ -81,7 +82,16 @@ pub fn project_stored_message(message: &StoredMessage) -> MessageContentProjecti
     };
     body.entities = scan_entities(&body.text, &body.mentioned_user_ids);
 
-    body.attachment_url = string_at(&sources, &["url", "attachment_url"]);
+    if message.message_type == 6 {
+        body.sticker_id = string_at(&sources, &["sticker_id"]);
+    }
+
+    body.attachment_url = if message.message_type == 6 {
+        string_at(&sources, &["image_url"])
+            .or_else(|| string_at(&sources, &["url", "attachment_url"]))
+    } else {
+        string_at(&sources, &["url", "attachment_url"])
+    };
     body.attachment_file_id = u64_at(&sources, &["file_id", "attachment_file_id"]);
     body.thumbnail_url = string_at(&sources, &["thumbnail_url", "thumbnail"]);
     body.thumbnail_file_id = u64_at(&sources, &["thumbnail_file_id"]);
@@ -434,6 +444,36 @@ fn entity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::caption_projection_tests::received;
+
+    #[test]
+    fn sticker_projection_preserves_image_from_each_supported_storage_shape() {
+        for (content, extra) in [
+            (r#"{"sticker_id":"s1","image_url":"https://cdn.example/sticker.webp"}"#, "{}"),
+            ("", r#"{"metadata":{"sticker_id":"s1","image_url":"https://cdn.example/sticker.webp"}}"#),
+            ("", r#"{"sticker_id":"s1","image_url":"https://cdn.example/sticker.webp"}"#),
+        ] {
+            let mut message = received(content, extra);
+            message.message_type = 6;
+            let projection = project_stored_message(&message);
+            assert_eq!(projection.kind, "sticker");
+            assert_eq!(projection.sticker_id.as_deref(), Some("s1"));
+            assert_eq!(projection.attachment_url.as_deref(), Some("https://cdn.example/sticker.webp"));
+            assert!(projection.text.is_empty());
+        }
+    }
+
+    #[test]
+    fn sticker_canonical_image_wins_over_legacy_url_without_affecting_other_types() {
+        let mut message = received(r#"{"url":"legacy"}"#, r#"{"metadata":{"image_url":"canonical"}}"#);
+        message.message_type = 6;
+        assert_eq!(project_stored_message(&message).attachment_url.as_deref(), Some("canonical"));
+        message.extra = "{}".into();
+        assert_eq!(project_stored_message(&message).attachment_url.as_deref(), Some("legacy"));
+        message.message_type = 2;
+        message.content = r#"{"image_url":"sticker-only"}"#.into();
+        assert_eq!(project_stored_message(&message).attachment_url, None);
+    }
     #[test]
     fn text_projection_is_typed_and_uses_utf16_offsets() {
         let mut message: StoredMessage = serde_json::from_value(serde_json::json!({"message_id":1,"server_message_id":null,"local_message_id":null,"channel_id":1,"channel_type":1,"from_uid":2,"message_type":0,"content":"😀 @客服 https://example.com hi@example.com 13800138000","status":2,"created_at":1,"updated_at":1,"extra":"{\"mentioned_user_ids\":[9]}","revoked":false,"revoked_by":null,"mime_type":null,"media_downloaded":false,"thumb_status":0,"delivered":false,"pts":null})).unwrap();
@@ -532,7 +572,7 @@ mod caption_projection_tests {
 
     /// 收方拿到的形态：`content` 是 wire envelope 的正文（caption 或占位文案），
     /// 附件描述在 `extra.metadata` 里。
-    fn received(content: &str, metadata_extra: &str) -> StoredMessage {
+    pub(super) fn received(content: &str, metadata_extra: &str) -> StoredMessage {
         let mut m = attachment(metadata_extra);
         m.content = content.to_string();
         m

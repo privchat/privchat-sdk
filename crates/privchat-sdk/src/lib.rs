@@ -802,6 +802,11 @@ pub enum SdkEvent {
     },
     ShutdownStarted,
     ShutdownCompleted,
+    /// Authenticated server one-way RPC notification; no client response is sent.
+    RpcNotificationReceived {
+        route: String,
+        body: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1996,6 +2001,10 @@ async fn start_inbound_task(
                     (msg.biz_type(), msg.into_payload())
                 }
                 ClientEvent::Request(req) => {
+                    // RPC notifications are one-way Message frames, never request/ACK traffic.
+                    if req.biz_type() == MessageType::RpcRequest as u8 {
+                        continue;
+                    }
                     if inbound_logs_enabled() {
                         eprintln!(
                             "[SDK.inbound] request received biz_type={} len={}",
@@ -6440,9 +6449,7 @@ impl State {
                 }
             }
             MessageType::RpcRequest => {
-                if let Ok(v) = decode_message::<RpcRequest>(data) {
-                    eprintln!("[SDK.inbound] decoded RpcRequest: {:?}", v);
-                }
+                // RPC notification bodies may contain private call state or credentials.
             }
             MessageType::RpcResponse => {
                 if let Ok(v) = decode_message::<RpcResponse>(data) {
@@ -9351,6 +9358,7 @@ impl State {
             "video" => ContentMessageType::Video,
             // 注：普通音频文件（mp3/wav/...）作为 File 消息发送，不再有独立 Audio 类型
             "file" | "audio" => ContentMessageType::File,
+            "sticker" => ContentMessageType::Sticker,
             "location" => ContentMessageType::Location,
             // RP-12：资金卡片（服务端注入）历史/冷同步必须保留类型，否则落成 Text→渲染原始 JSON
             "red_packet" => ContentMessageType::RedPacket,
@@ -10518,6 +10526,13 @@ impl State {
         false
     }
 
+    async fn handle_inbound_frame_at_epoch(&mut self, epoch: u64, biz_type: u8, data: Vec<u8>) -> Result<usize> {
+        if epoch != self.inbound_epoch {
+            return Ok(0);
+        }
+        self.handle_inbound_frame(biz_type, data).await
+    }
+
     async fn handle_inbound_frame(&mut self, biz_type: u8, data: Vec<u8>) -> Result<usize> {
         if inbound_logs_enabled() {
             eprintln!(
@@ -10570,6 +10585,28 @@ impl State {
         // (channel_id, channel_type, server_message_id, delivered_at)
         let mut delivery_receipts: Vec<(u64, i32, u64, u64)> = Vec::new();
         match message_type {
+            MessageType::RpcRequest => {
+                if self.session_state != SessionState::Authenticated {
+                    return Ok(0);
+                }
+                // Bound before decoding as well as after decoding. Never include body in errors.
+                if data.len() > 256 * 1024 + 1024 {
+                    return Err(Error::Serialization("RPC notification too large".into()));
+                }
+                let req: RpcRequest = decode_message(&data)
+                    .map_err(|_| Error::Serialization("Invalid RPC notification".into()))?;
+                if req.route.is_empty() || req.route.len() > 256
+                    || req.route.chars().any(|c| c.is_control() || c.is_whitespace())
+                    || req.body.len() > 256 * 1024
+                {
+                    return Err(Error::Serialization("Invalid RPC notification bounds".into()));
+                }
+                self.pending_events.push(SdkEvent::RpcNotificationReceived {
+                    route: req.route,
+                    body: req.body,
+                });
+                return Ok(0);
+            }
             MessageType::SendMessageRequest => {
                 let req: SendMessageRequest = decode_message(&data).map_err(|e| {
                     Error::Serialization(format!("decode send message request: {e}"))
@@ -15536,7 +15573,7 @@ impl PrivchatSdk {
                             "[SDK_PUSH_FRAME_RECEIVED] frame_epoch={} current_epoch={} biz_type={} payload_len={} uid={:?}",
                             epoch, state.inbound_epoch, biz_type, data.len(), state.current_uid
                         ); }
-                        match state.handle_inbound_frame(biz_type, data).await {
+                        match state.handle_inbound_frame_at_epoch(epoch, biz_type, data).await {
                             Ok(applied) if applied > 0 => {
                                 for evt in state.last_sync_entity_events.clone() {
                                     emit_sequenced_event(
@@ -21559,6 +21596,34 @@ mod tests {
     }
 
     #[test]
+    fn history_sticker_preserves_type_and_image() {
+        let dir = tempfile::tempdir().expect("temporary store");
+        let store = LocalStore::open_at(dir.path().to_path_buf()).expect("open store");
+        let item = privchat_protocol::rpc::message::history::MessageHistoryItem {
+            message_id: 710_001,
+            channel_id: 45,
+            sender_id: 51,
+            content: "".into(),
+            message_type: "sticker".into(),
+            timestamp: 1_785_148_271_317,
+            message_seq: Some(14),
+            reply_to_message_id: None,
+            metadata: Some(serde_json::json!({"type":"sticker","sticker_id":"immutable-1","image_url":"https://cdn.example/original.webp"}).as_object().unwrap().clone()),
+            revoked: false,
+            revoked_at: None,
+            revoked_by: None,
+        };
+        let input = State::history_item_to_upsert_input(&item, 1);
+        assert_eq!(input.message_type, 6);
+        let result = store.upsert_remote_message_with_result("52", &input).unwrap();
+        let stored = store.get_message_by_id("52", result.message_id).unwrap().unwrap();
+        let body = crate::message_content::project_stored_message(&stored);
+        assert_eq!(body.kind, "sticker");
+        assert_eq!(body.sticker_id.as_deref(), Some("immutable-1"));
+        assert_eq!(body.attachment_url.as_deref(), Some("https://cdn.example/original.webp"));
+    }
+
+    #[test]
     fn history_location_preserves_projection_and_repairs_equal_version_text_row() {
         let dir = tempfile::tempdir().expect("temporary store");
         let store = LocalStore::open_at(dir.path().to_path_buf()).expect("open store");
@@ -23304,6 +23369,48 @@ mod tests {
         );
 
         drop(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rpc_notification_inbound_preserves_route_body_without_publish() {
+        use privchat_protocol::{encode_message, MessageType, RpcRequest};
+        let (mut state, _dir) = new_seeded_state("rpc-notification").await;
+        let body = br#"{"call_id":"42","state":"ringing"}"#.to_vec();
+        let frame = encode_message(&RpcRequest { route: "call/state".into(), body: body.clone() }).unwrap();
+        assert_eq!(state.handle_inbound_frame(MessageType::RpcRequest as u8, frame).await.unwrap(), 0);
+        assert_eq!(state.pending_events, vec![SdkEvent::RpcNotificationReceived {
+            route: "call/state".into(), body,
+        }]);
+        assert!(state.pending_prelogin_inbound_frames.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rpc_notification_inbound_rejects_invalid_bounds_and_unauthenticated() {
+        use privchat_protocol::{encode_message, MessageType, RpcRequest};
+        let (mut state, _dir) = new_seeded_state("rpc-notification-bounds").await;
+        for (route, body) in [
+            (String::new(), vec![]),
+            ("r".repeat(257), vec![]),
+            ("call/\nstate".into(), vec![]),
+            ("call/state".into(), vec![0; 256 * 1024 + 1]),
+        ] {
+            let frame = encode_message(&RpcRequest { route, body }).unwrap();
+            assert!(state.handle_inbound_frame(MessageType::RpcRequest as u8, frame).await.is_err());
+        }
+        for frame in [vec![0xff], vec![0; 256 * 1024 + 1025]] {
+            assert!(state.handle_inbound_frame(MessageType::RpcRequest as u8, frame).await.is_err());
+        }
+        let frame = encode_message(&RpcRequest { route: "call/state".into(), body: b"{}".to_vec() }).unwrap();
+        state.inbound_epoch = 7;
+        state.handle_inbound_frame_at_epoch(6, MessageType::RpcRequest as u8, frame.clone()).await.unwrap();
+        assert!(state.pending_events.is_empty());
+        state.session_state = SessionState::LoggedIn;
+        state.handle_inbound_frame(MessageType::RpcRequest as u8, frame.clone()).await.unwrap();
+        state.session_state = SessionState::Authenticated;
+        state.current_uid = None;
+        state.handle_inbound_frame(MessageType::RpcRequest as u8, frame).await.unwrap();
+        assert!(state.pending_events.is_empty());
+        assert!(state.pending_prelogin_inbound_frames.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -27649,6 +27756,26 @@ mod seal_once_tests {
 #[cfg(test)]
 mod attachment_wire_caption_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sticker_wire_preserves_immutable_identity_and_original_image() {
+        let (state, _dir) = crate::tests::new_seeded_state("sticker-wire").await;
+        let mut message = attachment_row(
+            r#"{"sticker_id":"immutable-42","image_url":"https://cdn.example/original.webp"}"#,
+        );
+        message.message_type = ContentMessageType::Sticker as i32;
+        message.mime_type = None;
+        let request = state
+            .build_send_message_request_with_content(&message, 7, String::new())
+            .expect("build sticker request");
+        assert_eq!(request.message_type, 6);
+        let envelope: privchat_protocol::protocol::MessagePayloadEnvelope =
+            privchat_protocol::decode_message(&request.payload).expect("decode sticker wire");
+        assert!(envelope.content.is_empty());
+        let metadata = envelope.to_legacy().metadata.expect("sticker metadata");
+        assert_eq!(metadata["sticker_id"], "immutable-42");
+        assert_eq!(metadata["image_url"], "https://cdn.example/original.webp");
+    }
 
     fn attachment_row(extra: &str) -> StoredMessage {
         StoredMessage {
