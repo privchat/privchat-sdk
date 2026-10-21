@@ -9351,6 +9351,7 @@ impl State {
             "video" => ContentMessageType::Video,
             // 注：普通音频文件（mp3/wav/...）作为 File 消息发送，不再有独立 Audio 类型
             "file" | "audio" => ContentMessageType::File,
+            "location" => ContentMessageType::Location,
             // RP-12：资金卡片（服务端注入）历史/冷同步必须保留类型，否则落成 Text→渲染原始 JSON
             "red_packet" => ContentMessageType::RedPacket,
             "money_transfer" => ContentMessageType::MoneyTransfer,
@@ -21555,6 +21556,72 @@ mod tests {
             Some(7119),
             "缩略图下载靠这个 file_id;取不到就会被判成「没有缩略图」"
         );
+    }
+
+    #[test]
+    fn history_location_preserves_projection_and_repairs_equal_version_text_row() {
+        let dir = tempfile::tempdir().expect("temporary store");
+        let store = LocalStore::open_at(dir.path().to_path_buf()).expect("open store");
+        let uid = "52";
+        for (index, crs) in ["wgs84", "gcj02", "bd09"].into_iter().enumerate() {
+            let item = privchat_protocol::rpc::message::history::MessageHistoryItem {
+                message_id: 700_001 + index as u64,
+                channel_id: 45,
+                sender_id: 51,
+                content: "Map acceptance".into(),
+                message_type: "location".into(),
+                timestamp: 1_785_148_271_317,
+                message_seq: Some(14 + index as i64),
+                reply_to_message_id: None,
+                metadata: Some(
+                    serde_json::json!({
+                        "type": "location", "latitude": 39.9, "longitude": 116.4,
+                        "coordinate_system": crs, "name": "Map acceptance",
+                        "thumbnail_file_id": 7119
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+                revoked: false,
+                revoked_at: None,
+                revoked_by: None,
+            };
+            let mut input = State::history_item_to_upsert_input(&item, 1);
+            assert_eq!(input.message_type, 8);
+            // Reproduce the old history mapping, then replay the same server snapshot.
+            input.message_type = 0;
+            let original = store
+                .upsert_remote_message_with_result(uid, &input)
+                .unwrap();
+            let input = State::history_item_to_upsert_input(&item, 1);
+            let replay = store.upsert_remote_message_with_result(uid, &input).unwrap();
+            assert_eq!(replay.message_id, original.message_id);
+            assert!(!replay.inserted_new);
+            let stored = store
+                .get_message_by_id(uid, replay.message_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.message_type, 8);
+            let body = crate::message_content::project_stored_message(&stored);
+            assert_eq!(body.kind, "location");
+            assert_eq!(body.latitude, Some(39.9));
+            assert_eq!(body.longitude, Some(116.4));
+            assert_eq!(body.coordinate_system.as_deref(), Some(crs));
+            assert_eq!(body.location_name.as_deref(), Some("Map acceptance"));
+            assert_eq!(body.thumbnail_file_id, Some(7119));
+
+            let mut broken = State::history_item_to_upsert_input(&item, 1);
+            broken.message_type = 0;
+            store.upsert_remote_message_with_result(uid, &broken).unwrap();
+            let batch = store.batch_upsert_remote_messages(uid, &[input]);
+            assert_eq!(batch[0].as_ref().unwrap().message_id, original.message_id);
+            let repaired = store
+                .get_message_by_id(uid, original.message_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(repaired.message_type, 8);
+        }
     }
 
     use super::{
