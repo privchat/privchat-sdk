@@ -8707,6 +8707,22 @@ impl PrivchatClient {
             .map_err(PrivchatFfiError::from)
     }
 
+    /// Read bytes from the current user's local KV store; no network is required.
+    pub async fn kv_get_local(&self, key: String) -> Result<Option<Vec<u8>>, PrivchatFfiError> {
+        self.inner
+            .kv_get_local(key)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// Write bytes to the current user's local KV store after local initialization.
+    pub async fn kv_put_local(&self, key: String, value: Vec<u8>) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .kv_put_local(key, value)
+            .await
+            .map_err(PrivchatFfiError::from)
+    }
+
     pub async fn user_storage_paths(&self) -> Result<UserStoragePaths, PrivchatFfiError> {
         let out = self
             .inner

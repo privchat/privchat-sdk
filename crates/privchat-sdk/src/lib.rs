@@ -20992,6 +20992,7 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    /// Writes current-account bytes after local bootstrap, without network access.
     pub async fn kv_put_local(&self, key: String, value: Vec<u8>) -> Result<()> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -21006,6 +21007,7 @@ impl PrivchatSdk {
         resp_rx.await.map_err(|_| self.actor_channel_error())?
     }
 
+    /// Reads current-account bytes after local bootstrap; missing keys return `None`.
     pub async fn kv_get_local(&self, key: String) -> Result<Option<Vec<u8>>> {
         self.ensure_running()?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -24117,6 +24119,94 @@ mod tests {
 
     // 旧测试 conversation_preview_is_rendered_in_sdk_layer 已删除——
     // SDK 不再渲染会话预览（架构归正：preview 是 UI 层职责，参见 SYSTEM_MESSAGE_SPEC）。
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kv_local_roundtrips_binary_empty_and_missing_values() {
+        let (sdk, dir) = new_seeded_sdk("kv-local-bytes").await;
+        let key = "app.directory.cache".to_string();
+        assert_eq!(sdk.kv_get_local(key.clone()).await.unwrap(), None);
+        let bytes = vec![0, 255, 128, 1, 0];
+        sdk.kv_put_local(key.clone(), bytes.clone()).await.unwrap();
+        assert_eq!(sdk.kv_get_local(key.clone()).await.unwrap(), Some(bytes));
+        sdk.kv_put_local(key.clone(), Vec::new()).await.unwrap();
+        assert_eq!(sdk.kv_get_local(key).await.unwrap(), Some(Vec::new()));
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kv_local_requires_selected_user_and_completed_local_bootstrap() {
+        let dir = unique_test_dir("kv-local-not-ready");
+        let store = LocalStore::open_at(dir.clone()).unwrap();
+        store
+            .save_login(
+                "10001",
+                &LoginResult {
+                    user_id: 10001,
+                    token: "token".to_string(),
+                    device_id: "device".to_string(),
+                    refresh_token: None,
+                    expires_at: 0,
+                },
+            )
+            .unwrap();
+        drop(store);
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        let sdk = PrivchatSdk::new(config);
+        for selected in [false, true] {
+            if selected {
+                sdk.set_current_uid("10001".to_string()).await.unwrap();
+            }
+            assert!(matches!(
+                sdk.kv_get_local("cache".to_string()).await,
+                Err(Error::InvalidState(_))
+            ));
+            assert!(matches!(
+                sdk.kv_put_local("cache".to_string(), vec![1]).await,
+                Err(Error::InvalidState(_))
+            ));
+        }
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kv_local_is_isolated_across_account_switches() {
+        let dir = unique_test_dir("kv-local-accounts");
+        let store = LocalStore::open_at(dir.clone()).unwrap();
+        for uid in ["10001", "10002"] {
+            store
+                .save_login(
+                    uid,
+                    &LoginResult {
+                        user_id: uid.parse().unwrap(),
+                        token: "token".to_string(),
+                        device_id: "device".to_string(),
+                        refresh_token: None,
+                        expires_at: 0,
+                    },
+                )
+                .unwrap();
+            store.set_bootstrap_completed(uid, true).unwrap();
+        }
+        drop(store);
+        let mut config = PrivchatConfig::default();
+        config.data_dir = dir.display().to_string();
+        let sdk = PrivchatSdk::new(config);
+        let key = "app.directory.cache".to_string();
+        sdk.set_current_uid("10001".to_string()).await.unwrap();
+        sdk.kv_put_local(key.clone(), vec![1]).await.unwrap();
+        sdk.switch_local_account("10002".to_string()).await.unwrap();
+        assert_eq!(sdk.kv_get_local(key.clone()).await.unwrap(), None);
+        sdk.kv_put_local(key.clone(), vec![2]).await.unwrap();
+        sdk.switch_local_account("10001".to_string()).await.unwrap();
+        assert_eq!(sdk.kv_get_local(key.clone()).await.unwrap(), Some(vec![1]));
+        sdk.switch_local_account("10002".to_string()).await.unwrap();
+        assert_eq!(sdk.kv_get_local(key).await.unwrap(), Some(vec![2]));
+        sdk.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn channel_prefs_roundtrip_through_semantic_api() {
