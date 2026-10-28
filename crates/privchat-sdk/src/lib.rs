@@ -97,6 +97,7 @@ const REPAIR_BACKOFF_MAX_SHIFT: u32 = 6;
 mod avatar_cache;
 pub use avatar_cache::AvatarCrop;
 pub mod canonical_inbound;
+pub mod component_config;
 pub mod error_codes;
 pub mod local_reader;
 mod local_store;
