@@ -1797,6 +1797,30 @@ mod payload_fallback_tests {
         assert_eq!(content, "hi");
     }
 
+    /// Page links on a pushed text message reach the stored extra at `metadata.links`,
+    /// the same place history puts them, so clients read one location.
+    #[test]
+    fn fb_envelope_page_links_land_at_metadata_links_in_extra() {
+        let link = privchat_protocol::MessageLink {
+            text: "修复按钮".to_string(),
+            route: "workspace.task".to_string(),
+            params: [("work_item_id".to_string(), "12".to_string())].into_iter().collect(),
+        };
+        let bytes = privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
+            content: "「修复按钮」卡住了".to_string(),
+            links: vec![link],
+            ..Default::default()
+        })
+        .expect("encode");
+        let (content, extra) = State::payload_bytes_to_message_content_and_extra(&bytes);
+        assert_eq!(content, "「修复按钮」卡住了");
+        let extra: serde_json::Value = serde_json::from_str(&extra.expect("extra")).unwrap();
+        assert_eq!(
+            extra["metadata"]["links"],
+            serde_json::json!([{"text":"修复按钮","route":"workspace.task","params":{"work_item_id":"12"}}])
+        );
+    }
+
     #[test]
     fn undecodable_binary_yields_empty_not_mojibake() {
         let mut bytes =
