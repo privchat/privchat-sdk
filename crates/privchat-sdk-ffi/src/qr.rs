@@ -43,8 +43,8 @@
 //! exception otherwise.
 
 use rxing::{
-    common::HybridBinarizer, qrcode::QRCodeReader, BinaryBitmap, DecodeHints, Luma8LuminanceSource,
-    Reader,
+    BinaryBitmap, DecodeHints, Luma8LuminanceSource, Reader, common::HybridBinarizer,
+    qrcode::QRCodeReader,
 };
 
 // NOTE: `QrDecodeError` and `qr_decode_luma` are re-exported / wrapped
@@ -100,7 +100,11 @@ pub fn decode_luma(
     // adaptive threshold) → BinaryBitmap → QRCodeReader. We pin to the
     // QR reader specifically — `MultiFormatReader` would also try
     // Aztec / DataMatrix / etc. which we don't enable as features.
-    let source = Luma8LuminanceSource::new(luma, width, height);
+    let source = Luma8LuminanceSource::new(luma, width, height).map_err(|e| {
+        QrDecodeError::DecoderError {
+            detail: e.to_string(),
+        }
+    })?;
     let binarizer = HybridBinarizer::new(source);
     let mut bitmap = BinaryBitmap::new(binarizer);
     let mut reader = QRCodeReader {};

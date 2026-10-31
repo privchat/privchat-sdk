@@ -26,7 +26,7 @@ privchat-sdk = { path = "../privchat-sdk" }
 # kept on so QR byte-mode payloads with ECI charset switches (UTF-8 /
 # Shift-JIS / GBK) decode correctly — pure-ASCII login QRs work either
 # way, but defensive for future encodings adds only ~200 KB.
-rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"] }
+rxing = { version = "0.9.3", default-features = false, features = ["decoders", "qrcode", "encoding_rs"] }
 # QR_CODE_SPEC v1.4 D0 — pure-Rust QR encoder. Pulled into release builds
 # so `qr_encode_matrix` can produce QR cell matrices that the UI layer
 # renders via gearui-kit Box grids (no platform Bitmap / CoreImage path).
