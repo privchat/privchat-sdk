@@ -305,12 +305,12 @@ fn validate_transport_pins(
 ) -> Result<()> {
     match protocol {
         TransportProtocol::Quic if pins.is_empty() && !allow_insecure_quic => Err(
-            Error::Transport(
+            Error::TransportRejected(
                 "no SPKI pin configured for this QUIC gateway; refusing to connect without server identity verification"
                     .to_string(),
             ),
         ),
-        TransportProtocol::Tcp if pins.is_empty() => Err(Error::Transport(
+        TransportProtocol::Tcp if pins.is_empty() => Err(Error::TransportRejected(
             "no SPKI pin configured for this TCP gateway; PrivChat tcp:// is TLS-only and will not fall back to plaintext"
                 .to_string(),
         )),
@@ -1804,7 +1804,9 @@ mod payload_fallback_tests {
         let link = privchat_protocol::MessageLink {
             text: "修复按钮".to_string(),
             route: "workspace.task".to_string(),
-            params: [("work_item_id".to_string(), "12".to_string())].into_iter().collect(),
+            params: [("work_item_id".to_string(), "12".to_string())]
+                .into_iter()
+                .collect(),
         };
         let bytes = privchat_protocol::encode_message(&privchat_protocol::MessagePayloadEnvelope {
             content: "「修复按钮」卡住了".to_string(),
@@ -2876,6 +2878,9 @@ pub struct LocalAccountSummary {
 pub enum Error {
     #[error("transport error: {0}")]
     Transport(String),
+    /// A non-retryable transport failure (for example certificate rejection).
+    #[error("transport rejected: {0}")]
+    TransportRejected(String),
     /// 上传会话没了（服务端已清理/从未存在/token 换了）。
     ///
     /// 🔴 与「网络失败」分开：这个不该重试同一个会话，而该**丢掉续传状态、重新
@@ -2978,6 +2983,15 @@ fn parse_auth_error_code(message: &str) -> Option<u32> {
 }
 
 impl Error {
+    fn from_transport(context: &str, error: TransportError) -> Self {
+        let message = format!("{context}: {error}");
+        if error.is_retryable() {
+            Self::Transport(message)
+        } else {
+            Self::TransportRejected(message)
+        }
+    }
+
     /// 若本错误是 `Error::Auth`，根据 message 前缀的错误码分层；否则返回 None。
     pub fn auth_kind(&self) -> Option<AuthErrorKind> {
         match self {
@@ -3031,7 +3045,7 @@ impl Error {
 
     pub fn sdk_code(&self) -> u32 {
         match self {
-            Error::Transport(_) => error_codes::TRANSPORT_FAILURE,
+            Error::Transport(_) | Error::TransportRejected(_) => error_codes::TRANSPORT_FAILURE,
             // 会话没了要重新 prepare，对宿主而言是一次可自愈的传输问题。
             Error::UploadSessionGone => error_codes::TRANSPORT_FAILURE,
             Error::AuthExpired => error_codes::AUTH_FAILURE,
@@ -3053,7 +3067,7 @@ impl Error {
 
     pub fn protocol_code(&self) -> u32 {
         match self {
-            Error::Transport(_) => ErrorCode::NetworkError as u32,
+            Error::Transport(_) | Error::TransportRejected(_) => ErrorCode::NetworkError as u32,
             Error::UploadSessionGone => ErrorCode::NetworkError as u32,
             Error::AuthExpired => ErrorCode::InvalidToken as u32,
             Error::RequestUnanswered { .. } => ErrorCode::NetworkError as u32,
@@ -4492,7 +4506,7 @@ impl State {
                 context: context.to_string(),
             }
         } else {
-            Error::Transport(format!("{context}: {error}"))
+            Error::from_transport(context, error)
         }
     }
 
@@ -4574,7 +4588,9 @@ impl State {
             | Error::NotConnected
             | Error::ActorClosed => ResumeFailureClass::RetryableTemporaryError,
             Error::AuthExpired => ResumeFailureClass::FullRebuildRequired,
-            Error::Serialization(_) => ResumeFailureClass::FatalProtocolError,
+            Error::Serialization(_) | Error::TransportRejected(_) => {
+                ResumeFailureClass::FatalProtocolError
+            }
             // 本地行缺幂等身份：重试或重连都救不回来，只能重建本地状态。
             Error::Storage(_) | Error::MissingLocalMessageId { .. } => {
                 ResumeFailureClass::FullRebuildRequired
@@ -8503,6 +8519,11 @@ impl State {
                 }
                 Ok(Err(e)) => {
                     eprintln!("[SDK.actor] connect: endpoint failed: {e}");
+                    if matches!(e, Error::TransportRejected(_)) {
+                        self.should_auto_reconnect = false;
+                        self.reset_reconnect_backoff();
+                        return Err(e);
+                    }
                     last_err = Some(e);
                 }
                 Err(_) => {
@@ -8626,7 +8647,7 @@ impl State {
             transport
                 .disconnect()
                 .await
-                .map_err(|e| Error::Transport(format!("disconnect: {e}")))?;
+                .map_err(|e| Error::from_transport("disconnect", e))?;
         }
         self.transport = None;
         Ok(())
@@ -8692,7 +8713,7 @@ impl State {
         let mut client = match ep.protocol {
             TransportProtocol::Quic => {
                 let mut cfg = QuicClientConfig::new(&target)
-                    .map_err(|e| Error::Transport(format!("quic config: {e}")))?
+                    .map_err(|e| Error::TransportRejected(format!("quic config: {e}")))?
                     .connect_timeout(timeout)
                     .server_name(ep.host.clone());
                 if pins.is_empty() {
@@ -8702,23 +8723,25 @@ impl State {
                     cfg = cfg.spki_pins(pins.clone());
                 }
                 TransportClientBuilder::new()
+                    .retry_strategy(msgtrans::RetryConfig::default().max_retries(0))
                     .protocol(cfg)
                     .build()
                     .await
-                    .map_err(|e| Error::Transport(format!("quic build: {e}")))?
+                    .map_err(|e| Error::from_transport("quic build", e))?
             }
             TransportProtocol::Tcp => {
                 // PrivChat tcp:// starts TLS immediately and never falls back to plaintext.
                 let cfg = TcpClientConfig::new(&target)
-                    .map_err(|e| Error::Transport(format!("tcp config: {e}")))?
+                    .map_err(|e| Error::TransportRejected(format!("tcp config: {e}")))?
                     .connect_timeout(timeout)
                     .spki_pins(pins.clone())
                     .server_name(ep.host.clone());
                 TransportClientBuilder::new()
+                    .retry_strategy(msgtrans::RetryConfig::default().max_retries(0))
                     .protocol(cfg)
                     .build()
                     .await
-                    .map_err(|e| Error::Transport(format!("tcp build: {e}")))?
+                    .map_err(|e| Error::from_transport("tcp build", e))?
             }
             TransportProtocol::WebSocket => {
                 let path = ep.path.as_deref().unwrap_or("/");
@@ -8728,7 +8751,7 @@ impl State {
                     format!("ws://{}:{}{}", ep.host, ep.port, path)
                 };
                 let cfg = WebSocketClientConfig::new(&url)
-                    .map_err(|e| Error::Transport(format!("ws config: {e}")))?
+                    .map_err(|e| Error::TransportRejected(format!("ws config: {e}")))?
                     .connect_timeout(timeout)
                     // msgtrans 2.0: TLS 行为改为 ClientTls 枚举(旧 verify_tls
                     // 是从未接线的假开关);use_tls=false 的端点走 ws:// 本就
@@ -8739,21 +8762,22 @@ impl State {
                         msgtrans::ClientTls::Insecure
                     });
                 TransportClientBuilder::new()
+                    .retry_strategy(msgtrans::RetryConfig::default().max_retries(0))
                     .protocol(cfg)
                     .build()
                     .await
-                    .map_err(|e| Error::Transport(format!("ws build: {e}")))?
+                    .map_err(|e| Error::from_transport("ws build", e))?
             }
         };
         // 先取事件流再 connect：事件流是有界队列，连接期间的事件会排队而不是丢失。
         let events = client
             .events()
             .await
-            .map_err(|e| Error::Transport(format!("events: {e}")))?;
+            .map_err(|e| Error::from_transport("events", e))?;
         client
             .connect()
             .await
-            .map_err(|e| Error::Transport(format!("connect: {e}")))?;
+            .map_err(|e| Error::from_transport("connect", e))?;
         if actor_logs_enabled() {
             eprintln!("[SDK.actor] connect_one: connected");
         }
@@ -10551,7 +10575,12 @@ impl State {
         false
     }
 
-    async fn handle_inbound_frame_at_epoch(&mut self, epoch: u64, biz_type: u8, data: Vec<u8>) -> Result<usize> {
+    async fn handle_inbound_frame_at_epoch(
+        &mut self,
+        epoch: u64,
+        biz_type: u8,
+        data: Vec<u8>,
+    ) -> Result<usize> {
         if epoch != self.inbound_epoch {
             return Ok(0);
         }
@@ -10620,11 +10649,17 @@ impl State {
                 }
                 let req: RpcRequest = decode_message(&data)
                     .map_err(|_| Error::Serialization("Invalid RPC notification".into()))?;
-                if req.route.is_empty() || req.route.len() > 256
-                    || req.route.chars().any(|c| c.is_control() || c.is_whitespace())
+                if req.route.is_empty()
+                    || req.route.len() > 256
+                    || req
+                        .route
+                        .chars()
+                        .any(|c| c.is_control() || c.is_whitespace())
                     || req.body.len() > 256 * 1024
                 {
-                    return Err(Error::Serialization("Invalid RPC notification bounds".into()));
+                    return Err(Error::Serialization(
+                        "Invalid RPC notification bounds".into(),
+                    ));
                 }
                 self.pending_events.push(SdkEvent::RpcNotificationReceived {
                     route: req.route,
@@ -14518,6 +14553,7 @@ pub struct PrivchatSdk {
     _runtime_provider: RuntimeProvider,
     task_registry: TaskRegistry,
     shutting_down: Arc<AtomicBool>,
+    shutdown_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     supervised_sync_running: Arc<AtomicBool>,
     /// 首屏扫补是否已在跑。宿主每次进入 SYNC_READY 都会踢一脚，重连/切前台会踢很多次；
     /// 没有这道闸，几百个会话的扫补会被并发起好几轮，互相抢 actor。
@@ -18200,7 +18236,12 @@ impl PrivchatSdk {
                                 to: state.session_state.as_connection_state(),
                             },
                         );
-                        state.transport = None;
+                        if let Some(transport) = state.transport.take() {
+                            if let Err(error) = transport.shutdown().await {
+                                tracing::warn!(%error, "transport shutdown failed");
+                            }
+                        }
+
                         state.storage.shutdown();
                         emit_sequenced_event(
                             &actor_event_tx,
@@ -18242,6 +18283,7 @@ impl PrivchatSdk {
             _runtime_provider: runtime_provider,
             task_registry,
             shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_task: Arc::new(tokio::sync::Mutex::new(None)),
             supervised_sync_running: Arc::new(AtomicBool::new(false)),
             first_screen_sweep_running: Arc::new(AtomicBool::new(false)),
             switch_requested: switch_requested_sdk,
@@ -18728,14 +18770,26 @@ impl PrivchatSdk {
     }
 
     pub async fn shutdown(&self) {
-        if self.shutting_down.swap(true, Ordering::AcqRel) {
-            return;
+        // The borrowed JoinHandle stays in this slot if an observer is
+        // cancelled. Cleanup itself runs independently and is started once.
+        let mut slot = self.shutdown_task.lock().await;
+        if !self.shutting_down.swap(true, Ordering::AcqRel) {
+            self.supervised_sync_running.store(false, Ordering::Release);
+            let tx = self.tx.clone();
+            let registry = self.task_registry.clone();
+            *slot = Some(self._runtime_provider.spawn(async move {
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let _ = tx.send(Command::Shutdown { resp: resp_tx }).await;
+                let _ = resp_rx.await;
+                registry.shutdown().await;
+            }));
         }
-        self.supervised_sync_running.store(false, Ordering::Release);
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::Shutdown { resp: resp_tx }).await;
-        let _ = resp_rx.await;
-        self.task_registry.shutdown().await;
+        if let Some(task) = slot.as_mut() {
+            if let Err(error) = task.await {
+                tracing::error!(%error, "SDK shutdown task failed");
+            }
+            slot.take();
+        }
     }
 
     pub async fn sync_entities(&self, entity_type: String, scope: Option<String>) -> Result<usize> {
@@ -21642,12 +21696,20 @@ mod tests {
         };
         let input = State::history_item_to_upsert_input(&item, 1);
         assert_eq!(input.message_type, 6);
-        let result = store.upsert_remote_message_with_result("52", &input).unwrap();
-        let stored = store.get_message_by_id("52", result.message_id).unwrap().unwrap();
+        let result = store
+            .upsert_remote_message_with_result("52", &input)
+            .unwrap();
+        let stored = store
+            .get_message_by_id("52", result.message_id)
+            .unwrap()
+            .unwrap();
         let body = crate::message_content::project_stored_message(&stored);
         assert_eq!(body.kind, "sticker");
         assert_eq!(body.sticker_id.as_deref(), Some("immutable-1"));
-        assert_eq!(body.attachment_url.as_deref(), Some("https://cdn.example/original.webp"));
+        assert_eq!(
+            body.attachment_url.as_deref(),
+            Some("https://cdn.example/original.webp")
+        );
     }
 
     #[test]
@@ -21687,7 +21749,9 @@ mod tests {
                 .upsert_remote_message_with_result(uid, &input)
                 .unwrap();
             let input = State::history_item_to_upsert_input(&item, 1);
-            let replay = store.upsert_remote_message_with_result(uid, &input).unwrap();
+            let replay = store
+                .upsert_remote_message_with_result(uid, &input)
+                .unwrap();
             assert_eq!(replay.message_id, original.message_id);
             assert!(!replay.inserted_new);
             let stored = store
@@ -21705,7 +21769,9 @@ mod tests {
 
             let mut broken = State::history_item_to_upsert_input(&item, 1);
             broken.message_type = 0;
-            store.upsert_remote_message_with_result(uid, &broken).unwrap();
+            store
+                .upsert_remote_message_with_result(uid, &broken)
+                .unwrap();
             let batch = store.batch_upsert_remote_messages(uid, &[input]);
             assert_eq!(batch[0].as_ref().unwrap().message_id, original.message_id);
             let repaired = store
@@ -23403,11 +23469,25 @@ mod tests {
         use privchat_protocol::{encode_message, MessageType, RpcRequest};
         let (mut state, _dir) = new_seeded_state("rpc-notification").await;
         let body = br#"{"call_id":"42","state":"ringing"}"#.to_vec();
-        let frame = encode_message(&RpcRequest { route: "call/state".into(), body: body.clone() }).unwrap();
-        assert_eq!(state.handle_inbound_frame(MessageType::RpcRequest as u8, frame).await.unwrap(), 0);
-        assert_eq!(state.pending_events, vec![SdkEvent::RpcNotificationReceived {
-            route: "call/state".into(), body,
-        }]);
+        let frame = encode_message(&RpcRequest {
+            route: "call/state".into(),
+            body: body.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            state
+                .handle_inbound_frame(MessageType::RpcRequest as u8, frame)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state.pending_events,
+            vec![SdkEvent::RpcNotificationReceived {
+                route: "call/state".into(),
+                body,
+            }]
+        );
         assert!(state.pending_prelogin_inbound_frames.is_empty());
     }
 
@@ -23422,20 +23502,39 @@ mod tests {
             ("call/state".into(), vec![0; 256 * 1024 + 1]),
         ] {
             let frame = encode_message(&RpcRequest { route, body }).unwrap();
-            assert!(state.handle_inbound_frame(MessageType::RpcRequest as u8, frame).await.is_err());
+            assert!(state
+                .handle_inbound_frame(MessageType::RpcRequest as u8, frame)
+                .await
+                .is_err());
         }
         for frame in [vec![0xff], vec![0; 256 * 1024 + 1025]] {
-            assert!(state.handle_inbound_frame(MessageType::RpcRequest as u8, frame).await.is_err());
+            assert!(state
+                .handle_inbound_frame(MessageType::RpcRequest as u8, frame)
+                .await
+                .is_err());
         }
-        let frame = encode_message(&RpcRequest { route: "call/state".into(), body: b"{}".to_vec() }).unwrap();
+        let frame = encode_message(&RpcRequest {
+            route: "call/state".into(),
+            body: b"{}".to_vec(),
+        })
+        .unwrap();
         state.inbound_epoch = 7;
-        state.handle_inbound_frame_at_epoch(6, MessageType::RpcRequest as u8, frame.clone()).await.unwrap();
+        state
+            .handle_inbound_frame_at_epoch(6, MessageType::RpcRequest as u8, frame.clone())
+            .await
+            .unwrap();
         assert!(state.pending_events.is_empty());
         state.session_state = SessionState::LoggedIn;
-        state.handle_inbound_frame(MessageType::RpcRequest as u8, frame.clone()).await.unwrap();
+        state
+            .handle_inbound_frame(MessageType::RpcRequest as u8, frame.clone())
+            .await
+            .unwrap();
         state.session_state = SessionState::Authenticated;
         state.current_uid = None;
-        state.handle_inbound_frame(MessageType::RpcRequest as u8, frame).await.unwrap();
+        state
+            .handle_inbound_frame(MessageType::RpcRequest as u8, frame)
+            .await
+            .unwrap();
         assert!(state.pending_events.is_empty());
         assert!(state.pending_prelogin_inbound_frames.is_empty());
     }
@@ -23962,6 +24061,92 @@ mod tests {
             Some(4242),
             "占位落库后没有 TimelineUpdated：宿主要等 materialize 走完才画得出气泡",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_observer_cancellation_does_not_cancel_cleanup() {
+        use std::{future::Future, task::Poll};
+        let sdk = super::PrivchatSdk::with_runtime(
+            PrivchatConfig::default(),
+            super::RuntimeProvider::from_handle(tokio::runtime::Handle::current()),
+        );
+        let mut shutdown = Box::pin(sdk.shutdown());
+        // On this runtime the spawned owner cannot run before this poll returns.
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await
+        );
+        drop(shutdown);
+        tokio::time::timeout(Duration::from_secs(5), sdk.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            sdk.tx.is_closed(),
+            "second observer returned before actor teardown"
+        );
+        assert_eq!(
+            sdk.recent_events(32)
+                .iter()
+                .filter(|e| matches!(e.event, SdkEvent::ShutdownCompleted))
+                .count(),
+            1
+        );
+        sdk.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn permanent_connect_failure_stops_fallback_and_background_retries() {
+        let (mut state, dir) = new_seeded_state("connect-rejection-no-fallback").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        state.config.spki_pins.clear();
+        state.should_auto_reconnect = true;
+        state.config.endpoints = vec![
+            super::ServerEndpoint {
+                protocol: super::TransportProtocol::Tcp,
+                host: "127.0.0.1".into(),
+                port,
+                path: None,
+                use_tls: true,
+            },
+            super::ServerEndpoint {
+                protocol: super::TransportProtocol::WebSocket,
+                host: "127.0.0.1".into(),
+                port,
+                path: None,
+                use_tls: false,
+            },
+        ];
+        // The second endpoint accepts TCP but never speaks HTTP. Falling back
+        // to it would hang instead of reporting the permanent pinning error.
+        let result = tokio::time::timeout(Duration::from_millis(300), state.connect())
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(Error::TransportRejected(_))));
+        assert!(!state.should_auto_reconnect);
+        assert!(state.next_reconnect_at.is_none());
+        state.storage.shutdown();
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transport_retry_classification_survives_sdk_mapping() {
+        use msgtrans::TransportError;
+        let rejected = Error::from_transport(
+            "connect",
+            TransportError::connection_error("certificate rejected", false),
+        );
+        assert!(!rejected.is_retryable());
+        assert!(matches!(rejected, Error::TransportRejected(_)));
+        assert_eq!(
+            State::classify_resume_error(&rejected),
+            ResumeFailureClass::FatalProtocolError
+        );
+        let temporary = Error::from_transport(
+            "connect",
+            TransportError::connection_error("temporary network failure", true),
+        );
+        assert!(temporary.is_retryable());
     }
 
     #[tokio::test(flavor = "current_thread")]
