@@ -2923,6 +2923,37 @@ pub struct LocalAccountSummary {
     pub login_identifier: Option<String>,
 }
 
+/// Whether `id` is a lowercase hyphenated random (v4, RFC 4122 variant) UUID: the device id format
+/// every PrivChat / Weey client and server uses.
+pub fn is_canonical_device_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, &c)| match i {
+            8 | 13 | 18 | 23 => c == b'-',
+            14 => c == b'4',
+            19 => matches!(c, b'8' | b'9' | b'a' | b'b'),
+            _ => c.is_ascii_digit() || (b'a'..=b'f').contains(&c),
+        })
+}
+
+/// A new device id: a random UUID v4 in the canonical form, from the OS random source. A host
+/// creates it once and persists it; it is the same device on every later start and login.
+pub fn new_device_id() -> String {
+    let mut b: [u8; 16] = rand::random();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+fn require_canonical_device_id(id: &str) -> Result<()> {
+    if is_canonical_device_id(id) {
+        Ok(())
+    } else {
+        Err(Error::InvalidDeviceId(id.to_owned()))
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, Serialize, Deserialize)]
 pub enum Error {
     #[error("transport error: {0}")]
@@ -2967,6 +2998,10 @@ pub enum Error {
     Shutdown,
     #[error("invalid state: {0}")]
     InvalidState(String),
+    /// The device id is not the one format every PrivChat / Weey client and server uses: a random
+    /// UUID v4 (RFC 4122 variant), lowercase and hyphenated. Rejected before anything is sent.
+    #[error("device_id must be a lowercase hyphenated UUID v4: {0}")]
+    InvalidDeviceId(String),
     #[error("server error: reason_code={code} message={message}")]
     Server { code: u32, message: String },
     /// 附件重试时本地源文件已不存在（被清理 / 该行来自另一台设备）。
@@ -3107,7 +3142,7 @@ impl Error {
             Error::Auth(_) => error_codes::AUTH_FAILURE,
             Error::ActorClosed => error_codes::ACTOR_CLOSED,
             Error::Shutdown => error_codes::SHUTDOWN,
-            Error::InvalidState(_) => error_codes::INVALID_STATE,
+            Error::InvalidState(_) | Error::InvalidDeviceId(_) => error_codes::INVALID_STATE,
             Error::AttachmentSourceMissing { .. } => error_codes::ATTACHMENT_SOURCE_MISSING,
             Error::SessionNotReady { .. } => error_codes::SESSION_NOT_READY,
             Error::Server { code, .. } => *code,
@@ -3128,6 +3163,7 @@ impl Error {
             Error::ActorClosed => ErrorCode::SystemBusy as u32,
             Error::Shutdown => ErrorCode::ServiceUnavailable as u32,
             Error::InvalidState(_) => ErrorCode::OperationNotAllowed as u32,
+            Error::InvalidDeviceId(_) => ErrorCode::InvalidParams as u32,
             // 专用码：UI 据此提示「源文件已不存在，请重新选择」，而不是笼统的失败。
             Error::AttachmentSourceMissing { .. } => ErrorCode::AttachmentSourceMissing as u32,
             Error::SessionNotReady { .. } => ErrorCode::SessionNotReady as u32,
@@ -4650,6 +4686,8 @@ impl State {
             Error::Shutdown => ResumeFailureClass::RetryableTemporaryError,
             // 与 resume 无关的本地附件错误：不该把它当成需要重建/重试的同步失败。
             Error::AttachmentSourceMissing { .. } => ResumeFailureClass::FatalProtocolError,
+            // The caller's device id is malformed: no retry can fix it.
+            Error::InvalidDeviceId(_) => ResumeFailureClass::FatalProtocolError,
             Error::SessionNotReady { .. } => ResumeFailureClass::RetryableTemporaryError,
             Error::InvalidState(message) => {
                 let lowered = message.to_ascii_lowercase();
@@ -18756,6 +18794,7 @@ impl PrivchatSdk {
         device_id: String,
     ) -> Result<LoginResult> {
         self.ensure_running()?;
+        require_canonical_device_id(&device_id)?;
         if actor_logs_enabled() {
             eprintln!("[SDK.api] login: send");
         }
@@ -18783,6 +18822,7 @@ impl PrivchatSdk {
         device_id: String,
     ) -> Result<LoginResult> {
         self.ensure_running()?;
+        require_canonical_device_id(&device_id)?;
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::Register {
@@ -18798,6 +18838,7 @@ impl PrivchatSdk {
 
     pub async fn authenticate(&self, user_id: u64, token: String, device_id: String) -> Result<()> {
         self.ensure_running()?;
+        require_canonical_device_id(&device_id)?;
         if actor_logs_enabled() {
             eprintln!("[SDK.api] authenticate: send");
         }
@@ -28682,6 +28723,35 @@ without server identity verification"
             let err =
                 validate_object_store_url("http://bucket.example/part?signature=x").unwrap_err();
             assert!(format!("{err}").contains("plaintext object-store"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod device_id_tests {
+    use super::{is_canonical_device_id, new_device_id};
+
+    #[test]
+    fn new_device_ids_are_canonical_v4_and_distinct() {
+        let ids: Vec<String> = (0..256).map(|_| new_device_id()).collect();
+        assert!(ids.iter().all(|id| is_canonical_device_id(id)));
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
+    }
+
+    #[test]
+    fn only_the_canonical_form_is_a_device_id() {
+        assert!(is_canonical_device_id("91710a71-f3ed-4fe5-8220-b96d02a9ce6e"));
+        for bad in [
+            "91710A71-F3ED-4FE5-8220-B96D02A9CE6E",
+            "15c5b1ee-02cb-3122-8f0a-6a1c3e2d9b77",
+            "91710a71f3ed4fe58220b96d02a9ce6e",
+            "{91710a71-f3ed-4fe5-8220-b96d02a9ce6e}",
+            "91710a71-f3ed-4fe5-7220-b96d02a9ce6e",
+            "00000000-0000-0000-0000-000000000000",
+            "91710a71-f3ed-4fe5-8220-b96d02a9ce6g",
+            "",
+        ] {
+            assert!(!is_canonical_device_id(bad), "{bad}");
         }
     }
 }

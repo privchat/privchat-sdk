@@ -90,21 +90,6 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// server 要求 device_id 为 UUID 格式；用时间戳+序号拼一个 v4 形状的伪 UUID。
-fn pseudo_uuid(idx: usize) -> String {
-    let a = now_millis();
-    let b = std::process::id() as u64;
-    let mix = a.wrapping_mul(2654435761).wrapping_add(idx as u64 * 7919);
-    format!(
-        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
-        (a & 0xffff_ffff) as u32,
-        (b & 0xffff) as u16,
-        (idx & 0xfff) as u16,
-        ((mix >> 12) & 0xfff) as u16,
-        mix & 0xffff_ffff_ffff
-    )
-}
-
 // ---------- server 进程管理 ----------
 
 /// 兜底：任何路径退出（含 ? 提前返回）都杀掉 server 子进程，
@@ -245,7 +230,7 @@ async fn provision_client(
     }));
     sdk.connect().await?;
     let username = format!("storm_{suffix}_{idx}");
-    let device_id = pseudo_uuid(idx);
+    let device_id = privchat_sdk::new_device_id();
     let login = sdk
         .register(username, "password123".to_string(), device_id)
         .await?;

@@ -32,19 +32,6 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn pseudo_uuid(idx: usize) -> String {
-    let a = now_millis();
-    let mix = a.wrapping_mul(2654435761).wrapping_add(idx as u64 * 7919);
-    format!(
-        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
-        (a & 0xffff_ffff) as u32,
-        (std::process::id() & 0xffff) as u16,
-        (idx & 0xfff) as u16,
-        ((mix >> 12) & 0xfff) as u16,
-        mix & 0xffff_ffff_ffff
-    )
-}
-
 struct ChildGuard(Option<Child>);
 impl ChildGuard {
     fn kill_now(&mut self) {
@@ -109,7 +96,7 @@ async fn register(host: &str, port: u16, tag: &str, idx: usize) -> BoxResult<Cli
         .register(
             format!("hyd_{}_{}", now_millis() % 1_000_000, tag),
             "password123".into(),
-            pseudo_uuid(idx),
+            privchat_sdk::new_device_id(),
         )
         .await?;
     sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())

@@ -230,7 +230,7 @@ impl MultiAccountManager {
     async fn create_and_auth_account(&mut self, key: &str, suffix: &str) -> BoxResult<()> {
         let username = format!("{}_{}", key, suffix);
         let password = "password123".to_string();
-        let device_id = pseudo_uuid_v4_like();
+        let device_id = privchat_sdk::new_device_id();
         let data_dir = self.base_dir.join(key);
         std::fs::create_dir_all(&data_dir)?;
 
@@ -1525,7 +1525,7 @@ impl MultiAccountManager {
                 .login(
                     cfg.username.clone(),
                     cfg.password.clone(),
-                    pseudo_uuid_v4_like(),
+                    privchat_sdk::new_device_id(),
                 )
                 .await?;
             sdk.authenticate(login.user_id, login.token.clone(), login.device_id.clone())
@@ -1667,30 +1667,6 @@ fn direct_key(a: &str, b: &str) -> String {
     } else {
         format!("{b}:{a}")
     }
-}
-
-pub fn pseudo_uuid_v4_like() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seq = LOCAL_MSG_SEQ.fetch_add(1, Ordering::Relaxed) as u128;
-    let pid = std::process::id() as u128;
-    let mut v = nanos ^ (seq << 8) ^ (pid << 48);
-    // Set version(4) and variant(10xx) bits.
-    v &= !(0xF_u128 << 76);
-    v |= 0x4_u128 << 76;
-    v &= !(0x3_u128 << 62);
-    v |= 0x2_u128 << 62;
-    let hex = format!("{v:032x}");
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
 }
 
 fn boxed_err(msg: impl Into<String>) -> BoxError {

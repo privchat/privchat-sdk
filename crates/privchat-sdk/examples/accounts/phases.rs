@@ -6067,7 +6067,7 @@ source={} sealed_cache={} extra={}",
         let device_dir = manager.base_dir.join("phase43-restart-device");
         // 服务端要求 device_id 是 UUID；同一台「设备」两次运行必须是同一个值，
         // 否则重开的是另一台设备，幂等键也就对不上。
-        let device_id = crate::account_manager::pseudo_uuid_v4_like();
+        let device_id = privchat_sdk::new_device_id();
 
         let stamp = now_millis();
         let contents: Vec<String> = (0..2)

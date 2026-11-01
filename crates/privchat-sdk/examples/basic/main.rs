@@ -73,7 +73,7 @@ async fn main() -> BoxResult<()> {
     let suffix = format!("{}{}", ts % 100000, std::process::id());
     let username = format!("basic_{}", suffix);
     let password = "password123".to_string();
-    let device_id = pseudo_uuid_v4_like();
+    let device_id = privchat_sdk::new_device_id();
 
     println!("2) register/login");
     let login = match sdk
@@ -167,20 +167,3 @@ fn path_to_string(path: &PathBuf) -> String {
     path.to_string_lossy().to_string()
 }
 
-fn pseudo_uuid_v4_like() -> String {
-    let ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id() as u128;
-    let x = ns ^ (pid << 32) ^ 0xa5a5_5a5a_dead_beef_u128;
-    let part1 = (x >> 96) as u32;
-    let part2 = (x >> 80) as u16;
-    let part3 = (((x >> 64) as u16) & 0x0fff) | 0x4000;
-    let part4 = (((x >> 48) as u16) & 0x3fff) | 0x8000;
-    let part5 = (x & 0x0000_0000_0000_ffff_ffff_ffff_u128) as u64;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        part1, part2, part3, part4, part5
-    )
-}

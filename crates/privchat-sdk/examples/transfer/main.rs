@@ -84,7 +84,7 @@ async fn main() -> BoxResult<()> {
     let suffix = format!("{}{}", ts % 100000, std::process::id());
     let username = format!("transfer_{}", suffix);
     let password = "password123".to_string();
-    let device_id = pseudo_uuid_v4_like();
+    let device_id = privchat_sdk::new_device_id();
 
     println!("2) register/login as {}", username);
     let login = match sdk
@@ -202,21 +202,6 @@ fn parse_env_u16(name: &str, default: u16) -> u16 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
-}
-
-fn pseudo_uuid_v4_like() -> String {
-    // Reuses the same pseudo-uuid pattern as examples/basic — good enough
-    // for demo device_id; not RFC-compliant.
-    let t = now_millis();
-    let p = std::process::id() as u128;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (t >> 32) as u32,
-        (t & 0xffff) as u16,
-        (p & 0xffff) as u16,
-        ((t ^ p) & 0xffff) as u16,
-        (t ^ (p << 32)) as u64 & 0xffff_ffff_ffff,
-    )
 }
 
 fn path_to_string(p: &std::path::Path) -> String {
