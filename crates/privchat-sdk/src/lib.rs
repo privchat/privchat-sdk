@@ -293,6 +293,55 @@ fn env_flag_enabled(key: &str) -> bool {
 ///
 /// 只有显式设置 `PRIVCHAT_ALLOW_INSECURE_TRANSPORT=1` 的本地开发构建才放行，
 /// 且每次都会打印警告。
+/// Process-wide trust anchors for `wss://` endpoints; `None` keeps the bundled
+/// webpki (Mozilla) roots. See [`set_wss_root_certificates_pem`].
+static WSS_ROOT_CERTIFICATES_PEM: std::sync::RwLock<Option<Arc<str>>> =
+    std::sync::RwLock::new(None);
+
+/// Replace the trust anchors used to verify `wss://` servers in this process.
+///
+/// By default (and after `set_wss_root_certificates_pem(None)`) WebSocket TLS
+/// verifies against the bundled webpki roots, exactly as before. A host that
+/// must also honour the operating system's trust store (a desktop app on a
+/// machine with an administrator-installed CA) passes the complete bundle it
+/// wants trusted — typically the bundled public roots plus the platform's
+/// trusted roots. Verification stays strict either way: chain, validity and
+/// host name are always checked; this only chooses the anchors.
+///
+/// Applies to connections opened after the call. QUIC and TLS/TCP keep using
+/// SPKI pinning and are unaffected. The bundle must contain at least one
+/// parseable certificate.
+pub fn set_wss_root_certificates_pem(pem: Option<String>) -> Result<()> {
+    if let Some(pem) = pem.as_deref() {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        let mut count = 0usize;
+        for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+            cert.map_err(|e| Error::TransportRejected(format!("wss roots PEM: {e}")))?;
+            count += 1;
+        }
+        if count == 0 {
+            return Err(Error::TransportRejected(
+                "wss roots PEM contains no certificates".to_string(),
+            ));
+        }
+    }
+    *WSS_ROOT_CERTIFICATES_PEM
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = pem.map(Arc::from);
+    Ok(())
+}
+
+fn wss_client_tls() -> msgtrans::ClientTls {
+    match WSS_ROOT_CERTIFICATES_PEM
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+    {
+        Some(pem) => msgtrans::ClientTls::CustomCa(pem.to_owned()),
+        None => msgtrans::ClientTls::SystemRoots,
+    }
+}
+
 fn insecure_transport_allowed() -> bool {
     env_flag_enabled("PRIVCHAT_ALLOW_INSECURE_TRANSPORT")
         || QUIC_ACCEPT_SELF_SIGNED_FOR_TESTING.load(Ordering::Acquire)
@@ -8757,7 +8806,7 @@ impl State {
                     // 是从未接线的假开关);use_tls=false 的端点走 ws:// 本就
                     // 不触发 TLS,这里映射为 Insecure 仅保语义完整。
                     .tls(if ep.use_tls {
-                        msgtrans::ClientTls::SystemRoots
+                        wss_client_tls()
                     } else {
                         msgtrans::ClientTls::Insecure
                     });
@@ -28426,6 +28475,28 @@ mod transport_pinning_tests {
 
         set_quic_accept_self_signed_for_testing(false);
         assert!(!insecure_transport_allowed(), "关闭后必须恢复拒绝");
+    }
+
+    #[test]
+    fn wss_roots_default_to_bundled_and_accept_only_real_certificates() {
+        // Default: bundled webpki roots, unchanged for every existing caller.
+        assert_eq!(wss_client_tls(), msgtrans::ClientTls::SystemRoots);
+
+        assert!(set_wss_root_certificates_pem(Some(String::new())).is_err());
+        assert!(set_wss_root_certificates_pem(Some("not a certificate".into())).is_err());
+        assert_eq!(
+            wss_client_tls(),
+            msgtrans::ClientTls::SystemRoots,
+            "a rejected bundle must not replace the current anchors"
+        );
+
+        let ca = rcgen::generate_simple_self_signed(vec!["ca.test".to_string()]).unwrap();
+        let pem = ca.cert.pem();
+        set_wss_root_certificates_pem(Some(pem.clone())).unwrap();
+        assert_eq!(wss_client_tls(), msgtrans::ClientTls::CustomCa(pem));
+
+        set_wss_root_certificates_pem(None).unwrap();
+        assert_eq!(wss_client_tls(), msgtrans::ClientTls::SystemRoots);
     }
 
     #[test]
