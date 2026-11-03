@@ -28588,10 +28588,12 @@ mod transport_pin_scope_tests {
 pub mod file_plane_http {
     use crate::{Error, Result};
 
-    /// 控制面客户端：对我们自己的服务器做 SPKI pinning。
-    ///
-    /// `https` 的控制面缺 pin 直接报错——不 fail-open。`http` 的控制面只在本地开发
-    /// 出现（没有 TLS 可言），此时 pin 无意义，按明文放行。
+    /// 控制面客户端，与 App 的 PlatformHttpClient 同一规则：
+    /// - 主机是**域名**（`https://gateway.weey.chat/api/app`）→ 公有 CA + 主机名校验，不 pin。
+    ///   Let's Encrypt 每次续期都换密钥，pin 叶子等于三个月后自己把上传打断
+    ///   （2026-09-24 迁到域名后正是如此：控制面仍只认旧自签证书的 pin，上传全部失败）。
+    /// - 主机是 **IP 字面量**（自签证书，没有可校验的名字）→ 只认 SPKI pin，缺 pin 直接报错，不 fail-open。
+    /// - `http` 只在本地开发出现（没有 TLS 可言），按明文放行；公网明文拒绝。
     pub fn control_client(control_url: &str, pins: &[String]) -> Result<reqwest::Client> {
         if !control_url.starts_with("https://") {
             if !is_local_control_url(control_url) {
@@ -28600,6 +28602,12 @@ pub mod file_plane_http {
                 )));
             }
             return Ok(reqwest::Client::new());
+        }
+        if !is_ip_literal_url(control_url)? {
+            return reqwest::Client::builder()
+                .https_only(true)
+                .build()
+                .map_err(|e| Error::Storage(format!("build public-CA http client: {e}")));
         }
 
         if pins.is_empty() {
@@ -28659,6 +28667,14 @@ without server identity verification"
         is_local_host(&parsed)
     }
 
+    /// Whether the URL's host is an IP literal (a self-signed server that only a pin can identify).
+    fn is_ip_literal_url(url: &str) -> Result<bool> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| Error::Storage(format!("invalid file control-plane URL: {e}")))?;
+        let host = parsed.host_str().unwrap_or_default();
+        Ok(host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok())
+    }
+
     fn is_local_host(parsed: &reqwest::Url) -> bool {
         let Some(host) = parsed.host_str() else {
             return false;
@@ -28709,9 +28725,22 @@ without server identity verification"
         }
 
         #[test]
-        fn empty_pin_list_is_rejected_not_ignored() {
-            assert!(control_client("https://example.com/x", &[]).is_err());
-            assert!(control_client("https://example.com/x", &["  ".to_string()]).is_err());
+        fn empty_pin_list_is_rejected_not_ignored_for_an_ip() {
+            assert!(control_client("https://106.55.63.153:9083/x", &[]).is_err());
+            assert!(control_client("https://106.55.63.153:9083/x", &["  ".to_string()]).is_err());
+            assert!(control_client("https://[2001:db8::1]:9083/x", &[]).is_err());
+        }
+
+        /// A domain carries a publicly trusted certificate whose key changes on every renewal:
+        /// it is verified by CA and host name like any public service, never by our pins.
+        #[test]
+        fn a_domain_control_plane_uses_public_ca_not_pins() {
+            assert!(control_client("https://gateway.weey.chat/api/app", &[]).is_ok());
+            assert!(control_client(
+                "https://gateway.weey.chat/api/app",
+                &["SKMkpK5wwUD8sXug1pEktuTrlEntEqwP70qDLfnlTT0=".to_string()],
+            )
+            .is_ok());
         }
 
         #[test]

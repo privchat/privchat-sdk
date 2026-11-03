@@ -69,7 +69,8 @@ async fn spawn_tls_server(cert_pem: String, key_pem: String) -> String {
         }
     });
 
-    format!("https://localhost:{}", addr.port())
+    // A self-signed server has no public name to verify: it is addressed by IP, where only the pin decides.
+    format!("https://127.0.0.1:{}", addr.port())
 }
 
 #[tokio::test]
