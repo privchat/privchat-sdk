@@ -110,6 +110,7 @@ mod storage_actor;
 mod sync_commit_applier;
 mod sync_coordinator;
 mod task;
+pub mod timezone;
 use receive_pipeline::ReceivePipeline;
 use runtime::runtime_provider::RuntimeProvider;
 use storage_actor::StorageHandle;
@@ -14661,6 +14662,9 @@ pub struct PrivchatSdk {
     file_route_key: Arc<Option<String>>,
     download_manager: media_download::DownloadManager,
     pending_media_jobs: Arc<StdMutex<HashMap<String, oneshot::Sender<MediaJobResult>>>>,
+    /// 显示时区（TIMEZONE_SPEC）。本地显示偏好，仅影响格式化输出，
+    /// 不改变任何数据模型里的 UTC 毫秒时间戳。默认设备系统时区。
+    display_timezone: Arc<StdMutex<timezone::DisplayTimezone>>,
 }
 
 impl PrivchatSdk {
@@ -18385,6 +18389,7 @@ impl PrivchatSdk {
             file_route_key: Arc::new(file_route_key),
             download_manager,
             pending_media_jobs,
+            display_timezone: Arc::new(StdMutex::new(timezone::DisplayTimezone::new_system_default())),
         }
     }
 

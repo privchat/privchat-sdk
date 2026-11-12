@@ -18,6 +18,10 @@ bytes.workspace = true
 msgtrans.workspace = true
 privchat-protocol.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# TIMEZONE_SPEC：IANA 时区（含 DST/历史规则）转换 + 设备系统时区 ID。
+# 禁止用固定 offset 代替 IANA ID，故必须带时区数据库的 chrono-tz。
+chrono-tz = { version = "0.10", default-features = false }
+iana-time-zone = "0.1"
 # SQLCipher's crypto: Apple platforms use the system CommonCrypto (no OpenSSL in the binary);
 # elsewhere a vendored OpenSSL provides it. TLS never uses OpenSSL (rustls).
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }

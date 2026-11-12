@@ -9898,3 +9898,97 @@ impl PrivchatClient {
         Ok((plain, sealed, meta))
     }
 }
+
+// ========== 显示时区 API（TIMEZONE_SPEC）==========
+//
+// local-first 硬约束：这些方法全是纯本地计算，不触网。存储/传输的时间戳永远是 UTC 毫秒，
+// 时区只影响格式化输出。core 实现见 `privchat_sdk::timezone`。
+
+/// UTC 毫秒在指定 IANA 时区下的本地日期时间分量（原子能力，供上层本地化格式化）。
+/// `day_of_week` 采用 ISO 约定：周一=1 … 周日=7。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LocalDateTimeParts {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+    pub day_of_week: u32,
+}
+
+impl From<privchat_sdk::timezone::TimezoneError> for PrivchatFfiError {
+    fn from(value: privchat_sdk::timezone::TimezoneError) -> Self {
+        Self::SdkError {
+            code: privchat_protocol::ErrorCode::InvalidParams as u32,
+            detail: value.to_string(),
+        }
+    }
+}
+
+#[uniffi::export]
+impl PrivchatClient {
+    /// 设置显示时区（IANA ID，如 `"Asia/Ho_Chi_Minh"`）。非法 ID 报错且保留原配置。
+    pub fn set_display_timezone(&self, zone_id: String) -> Result<(), PrivchatFfiError> {
+        self.inner
+            .set_display_timezone(&zone_id)
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// 获取当前显示时区 IANA ID。
+    pub fn get_display_timezone(&self) -> String {
+        self.inner.get_display_timezone()
+    }
+
+    /// 重置显示时区为设备系统默认。
+    pub fn reset_display_timezone(&self) {
+        self.inner.reset_display_timezone();
+    }
+
+    /// 消息气泡时间 `"HH:mm"`，按实例配置时区。`millis <= 0` 返回空串。
+    pub fn format_message_time(&self, millis: i64) -> Result<String, PrivchatFfiError> {
+        self.inner
+            .format_message_time(millis)
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// 会话列表时间（今天 HH:mm / 昨天 / 周X / MM-dd），按实例配置时区，"现在" 取当前 UTC。
+    pub fn format_conversation_time(&self, millis: i64) -> Result<String, PrivchatFfiError> {
+        self.inner
+            .format_conversation_time(millis)
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// 消息时间分隔符（今天/昨天/MM月dd日/yyyy年MM月dd日 + HH:mm），按实例配置时区。
+    pub fn format_separator_time(&self, millis: i64) -> Result<String, PrivchatFfiError> {
+        self.inner
+            .format_separator_time(millis)
+            .map_err(PrivchatFfiError::from)
+    }
+
+    /// UTC 毫秒 → 指定 IANA 时区的本地日期时间分量（原子能力，不依赖实例配置时区）。
+    pub fn epoch_millis_to_local_datetime(
+        &self,
+        millis: i64,
+        zone_id: String,
+    ) -> Result<LocalDateTimeParts, PrivchatFfiError> {
+        let p = self
+            .inner
+            .epoch_millis_to_local_datetime(millis, &zone_id)
+            .map_err(PrivchatFfiError::from)?;
+        Ok(LocalDateTimeParts {
+            year: p.year,
+            month: p.month,
+            day: p.day,
+            hour: p.hour,
+            minute: p.minute,
+            second: p.second,
+            day_of_week: p.day_of_week,
+        })
+    }
+
+    /// 设备系统时区的 IANA ID（原子能力）。
+    pub fn system_default_timezone_id(&self) -> String {
+        self.inner.system_default_timezone_id()
+    }
+}
