@@ -140,6 +140,9 @@ use privchat_protocol::rpc::{
     GroupSettingsUpdateResponse,
     GroupTransferOwnerRequest,
     GroupTransferOwnerResponse,
+    GroupUpdateRequest,
+    GroupProfilePatch,
+    GroupUpdateResponse,
     MessageReactionAddRequest,
     MessageReactionAddResponse,
     MessageReactionListRequest,
@@ -382,6 +385,12 @@ pub struct AccountUserDetailView {
     pub user_type: i16,
     pub is_friend: bool,
     pub can_send_message: bool,
+    /// 服务端算好的加好友能力位（PROFILE_VISIBILITY §2.5）；老 server 缺省 true。
+    pub can_add_friend: bool,
+    /// can_add_friend=false 时的原因：group_policy / personal_privacy / blacklist / already_friend。
+    pub deny_reason: Option<String>,
+    /// 查看凭证（§2.5.1，字符串防 JS 精度）；friend/apply 凭此放行。
+    pub grant_id: Option<String>,
     pub source_type: String,
     pub source_id: String,
     /// 是否已关注（仅 user_type=2 Bot 有意义；非 bot 永远 false）
@@ -6586,6 +6595,9 @@ impl PrivchatClient {
             user_type: resp.user_type,
             is_friend: resp.is_friend,
             can_send_message: resp.can_send_message,
+            can_add_friend: resp.can_add_friend,
+            deny_reason: resp.deny_reason,
+            grant_id: resp.grant_id,
             source_type: resp.source_type,
             source_id: resp.source_id,
             is_follow: resp.is_follow,
@@ -7044,6 +7056,24 @@ impl PrivchatClient {
                 .await;
         }
         Ok(resp.success)
+    }
+
+    /// 群资料（名称/简介）修改，走 `group/group/update`——与 owner-only 的治理设置
+    /// `group_settings::UPDATE` 是两条路由。operator 由服务端会话推断，请求体只带
+    /// group_id + profile，与协议 GroupUpdateRequest 一致。
+    pub async fn group_update_profile_remote(
+        &self,
+        group_id: u64,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> Result<bool, PrivchatFfiError> {
+        let req = GroupUpdateRequest {
+            group_id,
+            profile: GroupProfilePatch { name, description },
+        };
+        let _resp: GroupUpdateResponse =
+            rpc_call_typed(&self.inner, routes::group::UPDATE, &req).await?;
+        Ok(true)
     }
 
     pub async fn group_mute_all_remote(
