@@ -27,8 +27,6 @@ use privchat_protocol::rpc::{
     AccountPrivacyGetResponse,
     AccountPrivacyUpdateRequest,
     AccountPrivacyUpdateResponse,
-    AccountProfileGetRequest,
-    AccountProfileGetResponse,
     AccountProfileUpdateRequest,
     AccountProfileUpdateResponse,
     AccountSearchQueryRequest,
@@ -1344,15 +1342,6 @@ impl MultiAccountManager {
                 last_pts,
                 limit,
             },
-        )
-        .await
-    }
-
-    pub async fn profile_get(&self, key: &str) -> BoxResult<AccountProfileGetResponse> {
-        self.rpc_typed(
-            key,
-            routes::account_profile::GET,
-            &AccountProfileGetRequest { user_id: 0 },
         )
         .await
     }

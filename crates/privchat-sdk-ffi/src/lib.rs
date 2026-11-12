@@ -26,8 +26,6 @@ use privchat_protocol::rpc::{
     AccountPrivacyGetResponse,
     AccountPrivacyUpdateRequest,
     AccountPrivacyUpdateResponse,
-    AccountProfileGetRequest,
-    AccountProfileGetResponse,
     AccountProfileUpdateRequest,
     AccountProfileUpdateResponse,
     AccountSearchByQRCodeRequest,
@@ -37,8 +35,6 @@ use privchat_protocol::rpc::{
     AccountUserDetailResponse,
     AccountUserShareCardRequest,
     AccountUserShareCardResponse,
-    AccountUserUpdateRequest,
-    AccountUserUpdateResponse,
     BatchGetChannelPtsRequest,
     BatchGetChannelPtsResponse,
     BlacklistAddRequest,
@@ -548,13 +544,6 @@ pub struct RefreshAccessTokenResult {
     pub refresh_token: Option<String>,
     pub expires_at: u64,
     pub refresh_expires_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct AccountUserUpdateInput {
-    pub display_name: Option<String>,
-    pub avatar_url: Option<String>,
-    pub bio: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -6305,20 +6294,6 @@ impl PrivchatClient {
         Ok(resp.is_friend)
     }
 
-    pub async fn get_profile(&self) -> Result<ProfileView, PrivchatFfiError> {
-        let resp: AccountProfileGetResponse = rpc_call_typed(
-            &self.inner,
-            routes::account_profile::GET,
-            &AccountProfileGetRequest { user_id: 0 },
-        )
-        .await?;
-        Ok(ProfileView {
-            status: resp.status,
-            action: resp.action,
-            timestamp: resp.timestamp,
-        })
-    }
-
     pub async fn update_profile(
         &self,
         payload: ProfileUpdateInput,
@@ -6626,22 +6601,6 @@ impl PrivchatClient {
             share_url: resp.share_url.unwrap_or_default(),
             expire_at: resp.expire_at,
         })
-    }
-
-    pub async fn account_user_update_remote(
-        &self,
-        payload: AccountUserUpdateInput,
-    ) -> Result<bool, PrivchatFfiError> {
-        let mut req = AccountUserUpdateRequest {
-            display_name: payload.display_name,
-            avatar_url: payload.avatar_url,
-            bio: payload.bio,
-            user_id: 0,
-        };
-        req.user_id = 0;
-        let resp: AccountUserUpdateResponse =
-            rpc_call_typed(&self.inner, routes::account_user::UPDATE, &req).await?;
-        Ok(resp.status.eq_ignore_ascii_case("success"))
     }
 
     pub async fn auth_logout_remote(&self) -> Result<bool, PrivchatFfiError> {
