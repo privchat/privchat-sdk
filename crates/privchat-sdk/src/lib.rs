@@ -1214,7 +1214,7 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
         session: &ChunkedSession,
         payload: &SealedPayload,
     ) -> Result<UploadedFileInfo> {
-        self.state
+        let info = self.state
             .upload_in_chunks(
                 session,
                 &self.mime_type,
@@ -1222,7 +1222,11 @@ impl AttachmentUploadIo for LiveAttachmentUploadIo<'_> {
                 &payload.blob,
                 &self.local_message_id,
             )
-            .await
+            .await?;
+        // Count after completion, at the common proxy/S3 boundary. Only this
+        // layer still knows if the canonical artifact is a thumbnail.
+        self.state.attachment_transfers.record_upload(&self.filename);
+        Ok(info)
     }
 
     fn on_upload_finished(&mut self) {
@@ -12849,13 +12853,7 @@ impl State {
             }
         }
 
-        let info = self
-            .complete_upload(&client, &base, token, mime_type)
-            .await?;
-        self.attachment_transfers
-            .body_uploads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(info)
+        self.complete_upload(&client, &base, token, mime_type).await
     }
 
     /// 查进度：服务端**同时**回已收与缺失，客户端直接用 `missing`。
@@ -13245,12 +13243,7 @@ impl State {
         let info = Self::parse_uploaded_file_info(&envelope, mime_type)?;
         // 传成了才计：失败的那次会重试，算进去等于把同一份内容数很多遍。
         // 缩略图走同一个接口，靠规范文件名区分（见 media_store::payload_filename）。
-        let counter = if filename.starts_with("thumb") {
-            &self.attachment_transfers.thumbnail_uploads
-        } else {
-            &self.attachment_transfers.body_uploads
-        };
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.attachment_transfers.record_upload(filename);
         Ok(info)
     }
 
@@ -14611,10 +14604,19 @@ pub struct AttachmentTransferCounters {
     pub claims: AtomicU64,
     /// **主文件**字节传上去并被服务端接收的次数。
     pub body_uploads: AtomicU64,
-    /// **缩略图**字节传上去并被服务端接收的次数。缩略图是本地重新生成的派生物，
-    /// 每次生成都是新字节，所以它不会命中秒传——这是已知代价，单独计数免得
-    /// 被算进「主文件没省下带宽」。
+    /// **缩略图**字节传上去并被服务端接收的次数；命中去重不计入上传。
     pub thumbnail_uploads: AtomicU64,
+}
+
+impl AttachmentTransferCounters {
+    fn record_upload(&self, filename: &str) {
+        let counter = if filename == media_store::THUMB_FILENAME {
+            &self.thumbnail_uploads
+        } else {
+            &self.body_uploads
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// [`PrivchatSdk::attachment_transfer_stats`] 的快照。

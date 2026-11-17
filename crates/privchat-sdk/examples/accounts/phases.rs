@@ -31,6 +31,8 @@ use crate::types::{PhaseMetrics, PhaseResult};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxResult<T> = Result<T, BoxError>;
 
+const ROOM_WIRE_CHANNEL_TYPE: u8 = 3;
+
 pub struct TestPhases;
 
 impl TestPhases {
@@ -1455,14 +1457,47 @@ impl TestPhases {
                 .push("blacklist list missing charlie".to_string());
         }
 
+        // A caller-supplied owner must not let one account inspect or alter
+        // another account's block list.
+        let alice_id = manager.user_id("alice")?;
+        let foreign: privchat_protocol::rpc::BlacklistCheckResponse = manager
+            .rpc_typed(
+                "bob",
+                privchat_protocol::rpc::routes::blacklist::CHECK,
+                &privchat_protocol::rpc::BlacklistCheckRequest {
+                    user_id: alice_id,
+                    target_user_id: charlie_id,
+                },
+            )
+            .await?;
+        let _: privchat_protocol::rpc::BlacklistRemoveResponse = manager
+            .rpc_typed(
+                "bob",
+                privchat_protocol::rpc::routes::blacklist::REMOVE,
+                &privchat_protocol::rpc::BlacklistRemoveRequest {
+                    user_id: alice_id,
+                    blocked_user_id: charlie_id,
+                },
+            )
+            .await?;
+        let survived = manager.blacklist_check("alice", charlie_id).await?;
+        metrics.rpc_calls += 3;
+        if !foreign.blocked && survived.blocked {
+            metrics.rpc_successes += 3;
+        } else {
+            metrics.errors.push("caller-supplied owner changed blacklist scope".to_string());
+        }
+
         let removed = manager.blacklist_remove("alice", charlie_id).await?;
         metrics.rpc_calls += 1;
-        if removed {
+        let still_blocked = manager.blacklist_check("alice", charlie_id).await?.blocked;
+        metrics.rpc_calls += 1;
+        if removed && !still_blocked {
             metrics.rpc_successes += 1;
         } else {
             metrics
                 .errors
-                .push("blacklist remove returned false".to_string());
+                .push("blacklist entry remained after removal".to_string());
         }
 
         Ok(PhaseResult {
@@ -1624,7 +1659,7 @@ impl TestPhases {
         let bob_sdk = manager.sdk("bob")?;
 
         // --- Step 2: bob 订阅频道（接收 typing 事件） ---
-        bob_sdk.subscribe_channel(channel_id, 0, None).await?;
+        bob_sdk.subscribe_channel(channel_id, DIRECT_SYNC_CHANNEL_TYPE, None).await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
@@ -1635,7 +1670,7 @@ impl TestPhases {
 
         // --- Step 3: alice 发送 typing → bob 应收到 PublishRequest(topic="typing") ---
         alice_sdk
-            .send_typing(channel_id, 0, true, privchat_sdk::TypingActionType::Typing)
+            .send_typing(channel_id, DIRECT_SYNC_CHANNEL_TYPE.into(), true, privchat_sdk::TypingActionType::Typing)
             .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
@@ -1677,7 +1712,7 @@ impl TestPhases {
         // 50ms 间隔连续发 3 次 typing
         for _ in 0..3 {
             let _ = alice_sdk
-                .send_typing(channel_id, 0, true, privchat_sdk::TypingActionType::Typing)
+                .send_typing(channel_id, DIRECT_SYNC_CHANNEL_TYPE.into(), true, privchat_sdk::TypingActionType::Typing)
                 .await;
             metrics.rpc_calls += 1;
             metrics.rpc_successes += 1;
@@ -1714,7 +1749,7 @@ impl TestPhases {
         }
 
         // --- Step 5: bob 取消订阅后不再收到 typing ---
-        bob_sdk.unsubscribe_channel(channel_id, 0).await?;
+        bob_sdk.unsubscribe_channel(channel_id, DIRECT_SYNC_CHANNEL_TYPE).await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
@@ -1725,7 +1760,7 @@ impl TestPhases {
         tokio::time::sleep(Duration::from_millis(600)).await;
 
         alice_sdk
-            .send_typing(channel_id, 0, true, privchat_sdk::TypingActionType::Typing)
+            .send_typing(channel_id, DIRECT_SYNC_CHANNEL_TYPE.into(), true, privchat_sdk::TypingActionType::Typing)
             .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
@@ -1765,12 +1800,12 @@ impl TestPhases {
         let charlie_sdk = manager.sdk("charlie")?;
 
         // bob 和 charlie 订阅群频道
-        bob_sdk.subscribe_channel(group_channel_id, 1, None).await?;
+        bob_sdk.subscribe_channel(group_channel_id, GROUP_SYNC_CHANNEL_TYPE, None).await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
         charlie_sdk
-            .subscribe_channel(group_channel_id, 1, None)
+            .subscribe_channel(group_channel_id, GROUP_SYNC_CHANNEL_TYPE, None)
             .await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
@@ -1784,7 +1819,7 @@ impl TestPhases {
         alice_sdk
             .send_typing(
                 group_channel_id,
-                1,
+                GROUP_SYNC_CHANNEL_TYPE.into(),
                 true,
                 privchat_sdk::TypingActionType::Typing,
             )
@@ -1846,8 +1881,8 @@ impl TestPhases {
         }
 
         // 清理：取消群订阅
-        let _ = bob_sdk.unsubscribe_channel(group_channel_id, 1).await;
-        let _ = charlie_sdk.unsubscribe_channel(group_channel_id, 1).await;
+        let _ = bob_sdk.unsubscribe_channel(group_channel_id, GROUP_SYNC_CHANNEL_TYPE).await;
+        let _ = charlie_sdk.unsubscribe_channel(group_channel_id, GROUP_SYNC_CHANNEL_TYPE).await;
 
         let details = format!(
             "private ch={} (recv={}, rate_limit_count={}/3), group ch={} (bob={}, charlie={})",
@@ -1968,7 +2003,7 @@ impl TestPhases {
                 .push("presence batch_get size < 2".to_string());
         }
 
-        alice_sdk.subscribe_channel(channel_id, 0, None).await?;
+        alice_sdk.subscribe_channel(channel_id, DIRECT_SYNC_CHANNEL_TYPE, None).await?;
         metrics.rpc_calls += 1;
         metrics.rpc_successes += 1;
 
@@ -2069,7 +2104,7 @@ impl TestPhases {
             metrics.rpc_successes += 1;
         }
 
-        let _ = alice_sdk.unsubscribe_channel(channel_id, 0).await;
+        let _ = alice_sdk.unsubscribe_channel(channel_id, DIRECT_SYNC_CHANNEL_TYPE).await;
 
         let state = alice_sdk.connection_state().await?;
         metrics.rpc_calls += 1;
@@ -2703,8 +2738,10 @@ impl TestPhases {
         })
         .collect();
 
-        // Inject one synthetic empty-name group channel to verify fallback title materialization.
+        // Leave both group and channel names empty, but provide a member
+        // alias for the documented member-name fallback.
         let synthetic_group_id: u64 = 9_900_000_001;
+        let synthetic_member_alias = "GA group member";
         let alice_sdk = manager.sdk("alice")?;
         alice_sdk
             .upsert_group(privchat_sdk::UpsertGroupInput {
@@ -2717,6 +2754,20 @@ impl TestPhases {
                 created_at: now_millis(),
                 version: now_millis(),
                 updated_at: now_millis(),
+            })
+            .await?;
+        let now = now_millis();
+        alice_sdk
+            .upsert_group_member(privchat_sdk::UpsertGroupMemberInput {
+                group_id: synthetic_group_id,
+                user_id: manager.user_id("alice")?,
+                role: 0,
+                status: 0,
+                alias: Some(synthetic_member_alias.to_string()),
+                is_muted: false,
+                joined_at: now,
+                version: now,
+                updated_at: now,
             })
             .await?;
         alice_sdk
@@ -2736,8 +2787,8 @@ impl TestPhases {
                 peer_user_id: None,
             })
             .await?;
-        metrics.rpc_calls += 2;
-        metrics.rpc_successes += 2;
+        metrics.rpc_calls += 3;
+        metrics.rpc_successes += 3;
 
         for key in ["alice", "bob", "charlie"] {
             let channels = manager.list_local_channels(key).await?;
@@ -2886,9 +2937,9 @@ impl TestPhases {
             .into_iter()
             .find(|c| c.channel_id == synthetic_group_id)
         {
-            if synthetic.channel_name.trim().is_empty() {
+            if synthetic.channel_name != synthetic_member_alias {
                 metrics.errors.push(
-                    "synthetic empty-name group did not materialize fallback title".to_string(),
+                    format!("expected member alias as group title, got {:?}", synthetic.channel_name),
                 );
             } else {
                 metrics.rpc_successes += 1;
@@ -3118,7 +3169,7 @@ impl TestPhases {
             };
             metrics.rpc_successes += 1;
 
-            match sdk.subscribe_channel(channel_id, 2, Some(ticket)).await {
+            match sdk.subscribe_channel(channel_id, ROOM_WIRE_CHANNEL_TYPE, Some(ticket)).await {
                 Ok(_) => {
                     metrics.rpc_calls += 1;
                     metrics.rpc_successes += 1;
@@ -3228,7 +3279,7 @@ impl TestPhases {
             ("bob", &bob_sdk),
             ("charlie", &charlie_sdk),
         ] {
-            if let Err(e) = sdk.unsubscribe_channel(channel_id, 2).await {
+            if let Err(e) = sdk.unsubscribe_channel(channel_id, ROOM_WIRE_CHANNEL_TYPE).await {
                 metrics
                     .errors
                     .push(format!("{} unsubscribe_channel failed: {}", name, e));
@@ -5319,11 +5370,6 @@ impl TestPhases {
             ));
         };
         let alice_wire = Self::sent_attachment_wire(&alice_sent);
-        let alice_file_url = alice_wire
-            .get("file_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
         let alice_file_id = alice_wire
             .get("file_id")
             .and_then(|v| v.as_u64())
@@ -5398,11 +5444,6 @@ impl TestPhases {
             ));
         };
         let bob_wire = Self::sent_attachment_wire(&bob_sent);
-        let bob_file_url = bob_wire
-            .get("file_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
         let bob_file_id = bob_wire
             .get("file_id")
             .and_then(|v| v.as_u64())
@@ -5420,14 +5461,12 @@ impl TestPhases {
                 before.body_uploads, after_resend.body_uploads
             ));
         }
-        // 🔴 已知代价：缩略图是本地重新生成的，字节每次都不同，永远命中不了秒传。
-        // 图片小、缩略图更小，所以先按现状钉住；真要省掉它，得在重发时复用
-        // 收到的那张 thumb 而不是重新生成。
-        if after_resend.thumbnail_uploads != before.thumbnail_uploads + 1 {
-            metrics.errors.push(format!(
-                "thumbnail upload count changed shape: {} -> {} (expected exactly one regenerated thumbnail)",
-                before.thumbnail_uploads, after_resend.thumbnail_uploads
-            ));
+        // Regenerating a thumbnail may itself hit plaintext dedup. The sent
+        // message must still have a thumbnail reference and may upload at most one.
+        if after_resend.thumbnail_uploads > before.thumbnail_uploads + 1
+            || bob_wire.get("thumbnail_file_id").and_then(|id| id.as_u64()).unwrap_or(0) == 0
+        {
+            metrics.errors.push("resend did not retain a valid thumbnail without duplicate uploads".into());
         }
         if after_resend.claims <= before.claims {
             metrics.errors.push(format!(
@@ -5435,10 +5474,18 @@ impl TestPhases {
                 before.claims, after_resend.claims
             ));
         }
-        if bob_file_url.is_empty() || bob_file_url != alice_file_url {
-            metrics.errors.push(format!(
-                "the claimed record must point at the same physical file: bob {bob_file_url:?} vs alice {alice_file_url:?}"
-            ));
+        let mut object_urls = Vec::new();
+        for (owner, file_id) in [("alice", alice_file_id), ("bob", bob_file_id)] {
+            let url: FileGetUrlResponse = manager
+                .rpc_typed(owner, privchat_protocol::rpc::routes::file::GET_URL,
+                    &FileGetUrlRequest { file_id, user_id: 0 })
+                .await?;
+            let parsed = reqwest::Url::parse(&url.file_url)?;
+            object_urls.push((parsed.origin(), parsed.path().to_owned()));
+        }
+        let shared_object = object_urls[0] == object_urls[1];
+        if !shared_object {
+            metrics.errors.push("independent file references must resolve to the same stored object".into());
         }
         if bob_sent.message_type != alice_sent.message_type {
             metrics
@@ -5452,7 +5499,7 @@ impl TestPhases {
             ));
         }
 
-        // 缓存没了 → 换一串密文 → 服务端没见过 → 必须退回整传，而且照样发得出去。
+        // Plaintext-hash dedup must still work when the sealed cache is gone.
         let removed =
             Self::drop_sealed_caches_under(&bob_root.join("users").join(bob_uid.to_string()));
         let Some(fallback_sent) = Self::send_one_fidelity_attachment(
@@ -5474,14 +5521,11 @@ impl TestPhases {
             return Ok(phase_fail(
                 "resend-received-attachment",
                 start.elapsed(),
-                "🔴 without a sealed cache the resend must fall back to a normal upload, not fail",
+                "resend without a sealed cache must still succeed",
                 metrics,
             ));
         };
         let fallback_wire = Self::sent_attachment_wire(&fallback_sent);
-        // 🔴 判据是 file_id，不是 file_url：本地行的 wire 描述按类型落在 content 或
-        // extra 两处，file_url 只在其中一处出现，读得早了还可能没回写完
-        // （这正是这条 phase 早先偶发失败的原因，不是产品问题）。
         let fallback_file_id = fallback_wire
             .get("file_id")
             .and_then(|v| v.as_u64())
@@ -5492,13 +5536,30 @@ impl TestPhases {
             ));
         }
         let after_fallback = manager.sdk("bob")?.attachment_transfer_stats();
-        if after_fallback.body_uploads <= after_resend.body_uploads {
-            // 缓存没了只能重新封装，密文必然不同，服务端不可能已经有它——
-            // 这一趟必须真的把字节传上去，而且照样发得出去。
-            metrics.errors.push(format!(
-                "🔴 without the sealed cache the body must actually be uploaded: body uploads {} -> {}",
-                after_resend.body_uploads, after_fallback.body_uploads
-            ));
+        if after_fallback.body_uploads != after_resend.body_uploads
+            || after_fallback.claims <= after_resend.claims
+        {
+            metrics.errors.push("removing the cache defeated plaintext dedup".into());
+        }
+
+        // A genuine miss must upload bytes. A unique pixel prevents a prior
+        // run (including the other transport) from accidentally seeding this object.
+        let mut different = image::load_from_memory(&png)?.to_rgb8();
+        let salt = (now_millis() as u64 ^ manager.user_id("bob")?).to_le_bytes();
+        for (index, value) in salt.into_iter().enumerate() {
+            different.get_pixel_mut(index as u32, 0).0[0] = value;
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(different).write_to(&mut bytes, image::ImageFormat::Png)?;
+        let uploaded = Self::send_one_fidelity_attachment(
+            manager, "bob", target, channel_type, bob_uid, "ga-dedup-miss.png", "image/png",
+            privchat_protocol::message::ContentMessageType::Image as i32,
+            None, bytes.get_ref(), None, &mut metrics,
+        ).await?;
+        let upload_delta = manager.sdk("bob")?.attachment_transfer_stats().body_uploads
+            - after_fallback.body_uploads;
+        if uploaded.is_none() || upload_delta != 1 {
+            metrics.errors.push(format!("new attachment should upload exactly once, got {upload_delta}"));
         }
         if removed == 0 {
             metrics
@@ -5512,8 +5573,8 @@ impl TestPhases {
             success,
             duration: start.elapsed(),
             details: format!(
-                "alice_file_id={alice_file_id} bob_file_id={bob_file_id} shared_url={} resend_body_uploads={} resend_claims={} fallback_body_uploads={} sealed_caches_removed={removed}",
-                bob_file_url == alice_file_url,
+                "alice_file_id={alice_file_id} bob_file_id={bob_file_id} shared_object={} resend_body_uploads={} resend_claims={} cacheless_body_uploads={} miss_body_uploads={upload_delta} sealed_caches_removed={removed}",
+                shared_object,
                 after_resend.body_uploads - before.body_uploads,
                 after_resend.claims - before.claims,
                 after_fallback.body_uploads - after_resend.body_uploads

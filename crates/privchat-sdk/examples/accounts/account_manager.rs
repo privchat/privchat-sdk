@@ -157,6 +157,8 @@ pub struct MultiAccountManager {
     direct_channels: HashMap<String, u64>,
     group_channels: HashMap<String, u64>,
     endpoints: Vec<ServerEndpoint>,
+    spki_pins: Vec<String>,
+    timeout_secs: u64,
     suffix: String,
     pub base_dir: PathBuf,
 }
@@ -175,7 +177,7 @@ impl MultiAccountManager {
         // 报出来像「连不上」而不是「路径写错」。
         let ws_path = std::env::var("PRIVCHAT_WS_PATH").unwrap_or_else(|_| "/".to_string());
 
-        let endpoints = vec![
+        let mut endpoints = vec![
             ServerEndpoint {
                 protocol: TransportProtocol::Quic,
                 host: host.clone(),
@@ -199,6 +201,30 @@ impl MultiAccountManager {
             },
         ];
 
+        if let Ok(protocol) = std::env::var("PRIVCHAT_TEST_TRANSPORT") {
+            let protocol = match protocol.as_str() {
+                "quic" => TransportProtocol::Quic,
+                "tcp" => TransportProtocol::Tcp,
+                "websocket" => TransportProtocol::WebSocket,
+                _ => return Err(boxed_err("invalid PRIVCHAT_TEST_TRANSPORT")),
+            };
+            endpoints.retain(|endpoint| {
+                std::mem::discriminant(&endpoint.protocol) == std::mem::discriminant(&protocol)
+            });
+        }
+        let spki_pins = std::env::var("PRIVCHAT_SPKI_PINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|pin| !pin.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let timeout_secs = std::env::var("PRIVCHAT_TEST_TIMEOUT_SECS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()?
+            .unwrap_or(30);
+
         let ts = now_millis();
         let base_dir = std::env::temp_dir().join(format!(
             "privchat-rust-accounts-{}-{}",
@@ -212,6 +238,8 @@ impl MultiAccountManager {
             direct_channels: HashMap::new(),
             group_channels: HashMap::new(),
             endpoints,
+            spki_pins,
+            timeout_secs,
             suffix: String::new(),
             base_dir,
         };
@@ -234,9 +262,9 @@ impl MultiAccountManager {
 
         let sdk = Arc::new(PrivchatSdk::new(PrivchatConfig {
             endpoints: self.endpoints.clone(),
-            connection_timeout_secs: 30,
+            connection_timeout_secs: self.timeout_secs,
             data_dir: data_dir.to_string_lossy().to_string(),
-            spki_pins: vec![],
+            spki_pins: self.spki_pins.clone(),
         }));
 
         sdk.connect().await?;
@@ -1404,9 +1432,9 @@ impl MultiAccountManager {
         std::fs::create_dir_all(&data_dir)?;
         let sdk = PrivchatSdk::new(PrivchatConfig {
             endpoints: self.endpoints.clone(),
-            connection_timeout_secs: 30,
+            connection_timeout_secs: self.timeout_secs,
             data_dir: data_dir.to_string_lossy().to_string(),
-            spki_pins: vec![],
+            spki_pins: self.spki_pins.clone(),
         });
         sdk.connect().await?;
         let login = sdk
@@ -1471,9 +1499,9 @@ impl MultiAccountManager {
         std::fs::create_dir_all(data_dir)?;
         let sdk = Arc::new(PrivchatSdk::new(PrivchatConfig {
             endpoints: self.endpoints.clone(),
-            connection_timeout_secs: 30,
+            connection_timeout_secs: self.timeout_secs,
             data_dir: data_dir.to_string_lossy().to_string(),
-            spki_pins: vec![],
+            spki_pins: self.spki_pins.clone(),
         }));
         sdk.connect().await?;
         let login = sdk
@@ -1500,9 +1528,9 @@ impl MultiAccountManager {
 
         let sdk = PrivchatSdk::new(PrivchatConfig {
             endpoints: self.endpoints.clone(),
-            connection_timeout_secs: 30,
+            connection_timeout_secs: self.timeout_secs,
             data_dir: data_dir.to_string_lossy().to_string(),
-            spki_pins: vec![],
+            spki_pins: self.spki_pins.clone(),
         });
 
         let mut details = String::new();
@@ -1510,6 +1538,7 @@ impl MultiAccountManager {
 
         let run = async {
             sdk.connect().await?;
+            let login_started = now_millis();
             let login = sdk
                 .login(
                     cfg.username.clone(),
@@ -1532,6 +1561,11 @@ impl MultiAccountManager {
                             || c.channel_name == "__system_1__"
                             || c.channel_remark == "__system_1__")
                 }) {
+                    // Bootstrap initializes entities, not every timeline.
+                    // Read the system-channel difference before asserting
+                    // that this login's notice is persisted locally.
+                    sdk.sync_channel(system_channel.channel_id, system_channel.channel_type)
+                        .await?;
                     let messages = sdk
                         .list_messages(
                             system_channel.channel_id,
@@ -1544,9 +1578,9 @@ impl MultiAccountManager {
                     // connect_message_handler::send_login_notice_message_bg）。早期注释里的
                     // 「设备登录了」是旧文案，已不再产生——按 from_uid==1(系统) + 「登录了」
                     // 匹配（欢迎语不含「登录了」，不会误判）。
-                    let has_login_notice = messages
-                        .iter()
-                        .any(|m| m.from_uid == 1 && m.content.contains("登录了"));
+                    let has_login_notice = messages.iter().any(|m| {
+                        m.from_uid == 1 && m.created_at >= login_started && m.content.contains("登录了")
+                    });
                     details = format!(
                         "system_channel={} unread={} messages={} has_login_notice={}",
                         system_channel.channel_id,
