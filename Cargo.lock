@@ -1875,6 +1875,7 @@ name = "privchat-sdk"
 version = "1.0.0-beta.1"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "base64",
  "bytes",
  "chrono",

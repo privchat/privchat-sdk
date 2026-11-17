@@ -24224,6 +24224,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn quic_blackhole_falls_back_but_real_certificate_rejection_does_not() {
+        struct Sink;
+        #[async_trait::async_trait]
+        impl msgtrans::SessionHandler for Sink {
+            async fn on_message(
+                &self,
+                _: msgtrans::SessionId,
+                _: msgtrans::Packet,
+                _: msgtrans::SessionSender,
+            ) {}
+
+            async fn on_request(
+                &self,
+                _: msgtrans::SessionId,
+                _: msgtrans::Packet,
+                _: msgtrans::Responder,
+            ) {}
+        }
+
+        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut state, dir) = new_seeded_state("quic-fallback").await;
+        let quic_addr = {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.local_addr().unwrap()
+        };
+        let ws_addr = {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            socket.local_addr().unwrap()
+        };
+        let server = msgtrans::TransportServerBuilder::new()
+            .protocol(msgtrans::QuicServerConfig::new(&quic_addr.to_string()).unwrap())
+            .protocol(msgtrans::WebSocketServerConfig::new(&ws_addr.to_string()).unwrap())
+            .build(Arc::new(Sink))
+            .await
+            .unwrap();
+        let bg = server.clone();
+        let serving = tokio::spawn(async move { bg.serve().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tokio::net::TcpStream::connect(ws_addr).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        state.config.connection_timeout_secs = 1;
+        state.config.spki_pins = vec!["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()];
+        state.config.endpoints = vec![
+            super::ServerEndpoint {
+                protocol: super::TransportProtocol::Quic,
+                host: "127.0.0.1".into(),
+                port: blackhole.local_addr().unwrap().port(),
+                path: None,
+                use_tls: true,
+            },
+            super::ServerEndpoint {
+                protocol: super::TransportProtocol::WebSocket,
+                host: "127.0.0.1".into(),
+                port: ws_addr.port(),
+                path: None,
+                use_tls: false,
+            },
+        ];
+        tokio::time::timeout(Duration::from_secs(4), state.connect())
+            .await
+            .unwrap()
+            .expect("UDP blackhole must fall back to WebSocket");
+        assert!(state.transport.as_ref().unwrap().is_connected().await);
+        state.disconnect().await.unwrap();
+
+        // Keep the same live WS fallback, but now QUIC can reply with a real
+        // certificate. The configured pin cannot match its generated key.
+        state.config.endpoints[0].port = quic_addr.port();
+        state.should_auto_reconnect = true;
+        let err = state.connect().await.unwrap_err();
+        assert!(matches!(err, Error::TransportRejected(_)), "{err:?}");
+        assert!(
+            state.transport.is_none(),
+            "certificate rejection must not downgrade"
+        );
+        assert!(!state.should_auto_reconnect);
+
+        assert!(server.shutdown().await.clean);
+        serving.await.unwrap().unwrap();
+        state.storage.shutdown();
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn transport_retry_classification_survives_sdk_mapping() {
         use msgtrans::TransportError;

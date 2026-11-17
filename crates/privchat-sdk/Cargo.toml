@@ -45,6 +45,7 @@ libc = "0.2"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile = "3"
 # 确定性 TLS 测试：起一张真证书 + 真握手，不依赖任何环境变量或外部服务
 rcgen = "0.14"
