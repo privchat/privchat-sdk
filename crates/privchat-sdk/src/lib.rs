@@ -107,14 +107,12 @@ mod receive_pipeline;
 pub mod resumable_upload;
 mod runtime;
 mod storage_actor;
-mod sync_commit_applier;
 mod sync_coordinator;
 mod task;
 pub mod timezone;
 use receive_pipeline::ReceivePipeline;
 use runtime::runtime_provider::RuntimeProvider;
 use storage_actor::StorageHandle;
-use sync_commit_applier::SyncCommitApplier;
 use sync_coordinator::SyncCoordinator;
 // Convergence 刻意不导出：它是 SDK 内部维度，不进公共 API / FFI ABI。
 pub use sync_coordinator::{
@@ -7810,28 +7808,28 @@ impl State {
                         .channel_id
                         .or(scoped_channel.map(|v| v.1))
                         .unwrap_or(0);
-                    let mut message_id = raw_message_id;
-                    if channel_id > 0 {
-                        if let Ok(Some(local_id)) = self
-                            .storage
-                            .get_message_id_by_server_message_id(
-                                channel_id,
-                                channel_type,
-                                raw_message_id,
-                            )
-                            .await
-                        {
-                            message_id = local_id;
-                        }
-                    }
                     if let Some(status) = status_sync.status {
-                        let _ = self.storage.update_message_status(message_id, status).await;
-                        emitted.push(SdkEvent::MessageSendStatusChanged {
-                            message_id,
-                            status,
-                            server_message_id: Some(raw_message_id),
-                            error_code: None,
-                        });
+                        let message_id = if channel_id > 0 {
+                            self.storage
+                                .get_message_id_by_server_message_id(channel_id, channel_type, raw_message_id)
+                                .await?
+                        } else {
+                            self.storage
+                                .get_message_by_id(raw_message_id)
+                                .await?
+                                .map(|message| message.message_id)
+                        };
+                        // A status can arrive for a message this device has never hydrated.
+                        // Do not emit a fictitious update or store it under a server ID as local ID.
+                        if let Some(message_id) = message_id {
+                            self.storage.update_message_status(message_id, status).await?;
+                            emitted.push(SdkEvent::MessageSendStatusChanged {
+                                message_id,
+                                status,
+                                server_message_id: Some(raw_message_id),
+                                error_code: None,
+                            });
+                        }
                     }
                     emitted.push(SdkEvent::SyncEntityChanged {
                         entity_type: "message_status".to_string(),
@@ -7876,10 +7874,7 @@ impl State {
                             .get_channel_unread_count(channel_id, channel_type)
                             .await
                             .ok();
-                        let _ = self
-                            .storage
-                            .project_channel_read_cursor(channel_id, channel_type, read_pts)
-                            .await;
+                        self.storage.project_channel_read_cursor(channel_id, channel_type, read_pts).await?;
                         let unread_after = self
                             .storage
                             .get_channel_unread_count(channel_id, channel_type)
@@ -7898,10 +7893,7 @@ impl State {
                             );
                         }
                     } else if read_pts > 0 {
-                        let _ = self
-                            .storage
-                            .save_peer_read_pts(channel_id, channel_type, read_pts)
-                            .await;
+                        self.storage.save_peer_read_pts(channel_id, channel_type, read_pts).await?;
                         emitted.push(SdkEvent::PeerReadPtsAdvanced {
                             channel_id,
                             channel_type,
@@ -9300,29 +9292,7 @@ impl State {
             since_version = response.next_version;
         };
 
-        let mut applied = 0usize;
-        let mut entity_events: Vec<SdkEvent> = Vec::new();
-        for batch in SyncCommitApplier::drain_batches(&mut self.receive_pipeline) {
-            let count = batch.items.len();
-            match self
-                .apply_sync_entities(
-                    &batch.entity_type,
-                    batch.scope.as_deref(),
-                    &batch.items,
-                    false,
-                )
-                .await
-            {
-                Ok(events) => {
-                    applied += count;
-                    entity_events.extend(events);
-                }
-                Err(err) => {
-                    SyncCommitApplier::requeue_front(&mut self.receive_pipeline, batch);
-                    return Err(err);
-                }
-            }
-        }
+        let (applied, entity_events) = self.apply_pending_receive_batches(false).await?;
         if persist_cursor {
             self.save_sync_next_version(
                 &entity_type_for_apply,
@@ -10045,7 +10015,7 @@ impl State {
         let mut applied = 0usize;
         for (item, message_id) in resp.messages.into_iter().zip(message_ids) {
             let timestamp_ms = i64::try_from(item.timestamp).unwrap_or(i64::MAX);
-            let _ = self
+            self
                 .update_channel_last_message(
                     item.channel_id,
                     normalized_channel_type,
@@ -10055,7 +10025,7 @@ impl State {
                     Some(item.sender_id),
                     false,
                 )
-                .await;
+                .await?;
             applied += 1;
         }
         Ok(applied)
@@ -10169,13 +10139,11 @@ impl State {
         channel_type: i32,
     ) -> Result<usize> {
         let scope = Some(format!("{channel_type}:{channel_id}"));
+        // A pushed message is not proof that earlier timeline events were applied.
         let mut last_pts = self
-            .storage
-            .max_message_pts(channel_id, channel_type)
-            .await?;
-        if let Some(cursor_pts) = self.load_resume_channel_pts(channel_id, channel_type).await {
-            last_pts = last_pts.max(cursor_pts);
-        }
+            .load_resume_channel_pts(channel_id, channel_type)
+            .await
+            .unwrap_or(0);
         let mut total_applied = 0usize;
         let mut pages = 0usize;
         loop {
@@ -10196,12 +10164,11 @@ impl State {
                         == ResumeFailureClass::ChannelResyncRequired
                     {
                         let current_pts = self.get_channel_pts(channel_id, channel_type).await?;
-                        self.save_resume_channel_pts(channel_id, channel_type, current_pts)
-                            .await?;
                         let recovered = self
                             .hydrate_channel_messages_from_history(channel_id, channel_type, 100)
-                            .await
-                            .unwrap_or(0);
+                            .await?;
+                        self.save_resume_channel_pts(channel_id, channel_type, current_pts)
+                            .await?;
                         return Ok(total_applied + recovered);
                     }
                     return Err(err);
@@ -10374,15 +10341,10 @@ impl State {
         };
         let mut observations = Vec::with_capacity(channels.len());
         for (channel_id, channel_type) in channels.iter().copied() {
-            let materialized_pts = self
-                .storage
-                .max_message_pts(channel_id, channel_type)
-                .await?;
             let local_pts = self
                 .load_resume_channel_pts(channel_id, channel_type)
                 .await
-                .unwrap_or(0)
-                .max(materialized_pts);
+                .unwrap_or(0);
             observations.push(AntiEntropyObservation {
                 key: (channel_id, channel_type),
                 local_pts,
@@ -10617,9 +10579,21 @@ impl State {
         self.last_sync_queued = stats.queued_items;
         self.last_sync_dropped_duplicates = stats.dropped_duplicates;
 
+        let (applied, entity_events) = self
+            .apply_pending_receive_batches(bump_unread_on_incoming)
+            .await?;
+        self.invalidate_cache_for_events(&entity_events);
+        self.last_sync_entity_events = entity_events;
+        Ok(applied)
+    }
+
+    async fn apply_pending_receive_batches(
+        &mut self,
+        bump_unread_on_incoming: bool,
+    ) -> Result<(usize, Vec<SdkEvent>)> {
         let mut applied = 0usize;
         let mut entity_events: Vec<SdkEvent> = Vec::new();
-        for batch in SyncCommitApplier::drain_batches(&mut self.receive_pipeline) {
+        while let Some(batch) = self.receive_pipeline.pop_batch() {
             let count = batch.items.len();
             match self
                 .apply_sync_entities(
@@ -10635,14 +10609,12 @@ impl State {
                     entity_events.extend(events);
                 }
                 Err(err) => {
-                    SyncCommitApplier::requeue_front(&mut self.receive_pipeline, batch);
+                    self.receive_pipeline.requeue_front(batch);
                     return Err(err);
                 }
             }
         }
-        self.invalidate_cache_for_events(&entity_events);
-        self.last_sync_entity_events = entity_events;
-        Ok(applied)
+        Ok((applied, entity_events))
     }
 
     /// P1-05：room 广播去重。返回 true 表示这条 (channel_id, server_message_id) 最近
@@ -25126,6 +25098,51 @@ mod tests {
         assert_eq!(reactions[0].emoji, "👍");
         assert!(!reactions[0].is_deleted);
 
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_receive_batch_keeps_later_batches_and_publishes_no_receipt() {
+        let (mut state, dir) = new_seeded_state("receive-batch-retry").await;
+        let paths = state.storage.get_storage_paths().await.unwrap();
+        let conn = rusqlite::Connection::open(paths.db_path).unwrap();
+        conn.pragma_update(
+            None, "key", &crate::local_store::LocalStore::derive_encryption_key("10001"),
+        ).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER block_peer_read BEFORE INSERT ON channel_extra
+             BEGIN SELECT RAISE(ABORT, 'forced read cursor failure'); END;",
+        ).unwrap();
+
+        let item = |channel_id: u64| SyncEntityItem {
+            entity_id: channel_id.to_string(),
+            version: 10,
+            deleted: false,
+            payload: Some(serde_json::json!({
+                "channel_id": channel_id, "channel_type": 1,
+                "reader_id": 20002, "last_read_pts": 10
+            })),
+        };
+        for channel_id in [92101, 92102] {
+            assert!(state.enqueue_and_apply_sync_items(
+                "channel_read_cursor".into(), None, vec![item(channel_id)], false,
+            ).await.is_err());
+            assert!(state.last_sync_entity_events.is_empty());
+        }
+
+        conn.execute_batch("DROP TRIGGER block_peer_read;").unwrap();
+        assert_eq!(state.enqueue_and_apply_sync_items(
+            "channel_read_cursor".into(), None, vec![item(92102)], false,
+        ).await.unwrap(), 2);
+        for channel_id in [92101, 92102] {
+            assert_eq!(state.storage.get_peer_read_pts(channel_id, 1).await.unwrap(), Some(10));
+            assert!(state.last_sync_entity_events.iter().any(|event| matches!(
+                event, SdkEvent::PeerReadPtsAdvanced { channel_id: id, read_pts: 10, .. }
+                if *id == channel_id
+            )));
+        }
+        drop(conn);
         state.storage.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }
