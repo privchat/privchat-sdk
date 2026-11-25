@@ -17,6 +17,7 @@
 
 mod account_manager;
 mod coordinator;
+mod dead_recovery;
 mod phases;
 mod restart_fault;
 mod types;
@@ -72,6 +73,9 @@ async fn main() -> BoxResult<()> {
     println!("duration     : {:.2}s", summary.duration.as_secs_f64());
 
     if summary.failed == 0 {
+        if let Some(dir) = std::env::var_os("PRIVCHAT_DEAD_RECOVERY_DIR") {
+            dead_recovery::run(&manager, std::path::Path::new(&dir)).await?;
+        }
         if let Some(dir) = std::env::var_os("PRIVCHAT_RESTART_FAULT_DIR") {
             restart_fault::run(&manager, std::path::Path::new(&dir)).await?;
         }

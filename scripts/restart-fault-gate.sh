@@ -17,7 +17,7 @@ SERVICE_MASTER_KEY=$(openssl rand -hex 32)
 umask 077
 root=$(mktemp -d "${TMPDIR:-/tmp}/privchat-restart-gate.XXXXXX")
 echo "Restart gate evidence: $root"
-server_pid= proxy_pid= accounts_pid=
+server_pid= proxy_pid= accounts_pid= prometheus_pid= alertmanager_pid= webhook_pid=
 stop() {
     if [[ -n "$1" ]]; then kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; fi
 }
@@ -26,6 +26,7 @@ cleanup() {
         kill -TERM -- "-$accounts_pid" 2>/dev/null || true
         wait "$accounts_pid" 2>/dev/null || true
     fi
+    stop "$prometheus_pid"; stop "$alertmanager_pid"; stop "$webhook_pid"
     stop "$proxy_pid"; stop "$server_pid"
     # The fixture contains a disposable login. Do not retain it with logs.
     for secret in "$root/fixture" "$root/fixture.tmp"; do
@@ -80,6 +81,11 @@ start() {
         -H "X-Service-Key: $SERVICE_MASTER_KEY" "http://127.0.0.1:$admin/api/service/system/ready" 2>/dev/null
 }
 start
+if [[ "${PRIVCHAT_GATE_MODE:-restart}" == dead-recovery || "${PRIVCHAT_GATE_MODE:-restart}" == dead-recovery-wire ]]; then
+    source "$script_dir/dead-recovery-gate.inc.sh"
+    run_dead_recovery_gate
+    exit 0
+fi
 python3 "$script_dir/restart-fault-proxy.py" "$root" "$PRIVCHAT_FAULT_PROXY_PORT" "$PRIVCHAT_TCP_PORT" >proxy.log 2>&1 &
 proxy_pid=$!
 wait_for 10 test -f proxy-ready
