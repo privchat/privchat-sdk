@@ -109,6 +109,8 @@ pub(crate) async fn run(manager: &MultiAccountManager, dir: &Path) -> BoxResult<
         .local_reader()
         .await?
         .ok_or_else(|| std::io::Error::other("no Bob reader"))?;
+    let trace = dir.join("accounts.log");
+    let offset = std::fs::metadata(&trace)?.len();
     let fixture = serde_json::json!({
         "channel": channel.to_string(),
         "alice": manager.user_id("alice")?.to_string(),
@@ -127,8 +129,6 @@ pub(crate) async fn run(manager: &MultiAccountManager, dir: &Path) -> BoxResult<
         "Bob already had the message before the recovery hint",
     )?;
 
-    let trace = dir.join("accounts.log");
-    let offset = std::fs::metadata(&trace)?.len();
     let url = format!(
         "http://127.0.0.1:{}/api/service/messages/dispatch/recover",
         std::env::var("PRIVCHAT_ADMIN_API_PORT")?.parse::<u16>()?
@@ -191,4 +191,45 @@ pub(crate) async fn run(manager: &MultiAccountManager, dir: &Path) -> BoxResult<
     println!("[PASS] one bodyless wire hint, no replay, one authorized local projection");
     std::fs::write(dir.join("wire-passed"), "")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use privchat_protocol::{encode_message, EntityInvalidation, PushMessageRequest};
+
+    #[test]
+    fn wire_inspector_rejects_duplicate_hints_and_original_body_pushes() {
+        let batch = EntityInvalidationBatch::new_v1(
+            41,
+            vec![EntityInvalidation {
+                entity_type: "message_timeline".into(),
+                entity_id: None,
+                target_version: 0,
+                scope: Some("1:42".into()),
+                mutation_hint: EntityMutationHint::Unknown,
+            }],
+            1000,
+        )
+        .unwrap();
+        let frame = PushMessageRequest {
+            topic: ENTITY_INVALIDATION_PUSH_TOPIC_V1.into(),
+            payload: encode_message(&batch).unwrap(),
+            ..Default::default()
+        };
+        let log = format!("[SDK.inbound] decoded PushMessageRequest: {frame:?}\n");
+        inspect_inbound_trace(&log, "1:42").unwrap();
+        assert!(inspect_inbound_trace(&log, "1:43").is_err());
+        assert!(inspect_inbound_trace(&format!("{log}{log}"), "1:42").is_err());
+
+        let replay = PushMessageRequest {
+            payload: PROBE.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        assert!(inspect_inbound_trace(
+            &format!("{log}[SDK.inbound] decoded PushMessageRequest: {replay:?}\n"),
+            "1:42"
+        )
+        .is_err());
+    }
 }

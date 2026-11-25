@@ -68,6 +68,12 @@ YAML
         wait_for 30 metrics_baseline
     fi
 
+    read_expiry_counter() {
+        curl --noproxy 127.0.0.1 -fsS --max-time 2 "http://127.0.0.1:$file/metrics" |
+            awk '/^privchat_timeline_dispatch_dead_total\{reason="lease_expired"\} / {print $NF}'
+    }
+    [[ "$(read_expiry_counter)" = 0 ]]
+
     unset PRIVCHAT_RESTART_FAULT_DIR
     export PRIVCHAT_DEAD_RECOVERY_DIR="$root" PRIVCHAT_ADMIN_API_PORT="$admin" PRIVCHAT_INBOUND_LOG=1
     mkdir accounts-tmp
@@ -112,6 +118,8 @@ SQL
         [[ "$(psql -XAt -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "SELECT state || ':' || attempts FROM privchat_message_dispatch_recipient WHERE event_id=$message AND user_id=$bob")" = "3:8" ]]
     }
     wait_for 20 expiry_persisted
+    expiry_counted() { [[ "$(read_expiry_counter)" = 1 ]]; }
+    wait_for 5 expiry_counted
     touch dead-ready
     wait_for 40 test -f wire-passed
     wait "$accounts_pid"
