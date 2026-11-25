@@ -18,6 +18,7 @@
 mod account_manager;
 mod coordinator;
 mod phases;
+mod restart_fault;
 mod types;
 
 use account_manager::MultiAccountManager;
@@ -36,6 +37,9 @@ async fn main() -> BoxResult<()> {
     // 🔴 合并进**已有**的值，而不是「两个都没设才写」：只要环境里已经有一个
     // `NO_PROXY=localhost`，缺失的网段就永远补不上，附件上传照样走代理。
     ensure_proxy_bypass();
+    if let Ok(mode) = std::env::var("PRIVCHAT_RESTART_FAULT_MODE") {
+        return restart_fault::child(&mode).await;
+    }
 
     println!("\nPrivChat SDK Multi-Account Example (accounts)");
     println!("================================================");
@@ -67,6 +71,11 @@ async fn main() -> BoxResult<()> {
     println!("failed       : {}", summary.failed);
     println!("duration     : {:.2}s", summary.duration.as_secs_f64());
 
+    if summary.failed == 0 {
+        if let Some(dir) = std::env::var_os("PRIVCHAT_RESTART_FAULT_DIR") {
+            restart_fault::run(&manager, std::path::Path::new(&dir)).await?;
+        }
+    }
     manager.cleanup().await?;
 
     if summary.failed > 0 {

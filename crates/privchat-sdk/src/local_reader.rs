@@ -211,7 +211,8 @@ mod tests {
             .await
             .unwrap();
         entered_rx.await.unwrap();
-        let reads = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // The unreleased actor barrier proves isolation. This watchdog is not a latency SLO.
+        let reads = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             assert_eq!(reader.session().await.unwrap().unwrap().user_id, 10001);
             reader.channels(10, 0).await.unwrap();
             assert_eq!(reader.friends(10, 0).await.unwrap()[0].user_id, 55);
@@ -231,7 +232,7 @@ mod tests {
         );
         let _ = release_tx.send(());
         sdk.shutdown().await;
-        assert!(reads.is_ok(), "local reads waited behind the network actor");
+        assert!(reads.is_ok(), "local reads did not finish while the network actor was held");
         drop(sdk);
         drop(reader);
         let _ = std::fs::remove_dir_all(dir);

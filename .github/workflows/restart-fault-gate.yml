@@ -1,0 +1,79 @@
+name: restart-fault-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  restart-fault:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: privchat_fault_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d privchat_fault_ci"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      PRIVCHAT_FAULT_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/privchat_fault_ci
+      PRIVCHAT_FAULT_REDIS_URL: redis://127.0.0.1:6379
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: privchat-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: privchat/privchat
+          ref: da11408546b42adf912560319e437fa1e7a6178c
+          path: privchat-server
+      - uses: actions/checkout@v4
+        with:
+          repository: zoujiaqing/msgtrans
+          ref: 2c3086dc3b12da75aa20f0fbec448620b9a126e9
+          path: msgtrans
+      - uses: actions/checkout@v4
+        with:
+          repository: privchat/privchat-protocol
+          ref: 213b99c6a2a3a7ea31821df21a850720939e648e
+          path: privchat-protocol
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            privchat-server
+            privchat-sdk
+      - name: Install database client tools
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client redis-tools jq
+      - name: Build server with online SQLx schema
+        run: |
+          psql "$PRIVCHAT_FAULT_DB_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE privchat_fault_compile;'
+          compile_db="${PRIVCHAT_FAULT_DB_URL%/*}/privchat_fault_compile"
+          for schema in migrations/00[1-9]*.sql; do
+            psql "$compile_db" -v ON_ERROR_STOP=1 -f "$schema"
+          done
+          DATABASE_URL="$compile_db" cargo build --bin privchat
+        working-directory: privchat-server
+      - name: Build two-client harness
+        run: cargo build -p privchat-sdk --example accounts
+        working-directory: privchat-sdk
+      - name: Real TLS ACK loss and process restart
+        run: bash privchat-sdk/scripts/restart-fault-gate.sh privchat-server/target/debug/privchat privchat-sdk/target/debug/examples/accounts
