@@ -3175,6 +3175,26 @@ impl Error {
     }
 }
 
+fn validate_difference_page(req: &GetDifferenceRequest, page: &GetDifferenceResponse) -> Result<()> {
+    let end = page.commits.iter().try_fold(req.last_pts, |previous, commit| {
+        (previous.checked_add(1) == Some(commit.pts)
+            && commit.channel_id == req.channel_id
+            && commit.channel_type == req.channel_type)
+            .then_some(commit.pts)
+    });
+    if end.is_some_and(|end| {
+        end <= page.current_pts
+            && page.has_more == (end < page.current_pts)
+            && (!page.has_more || end > req.last_pts)
+    }) {
+        return Ok(());
+    }
+    Err(Error::Server {
+        code: ErrorCode::ServiceUnavailable as u32,
+        message: format!("Invalid difference page for channel {}", req.channel_id),
+    })
+}
+
 /// 服务端业务错误码是否可重试（仅瞬时类）。
 /// 其余业务码都视为永久失败 —— 例如 MessageNotFound/InvalidParams/PermissionDenied
 /// 之类的用户态错误，重试只会反复失败，应当出队并标记 failed。
@@ -9397,8 +9417,10 @@ impl State {
         let body = rpc_resp
             .data
             .ok_or_else(|| Error::Serialization("empty get_difference data".into()))?;
-        serde_json::from_slice(&body)
-            .map_err(|e| Error::Serialization(format!("decode get_difference response: {e}")))
+        let response = serde_json::from_slice(&body)
+            .map_err(|e| Error::Serialization(format!("decode get_difference response: {e}")))?;
+        validate_difference_page(&req, &response)?;
+        Ok(response)
     }
 
     async fn get_channel_pts(&mut self, channel_id: u64, channel_type: i32) -> Result<u64> {
@@ -10207,16 +10229,7 @@ impl State {
                         .await?;
                 }
             }
-            let next_last_pts = response
-                .commits
-                .iter()
-                .map(|commit| commit.pts)
-                .max()
-                .unwrap_or(last_pts);
-            if next_last_pts <= last_pts {
-                break;
-            }
-            last_pts = next_last_pts;
+            last_pts = response.commits.last().expect("validated non-empty page").pts;
             self.save_resume_channel_pts(channel_id, channel_type, last_pts)
                 .await?;
             if !response.has_more {
@@ -25100,6 +25113,31 @@ mod tests {
 
         state.storage.shutdown();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn difference_rejects_a_gap_before_applying_any_commit() {
+        let req = super::GetDifferenceRequest {
+            channel_id: 7, channel_type: 1, last_pts: 100, limit: Some(200),
+        };
+        let commit = |pts| super::ServerCommit {
+            pts, event_id: None, channel_id: 7, channel_type: 1,
+            server_msg_id: pts, local_message_id: None, sender_id: 1, sender_info: None,
+            message_type: "text".into(), content: serde_json::json!({"content": "message"}),
+            server_timestamp: 0, event_schema_version: None, canonical_event: None,
+        };
+        let mut page = super::GetDifferenceResponse {
+            commits: vec![commit(101), commit(103)], current_pts: 103, has_more: false,
+        };
+        let err = super::validate_difference_page(&req, &page).unwrap_err();
+        assert!(matches!(State::classify_resume_error(&err), super::ResumeFailureClass::RetryableTemporaryError));
+        page.commits.insert(1, commit(102));
+        super::validate_difference_page(&req, &page).unwrap();
+        page.commits.swap(1, 2);
+        assert!(super::validate_difference_page(&req, &page).is_err());
+        page.commits.clear();
+        page.has_more = true;
+        assert!(super::validate_difference_page(&req, &page).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

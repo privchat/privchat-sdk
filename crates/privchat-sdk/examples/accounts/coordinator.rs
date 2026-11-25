@@ -404,6 +404,13 @@ impl TestCoordinator {
             )
             .await;
         }
+        if self.enabled("phase50_offline_revoke_recovers") {
+            self.run_phase(
+                "phase50_offline_revoke_recovers",
+                TestPhases::phase50_offline_revoke_recovers(manager).await,
+            )
+            .await;
+        }
         self.finish_selection()
     }
 

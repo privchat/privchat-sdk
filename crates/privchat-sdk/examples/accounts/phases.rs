@@ -797,6 +797,64 @@ impl TestPhases {
         })
     }
 
+    pub async fn phase50_offline_revoke_recovers(
+        manager: &mut MultiAccountManager,
+    ) -> BoxResult<PhaseResult> {
+        let start = std::time::Instant::now();
+        let channel_id = manager.cached_direct_channel("alice", "bob")
+            .ok_or_else(|| boxed_err("missing Alice/Bob direct channel"))?;
+        let channel_type = i32::from(DIRECT_SYNC_CHANNEL_TYPE);
+        let bob = manager.sdk("bob")?;
+        let reader = bob.local_reader().await?.ok_or_else(|| boxed_err("Bob local reader unavailable"))?;
+        let seed = format!("offline-revoke-{}", now_millis());
+        let submission = manager.send_text("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE, &seed).await?;
+        let server_id = submission.server_msg_id.ok_or_else(|| boxed_err("seed not committed"))?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let messages = reader.messages(channel_id, channel_type, 50, 0).await?;
+                if messages.iter().any(|m| m.server_message_id == Some(server_id) && !m.revoked && m.content.contains(&seed)) {
+                    break Ok::<_, BoxError>(());
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }).await.map_err(|_| boxed_err("Bob did not receive the seed message"))??;
+
+        bob.disconnect().await?;
+        if !manager.message_revoke("alice", channel_id, server_id).await? {
+            return Err(boxed_err("offline revoke was not accepted"));
+        }
+        let follow_up = format!("after-{seed}");
+        let later = manager.send_text("alice", channel_id, DIRECT_SYNC_CHANNEL_TYPE, &follow_up).await?;
+        let later_id = later.server_msg_id.ok_or_else(|| boxed_err("follow-up not committed"))?;
+
+        // Do not read history into SQLite from the harness; reconnect/auth plus
+        // the SDK's normal recovery must apply both the revoke and later message.
+        let cfg = manager.account_config("bob")?;
+        bob.connect().await?;
+        bob.authenticate(cfg.user_id, cfg.token.clone(), cfg.device_id.clone()).await?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let messages = reader.messages(channel_id, channel_type, 50, 0).await?;
+                let original = messages.iter().filter(|m| m.server_message_id == Some(server_id)).collect::<Vec<_>>();
+                let later = messages.iter().filter(|m| m.server_message_id == Some(later_id)).collect::<Vec<_>>();
+                if original.len() == 1 && original[0].revoked
+                    && later.len() == 1 && later[0].content.contains(&follow_up)
+                {
+                    break Ok::<_, BoxError>(());
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }).await.map_err(|_| boxed_err("Bob did not converge after reconnect"))??;
+
+        Ok(PhaseResult {
+            phase_name: "offline-revoke-recovers".into(),
+            success: true,
+            duration: start.elapsed(),
+            details: format!("revoked={server_id}, following={later_id}, one row each"),
+            metrics: PhaseMetrics { messages_sent: 2, ..Default::default() },
+        })
+    }
+
     pub async fn phase13_offline_messages(
         manager: &mut MultiAccountManager,
     ) -> BoxResult<PhaseResult> {
