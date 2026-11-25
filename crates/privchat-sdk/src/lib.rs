@@ -6417,7 +6417,7 @@ impl State {
         for item in batch.items {
             if !matches!(
                 item.entity_type.as_str(),
-                "friend" | "user" | "group" | "group_member" | "channel" | "channel_read_cursor"
+                "friend" | "user" | "group" | "group_member" | "channel" | "channel_read_cursor" | "message_timeline"
             ) {
                 tracing::warn!(
                     entity_type = item.entity_type,
@@ -6440,6 +6440,19 @@ impl State {
 
         let mut total_applied = 0usize;
         for (entity_type, scope) in pulls {
+            if entity_type == "message_timeline" {
+                if let Some((wire_type, id)) = scope.as_deref().and_then(|scope| scope.split_once(':')) {
+                    let channel_type = match wire_type {
+                        "1" => 1,
+                        "2" => 2,
+                        _ => continue,
+                    };
+                    if let Ok(channel_id @ 1..) = id.parse::<u64>() {
+                        total_applied += self.resume_channel_difference(channel_id, channel_type).await?;
+                    }
+                }
+                continue;
+            }
             let applied = self
                 .sync_entities(entity_type.clone(), scope.clone())
                 .await?;
@@ -23291,6 +23304,34 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&("friend".to_string(), None)));
         assert!(keys.contains(&("group_member".to_string(), Some("20001".to_string()))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeline_hint_only_uses_the_authoritative_difference_path() {
+        let (mut state, dir) = new_seeded_state("timeline-recovery-hint").await;
+        let push = |scope: &str| {
+            let batch = EntityInvalidationBatch::new_v1(101, vec![EntityInvalidation {
+                entity_type: "message_timeline".into(),
+                entity_id: None,
+                scope: Some(scope.into()),
+                target_version: 90_000,
+                mutation_hint: EntityMutationHint::Unknown,
+            }], 1000).unwrap();
+            PushMessageRequest {
+                topic: ENTITY_INVALIDATION_PUSH_TOPIC_V1.into(),
+                payload: batch.encode_fb().unwrap(),
+                ..Default::default()
+            }
+        };
+        for invalid in ["3:20", "0:20", "1:0", "1:x:20"] {
+            assert_eq!(state.apply_entity_invalidation_push(&push(invalid)).await.unwrap(), Some(0));
+        }
+        // The fixture has no transport. A valid hint must attempt a difference
+        // RPC rather than advancing its cursor from the untrusted target version.
+        assert!(state.apply_entity_invalidation_push(&push("1:20")).await.is_err());
+        assert!(state.load_resume_channel_pts(20, 1).await.is_none());
+        state.storage.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
