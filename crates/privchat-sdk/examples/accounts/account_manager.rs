@@ -170,6 +170,9 @@ pub const GROUP_SYNC_CHANNEL_TYPE: u8 = 2;
 impl MultiAccountManager {
     pub async fn new() -> BoxResult<Self> {
         let host = std::env::var("PRIVCHAT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        if std::env::var_os("PRIVCHAT_CROSS_TRANSPORT_DIR").is_some() && host != "127.0.0.1" {
+            return Err(boxed_err("cross-transport fixture must use loopback"));
+        }
         let tcp_port = parse_env_u16("PRIVCHAT_TCP_PORT", 9001);
         let quic_port = parse_env_u16("PRIVCHAT_QUIC_PORT", 9001);
         let ws_port = parse_env_u16("PRIVCHAT_WS_PORT", 9080);
@@ -260,8 +263,22 @@ impl MultiAccountManager {
         let data_dir = self.base_dir.join(key);
         std::fs::create_dir_all(&data_dir)?;
 
+        let mut endpoints = self.endpoints.clone();
+        if std::env::var_os("PRIVCHAT_CROSS_TRANSPORT_DIR").is_some() {
+            let protocol = if key == "alice" {
+                TransportProtocol::Quic
+            } else {
+                TransportProtocol::Tcp
+            };
+            endpoints.retain(|endpoint| {
+                std::mem::discriminant(&endpoint.protocol) == std::mem::discriminant(&protocol)
+            });
+            if endpoints.len() != 1 {
+                return Err(boxed_err("cross-transport fixture requires QUIC and TCP endpoints"));
+            }
+        }
         let sdk = Arc::new(PrivchatSdk::new(PrivchatConfig {
-            endpoints: self.endpoints.clone(),
+            endpoints,
             connection_timeout_secs: self.timeout_secs,
             data_dir: data_dir.to_string_lossy().to_string(),
             spki_pins: self.spki_pins.clone(),

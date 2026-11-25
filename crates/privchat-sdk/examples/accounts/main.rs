@@ -17,6 +17,7 @@
 
 mod account_manager;
 mod coordinator;
+mod cross_transport;
 mod dead_recovery;
 mod phases;
 mod restart_fault;
@@ -48,6 +49,11 @@ async fn main() -> BoxResult<()> {
 
     let started = std::time::Instant::now();
     let mut manager = MultiAccountManager::new().await?;
+    if let Some(dir) = std::env::var_os("PRIVCHAT_CROSS_TRANSPORT_DIR") {
+        cross_transport::run(&mut manager, std::path::Path::new(&dir)).await?;
+        manager.cleanup().await?;
+        return Ok(());
+    }
 
     let alice = manager.account_config("alice")?;
     let bob = manager.account_config("bob")?;
