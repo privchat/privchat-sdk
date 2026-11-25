@@ -81,13 +81,15 @@ YAML
         "$accounts_bin" >accounts.log 2>&1 &
     accounts_pid=$!
     wait_for 120 test -s fixture
-    local channel alice bob message body
+    local channel alice bob message body offline_before
     channel=$(jq -er .channel fixture)
     alice=$(jq -er .alice fixture)
     bob=$(jq -er .bob fixture)
     message=$(jq -er .message fixture)
     body=$(jq -er .body fixture)
     [[ "$channel" =~ ^[0-9]+$ && "$alice" =~ ^[0-9]+$ && "$bob" =~ ^[0-9]+$ && "$message" =~ ^[0-9]+$ ]]
+    offline_before=$(redis-cli --raw -u "$REDIS_URL" llen "offline:$bob:messages")
+    [[ "$offline_before" =~ ^[0-9]+$ ]]
 
     # Create a committed timeline event with only a final expired lease.
     # The real worker, not the harness, must transition it to DEAD.
@@ -130,7 +132,20 @@ SQL
         jq -e '.receiver == "acceptance-webhook" and any(.alerts[]; .status == "firing" and .labels.alertname == "PrivChatTimelineDeliveryDead" and .labels.job == "privchat-acceptance")' alert-delivered.json >/dev/null
         echo '[PASS] real Prometheus rule fired and Alertmanager delivered the webhook'
     fi
-    [[ "$(psql -XAt -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "SELECT count(*) FROM privchat_timeline_recovery_audit WHERE event_id=$message AND user_id=$bob AND notified_sessions=1")" = 1 ]]
-    expiry_persisted
-    [[ "$(redis-cli -u "$REDIS_URL" exists "offline:$bob:messages")" = 0 ]]
+    local audit_count offline_after
+    audit_count=$(psql -XAt -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "SELECT count(*) FROM privchat_timeline_recovery_audit WHERE event_id=$message AND user_id=$bob AND notified_sessions=1")
+    if [[ "$audit_count" != 1 ]]; then
+        echo "Expected one online recovery audit record, got: $audit_count" >&2
+        return 1
+    fi
+    if ! expiry_persisted; then
+        echo "Recovery changed the DEAD recipient state or attempt count" >&2
+        return 1
+    fi
+    offline_after=$(redis-cli --raw -u "$REDIS_URL" llen "offline:$bob:messages")
+    if [[ "$offline_after" != "$offline_before" ]]; then
+        echo "Recovery changed the recipient offline queue: $offline_before -> $offline_after" >&2
+        return 1
+    fi
+    echo '[PASS] one audit record, recipient still DEAD, offline queue unchanged'
 }
