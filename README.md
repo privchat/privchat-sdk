@@ -246,3 +246,14 @@ This project is not intended for direct use by application developers. Instead, 
 - [Architecture Spec](docs/architecture-spec.md) - Actor model / local-first / FFI constraints
 - [Public API v2](docs/public-api-v2.md) - SDK public API and call flows
 - [Sync Resume Spec](../privchat-docs/spec/03-protocol-sdk/SDK_SYNC_RESUME_SPEC.md) - Reconnect recovery using entity versions and per-channel `pts`
+
+### TLS and database encryption
+
+Network TLS (including uploads and downloads) uses rustls. Apple builds use
+SQLCipher with CommonCrypto. Android and Linux SDK builds use vendored OpenSSL
+libcrypto through SQLCipher for local database encryption; this is not an
+OpenSSL TLS transport. The `openssl-probe` crate only locates system trust
+stores; it does not link an OpenSSL library.
+
+The Rust SDK inherits the compiler/runtime pair from the sibling
+`privchat-protocol` repository. See its protocol README for the pinned `flatc`.
